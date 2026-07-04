@@ -46,7 +46,7 @@ class Storage:
                 show_cny INTEGER NOT NULL DEFAULT 1,
                 all_members_can_record INTEGER NOT NULL DEFAULT 0,
                 simple_limit INTEGER,
-                day_cutoff_hour INTEGER NOT NULL DEFAULT 6,
+                day_cutoff_hour INTEGER NOT NULL DEFAULT 0,
                 pin_enabled INTEGER NOT NULL DEFAULT 0,
                 realtime_rate INTEGER NOT NULL DEFAULT 0,
                 realtime_rate_offset TEXT NOT NULL DEFAULT '0',
@@ -369,7 +369,19 @@ class Storage:
         self.conn.execute("UPDATE records SET bot_message_id = ? WHERE id = ?", (bot_message_id, record_id))
         self.conn.commit()
 
-    def list_records_for_day(self, chat_id: int, day_key: str) -> list[sqlite3.Row]:
+    def list_records_for_day(self, chat_id: int, day_key: str, *, all_days: bool = False) -> list[sqlite3.Row]:
+        if all_days:
+            return list(
+                self.conn.execute(
+                    """
+                    SELECT * FROM records
+                    WHERE chat_id = ?
+                      AND deleted_at IS NULL
+                    ORDER BY id ASC
+                    """,
+                    (chat_id,),
+                )
+            )
         return list(
             self.conn.execute(
                 """
@@ -434,14 +446,23 @@ class Storage:
             self.soft_delete_record(chat_id, row["id"], now, kind=kind)
         return rows
 
-    def soft_delete_day(self, chat_id: int, day_key: str, now: datetime) -> int:
-        cursor = self.conn.execute(
-            """
-            UPDATE records SET deleted_at = ?
-            WHERE chat_id = ? AND day_key = ? AND deleted_at IS NULL AND is_balance = 0
-            """,
-            (now.isoformat(), chat_id, day_key),
-        )
+    def soft_delete_day(self, chat_id: int, day_key: str, now: datetime, *, all_days: bool = False) -> int:
+        if all_days:
+            cursor = self.conn.execute(
+                """
+                UPDATE records SET deleted_at = ?
+                WHERE chat_id = ? AND deleted_at IS NULL AND is_balance = 0
+                """,
+                (now.isoformat(), chat_id),
+            )
+        else:
+            cursor = self.conn.execute(
+                """
+                UPDATE records SET deleted_at = ?
+                WHERE chat_id = ? AND day_key = ? AND deleted_at IS NULL AND is_balance = 0
+                """,
+                (now.isoformat(), chat_id, day_key),
+            )
         self.conn.commit()
         return cursor.rowcount
 
@@ -466,16 +487,35 @@ class Storage:
             )
         )
 
-    def update_day_exchange_rate(self, chat_id: int, day_key: str, exchange_rate: str, now: datetime) -> int:
-        rows = list(
-            self.conn.execute(
-                """
-                SELECT * FROM records
-                WHERE chat_id = ? AND day_key = ? AND deleted_at IS NULL
-                """,
-                (chat_id, day_key),
+    def update_day_exchange_rate(
+        self,
+        chat_id: int,
+        day_key: str,
+        exchange_rate: str,
+        now: datetime,
+        *,
+        all_days: bool = False,
+    ) -> int:
+        if all_days:
+            rows = list(
+                self.conn.execute(
+                    """
+                    SELECT * FROM records
+                    WHERE chat_id = ? AND deleted_at IS NULL
+                    """,
+                    (chat_id,),
+                )
             )
-        )
+        else:
+            rows = list(
+                self.conn.execute(
+                    """
+                    SELECT * FROM records
+                    WHERE chat_id = ? AND day_key = ? AND deleted_at IS NULL
+                    """,
+                    (chat_id, day_key),
+                )
+            )
         changed = 0
         for row in rows:
             values = _recalculate_record(row, exchange_rate)

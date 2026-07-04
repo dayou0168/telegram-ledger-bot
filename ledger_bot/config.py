@@ -36,6 +36,12 @@ class Config:
     tron_usdt_contract: str
     tron_poll_interval_seconds: int
     tron_initial_lookback_minutes: int
+    p2p_rate_api_base: str
+    p2p_rate_front_api: str
+    p2p_rate_market: str
+    p2p_rate_fiat_unit: str
+    p2p_rate_asset: str
+    p2p_rate_trade_methods: tuple[str, ...]
     poll_timeout: int = 50
     request_timeout: int = 70
 
@@ -72,6 +78,16 @@ def load_config() -> Config:
         tron_usdt_contract=os.environ.get("TRON_USDT_CONTRACT", "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"),
         tron_poll_interval_seconds=int(os.environ.get("TRON_POLL_INTERVAL_SECONDS", "5")),
         tron_initial_lookback_minutes=int(os.environ.get("TRON_INITIAL_LOOKBACK_MINUTES", "15")),
+        p2p_rate_api_base=os.environ.get("P2P_RATE_API_BASE", "https://p2p.army/api/fapi").rstrip("/"),
+        p2p_rate_front_api=os.environ.get("P2P_RATE_FRONT_API", "NextVOF2Ozuh36mW0TCv"),
+        p2p_rate_market=os.environ.get("P2P_RATE_MARKET", "okx"),
+        p2p_rate_fiat_unit=os.environ.get("P2P_RATE_FIAT_UNIT", "CNY"),
+        p2p_rate_asset=os.environ.get("P2P_RATE_ASSET", "USDT"),
+        p2p_rate_trade_methods=tuple(
+            value.strip()
+            for value in os.environ.get("P2P_RATE_TRADE_METHODS", "aliPay").split(",")
+            if value.strip()
+        ),
         poll_timeout=int(os.environ.get("BOT_POLL_TIMEOUT", "50")),
         request_timeout=int(os.environ.get("BOT_REQUEST_TIMEOUT", "70")),
     )

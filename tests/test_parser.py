@@ -50,3 +50,37 @@ def test_operator_mentions() -> None:
     assert isinstance(parsed, ParsedCommand)
     assert parsed.name == "add_operator"
     assert parsed.args["mentions"] == ["alice", "bob_123"]
+
+
+def test_cutoff_off_commands() -> None:
+    for text in ["关闭日切", "取消日切", "日切关闭"]:
+        parsed = parse_message(text)
+        assert isinstance(parsed, ParsedCommand)
+        assert parsed.name == "cutoff_off"
+
+
+def test_set_cutoff_minus_one() -> None:
+    parsed = parse_message("设置日切-1")
+    assert isinstance(parsed, ParsedCommand)
+    assert parsed.name == "set_cutoff"
+    assert parsed.args["hour"] == -1
+
+
+def test_z0_shows_otc_top() -> None:
+    parsed = parse_message("Z0")
+    assert isinstance(parsed, ParsedCommand)
+    assert parsed.name == "otc"
+
+
+def test_z_rank_sets_rate_with_offset() -> None:
+    parsed = parse_message("z1 -0.1")
+    assert isinstance(parsed, ParsedCommand)
+    assert parsed.name == "set_rate_from_otc_rank"
+    assert parsed.args["rank"] == 1
+    assert parsed.args["offset"] == Decimal("-0.1")
+
+    parsed = parse_message("Z10 +0.1")
+    assert isinstance(parsed, ParsedCommand)
+    assert parsed.name == "set_rate_from_otc_rank"
+    assert parsed.args["rank"] == 10
+    assert parsed.args["offset"] == Decimal("0.1")

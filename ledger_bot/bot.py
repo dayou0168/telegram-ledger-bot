@@ -11,6 +11,7 @@ from urllib.parse import urlencode
 from .address_watch import format_transfer_notice, should_notify_transfer
 from .calculator import CalculatorError, calculate_expression, format_calculation_result, is_arithmetic_expression
 from .config import Config
+from .p2p_rates import P2POrderBookEntry, P2PRateClient, P2PRateError
 from .parser import ParsedCommand, ParsedLedgerEntry, parse_message
 from .storage import Storage, TelegramUser, business_day_key, business_day_range, user_from_telegram
 from .telegram_api import TelegramAPIError, TelegramClient, run_with_backoff
@@ -49,6 +50,7 @@ MANAGEMENT_COMMANDS = {
     "all_members_on",
     "all_members_off",
     "modify_exchange_for_bill",
+    "set_rate_from_otc_rank",
     "save_bill",
     "leave_group",
 }
@@ -94,6 +96,11 @@ class LedgerBot:
         self.tron_client = TronGridClient(
             api_base=config.trongrid_api_base,
             api_key=config.trongrid_api_key,
+            request_timeout=config.request_timeout,
+        )
+        self.p2p_rate_client = P2PRateClient(
+            api_base=config.p2p_rate_api_base,
+            front_api=config.p2p_rate_front_api,
             request_timeout=config.request_timeout,
         )
         self.offset: int | None = None
@@ -271,7 +278,14 @@ class LedgerBot:
             case "modify_exchange_for_bill":
                 day_key = self.day_key(ctx)
                 rate = str(command.args["exchange_rate"])
-                changed = self.storage.update_day_exchange_rate(ctx.chat_id, day_key, rate, ctx.now)
+                group = self.storage.get_group(ctx.chat_id)
+                changed = self.storage.update_day_exchange_rate(
+                    ctx.chat_id,
+                    day_key,
+                    rate,
+                    ctx.now,
+                    all_days=self.day_cutoff_disabled(group),
+                )
                 self.storage.update_group(ctx.chat_id, ctx.now, deposit_exchange_rate=rate)
                 self.reply(ctx, f"已同步今日账单汇率为 {format_number(Decimal(rate))}，更新 {changed} 条。")
             case "pin_on":
@@ -321,10 +335,92 @@ class LedgerBot:
                 self.reply(ctx, "机器人即将退群，并清除本群权限和账单。")
                 self.storage.delete_group_data(ctx.chat_id)
                 self.client.leave_chat(ctx.chat_id)
-            case "external_query" | "otc" | "rate_query":
+            case "set_rate_from_otc_rank":
+                self.set_rate_from_otc_rank(ctx, int(command.args["rank"]), command.args["offset"])
+            case "otc":
+                self.send_otc_rates(ctx)
+            case "rate_query":
+                self.reply(ctx, self.format_current_rate(group))
+            case "external_query":
                 self.reply(ctx, "查询接口还未接入。可以先正常记账，OTC/银行卡/地址查询会作为独立模块添加。")
             case _:
                 self.reply(ctx, "这个指令已识别，但当前版本还未启用。")
+
+    def fetch_otc_top_entries(self, limit: int = 10) -> list[P2POrderBookEntry]:
+        return self.p2p_rate_client.fetch_order_book_top(
+            market=self.config.p2p_rate_market,
+            fiat_unit=self.config.p2p_rate_fiat_unit,
+            asset=self.config.p2p_rate_asset,
+            trade_methods=list(self.config.p2p_rate_trade_methods),
+            limit=limit,
+        )
+
+    def send_otc_rates(self, ctx: MessageContext) -> None:
+        try:
+            entries = self.fetch_otc_top_entries(10)
+        except P2PRateError as exc:
+            self.reply(ctx, f"Z0 查询失败：{exc}")
+            return
+
+        methods = self.config.p2p_rate_trade_methods
+        method_text = "、".join(methods) if methods else "全部支付方式"
+        lines = [
+            f"OKX {self.config.p2p_rate_fiat_unit}买{self.config.p2p_rate_asset} TOP10",
+            f"支付方式：{method_text}",
+        ]
+        for entry in entries:
+            limits = self.format_entry_limits(entry)
+            merchant = self.trim_text(entry.merchant_name, 10)
+            lines.append(f"Z{entry.rank}  {format_number(entry.price)}  {merchant}{limits}")
+        lines.append("")
+        lines.append("发送 Z1 -0.1 或 Z1 +0.1 可按第1档偏移后设置汇率。")
+        self.reply(ctx, "\n".join(lines))
+
+    def set_rate_from_otc_rank(self, ctx: MessageContext, rank: int, offset: Decimal) -> None:
+        try:
+            entries = self.fetch_otc_top_entries(max(10, rank))
+        except P2PRateError as exc:
+            self.reply(ctx, f"设置失败：{exc}")
+            return
+
+        entry = next((item for item in entries if item.rank == rank), None)
+        if entry is None:
+            self.reply(ctx, f"设置失败：没有找到 Z{rank} 档。")
+            return
+
+        rate = entry.price + offset
+        if rate <= 0:
+            self.reply(ctx, "设置失败：计算后的汇率不能小于或等于 0。")
+            return
+
+        rate_text = format_number(rate)
+        self.storage.update_group(
+            ctx.chat_id,
+            ctx.now,
+            deposit_exchange_rate=str(rate),
+            realtime_rate=1,
+            realtime_rate_offset=str(offset),
+        )
+        self.reply(
+            ctx,
+            f"操作成功：Z{rank} 基准 {format_number(entry.price)}，偏移 {format_signed_decimal(offset)}，当前汇率 {rate_text}",
+        )
+
+    def format_current_rate(self, group: Any) -> str:
+        return (
+            f"当前入款汇率：{format_number(Decimal(group['deposit_exchange_rate']))}\n"
+            f"当前下发汇率：{format_number(Decimal(group['payout_exchange_rate']))}"
+        )
+
+    @staticmethod
+    def format_entry_limits(entry: P2POrderBookEntry) -> str:
+        if entry.limit_min is None or entry.limit_max is None:
+            return ""
+        return f"  限额{format_number(entry.limit_min)}-{format_number(entry.limit_max)}"
+
+    @staticmethod
+    def trim_text(value: str, max_len: int) -> str:
+        return value if len(value) <= max_len else value[:max_len] + "..."
 
     def handle_private_message(
         self,
@@ -616,7 +712,7 @@ class LedgerBot:
         compact: bool = False,
     ) -> str:
         group = self.storage.get_group(chat_id)
-        rows = self.storage.list_records_for_day(chat_id, day_key)
+        rows = self.storage.list_records_for_day(chat_id, day_key, all_days=self.day_cutoff_disabled(group))
         if only_user_id is not None:
             rows = [row for row in rows if row["actor_user_id"] == only_user_id or row["subject_user_id"] == only_user_id]
         deposits = [row for row in rows if row["kind"] == "deposit"]
@@ -710,12 +806,23 @@ class LedgerBot:
 
     def build_bill_url(self, chat_id: int, day_key: str) -> str | None:
         group = self.storage.get_group(chat_id)
-        begin, end = business_day_range(day_key, group["day_cutoff_hour"], self.config.timezone)
+        if self.day_cutoff_disabled(group):
+            begin_time = ""
+            end_time = ""
+            all_flag = "1"
+            bill_key = "active"
+        else:
+            begin, end = business_day_range(day_key, group["day_cutoff_hour"], self.config.timezone)
+            begin_time = begin.strftime("%Y-%m-%d %H:%M:%S")
+            end_time = end.strftime("%Y-%m-%d %H:%M:%S")
+            all_flag = ""
+            bill_key = day_key
         values = {
             "chat_id": str(chat_id),
-            "day_key": day_key,
-            "begin_time": begin.strftime("%Y-%m-%d %H:%M:%S"),
-            "end_time": end.strftime("%Y-%m-%d %H:%M:%S"),
+            "day_key": bill_key,
+            "begin_time": begin_time,
+            "end_time": end_time,
+            "all": all_flag,
             "bot_name": self.config.public_bill_bot_name,
             "up_page": "1",
             "down_page": "1",
@@ -735,13 +842,13 @@ class LedgerBot:
                 "created_at": "",
                 "begintime": values["begin_time"],
                 "endtime": values["end_time"],
-                "all": "",
+                "all": values["all"],
                 "phpname": values["bot_name"],
                 "type": "bjr",
             }
             separator = "&" if "?" in base else "?"
             return f"{base}{separator}{urlencode(params)}"
-        return f"{base}/bill/{values['chat_id']}/{day_key}"
+        return f"{base}/bill/{values['chat_id']}/{values['day_key']}"
 
     def ask_clear_confirm(self, ctx: MessageContext, scope: str) -> None:
         label = "今日账单" if scope == "today" else "全部账单"
@@ -874,9 +981,15 @@ class LedgerBot:
             if scope == "cancel":
                 self.client.answer_callback_query(callback["id"], "已取消。")
                 return
-            day_key = business_day_key(now, self.storage.get_group(chat_id)["day_cutoff_hour"], self.config.timezone)
+            group = self.storage.get_group(chat_id)
+            day_key = business_day_key(now, group["day_cutoff_hour"], self.config.timezone)
             if scope == "today":
-                count = self.storage.soft_delete_day(chat_id, day_key, now)
+                count = self.storage.soft_delete_day(
+                    chat_id,
+                    day_key,
+                    now,
+                    all_days=self.day_cutoff_disabled(group),
+                )
             else:
                 count = self.storage.soft_delete_all(chat_id, now)
             self.client.answer_callback_query(callback["id"], f"已删除 {count} 条。")
@@ -884,7 +997,8 @@ class LedgerBot:
             return
 
         if data == "bill:full":
-            day_key = business_day_key(now, self.storage.get_group(chat_id)["day_cutoff_hour"], self.config.timezone)
+            group = self.storage.get_group(chat_id)
+            day_key = business_day_key(now, group["day_cutoff_hour"], self.config.timezone)
             self.client.answer_callback_query(callback["id"])
             self.client.send_message(chat_id, self.build_bill_text(chat_id, day_key))
 
@@ -1001,6 +1115,10 @@ class LedgerBot:
         group = self.storage.get_group(ctx.chat_id)
         return business_day_key(ctx.now, group["day_cutoff_hour"], self.config.timezone)
 
+    @staticmethod
+    def day_cutoff_disabled(group: Any) -> bool:
+        return int(group["day_cutoff_hour"]) < 0
+
     def reply(self, ctx: MessageContext, text: str) -> None:
         self.client.send_message(ctx.chat_id, text, reply_to_message_id=ctx.message_id)
 
@@ -1055,6 +1173,14 @@ def format_number(value: Decimal) -> str:
     if "." in text:
         text = text.rstrip("0").rstrip(".")
     return text or "0"
+
+
+def format_signed_decimal(value: Decimal) -> str:
+    if value == 0:
+        return "0"
+    if value > 0:
+        return f"+{format_number(value)}"
+    return format_number(value)
 
 
 def sum_decimal(values: Any) -> Decimal:

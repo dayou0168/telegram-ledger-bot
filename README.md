@@ -13,6 +13,7 @@
 - 入款：`+1000`、`+1000/7.1`、`+1000*5`、`+1000*5/7.1`、`+1000*12%`、`+1000U`。
 - 下发：`下发5000`、`下发5000/7.8`、`下发5000*5/7.1`、`下发5000U`。
 - 群内运算：`1000/6.8`、`1000/7.5-1000/6.8`，机器人直接回复 `原式=结果`，不写入账单。
+- `Z0` 查询 OKX CNY 买 USDT 支付宝 TOP10；`Z1 -0.1` 按第 1 档下浮 0.1 设置入款汇率，`Z1 +0.1` 则上浮 0.1。
 - 私聊菜单：开始记账、详细说明、分组广播、自助续费、地址监听、群发广播、功能设置、账单统计。
 - 地址监听：私聊发送 `添加监听地址 Txxxx 备注`、`删除监听地址 Txxxx`、`地址监听`。USDT 监听只支持 TRC20，收入/支出/TRX 通知可单独开关。
 - TRC20 USDT 交易提醒格式已预留：收入显示出账地址和入账监听地址，支出显示出账监听地址和入账地址，交易哈希可点击跳转 Tronscan。
@@ -20,7 +21,7 @@
 - 加账本人回复错误的机器人记账回执，发送 `撤销` / `撤销入款` / `撤销下发` 可撤销。
 - `删除账单`、`清除今日账单` 会二次确认。
 - `简洁模式10` / `显示条数10`、`完整模式`。
-- `设置日切6`、`设置日切-1` 或 `关闭日切`。
+- 默认按北京时间 00:00 日切，可用 `设置日切6` 改到 6 点，`设置日切-1` 或 `关闭日切` 可关闭自动日切。
 - `开启记账置顶` / `关闭记账置顶`。
 - 每个群的 `🌏完整账单` 按钮会按 `chat_id` 生成独立链接。
 
@@ -62,7 +63,7 @@ PUBLIC_BILL_BOT_NAME=YOUR_BOT_CODE
 机器人会给每个群生成类似这样的独立链接：
 
 ```text
-https://your-domain.example/day_xxb.php?firstname=&chat_id=-100xxx&up_page=1&down_page=1&created_at=&begintime=2026-07-04+06%3A00%3A00&endtime=2026-07-05+06%3A00%3A00&all=&phpname=YOUR_BOT_CODE&type=bjr
+https://your-domain.example/day_xxb.php?firstname=&chat_id=-100xxx&up_page=1&down_page=1&created_at=&begintime=2026-07-04+00%3A00%3A00&endtime=2026-07-05+00%3A00%3A00&all=&phpname=YOUR_BOT_CODE&type=bjr
 ```
 
 核心隔离字段是 `chat_id`，不同群会打开不同账单。
@@ -86,6 +87,21 @@ TRON_INITIAL_LOOKBACK_MINUTES=15
 ```
 
 机器人会定时请求 TronGrid 的 TRC20 交易接口，发现新的 USDT 收入/支出后私聊推送。`TRON_POLL_INTERVAL_SECONDS=5` 是接近秒级提醒；如果要更快可以调到 `2` 或 `3`，但主网强烈建议配置 `TRONGRID_API_KEY`。`TRON_INITIAL_LOOKBACK_MINUTES` 控制每次轮询回看的时间窗口，去重表会避免重复提醒。
+
+### Z0 汇率查询
+
+默认查询 OKX P2P 的 CNY 买 USDT 支付宝订单簿：
+
+```env
+P2P_RATE_API_BASE=https://p2p.army/api/fapi
+P2P_RATE_FRONT_API=NextVOF2Ozuh36mW0TCv
+P2P_RATE_MARKET=okx
+P2P_RATE_FIAT_UNIT=CNY
+P2P_RATE_ASSET=USDT
+P2P_RATE_TRADE_METHODS=aliPay
+```
+
+群里发送 `Z0` 会显示最近 TOP10。发送 `Z1 -0.1` 会取第 1 档价格减 0.1 后写入当前群入款汇率；`Z1 +0.1` 会取第 1 档价格加 0.1。
 
 3. 启动：
 
@@ -125,7 +141,7 @@ volumes:
 
 这些功能已经预留指令入口，但需要第三方 API 或后台页面再接：
 
-- OTC/欧易/火币/越南盾/马币/金价查询。
+- 火币/越南盾/马币/金价查询。
 - 手机号、银行卡、身份证、TRX 地址查询。
 - 网页版完整账单。
 - 群发后台。

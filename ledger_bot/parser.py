@@ -69,6 +69,8 @@ def parse_message(text: str) -> ParsedMessage:
         "显示人民币": "show_cny_on",
         "隐藏人民币": "show_cny_off",
         "关闭日切": "cutoff_off",
+        "取消日切": "cutoff_off",
+        "日切关闭": "cutoff_off",
         "关闭全局日切": "global_cutoff_off",
         "设置所有人": "all_members_on",
         "取消所有人": "all_members_off",
@@ -81,8 +83,14 @@ def parse_message(text: str) -> ParsedMessage:
     if normalized in exact_commands:
         return ParsedCommand(exact_commands[normalized], {})
 
-    if normalized.lower() == "z0":
-        return ParsedCommand("otc", {})
+    if match := re.fullmatch(r"[zZ](\d{1,2})(?:\s*([+-]?\d+(?:\.\d+)?))?", normalized):
+        rank = int(match.group(1))
+        if rank == 0:
+            return ParsedCommand("otc", {})
+        if 1 <= rank <= 10:
+            offset = _decimal(match.group(2)) if match.group(2) else Decimal("0")
+            return ParsedCommand("set_rate_from_otc_rank", {"rank": rank, "offset": offset})
+        return None
 
     if match := re.fullmatch(r"设置(?:入款)?费率\s*(%s)\s*%%?" % NUMBER, normalized):
         return ParsedCommand("set_deposit_fee_rate", {"fee_rate": _decimal(match.group(1))})
