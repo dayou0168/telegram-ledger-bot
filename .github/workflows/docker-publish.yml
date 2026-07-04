@@ -38,8 +38,10 @@ jobs:
 
           modules = [
               "tests.test_parser",
+              "tests.test_broadcast",
               "tests.test_calculate",
               "tests.test_calculator",
+              "tests.test_config",
               "tests.test_address_watch",
               "tests.test_tron_api",
               "tests.test_storage",

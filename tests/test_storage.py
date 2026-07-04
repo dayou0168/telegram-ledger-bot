@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from ledger_bot.storage import Storage, business_day_key
+from ledger_bot.storage import Storage, TelegramUser, business_day_key
 
 
 BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
@@ -74,5 +74,122 @@ def test_cutoff_off_lists_and_clears_current_open_bill() -> None:
 
             assert deleted == 2
             assert [row["amount"] for row in remaining] == ["50"]
+        finally:
+            storage.conn.close()
+
+
+def test_group_is_deduped_by_chat_id_and_title_updates() -> None:
+    with TemporaryDirectory() as tmp:
+        storage = Storage(Path(tmp) / "bot.db")
+        try:
+            now = datetime(2026, 7, 4, 12, tzinfo=BEIJING_TZ)
+            storage.ensure_group(-100123, "旧群名", now)
+            group = storage.ensure_group(-100123, "新群名", now)
+            rows = storage.list_broadcast_groups()
+
+            assert group["chat_title"] == "新群名"
+            assert len(rows) == 1
+            assert rows[0]["chat_title"] == "新群名"
+        finally:
+            storage.conn.close()
+
+
+def test_set_group_owner_replaces_previous_owner_role() -> None:
+    with TemporaryDirectory() as tmp:
+        storage = Storage(Path(tmp) / "bot.db")
+        try:
+            now = datetime(2026, 7, 4, 12, tzinfo=BEIJING_TZ)
+            storage.ensure_group(-100123, "测试群", now)
+            old_owner = TelegramUser(1001, "old", "Old")
+            host = TelegramUser(2002, "host", "Host")
+
+            storage.set_group_owner(-100123, old_owner, now=now)
+            storage.set_group_owner(-100123, host, now=now)
+            rows = storage.list_operators(-100123)
+
+            assert storage.get_group(-100123)["owner_user_id"] == 2002
+            assert [(row["user_id"], row["role"]) for row in rows] == [(2002, "owner")]
+        finally:
+            storage.conn.close()
+
+
+def test_named_broadcast_group_bulk_add_remove_and_title_refresh() -> None:
+    with TemporaryDirectory() as tmp:
+        storage = Storage(Path(tmp) / "bot.db")
+        try:
+            now = datetime(2026, 7, 4, 12, tzinfo=BEIJING_TZ)
+            storage.ensure_group(-1001, "A群", now)
+            storage.ensure_group(-1002, "B群", now)
+            storage.create_named_broadcast_group("财务", created_by=9, now=now)
+
+            added, known_ids, missing_ids = storage.add_broadcast_group_members(
+                "财务",
+                [-1001, -1002, -1001, -1999],
+                now=now,
+            )
+
+            assert added == 2
+            assert known_ids == [-1002, -1001]
+            assert missing_ids == [-1999]
+            assert set(storage.target_chat_ids_for_broadcast_group("财务")) == {-1001, -1002}
+
+            storage.ensure_group(-1002, "B群新名字", now)
+            members = storage.list_broadcast_group_members("财务")
+
+            assert {row["chat_id"]: row["chat_title"] for row in members} == {
+                -1001: "A群",
+                -1002: "B群新名字",
+            }
+
+            removed = storage.remove_broadcast_group_members("财务", [-1001, -1999], now=now)
+
+            assert removed == 1
+            assert storage.target_chat_ids_for_broadcast_group("财务") == [-1002]
+        finally:
+            storage.conn.close()
+
+
+def test_broadcast_job_stores_source_message_and_notify_all() -> None:
+    with TemporaryDirectory() as tmp:
+        storage = Storage(Path(tmp) / "bot.db")
+        try:
+            now = datetime(2026, 7, 4, 12, tzinfo=BEIJING_TZ)
+            job = storage.create_broadcast_job(
+                creator_user_id=10,
+                scope="all",
+                target_chat_ids=[-1001, -1002],
+                text="[图片] 说明",
+                source_chat_id=10,
+                source_message_id=55,
+                message_kind="photo",
+                notify_all=True,
+                now=now,
+            )
+
+            assert job["source_chat_id"] == 10
+            assert job["source_message_id"] == 55
+            assert job["message_kind"] == "photo"
+            assert job["notify_all"] == 1
+            assert job["target_chat_ids"] == "[-1001, -1002]"
+        finally:
+            storage.conn.close()
+
+
+def test_forget_group_preserves_records_but_removes_broadcast_target() -> None:
+    with TemporaryDirectory() as tmp:
+        storage = Storage(Path(tmp) / "bot.db")
+        try:
+            now = datetime(2026, 7, 4, 12, tzinfo=BEIJING_TZ)
+            storage.ensure_group(-1001, "测试群", now)
+            storage.insert_record(make_record(-1001, "2026-07-04", amount="100"))
+            storage.create_named_broadcast_group("财务", created_by=9, now=now)
+            storage.add_broadcast_group_members("财务", [-1001], now=now)
+
+            storage.forget_group(-1001)
+
+            assert storage.list_broadcast_groups() == []
+            assert storage.target_chat_ids_for_broadcast_group("财务") == []
+            rows = storage.list_records_for_day(-1001, "2026-07-04")
+            assert [row["amount"] for row in rows] == ["100"]
         finally:
             storage.conn.close()

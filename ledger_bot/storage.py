@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import json
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -155,6 +156,42 @@ class Storage:
                 created_at TEXT NOT NULL,
                 UNIQUE(owner_user_id, address, tx_hash, direction)
             );
+
+            CREATE TABLE IF NOT EXISTS broadcast_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                creator_user_id INTEGER NOT NULL,
+                scope TEXT NOT NULL,
+                target_chat_ids TEXT NOT NULL,
+                text TEXT NOT NULL,
+                source_chat_id INTEGER,
+                source_message_id INTEGER,
+                message_kind TEXT NOT NULL DEFAULT 'text',
+                notify_all INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending',
+                success_count INTEGER NOT NULL DEFAULT 0,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                confirmed_at TEXT,
+                completed_at TEXT,
+                updated_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS broadcast_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                name_norm TEXT NOT NULL UNIQUE,
+                created_by INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS broadcast_group_members (
+                group_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (group_id, chat_id),
+                FOREIGN KEY(group_id) REFERENCES broadcast_groups(id) ON DELETE CASCADE
+            );
             """
         )
         self._add_missing_columns(
@@ -178,7 +215,233 @@ class Storage:
                 "bot_message_id": "INTEGER",
             },
         )
+        self._add_missing_columns(
+            "broadcast_jobs",
+            {
+                "source_chat_id": "INTEGER",
+                "source_message_id": "INTEGER",
+                "message_kind": "TEXT NOT NULL DEFAULT 'text'",
+                "notify_all": "INTEGER NOT NULL DEFAULT 0",
+                "updated_at": "TEXT",
+            },
+        )
         self.conn.commit()
+
+    def list_broadcast_groups(self, *, chat_ids: list[int] | None = None) -> list[sqlite3.Row]:
+        if chat_ids is not None:
+            if not chat_ids:
+                return []
+            placeholders = ", ".join("?" for _ in chat_ids)
+            return list(
+                self.conn.execute(
+                    f"""
+                    SELECT * FROM groups
+                    WHERE chat_id < 0 AND chat_id IN ({placeholders})
+                    ORDER BY updated_at DESC, chat_id ASC
+                    """,
+                    chat_ids,
+                )
+            )
+        return list(
+            self.conn.execute(
+                """
+                SELECT * FROM groups
+                WHERE chat_id < 0
+                ORDER BY updated_at DESC, chat_id ASC
+                """
+            )
+        )
+
+    def create_broadcast_job(
+        self,
+        *,
+        creator_user_id: int,
+        scope: str,
+        target_chat_ids: list[int],
+        text: str,
+        source_chat_id: int | None = None,
+        source_message_id: int | None = None,
+        message_kind: str = "text",
+        notify_all: bool = False,
+        now: datetime,
+    ) -> sqlite3.Row:
+        cursor = self.conn.execute(
+            """
+            INSERT INTO broadcast_jobs(
+                creator_user_id,
+                scope,
+                target_chat_ids,
+                text,
+                source_chat_id,
+                source_message_id,
+                message_kind,
+                notify_all,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                creator_user_id,
+                scope,
+                json.dumps(target_chat_ids),
+                text,
+                source_chat_id,
+                source_message_id,
+                message_kind,
+                1 if notify_all else 0,
+                now.isoformat(),
+                now.isoformat(),
+            ),
+        )
+        self.conn.commit()
+        return self.get_broadcast_job(cursor.lastrowid)
+
+    def get_broadcast_job(self, job_id: int) -> sqlite3.Row:
+        row = self.conn.execute("SELECT * FROM broadcast_jobs WHERE id = ?", (job_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Broadcast job {job_id} is missing")
+        return row
+
+    def update_broadcast_job(self, job_id: int, now: datetime, **fields: Any) -> sqlite3.Row:
+        fields["updated_at"] = now.isoformat()
+        existing = {row["name"] for row in self.conn.execute("PRAGMA table_info(broadcast_jobs)")}
+        fields = {key: value for key, value in fields.items() if key in existing}
+        if not fields:
+            return self.get_broadcast_job(job_id)
+        columns = ", ".join(f"{name} = ?" for name in fields)
+        values = list(fields.values())
+        values.append(job_id)
+        self.conn.execute(f"UPDATE broadcast_jobs SET {columns} WHERE id = ?", values)
+        self.conn.commit()
+        return self.get_broadcast_job(job_id)
+
+    @staticmethod
+    def normalize_broadcast_group_name(name: str) -> str:
+        return name.strip().lower()
+
+    def create_named_broadcast_group(self, name: str, *, created_by: int, now: datetime) -> sqlite3.Row:
+        clean_name = name.strip()
+        if not clean_name:
+            raise ValueError("Broadcast group name is empty")
+        name_norm = self.normalize_broadcast_group_name(clean_name)
+        self.conn.execute(
+            """
+            INSERT INTO broadcast_groups(name, name_norm, created_by, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(name_norm) DO UPDATE SET
+                name = excluded.name,
+                updated_at = excluded.updated_at
+            """,
+            (clean_name, name_norm, created_by, now.isoformat(), now.isoformat()),
+        )
+        self.conn.commit()
+        row = self.get_named_broadcast_group(clean_name)
+        if row is None:
+            raise KeyError(f"Broadcast group {clean_name} is missing")
+        return row
+
+    def get_named_broadcast_group(self, name: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM broadcast_groups WHERE name_norm = ?",
+            (self.normalize_broadcast_group_name(name),),
+        ).fetchone()
+
+    def delete_named_broadcast_group(self, name: str) -> int:
+        cursor = self.conn.execute(
+            "DELETE FROM broadcast_groups WHERE name_norm = ?",
+            (self.normalize_broadcast_group_name(name),),
+        )
+        self.conn.commit()
+        return cursor.rowcount
+
+    def list_named_broadcast_groups(self) -> list[sqlite3.Row]:
+        return list(
+            self.conn.execute(
+                """
+                SELECT bg.*, COUNT(bgm.chat_id) AS member_count
+                FROM broadcast_groups bg
+                LEFT JOIN broadcast_group_members bgm ON bgm.group_id = bg.id
+                GROUP BY bg.id
+                ORDER BY bg.updated_at DESC, bg.id ASC
+                """
+            )
+        )
+
+    def add_broadcast_group_members(
+        self,
+        name: str,
+        chat_ids: list[int],
+        *,
+        now: datetime,
+    ) -> tuple[int, list[int], list[int]]:
+        group = self.get_named_broadcast_group(name)
+        if group is None:
+            raise KeyError(f"Broadcast group {name} is missing")
+        unique_ids = list(dict.fromkeys(chat_ids))
+        known_rows = self.list_broadcast_groups(chat_ids=unique_ids)
+        known_ids = {int(row["chat_id"]) for row in known_rows}
+        missing_ids = [chat_id for chat_id in unique_ids if chat_id not in known_ids]
+        added = 0
+        for chat_id in unique_ids:
+            if chat_id not in known_ids:
+                continue
+            cursor = self.conn.execute(
+                """
+                INSERT OR IGNORE INTO broadcast_group_members(group_id, chat_id, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (group["id"], chat_id, now.isoformat()),
+            )
+            added += cursor.rowcount
+        self.conn.execute(
+            "UPDATE broadcast_groups SET updated_at = ? WHERE id = ?",
+            (now.isoformat(), group["id"]),
+        )
+        self.conn.commit()
+        return added, sorted(known_ids), missing_ids
+
+    def remove_broadcast_group_members(self, name: str, chat_ids: list[int], *, now: datetime) -> int:
+        group = self.get_named_broadcast_group(name)
+        if group is None:
+            raise KeyError(f"Broadcast group {name} is missing")
+        unique_ids = list(dict.fromkeys(chat_ids))
+        if not unique_ids:
+            return 0
+        placeholders = ", ".join("?" for _ in unique_ids)
+        cursor = self.conn.execute(
+            f"""
+            DELETE FROM broadcast_group_members
+            WHERE group_id = ? AND chat_id IN ({placeholders})
+            """,
+            [group["id"], *unique_ids],
+        )
+        self.conn.execute(
+            "UPDATE broadcast_groups SET updated_at = ? WHERE id = ?",
+            (now.isoformat(), group["id"]),
+        )
+        self.conn.commit()
+        return cursor.rowcount
+
+    def list_broadcast_group_members(self, name: str) -> list[sqlite3.Row]:
+        group = self.get_named_broadcast_group(name)
+        if group is None:
+            raise KeyError(f"Broadcast group {name} is missing")
+        return list(
+            self.conn.execute(
+                """
+                SELECT bgm.chat_id, bgm.created_at, g.chat_title, g.updated_at AS group_updated_at
+                FROM broadcast_group_members bgm
+                LEFT JOIN groups g ON g.chat_id = bgm.chat_id
+                WHERE bgm.group_id = ?
+                ORDER BY g.updated_at DESC, bgm.chat_id ASC
+                """,
+                (group["id"],),
+            )
+        )
+
+    def target_chat_ids_for_broadcast_group(self, name: str) -> list[int]:
+        return [int(row["chat_id"]) for row in self.list_broadcast_group_members(name)]
 
     def _add_missing_columns(self, table: str, columns: dict[str, str]) -> None:
         existing = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
@@ -301,6 +564,11 @@ class Storage:
             (chat_id, username_norm, username_norm, f"@{username_norm}", added_by, now.isoformat()),
         )
         self.conn.commit()
+
+    def set_group_owner(self, chat_id: int, user: TelegramUser, *, now: datetime) -> None:
+        self.conn.execute("DELETE FROM operators WHERE chat_id = ? AND role = 'owner'", (chat_id,))
+        self.add_operator(chat_id, user, added_by=user.user_id, role="owner", now=now)
+        self.update_group(chat_id, now, owner_user_id=user.user_id)
 
     def remove_operator(
         self,
@@ -546,6 +814,14 @@ class Storage:
         self.conn.execute("DELETE FROM records WHERE chat_id = ?", (chat_id,))
         self.conn.execute("DELETE FROM operators WHERE chat_id = ?", (chat_id,))
         self.conn.execute("DELETE FROM group_members WHERE chat_id = ?", (chat_id,))
+        self.conn.execute("DELETE FROM broadcast_group_members WHERE chat_id = ?", (chat_id,))
+        self.conn.execute("DELETE FROM groups WHERE chat_id = ?", (chat_id,))
+        self.conn.commit()
+
+    def forget_group(self, chat_id: int) -> None:
+        self.conn.execute("DELETE FROM operators WHERE chat_id = ?", (chat_id,))
+        self.conn.execute("DELETE FROM group_members WHERE chat_id = ?", (chat_id,))
+        self.conn.execute("DELETE FROM broadcast_group_members WHERE chat_id = ?", (chat_id,))
         self.conn.execute("DELETE FROM groups WHERE chat_id = ?", (chat_id,))
         self.conn.commit()
 

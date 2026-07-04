@@ -15,6 +15,12 @@
 - 群内运算：`1000/6.8`、`1000/7.5-1000/6.8`，机器人直接回复 `原式=结果`，不写入账单。
 - `Z0` 查询 OKX CNY 买 USDT 支付宝 TOP10；`Z1 -0.1` 按第 1 档下浮 0.1 设置入款汇率，`Z1 +0.1` 则上浮 0.1。
 - 私聊菜单：开始记账、详细说明、分组广播、自助续费、地址监听、群发广播、功能设置、账单统计。
+- 机器人只有一个宿主；默认操作人只由维护人员修改服务器配置 `DEFAULT_OPERATOR_USER_IDS` 添加/删除，默认操作人可以邀请机器人进群、在任意群记账、使用群发广播和分组广播。
+- 宿主或本群最高权限可以在群内发送 `添加操作员 @user` / `删除操作员 @user` 设置单群操作人。
+- 机器人被邀请进群或群里有人发言时会按 `chat_id` 保存群组，群名变更后会自动更新；唯一宿主必须在群内，否则机器人自动退群，即使默认操作人在群内也不会保留。
+- 私聊 `群发广播 广播内容` 可发给全部已保存群；图片/图片+文字先发给机器人，再回复该素材发送 `群发广播`。
+- 私聊 `新建分组 财务`、`分组添加 财务 -100111 -100222`、`分组移除 财务 -100111` 管理分组，`分组广播 财务 广播内容` 发送到该分组。
+- 群发广播和分组广播都支持 `通知所有人`，会在目标群内 @ 所有有过发言记录的用户，例如 `群发广播 通知所有人 广播内容`。
 - 地址监听：私聊发送 `添加监听地址 Txxxx 备注`、`删除监听地址 Txxxx`、`地址监听`。USDT 监听只支持 TRC20，收入/支出/TRX 通知可单独开关。
 - TRC20 USDT 交易提醒格式已预留：收入显示出账地址和入账监听地址，支出显示出账监听地址和入账地址，交易哈希可点击跳转 Tronscan。
 - `+0` 查看简洁账单，`显示账单` 查看完整今日账单。
@@ -41,7 +47,11 @@ TELEGRAM_BOT_USERNAME=your_bot_username
 TELEGRAM_API_BASE=https://api.telegram.org
 BOT_DB_PATH=data/ledger_bot.db
 BOT_TIMEZONE=Asia/Shanghai
+BOT_HOST_USER_ID=123456789
+DEFAULT_OPERATOR_USER_IDS=
 ```
+
+先私聊机器人发送 `我的ID` 获取你的 Telegram ID，再填入 `BOT_HOST_USER_ID`。机器人只允许配置一个宿主。默认操作人可在 `.env` 的 `DEFAULT_OPERATOR_USER_IDS` 里用英文逗号分隔，只有维护程序的人员能通过改服务器配置添加或删除。
 
 如果你用自建 Telegram Bot API Server，`TELEGRAM_API_BASE` 填服务根地址即可，例如：
 
@@ -125,6 +135,8 @@ services:
       TELEGRAM_API_BASE: "https://api.telegram.org"
       BOT_DB_PATH: "data/ledger_bot.db"
       BOT_TIMEZONE: "Asia/Shanghai"
+      BOT_HOST_USER_ID: "replace-with-your-telegram-id"
+      DEFAULT_OPERATOR_USER_IDS: ""
       TRONGRID_API_BASE: "https://api.trongrid.io"
       TRONGRID_API_KEY: "replace-with-your-trongrid-key"
       TRON_USDT_CONTRACT: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
@@ -144,5 +156,4 @@ volumes:
 - 火币/越南盾/马币/金价查询。
 - 手机号、银行卡、身份证、TRX 地址查询。
 - 网页版完整账单。
-- 群发后台。
 - 地址白名单和 USDT 交易提醒。

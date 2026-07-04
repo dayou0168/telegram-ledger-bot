@@ -89,6 +89,19 @@ class TelegramClient:
             payload["text"] = text
         self.request("answerCallbackQuery", payload)
 
+    def copy_message(self, chat_id: int, from_chat_id: int, message_id: int) -> dict[str, Any]:
+        return self.request(
+            "copyMessage",
+            {
+                "chat_id": chat_id,
+                "from_chat_id": from_chat_id,
+                "message_id": message_id,
+            },
+        )
+
+    def get_chat_member(self, chat_id: int, user_id: int) -> dict[str, Any]:
+        return self.request("getChatMember", {"chat_id": chat_id, "user_id": user_id})
+
     def set_chat_permissions(self, chat_id: int, can_send_messages: bool) -> None:
         permissions = {
             "can_send_messages": can_send_messages,

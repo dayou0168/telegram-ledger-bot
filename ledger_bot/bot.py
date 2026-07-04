@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
+from html import escape
+import json
 import re
 import time
 from typing import Any
@@ -14,7 +16,7 @@ from .config import Config
 from .p2p_rates import P2POrderBookEntry, P2PRateClient, P2PRateError
 from .parser import ParsedCommand, ParsedLedgerEntry, parse_message
 from .storage import Storage, TelegramUser, business_day_key, business_day_range, user_from_telegram
-from .telegram_api import TelegramAPIError, TelegramClient, run_with_backoff
+from .telegram_api import TelegramAPIError, TelegramClient, TelegramRetryableError, run_with_backoff
 from .tron_api import TronGridClient, TronGridError, parse_usdt_transfer
 
 
@@ -141,12 +143,29 @@ class LedgerBot:
         if not actor or chat.get("type") not in {"group", "supergroup"}:
             return
         now = datetime.now(self.config.timezone)
-        self.storage.ensure_group(int(chat["id"]), chat.get("title"), now)
+        chat_id = int(chat["id"])
+        new_status = (update.get("new_chat_member") or {}).get("status")
+        if new_status in {"member", "administrator", "restricted"}:
+            inviter = user_from_telegram(actor)
+            self.storage.touch_user(chat_id, inviter, now)
+            if not self.can_invite_bot(inviter):
+                try:
+                    self.client.send_message(chat_id, "邀请人没有授权，机器人将自动退出。")
+                except TelegramAPIError:
+                    pass
+                self.client.leave_chat(chat_id)
+                self.storage.forget_group(chat_id)
+                return
+            self.storage.ensure_group(chat_id, chat.get("title"), now)
+            if not self.ensure_host_present_or_leave(chat_id, chat.get("title"), inviter, now):
+                return
+            return
+        if new_status in {"left", "kicked"}:
+            return
+        self.storage.ensure_group(chat_id, chat.get("title"), now)
 
     def handle_message(self, message: dict[str, Any]) -> None:
         text = (message.get("text") or message.get("caption") or "").strip()
-        if not text:
-            return
 
         chat = message["chat"]
         chat_type = chat.get("type")
@@ -178,6 +197,11 @@ class LedgerBot:
         self.storage.touch_user(ctx.chat_id, user, now)
         if ctx.reply_user:
             self.storage.touch_user(ctx.chat_id, ctx.reply_user, now)
+        if not self.ensure_host_present_or_leave(ctx.chat_id, ctx.chat_title, user, now):
+            return
+
+        if not text:
+            return
 
         parsed = parse_message(text)
         if parsed is None:
@@ -200,7 +224,7 @@ class LedgerBot:
 
     def handle_command(self, ctx: MessageContext, command: ParsedCommand) -> None:
         group = self.storage.get_group(ctx.chat_id)
-        if command.name in MANAGEMENT_COMMANDS and command.name != "start":
+        if command.name in MANAGEMENT_COMMANDS:
             if not self.require_operator(ctx):
                 return
 
@@ -438,23 +462,31 @@ class LedgerBot:
         if normalized in {"/start", "菜单", "功能", "返回菜单"}:
             self.send_private_menu(chat_id, message_id)
             return
+        if normalized in {"我的ID", "/id", "id", "ID"}:
+            self.client.send_message(chat_id, f"你的 Telegram ID：{user.user_id}", reply_to_message_id=message_id)
+            return
+        if self.handle_default_operator_command(chat_id, user, normalized, message_id):
+            return
+        if self.handle_broadcast_private_command(
+            message=message,
+            chat_id=chat_id,
+            user=user,
+            text=normalized,
+            now=now,
+            reply_to_message_id=message_id,
+        ):
+            return
         if normalized in {"✍开始记账", "开始记账"}:
             self.send_start_group_help(chat_id, message_id)
             return
         if normalized in {"📃详细说明", "详细说明"}:
             self.client.send_message(chat_id, self.private_help_text(), reply_to_message_id=message_id)
             return
-        if normalized in {"📣分组广播", "分组广播"}:
-            self.client.send_message(chat_id, "分组广播用于按群分组发送通知，后台模块接入后启用。", reply_to_message_id=message_id)
-            return
         if normalized in {"💵自助续费", "自助续费"}:
             self.client.send_message(chat_id, "自助续费入口已预留，后续可接支付或卡密。", reply_to_message_id=message_id)
             return
         if normalized in {"🔔地址监听", "地址监听", "监听地址"}:
             self.send_address_watch_menu(chat_id, user.user_id, message_id)
-            return
-        if normalized in {"📡群发广播", "群发广播"}:
-            self.client.send_message(chat_id, "群发广播用于通知机器人所在群，后台模块接入后启用。", reply_to_message_id=message_id)
             return
         if normalized in {"🛠功能设置", "功能设置"}:
             self.client.send_message(chat_id, "功能设置已预留：记账置顶、日切、汇率模式、地址识别等会集中到这里。", reply_to_message_id=message_id)
@@ -466,6 +498,63 @@ class LedgerBot:
             return
 
         self.send_private_menu(chat_id, message_id)
+
+    def handle_default_operator_command(
+        self,
+        chat_id: int,
+        user: TelegramUser,
+        text: str,
+        reply_to_message_id: int,
+    ) -> bool:
+        if text in {"默认操作人", "显示默认操作人", "全局操作人"}:
+            if not self.is_host(user.user_id):
+                self.client.send_message(chat_id, "只有宿主可以查看默认操作人。", reply_to_message_id=reply_to_message_id)
+                return True
+            self.client.send_message(chat_id, self.format_default_operators(), reply_to_message_id=reply_to_message_id)
+            return True
+
+        match = re.fullmatch(r"(?:添加|设置)(?:默认|全局)?操作人\s+(.+)", text)
+        if match:
+            self.client.send_message(
+                chat_id,
+                "默认操作人只能由维护人员修改服务器配置 DEFAULT_OPERATOR_USER_IDS。",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
+
+        match = re.fullmatch(r"(?:删除|移除)(?:默认|全局)?操作人\s+(.+)", text)
+        if match:
+            self.client.send_message(
+                chat_id,
+                "默认操作人只能由维护人员修改服务器配置 DEFAULT_OPERATOR_USER_IDS。",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
+
+        return False
+
+    @staticmethod
+    def parse_operator_targets(text: str) -> list[str]:
+        targets: list[str] = []
+        for token in re.split(r"[\s,，]+", text.strip()):
+            if not token:
+                continue
+            if re.fullmatch(r"@?[A-Za-z0-9_]{3,32}", token) and not token.lstrip("@").isdigit():
+                targets.append(token if token.startswith("@") else f"@{token}")
+            elif re.fullmatch(r"\d{4,20}", token):
+                targets.append(token)
+        return targets
+
+    def format_default_operators(self) -> str:
+        lines = ["默认操作人："]
+        configured = sorted(self.config.default_operator_user_ids)
+        if configured:
+            lines.extend(f"- {user_id}" for user_id in configured)
+        else:
+            lines.append("暂无")
+        lines.append("")
+        lines.append("默认操作人由维护人员通过服务器配置 DEFAULT_OPERATOR_USER_IDS 管理。")
+        return "\n".join(lines)
 
     def send_private_menu(self, chat_id: int, reply_to_message_id: int | None = None) -> None:
         self.client.send_message(
@@ -515,6 +604,468 @@ class LedgerBot:
                 "撤销：回复机器人记账回执，发送“撤销入款”或“撤销下发”。",
             ]
         )
+
+    def handle_broadcast_private_command(
+        self,
+        *,
+        message: dict[str, Any],
+        chat_id: int,
+        user: TelegramUser,
+        text: str,
+        now: datetime,
+        reply_to_message_id: int,
+    ) -> bool:
+        if text in {"📣分组广播", "分组广播"}:
+            self.send_broadcast_help(chat_id, user, grouped=True, reply_to_message_id=reply_to_message_id)
+            return True
+        if text in {"📡群发广播", "群发广播"}:
+            if message.get("reply_to_message"):
+                self.create_broadcast_from_private(chat_id, user, "", message, now, reply_to_message_id)
+            else:
+                self.send_broadcast_help(chat_id, user, grouped=False, reply_to_message_id=reply_to_message_id)
+            return True
+        if text in {"群列表", "群组列表", "广播群列表"}:
+            self.send_broadcast_group_list(chat_id, user, reply_to_message_id=reply_to_message_id)
+            return True
+        if text in {"分组列表", "广播分组", "广播分组列表"}:
+            self.send_named_broadcast_group_list(chat_id, user, reply_to_message_id=reply_to_message_id)
+            return True
+        match = re.fullmatch(r"(?:新建|创建)分组\s+(.+)", text)
+        if match:
+            if not self.can_use_broadcast(user):
+                self.client.send_message(chat_id, "没有广播权限。", reply_to_message_id=reply_to_message_id)
+                return True
+            group = self.storage.create_named_broadcast_group(match.group(1), created_by=user.user_id, now=now)
+            self.client.send_message(chat_id, f"分组已创建：{group['name']}", reply_to_message_id=reply_to_message_id)
+            return True
+
+        match = re.fullmatch(r"删除分组\s+(.+)", text)
+        if match:
+            if not self.can_use_broadcast(user):
+                self.client.send_message(chat_id, "没有广播权限。", reply_to_message_id=reply_to_message_id)
+                return True
+            deleted = self.storage.delete_named_broadcast_group(match.group(1))
+            self.client.send_message(
+                chat_id,
+                "分组已删除。" if deleted else "没有找到这个分组。",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
+
+        match = re.fullmatch(r"(?:分组添加|添加分组群)\s+(\S+)\s+(.+)", text, flags=re.S)
+        if match:
+            self.add_or_remove_broadcast_group_members(
+                chat_id,
+                user,
+                group_name=match.group(1),
+                ids_text=match.group(2),
+                add=True,
+                now=now,
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
+
+        match = re.fullmatch(r"(?:分组移除|分组删除|删除分组群|移除分组群)\s+(\S+)\s+(.+)", text, flags=re.S)
+        if match:
+            self.add_or_remove_broadcast_group_members(
+                chat_id,
+                user,
+                group_name=match.group(1),
+                ids_text=match.group(2),
+                add=False,
+                now=now,
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
+
+        match = re.fullmatch(r"(?:分组详情|查看分组)\s+(.+)", text)
+        if match:
+            self.send_named_broadcast_group_detail(
+                chat_id,
+                user,
+                match.group(1),
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
+
+        if text.startswith("群发广播 "):
+            self.create_broadcast_from_private(
+                chat_id,
+                user,
+                text.removeprefix("群发广播 ").strip(),
+                message,
+                now,
+                reply_to_message_id,
+            )
+            return True
+
+        if text.startswith("分组广播 "):
+            self.create_grouped_broadcast_from_private(
+                chat_id,
+                user,
+                text.removeprefix("分组广播 ").strip(),
+                message,
+                now,
+                reply_to_message_id,
+            )
+            return True
+
+        if self.broadcast_message_kind(message) != "text" and self.is_broadcastable_message(message):
+            self.client.send_message(
+                chat_id,
+                "素材已收到。回复这条消息发送“群发广播”或“分组广播 分组名”。",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
+
+        return False
+
+    def send_broadcast_help(
+        self,
+        chat_id: int,
+        user: TelegramUser,
+        *,
+        grouped: bool,
+        reply_to_message_id: int | None = None,
+    ) -> None:
+        if not self.can_use_broadcast(user):
+            self.client.send_message(chat_id, "没有广播权限。", reply_to_message_id=reply_to_message_id)
+            return
+        if grouped:
+            named_groups = self.storage.list_named_broadcast_groups()
+            lines = [
+                "分组广播",
+                "新建分组：新建分组 财务",
+                "批量添加：分组添加 财务 -100111 -100222",
+                "批量移除：分组移除 财务 -100111 -100222",
+                "查看成员：分组详情 财务",
+                "文字广播：分组广播 财务 广播内容",
+                "图片广播：回复图片发送 分组广播 财务",
+                "通知所有人：分组广播 财务 通知所有人 广播内容",
+                "",
+                f"当前分组：{len(named_groups)} 个",
+            ]
+            for row in named_groups[:20]:
+                lines.append(f"{row['name']}（{row['member_count']}群）")
+            if len(named_groups) > 20:
+                lines.append(f"... 还有 {len(named_groups) - 20} 个，发送“分组列表”查看。")
+        else:
+            groups = self.storage.list_broadcast_groups()
+            lines = [
+                "群发广播",
+                "文字广播：群发广播 广播内容",
+                "图片广播：回复图片发送 群发广播",
+                "通知所有人：群发广播 通知所有人 广播内容",
+                "查看群：群列表",
+                "发送后会先生成确认按钮，点确认才会发送。",
+                "",
+                f"当前已保存群组：{len(groups)} 个",
+            ]
+            for row in groups[:20]:
+                lines.append(self.format_broadcast_group(row))
+            if len(groups) > 20:
+                lines.append(f"... 还有 {len(groups) - 20} 个，发送“群列表”查看。")
+        self.client.send_message(chat_id, "\n".join(lines), reply_to_message_id=reply_to_message_id)
+
+    def send_broadcast_group_list(
+        self,
+        chat_id: int,
+        user: TelegramUser,
+        *,
+        reply_to_message_id: int | None = None,
+    ) -> None:
+        if not self.can_use_broadcast(user):
+            self.client.send_message(chat_id, "没有广播权限。", reply_to_message_id=reply_to_message_id)
+            return
+        groups = self.storage.list_broadcast_groups()
+        if not groups:
+            self.client.send_message(chat_id, "当前没有已保存群组。", reply_to_message_id=reply_to_message_id)
+            return
+        chunks: list[list[str]] = [[]]
+        for row in groups:
+            line = self.format_broadcast_group(row)
+            if sum(len(item) + 1 for item in chunks[-1]) + len(line) > 3500:
+                chunks.append([])
+            chunks[-1].append(line)
+        for index, chunk in enumerate(chunks):
+            title = f"已保存群组（{len(groups)}个）"
+            if len(chunks) > 1:
+                title += f" {index + 1}/{len(chunks)}"
+            self.client.send_message(
+                chat_id,
+                title + "\n" + "\n".join(chunk),
+                reply_to_message_id=reply_to_message_id if index == 0 else None,
+            )
+
+    def send_named_broadcast_group_list(
+        self,
+        chat_id: int,
+        user: TelegramUser,
+        *,
+        reply_to_message_id: int | None = None,
+    ) -> None:
+        if not self.can_use_broadcast(user):
+            self.client.send_message(chat_id, "没有广播权限。", reply_to_message_id=reply_to_message_id)
+            return
+        rows = self.storage.list_named_broadcast_groups()
+        if not rows:
+            self.client.send_message(
+                chat_id,
+                "当前没有广播分组。发送“新建分组 分组名”创建。",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return
+        lines = ["广播分组："]
+        for row in rows:
+            lines.append(f"{row['name']}（{row['member_count']}群）")
+        self.client.send_message(chat_id, "\n".join(lines), reply_to_message_id=reply_to_message_id)
+
+    def send_named_broadcast_group_detail(
+        self,
+        chat_id: int,
+        user: TelegramUser,
+        group_name: str,
+        *,
+        reply_to_message_id: int | None = None,
+    ) -> None:
+        if not self.can_use_broadcast(user):
+            self.client.send_message(chat_id, "没有广播权限。", reply_to_message_id=reply_to_message_id)
+            return
+        group = self.storage.get_named_broadcast_group(group_name)
+        if group is None:
+            self.client.send_message(chat_id, "没有找到这个分组。", reply_to_message_id=reply_to_message_id)
+            return
+        members = self.storage.list_broadcast_group_members(group["name"])
+        lines = [f"分组：{group['name']}（{len(members)}群）"]
+        lines.extend(self.format_broadcast_group(row) for row in members)
+        if len(lines) == 1:
+            lines.append("暂无群组。")
+        self.client.send_message(chat_id, "\n".join(lines), reply_to_message_id=reply_to_message_id)
+
+    @staticmethod
+    def format_broadcast_group(row: Any) -> str:
+        title = row["chat_title"] or "(未命名群)"
+        return f"{row['chat_id']}  {title}"
+
+    def add_or_remove_broadcast_group_members(
+        self,
+        chat_id: int,
+        user: TelegramUser,
+        *,
+        group_name: str,
+        ids_text: str,
+        add: bool,
+        now: datetime,
+        reply_to_message_id: int,
+    ) -> None:
+        if not self.can_use_broadcast(user):
+            self.client.send_message(chat_id, "没有广播权限。", reply_to_message_id=reply_to_message_id)
+            return
+        chat_ids = self.parse_chat_ids(ids_text)
+        if not chat_ids:
+            self.client.send_message(chat_id, "没有识别到群ID。", reply_to_message_id=reply_to_message_id)
+            return
+        try:
+            if add:
+                changed, known_ids, missing_ids = self.storage.add_broadcast_group_members(
+                    group_name,
+                    chat_ids,
+                    now=now,
+                )
+                lines = [f"已添加 {changed} 个群到分组“{group_name}”。"]
+                skipped = len(known_ids) - changed
+                if skipped > 0:
+                    lines.append(f"已存在/重复：{skipped} 个")
+                if missing_ids:
+                    lines.append("未保存的群ID：" + " ".join(str(value) for value in missing_ids))
+            else:
+                changed = self.storage.remove_broadcast_group_members(group_name, chat_ids, now=now)
+                lines = [f"已从分组“{group_name}”移除 {changed} 个群。"]
+        except KeyError:
+            self.client.send_message(chat_id, "没有找到这个分组，请先发送“新建分组 分组名”。", reply_to_message_id=reply_to_message_id)
+            return
+        self.client.send_message(chat_id, "\n".join(lines), reply_to_message_id=reply_to_message_id)
+
+    @staticmethod
+    def parse_chat_ids(text: str) -> list[int]:
+        return [int(value) for value in re.findall(r"-\d{5,20}", text)]
+
+    def create_broadcast_from_private(
+        self,
+        chat_id: int,
+        user: TelegramUser,
+        body: str,
+        message: dict[str, Any],
+        now: datetime,
+        reply_to_message_id: int,
+    ) -> None:
+        if not self.can_use_broadcast(user):
+            self.client.send_message(chat_id, "没有广播权限。", reply_to_message_id=reply_to_message_id)
+            return
+        notify_all, text = self.extract_notify_all_option(body)
+        source_message = message.get("reply_to_message") if not text else None
+        if not text and not self.is_broadcastable_message(source_message):
+            self.send_broadcast_help(chat_id, user, grouped=False, reply_to_message_id=reply_to_message_id)
+            return
+        groups = self.storage.list_broadcast_groups()
+        target_ids = [int(row["chat_id"]) for row in groups]
+        self.create_broadcast_job_reply(
+            chat_id,
+            user,
+            "all",
+            target_ids,
+            text,
+            source_message,
+            notify_all,
+            now,
+            reply_to_message_id,
+        )
+
+    def create_grouped_broadcast_from_private(
+        self,
+        chat_id: int,
+        user: TelegramUser,
+        body: str,
+        message: dict[str, Any],
+        now: datetime,
+        reply_to_message_id: int,
+    ) -> None:
+        if not self.can_use_broadcast(user):
+            self.client.send_message(chat_id, "没有广播权限。", reply_to_message_id=reply_to_message_id)
+            return
+        if not body:
+            self.send_broadcast_help(chat_id, user, grouped=True, reply_to_message_id=reply_to_message_id)
+            return
+        parts = body.split(maxsplit=1)
+        group_name = parts[0]
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        notify_all, text = self.extract_notify_all_option(rest)
+        source_message = message.get("reply_to_message") if not text else None
+        if not text and not self.is_broadcastable_message(source_message):
+            self.send_broadcast_help(chat_id, user, grouped=True, reply_to_message_id=reply_to_message_id)
+            return
+        group = self.storage.get_named_broadcast_group(group_name)
+        if group is None:
+            self.client.send_message(chat_id, "没有找到这个分组。", reply_to_message_id=reply_to_message_id)
+            return
+        target_ids = self.storage.target_chat_ids_for_broadcast_group(group["name"])
+        self.create_broadcast_job_reply(
+            chat_id,
+            user,
+            f"group:{group['name']}",
+            target_ids,
+            text,
+            source_message,
+            notify_all,
+            now,
+            reply_to_message_id,
+        )
+
+    @staticmethod
+    def extract_notify_all_option(body: str) -> tuple[bool, str]:
+        text = body.strip()
+        notify_all = False
+        markers = ["通知所有人", "@所有人", "@all"]
+        changed = True
+        while changed:
+            changed = False
+            for marker in markers:
+                if text == marker:
+                    return True, ""
+                if text.startswith(marker + " "):
+                    text = text[len(marker):].strip()
+                    notify_all = True
+                    changed = True
+                elif text.endswith(" " + marker):
+                    text = text[: -len(marker)].strip()
+                    notify_all = True
+                    changed = True
+        return notify_all, text
+
+    def create_broadcast_job_reply(
+        self,
+        chat_id: int,
+        user: TelegramUser,
+        scope: str,
+        target_chat_ids: list[int],
+        text: str,
+        source_message: dict[str, Any] | None,
+        notify_all: bool,
+        now: datetime,
+        reply_to_message_id: int,
+    ) -> None:
+        target_chat_ids = list(dict.fromkeys(target_chat_ids))
+        if not target_chat_ids:
+            self.client.send_message(chat_id, "当前没有可广播的群组。", reply_to_message_id=reply_to_message_id)
+            return
+        source_chat_id: int | None = None
+        source_message_id: int | None = None
+        message_kind = "text"
+        preview = text
+        if source_message is not None:
+            source_chat_id = chat_id
+            source_message_id = int(source_message["message_id"])
+            message_kind = self.broadcast_message_kind(source_message)
+            preview = self.broadcast_preview(source_message)
+        job = self.storage.create_broadcast_job(
+            creator_user_id=user.user_id,
+            scope=scope,
+            target_chat_ids=target_chat_ids,
+            text=preview,
+            source_chat_id=source_chat_id,
+            source_message_id=source_message_id,
+            message_kind=message_kind,
+            notify_all=notify_all,
+            now=now,
+        )
+        preview_text = preview if len(preview) <= 600 else preview[:600] + "..."
+        notify_text = "\n通知所有人：开启" if notify_all else ""
+        self.client.send_message(
+            chat_id,
+            f"确认发送广播？\n目标群：{len(target_chat_ids)} 个\n类型：{message_kind}{notify_text}\n\n{preview_text}",
+            reply_to_message_id=reply_to_message_id,
+            reply_markup={
+                "inline_keyboard": [
+                    [
+                        {"text": "确认发送", "callback_data": f"broadcast:send:{job['id']}"},
+                        {"text": "取消", "callback_data": f"broadcast:cancel:{job['id']}"},
+                    ]
+                ]
+            },
+        )
+
+    @staticmethod
+    def broadcast_message_kind(message: dict[str, Any] | None) -> str:
+        if not message:
+            return "text"
+        for kind in ("photo", "video", "animation", "document", "audio", "voice"):
+            if kind in message:
+                return kind
+        return "text"
+
+    @staticmethod
+    def is_broadcastable_message(message: dict[str, Any] | None) -> bool:
+        if not message:
+            return False
+        return bool(message.get("text") or message.get("caption")) or any(
+            kind in message for kind in ("photo", "video", "animation", "document", "audio", "voice")
+        )
+
+    @classmethod
+    def broadcast_preview(cls, message: dict[str, Any]) -> str:
+        text = (message.get("text") or message.get("caption") or "").strip()
+        kind = cls.broadcast_message_kind(message)
+        if kind == "text":
+            return text
+        prefix = {
+            "photo": "[图片]",
+            "video": "[视频]",
+            "animation": "[动图]",
+            "document": "[文件]",
+            "audio": "[音频]",
+            "voice": "[语音]",
+        }.get(kind, "[消息]")
+        return f"{prefix} {text}".strip()
 
     def send_address_watch_menu(
         self,
@@ -900,6 +1451,8 @@ class LedgerBot:
         return row["actor_user_id"] == ctx.user.user_id or self.storage.is_owner(ctx.chat_id, ctx.user.user_id)
 
     def add_or_remove_operator(self, ctx: MessageContext, *, add: bool, mentions: list[str]) -> None:
+        if not self.require_operator_manager(ctx):
+            return
         changed = 0
         if ctx.reply_user:
             if add:
@@ -940,6 +1493,60 @@ class LedgerBot:
                 mentions.append(member["display_name"])
         self.reply(ctx, " ".join(mentions[:80]) if mentions else "暂无可通知成员。")
 
+    def set_group_owner_if_missing(self, chat_id: int, user: TelegramUser, now: datetime) -> None:
+        group = self.storage.get_group(chat_id)
+        if group["owner_user_id"] == user.user_id:
+            return
+        self.storage.set_group_owner(chat_id, user, now=now)
+
+    def ensure_host_present_or_leave(
+        self,
+        chat_id: int,
+        chat_title: str | None,
+        actor: TelegramUser,
+        now: datetime,
+    ) -> bool:
+        host_user = self.find_host_in_group(chat_id, actor, now)
+        if host_user is not None:
+            self.set_group_owner_if_missing(chat_id, host_user, now)
+            return True
+
+        reason = "未配置宿主，机器人将自动退出。" if self.config.bot_host_user_id is None else "宿主不在群内，机器人将自动退出。"
+        try:
+            self.client.send_message(chat_id, reason)
+        except TelegramAPIError:
+            pass
+        try:
+            self.client.leave_chat(chat_id)
+        finally:
+            self.storage.forget_group(chat_id)
+        print(f"Left group {chat_id} ({chat_title or 'untitled'}): host is not present", flush=True)
+        return False
+
+    def find_host_in_group(self, chat_id: int, actor: TelegramUser, now: datetime) -> TelegramUser | None:
+        host_user_id = self.config.bot_host_user_id
+        if host_user_id is None:
+            return None
+        if actor.user_id == host_user_id:
+            return actor
+        try:
+            member = self.client.get_chat_member(chat_id, host_user_id)
+        except TelegramRetryableError:
+            raise
+        except TelegramAPIError as exc:
+            print(f"Could not verify host {host_user_id} in {chat_id}: {exc}", flush=True)
+            return None
+        status = member.get("status")
+        if status in {"left", "kicked"}:
+            return None
+        user_data = member.get("user")
+        if not user_data:
+            return None
+        host_user = user_from_telegram(user_data)
+        self.storage.touch_user(chat_id, host_user, now)
+        return host_user
+        return None
+
     def format_expiration(self, group: Any) -> str:
         if not group["trial_until"]:
             return "还未激活试用。"
@@ -958,10 +1565,17 @@ class LedgerBot:
         user = user_from_telegram(actor)
         self.storage.ensure_group(chat_id, chat.get("title"), now)
         self.storage.touch_user(chat_id, user, now)
+        if chat.get("type") in {"group", "supergroup"}:
+            if not self.ensure_host_present_or_leave(chat_id, chat.get("title"), user, now):
+                return
         fake_ctx = MessageContext(message=message, chat_id=chat_id, chat_title=chat.get("title"), user=user, text="", now=now)
 
         if data.startswith("watch:"):
             self.handle_address_watch_callback(chat_id, user.user_id, callback["id"], data, now)
+            return
+
+        if data.startswith("broadcast:"):
+            self.handle_broadcast_callback(chat_id, user, callback["id"], data, now)
             return
 
         if data.startswith("undo:"):
@@ -1001,6 +1615,102 @@ class LedgerBot:
             day_key = business_day_key(now, group["day_cutoff_hour"], self.config.timezone)
             self.client.answer_callback_query(callback["id"])
             self.client.send_message(chat_id, self.build_bill_text(chat_id, day_key))
+
+    def handle_broadcast_callback(
+        self,
+        chat_id: int,
+        user: TelegramUser,
+        callback_id: str,
+        data: str,
+        now: datetime,
+    ) -> None:
+        if not self.can_use_broadcast(user):
+            self.client.answer_callback_query(callback_id, "没有广播权限。")
+            return
+        parts = data.split(":")
+        if len(parts) != 3:
+            self.client.answer_callback_query(callback_id, "广播任务无效。")
+            return
+        action, job_id_text = parts[1], parts[2]
+        try:
+            job = self.storage.get_broadcast_job(int(job_id_text))
+        except (KeyError, ValueError):
+            self.client.answer_callback_query(callback_id, "广播任务不存在。")
+            return
+        if int(job["creator_user_id"]) != user.user_id and not self.is_host(user.user_id):
+            self.client.answer_callback_query(callback_id, "只能操作自己创建的广播。")
+            return
+        if job["status"] != "pending":
+            self.client.answer_callback_query(callback_id, f"任务已是 {job['status']} 状态。")
+            return
+        if action == "cancel":
+            self.storage.update_broadcast_job(job["id"], now, status="cancelled", completed_at=now.isoformat())
+            self.client.answer_callback_query(callback_id, "已取消。")
+            self.client.send_message(chat_id, "广播已取消。")
+            return
+        if action != "send":
+            self.client.answer_callback_query(callback_id, "未知操作。")
+            return
+
+        self.client.answer_callback_query(callback_id, "开始发送。")
+        self.storage.update_broadcast_job(job["id"], now, status="sending", confirmed_at=now.isoformat())
+        success, failure = self.deliver_broadcast_job(job)
+        self.storage.update_broadcast_job(
+            job["id"],
+            datetime.now(self.config.timezone),
+            status="completed",
+            success_count=success,
+            failure_count=failure,
+            completed_at=datetime.now(self.config.timezone).isoformat(),
+        )
+        self.client.send_message(chat_id, f"广播完成：成功 {success} 个，失败 {failure} 个。")
+
+    def deliver_broadcast_job(self, job: Any) -> tuple[int, int]:
+        target_chat_ids = [int(value) for value in json.loads(job["target_chat_ids"])]
+        success = 0
+        failure = 0
+        for target_chat_id in target_chat_ids:
+            try:
+                self.send_broadcast_payload(job, target_chat_id)
+                if int(job["notify_all"]):
+                    self.send_notify_all_to_chat(target_chat_id)
+                success += 1
+            except TelegramAPIError as exc:
+                failure += 1
+                print(f"Broadcast failed for {target_chat_id}: {exc}", flush=True)
+            time.sleep(0.05)
+        return success, failure
+
+    def send_broadcast_payload(self, job: Any, target_chat_id: int) -> None:
+        if job["source_chat_id"] and job["source_message_id"]:
+            self.client.copy_message(
+                target_chat_id,
+                int(job["source_chat_id"]),
+                int(job["source_message_id"]),
+            )
+            return
+        self.client.send_message(target_chat_id, job["text"])
+
+    def send_notify_all_to_chat(self, chat_id: int) -> None:
+        rows = self.storage.recent_members(chat_id, limit=200)
+        mentions: list[str] = []
+        for row in rows:
+            username = row["username"]
+            if username:
+                mentions.append(f"@{username}")
+            else:
+                label = escape(row["display_name"] or str(row["user_id"]))
+                mentions.append(f'<a href="tg://user?id={row["user_id"]}">{label}</a>')
+        if not mentions:
+            return
+        chunks: list[list[str]] = [[]]
+        for mention in mentions:
+            if sum(len(item) + 1 for item in chunks[-1]) + len(mention) > 3300:
+                chunks.append([])
+            chunks[-1].append(mention)
+        for index, chunk in enumerate(chunks):
+            prefix = "通知所有人：\n" if index == 0 else ""
+            self.client.send_message(chat_id, prefix + " ".join(chunk), parse_mode="HTML")
 
     def poll_address_watches_if_due(self) -> None:
         if self.config.tron_poll_interval_seconds <= 0:
@@ -1101,7 +1811,7 @@ class LedgerBot:
         return self.require_operator(ctx)
 
     def require_operator(self, ctx: MessageContext, callback_id: str | None = None) -> bool:
-        ok = self.storage.is_operator(ctx.chat_id, ctx.user)
+        ok = self.is_host(ctx.user.user_id) or self.is_default_operator(ctx.user) or self.storage.is_operator(ctx.chat_id, ctx.user)
         if ok:
             return True
         text = "没有操作权限。请管理员添加操作员。"
@@ -1110,6 +1820,24 @@ class LedgerBot:
         else:
             self.reply(ctx, text)
         return False
+
+    def require_operator_manager(self, ctx: MessageContext) -> bool:
+        if self.is_host(ctx.user.user_id) or self.storage.is_owner(ctx.chat_id, ctx.user.user_id):
+            return True
+        self.reply(ctx, "只有宿主或本群最高权限可以设置单群操作员。")
+        return False
+
+    def is_host(self, user_id: int) -> bool:
+        return user_id == self.config.bot_host_user_id
+
+    def is_default_operator(self, user: TelegramUser) -> bool:
+        return user.user_id in self.config.default_operator_user_ids
+
+    def can_invite_bot(self, user: TelegramUser) -> bool:
+        return self.is_host(user.user_id) or self.is_default_operator(user)
+
+    def can_use_broadcast(self, user: TelegramUser) -> bool:
+        return self.is_host(user.user_id) or self.is_default_operator(user)
 
     def day_key(self, ctx: MessageContext) -> str:
         group = self.storage.get_group(ctx.chat_id)

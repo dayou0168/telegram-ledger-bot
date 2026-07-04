@@ -27,6 +27,8 @@ class Config:
     telegram_api_base: str
     db_path: Path
     timezone_name: str
+    bot_host_user_id: int | None
+    default_operator_user_ids: frozenset[int]
     public_bill_base_url: str | None
     public_bill_url_template: str | None
     public_bill_bot_name: str
@@ -69,6 +71,8 @@ def load_config() -> Config:
         telegram_api_base=os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/"),
         db_path=db_path,
         timezone_name=os.environ.get("BOT_TIMEZONE", "Asia/Shanghai"),
+        bot_host_user_id=parse_user_id(os.environ.get("BOT_HOST_USER_ID", "")),
+        default_operator_user_ids=parse_user_ids(os.environ.get("DEFAULT_OPERATOR_USER_IDS", "")),
         public_bill_base_url=os.environ.get("PUBLIC_BILL_BASE_URL") or None,
         public_bill_url_template=os.environ.get("PUBLIC_BILL_URL_TEMPLATE") or None,
         public_bill_bot_name=os.environ.get("PUBLIC_BILL_BOT_NAME", "LEDGER_BOT"),
@@ -91,3 +95,20 @@ def load_config() -> Config:
         poll_timeout=int(os.environ.get("BOT_POLL_TIMEOUT", "50")),
         request_timeout=int(os.environ.get("BOT_REQUEST_TIMEOUT", "70")),
     )
+
+
+def parse_user_ids(raw: str) -> frozenset[int]:
+    values: set[int] = set()
+    for part in raw.replace(";", ",").split(","):
+        item = part.strip()
+        if not item:
+            continue
+        values.add(int(item))
+    return frozenset(values)
+
+
+def parse_user_id(raw: str) -> int | None:
+    value = raw.strip()
+    if not value:
+        return None
+    return int(value)
