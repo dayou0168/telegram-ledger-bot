@@ -1,10 +1,18 @@
 from datetime import timezone
 from decimal import Decimal
 
-from ledger_bot.tron_api import parse_usdt_transfer
+from ledger_bot.tron_api import parse_usdt_transfer, safe_header_value
 
 
 USDT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+
+
+def test_safe_header_value_ignores_non_latin_placeholder() -> None:
+    assert safe_header_value("替换成你的TronGridKey") is None
+
+
+def test_safe_header_value_trims_ascii_key() -> None:
+    assert safe_header_value("  abc123  ") == "abc123"
 
 
 def test_parse_income_transfer() -> None:

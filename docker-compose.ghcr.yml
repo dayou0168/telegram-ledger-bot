@@ -12,7 +12,7 @@ services:
       BOT_HOST_USER_ID: "replace-with-your-telegram-id"
       DEFAULT_OPERATOR_USER_IDS: ""
       TRONGRID_API_BASE: "https://api.trongrid.io"
-      TRONGRID_API_KEY: "replace-with-your-trongrid-key"
+      TRONGRID_API_KEY: ""
       TRON_USDT_CONTRACT: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
       TRON_POLL_INTERVAL_SECONDS: "5"
       TRON_INITIAL_LOOKBACK_MINUTES: "15"

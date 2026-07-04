@@ -16,6 +16,19 @@ class TronGridError(RuntimeError):
     pass
 
 
+def safe_header_value(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    try:
+        cleaned.encode("latin-1")
+    except UnicodeEncodeError:
+        return None
+    return cleaned
+
+
 @dataclass(frozen=True)
 class TronGridClient:
     api_base: str = "https://api.trongrid.io"
@@ -28,17 +41,28 @@ class TronGridClient:
         if query:
             url = f"{url}?{query}"
         headers = {"Accept": "application/json"}
-        if self.api_key:
-            headers["TRON-PRO-API-KEY"] = self.api_key
-        request = urllib.request.Request(url, headers=headers, method="GET")
+        api_key = safe_header_value(self.api_key)
+        if api_key:
+            headers["TRON-PRO-API-KEY"] = api_key
         try:
-            with urllib.request.urlopen(request, timeout=self.request_timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
+            return self.open_json(url, headers)
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
+            if exc.code == 401 and api_key:
+                fallback_headers = {"Accept": "application/json"}
+                try:
+                    return self.open_json(url, fallback_headers)
+                except urllib.error.HTTPError as fallback_exc:
+                    fallback_body = fallback_exc.read().decode("utf-8", errors="replace")
+                    raise TronGridError(f"TronGrid HTTP {fallback_exc.code}: {fallback_body}") from fallback_exc
             raise TronGridError(f"TronGrid HTTP {exc.code}: {body}") from exc
         except (urllib.error.URLError, TimeoutError) as exc:
             raise TronGridError(f"TronGrid network error: {exc}") from exc
+
+    def open_json(self, url: str, headers: dict[str, str]) -> dict[str, Any]:
+        request = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(request, timeout=self.request_timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
 
     def fetch_trc20_transfers(
         self,

@@ -84,7 +84,7 @@ https://your-domain.example/day_xxb.php?firstname=&chat_id=-100xxx&up_page=1&dow
 
 ```env
 TRONGRID_API_BASE=https://api.trongrid.io
-TRONGRID_API_KEY=你的TronGridKey
+TRONGRID_API_KEY=
 TRON_USDT_CONTRACT=TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t
 TRON_POLL_INTERVAL_SECONDS=5
 TRON_INITIAL_LOOKBACK_MINUTES=15
@@ -96,7 +96,7 @@ TRON_INITIAL_LOOKBACK_MINUTES=15
 添加监听地址 TGhAAySHUUcEGua33pZZ88wP3bA6XSeQuZ 监控地址
 ```
 
-机器人会定时请求 TronGrid 的 TRC20 交易接口，发现新的 USDT 收入/支出后私聊推送。`TRON_POLL_INTERVAL_SECONDS=5` 是接近秒级提醒；如果要更快可以调到 `2` 或 `3`，但主网强烈建议配置 `TRONGRID_API_KEY`。`TRON_INITIAL_LOOKBACK_MINUTES` 控制每次轮询回看的时间窗口，去重表会避免重复提醒。
+机器人会定时请求 TronGrid 的 TRC20 交易接口，发现新的 USDT 收入/支出后私聊推送。`TRON_POLL_INTERVAL_SECONDS=5` 是接近秒级提醒；如果要更快可以调到 `2` 或 `3`，但主网强烈建议配置真实的 `TRONGRID_API_KEY`。没有 key 时保持空值，不要填中文占位符或 key 名称。`TRON_INITIAL_LOOKBACK_MINUTES` 控制每次轮询回看的时间窗口，去重表会避免重复提醒。
 
 ### Z0 汇率查询
 
@@ -138,7 +138,7 @@ services:
       BOT_HOST_USER_ID: "replace-with-your-telegram-id"
       DEFAULT_OPERATOR_USER_IDS: ""
       TRONGRID_API_BASE: "https://api.trongrid.io"
-      TRONGRID_API_KEY: "replace-with-your-trongrid-key"
+      TRONGRID_API_KEY: ""
       TRON_USDT_CONTRACT: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
       TRON_POLL_INTERVAL_SECONDS: "5"
       TRON_INITIAL_LOOKBACK_MINUTES: "15"
