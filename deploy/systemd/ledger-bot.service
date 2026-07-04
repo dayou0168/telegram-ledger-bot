@@ -1,0 +1,18 @@
+[Unit]
+Description=Telegram Ledger Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ledger-bot
+EnvironmentFile=/opt/ledger-bot/.env
+ExecStart=/opt/ledger-bot/.venv/bin/python -m ledger_bot
+Restart=always
+RestartSec=5
+User=ledgerbot
+Group=ledgerbot
+
+[Install]
+WantedBy=multi-user.target
+

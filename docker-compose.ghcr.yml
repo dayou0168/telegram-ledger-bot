@@ -1,0 +1,22 @@
+services:
+  ledger-bot:
+    image: ghcr.io/dayou0168/telegram-ledger-bot:latest
+    container_name: ledger-bot
+    restart: unless-stopped
+    environment:
+      TELEGRAM_BOT_TOKEN: "replace-with-your-token"
+      TELEGRAM_BOT_USERNAME: "replace-with-your-bot-username"
+      TELEGRAM_API_BASE: "https://api.telegram.org"
+      BOT_DB_PATH: "data/ledger_bot.db"
+      BOT_TIMEZONE: "Asia/Shanghai"
+      TRONGRID_API_BASE: "https://api.trongrid.io"
+      TRONGRID_API_KEY: "replace-with-your-trongrid-key"
+      TRON_USDT_CONTRACT: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+      TRON_POLL_INTERVAL_SECONDS: "5"
+      TRON_INITIAL_LOOKBACK_MINUTES: "15"
+    volumes:
+      - ledger_bot_data:/app/data
+
+volumes:
+  ledger_bot_data:
+

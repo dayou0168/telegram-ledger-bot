@@ -1,0 +1,10 @@
+services:
+  ledger-bot:
+    build: .
+    container_name: ledger-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+
