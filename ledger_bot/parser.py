@@ -98,6 +98,13 @@ def parse_message(text: str) -> ParsedMessage:
     if match := re.fullmatch(r"设置下发费率\s*(%s)\s*%%?" % NUMBER, normalized):
         return ParsedCommand("set_payout_fee_rate", {"fee_rate": _decimal(match.group(1))})
 
+    if match := re.fullmatch(r"设置(?:入款)?汇率\s*[zZ](\d{1,2})(?:\s*([+-]?\d+(?:\.\d+)?))?", normalized):
+        rank = int(match.group(1))
+        if 1 <= rank <= 10:
+            offset = _decimal(match.group(2)) if match.group(2) else Decimal("0")
+            return ParsedCommand("set_rate_from_otc_rank", {"rank": rank, "offset": offset})
+        return None
+
     if match := re.fullmatch(r"设置(?:入款)?汇率\s*(%s)" % NUMBER, normalized):
         return ParsedCommand("set_deposit_exchange_rate", {"exchange_rate": _decimal(match.group(1))})
 

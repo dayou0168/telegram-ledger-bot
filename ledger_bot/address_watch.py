@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from html import escape
 
 
@@ -30,31 +30,51 @@ def format_transfer_notice(transfer: Trc20Transfer) -> str:
         f"交易金额： {format_amount(amount)} USDT",
     ]
     if is_income:
-        lines.append(f"出账地址： {transfer.from_address}")
+        lines.append(f"出账地址： {format_address(transfer.from_address)}")
         lines.append(f"入账地址： {format_watched_address(transfer.to_address, transfer)}")
     else:
         lines.append(f"出账地址： {format_watched_address(transfer.from_address, transfer)}")
-        lines.append(f"入账地址： {transfer.to_address}")
+        lines.append(f"入账地址： {format_address(transfer.to_address)}")
     lines.extend(
         [
             f"交易时间： {transfer.tx_time:%Y-%m-%d %H:%M:%S}",
-            f'交易哈希： <a href="{tronscan_tx_url(transfer.tx_hash)}">{short_hash(transfer.tx_hash)}</a>',
+            f'交易哈希： <a href="{tronscan_tx_url(transfer.tx_hash)}">{escape(short_hash(transfer.tx_hash))}</a>',
         ]
     )
     return "\n".join(lines)
 
 
-def should_notify_transfer(direction: str, settings) -> bool:
-    if direction == "income":
-        return bool(settings["watch_income"])
-    if direction == "expense":
-        return bool(settings["watch_expense"])
-    return False
+def should_notify_transfer(transfer: Trc20Transfer, settings) -> bool:
+    if transfer.direction == "income":
+        enabled = bool(settings["watch_income"])
+    elif transfer.direction == "expense":
+        enabled = bool(settings["watch_expense"])
+    else:
+        return False
+    return enabled and abs(transfer.amount) >= min_notify_amount(settings)
+
+
+def min_notify_amount(settings) -> Decimal:
+    try:
+        raw = settings["min_notify_amount"]
+    except (KeyError, IndexError, TypeError):
+        raw = "0"
+    try:
+        amount = Decimal(str(raw or "0"))
+    except InvalidOperation:
+        return Decimal("0")
+    if amount < 0:
+        return Decimal("0")
+    return amount
 
 
 def format_watched_address(address: str, transfer: Trc20Transfer) -> str:
-    suffix = f" ← {transfer.watched_label}" if transfer.watched_label else ""
-    return f"{address}{suffix}"
+    suffix = f" ← {escape(transfer.watched_label)}" if transfer.watched_label else ""
+    return f"{format_address(address)}{suffix}"
+
+
+def format_address(address: str) -> str:
+    return f"<code>{escape(address)}</code>"
 
 
 def short_address(address: str) -> str:

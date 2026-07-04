@@ -213,3 +213,31 @@ def test_claim_update_is_idempotent_and_persistent() -> None:
             assert storage.last_processed_update_id() == 100
         finally:
             storage.conn.close()
+
+
+def test_address_watch_settings_min_amount_and_label_update() -> None:
+    with TemporaryDirectory() as tmp:
+        storage = Storage(Path(tmp) / "bot.db")
+        try:
+            now = datetime(2026, 7, 4, 12, tzinfo=BEIJING_TZ)
+            settings = storage.get_address_watch_settings(1001, now)
+
+            assert settings["min_notify_amount"] == "0"
+
+            storage.update_address_watch_settings(1001, now, min_notify_amount="10")
+            settings = storage.get_address_watch_settings(1001, now)
+            assert settings["min_notify_amount"] == "10"
+
+            storage.add_address_watch(1001, "TRC20", "TGhAAySHUUcEGua33pZZ88wP3bA6XSeQuZ", "旧备注", now)
+            changed = storage.update_address_watch_label(
+                1001,
+                "TGhAAySHUUcEGua33pZZ88wP3bA6XSeQuZ",
+                "新备注",
+                now,
+            )
+
+            assert changed == 1
+            row = storage.list_address_watches(1001)[0]
+            assert row["label"] == "新备注"
+        finally:
+            storage.conn.close()

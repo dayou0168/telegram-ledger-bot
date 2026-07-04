@@ -84,3 +84,15 @@ def test_z_rank_sets_rate_with_offset() -> None:
     assert parsed.name == "set_rate_from_otc_rank"
     assert parsed.args["rank"] == 10
     assert parsed.args["offset"] == Decimal("0.1")
+
+    parsed = parse_message("设置汇率 Z1")
+    assert isinstance(parsed, ParsedCommand)
+    assert parsed.name == "set_rate_from_otc_rank"
+    assert parsed.args["rank"] == 1
+    assert parsed.args["offset"] == Decimal("0")
+
+    parsed = parse_message("设置汇率 Z1 -0")
+    assert isinstance(parsed, ParsedCommand)
+    assert parsed.name == "set_rate_from_otc_rank"
+    assert parsed.args["rank"] == 1
+    assert parsed.args["offset"] == Decimal("-0")

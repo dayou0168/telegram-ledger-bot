@@ -141,6 +141,7 @@ class Storage:
                 watch_expense INTEGER NOT NULL DEFAULT 1,
                 notify_trx INTEGER NOT NULL DEFAULT 1,
                 display_mode TEXT NOT NULL DEFAULT 'compact',
+                min_notify_amount TEXT NOT NULL DEFAULT '0',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -228,6 +229,12 @@ class Storage:
                 "message_kind": "TEXT NOT NULL DEFAULT 'text'",
                 "notify_all": "INTEGER NOT NULL DEFAULT 0",
                 "updated_at": "TEXT",
+            },
+        )
+        self._add_missing_columns(
+            "address_watch_settings",
+            {
+                "min_notify_amount": "TEXT NOT NULL DEFAULT '0'",
             },
         )
         self.conn.commit()
@@ -881,6 +888,18 @@ class Storage:
         self.conn.commit()
         return cursor.rowcount
 
+    def update_address_watch_label(self, owner_user_id: int, address: str, label: str | None, now: datetime) -> int:
+        cursor = self.conn.execute(
+            """
+            UPDATE address_watches
+            SET label = ?, updated_at = ?
+            WHERE owner_user_id = ? AND address = ? AND active = 1
+            """,
+            (label, now.isoformat(), owner_user_id, address),
+        )
+        self.conn.commit()
+        return cursor.rowcount
+
     def list_address_watches(self, owner_user_id: int) -> list[sqlite3.Row]:
         return list(
             self.conn.execute(
@@ -902,7 +921,8 @@ class Storage:
                     s.watch_income,
                     s.watch_expense,
                     s.notify_trx,
-                    s.display_mode
+                    s.display_mode,
+                    s.min_notify_amount
                 FROM address_watches w
                 LEFT JOIN address_watch_settings s ON s.owner_user_id = w.owner_user_id
                 WHERE w.active = 1

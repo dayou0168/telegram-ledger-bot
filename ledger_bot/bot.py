@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from html import escape
 import json
 import re
@@ -10,7 +10,7 @@ import time
 from typing import Any
 from urllib.parse import urlencode
 
-from .address_watch import format_transfer_notice, should_notify_transfer
+from .address_watch import format_transfer_notice, min_notify_amount, should_notify_transfer
 from .calculator import CalculatorError, calculate_expression, format_calculation_result, is_arithmetic_expression
 from .config import Config
 from .p2p_rates import P2POrderBookEntry, P2PRateClient, P2PRateError
@@ -108,6 +108,7 @@ class LedgerBot:
         last_update_id = self.storage.last_processed_update_id()
         self.offset: int | None = last_update_id + 1 if last_update_id is not None else None
         self.next_tron_poll_at = 0.0
+        self.address_watch_pending: dict[int, str] = {}
 
     def run_forever(self) -> None:
         print("Ledger bot is running.", flush=True)
@@ -389,13 +390,13 @@ class LedgerBot:
             return
 
         market = self.config.p2p_rate_market.upper()
-        lines = [f"{market} OTC商家所有实时汇率 TOP 10"]
+        lines = [f"<b>{escape(f'{market} OTC商家所有实时汇率 TOP 10')}</b>", ""]
         for entry in entries:
-            merchant = self.trim_text(entry.merchant_name, 10)
+            merchant = escape(self.trim_text(entry.merchant_name, 10))
             lines.append(f"Z{entry.rank}  {format_number(entry.price)}  {merchant}")
         lines.append("")
-        lines.append("发送 Z1 -0.1 或 Z1 +0.1 可按第1档偏移后设置汇率。")
-        self.reply(ctx, "\n".join(lines))
+        lines.append("发送 设置汇率 Z1 或 设置汇率 Z1 -0.1 可按第1档偏移后设置汇率。")
+        self.client.send_message(ctx.chat_id, "\n".join(lines), parse_mode="HTML")
 
     def set_rate_from_otc_rank(self, ctx: MessageContext, rank: int, offset: Decimal) -> None:
         try:
@@ -455,6 +456,8 @@ class LedgerBot:
             return
         if normalized in {"我的ID", "/id", "id", "ID"}:
             self.client.send_message(chat_id, f"你的 Telegram ID：{user.user_id}", reply_to_message_id=message_id)
+            return
+        if self.handle_address_watch_pending_input(chat_id, user.user_id, normalized, now, message_id):
             return
         if self.handle_default_operator_command(chat_id, user, normalized, message_id):
             return
@@ -585,6 +588,8 @@ class LedgerBot:
                 "群内常用指令：",
                 "开始 / 关闭",
                 "设置汇率10",
+                "Z0",
+                "设置汇率 Z1",
                 "设置费率3",
                 "+1000",
                 "+1000/7.1",
@@ -1066,15 +1071,20 @@ class LedgerBot:
     ) -> None:
         rows = self.storage.list_address_watches(owner_user_id)
         settings = self.storage.get_address_watch_settings(owner_user_id, datetime.now(self.config.timezone))
+        min_amount = min_notify_amount(settings)
+        min_text = "不限" if min_amount == 0 else f"{format_number(min_amount)} USDT"
         lines = [
             "USDT 地址监听",
             f"模式：{'精简模式' if settings['display_mode'] == 'compact' else '完整模式'}",
             f"收入：{'开启' if settings['watch_income'] else '关闭'}",
             f"支出：{'开启' if settings['watch_expense'] else '关闭'}",
             f"TRX通知：{'开启' if settings['notify_trx'] else '关闭'}",
+            f"最小提醒：{min_text}",
             "",
-            "添加：添加监听地址 Txxxx 备注",
+            "添加：设置地址 Txxxx 备注",
             "删除：删除监听地址 Txxxx",
+            "备注：设置备注 Txxxx 备注",
+            "金额：设置监听金额 10",
             "",
             "当前监听地址：",
         ]
@@ -1097,8 +1107,18 @@ class LedgerBot:
         income_text = "收入✅" if settings["watch_income"] else "收入❌"
         expense_text = "支出✅" if settings["watch_expense"] else "支出❌"
         trx_text = "关闭TRX通知✅" if settings["notify_trx"] else "开启TRX通知❌"
+        min_amount = min_notify_amount(settings)
+        min_text = "最小金额：不限" if min_amount == 0 else f"最小金额：{format_number(min_amount)}U"
         return {
             "inline_keyboard": [
+                [
+                    {"text": "➕ 设置地址", "callback_data": "watch:prompt:add"},
+                    {"text": "📝 设置备注", "callback_data": "watch:prompt:label"},
+                ],
+                [
+                    {"text": "➖ 删除地址", "callback_data": "watch:prompt:remove"},
+                    {"text": min_text, "callback_data": "watch:prompt:min"},
+                ],
                 [
                     {"text": compact_text, "callback_data": "watch:mode:compact"},
                     {"text": full_text, "callback_data": "watch:mode:full"},
@@ -1119,23 +1139,12 @@ class LedgerBot:
         now: datetime,
         reply_to_message_id: int | None,
     ) -> bool:
-        add_match = re.fullmatch(r"(?:添加监听地址|监听)\s+(\S+)(?:\s+(.+))?", text)
+        add_match = re.fullmatch(r"(?:添加监听地址|设置监听地址|添加地址|设置地址|监听)\s+(.+)", text)
         if add_match:
-            address = add_match.group(1).strip()
-            network = detect_usdt_network(address)
-            if not network:
-                self.client.send_message(
-                    chat_id,
-                    "地址格式不支持。USDT 监听当前只支持 TRC20 的 T 开头地址。",
-                    reply_to_message_id=reply_to_message_id,
-                )
-                return True
-            label = (add_match.group(2) or "").strip() or None
-            self.storage.add_address_watch(owner_user_id, network, address, label, now)
-            self.client.send_message(chat_id, "监听地址已添加。", reply_to_message_id=reply_to_message_id)
+            self.add_address_watch_from_text(chat_id, owner_user_id, add_match.group(1), now, reply_to_message_id)
             return True
 
-        remove_match = re.fullmatch(r"(?:删除监听地址|取消监听)\s+(\S+)", text)
+        remove_match = re.fullmatch(r"(?:删除监听地址|删除地址|取消监听)\s+(\S+)", text)
         if remove_match:
             address = remove_match.group(1).strip()
             removed = self.storage.remove_address_watch(owner_user_id, address)
@@ -1145,7 +1154,122 @@ class LedgerBot:
                 reply_to_message_id=reply_to_message_id,
             )
             return True
+
+        label_match = re.fullmatch(r"(?:设置地址备注|设置备注|修改备注)\s+(.+)", text)
+        if label_match:
+            self.update_address_watch_label_from_text(chat_id, owner_user_id, label_match.group(1), now, reply_to_message_id)
+            return True
+
+        amount_match = re.fullmatch(r"(?:设置监听金额|设置最小金额|最小提醒金额|最小金额)\s*(\d+(?:\.\d+)?)", text)
+        if amount_match:
+            self.update_address_watch_min_amount(chat_id, owner_user_id, amount_match.group(1), now, reply_to_message_id)
+            return True
         return False
+
+    def handle_address_watch_pending_input(
+        self,
+        chat_id: int,
+        owner_user_id: int,
+        text: str,
+        now: datetime,
+        reply_to_message_id: int | None,
+    ) -> bool:
+        action = self.address_watch_pending.get(owner_user_id)
+        if not action:
+            return False
+        if text in {"取消", "退出", "返回"}:
+            self.address_watch_pending.pop(owner_user_id, None)
+            self.client.send_message(chat_id, "已取消。", reply_to_message_id=reply_to_message_id)
+            self.send_address_watch_menu(chat_id, owner_user_id)
+            return True
+        if action == "add":
+            ok = self.add_address_watch_from_text(chat_id, owner_user_id, text, now, reply_to_message_id)
+        elif action == "remove":
+            removed = self.storage.remove_address_watch(owner_user_id, text.strip())
+            self.client.send_message(
+                chat_id,
+                "监听地址已删除。" if removed else "没有找到这个监听地址。",
+                reply_to_message_id=reply_to_message_id,
+            )
+            ok = bool(removed)
+        elif action == "label":
+            ok = self.update_address_watch_label_from_text(chat_id, owner_user_id, text, now, reply_to_message_id)
+        elif action == "min":
+            ok = self.update_address_watch_min_amount(chat_id, owner_user_id, text, now, reply_to_message_id)
+        else:
+            ok = False
+        if ok:
+            self.address_watch_pending.pop(owner_user_id, None)
+            self.send_address_watch_menu(chat_id, owner_user_id)
+        return True
+
+    def add_address_watch_from_text(
+        self,
+        chat_id: int,
+        owner_user_id: int,
+        text: str,
+        now: datetime,
+        reply_to_message_id: int | None,
+    ) -> bool:
+        address, label = self.parse_address_and_tail(text)
+        if not address:
+            self.client.send_message(chat_id, "请发送地址，格式：T地址 备注", reply_to_message_id=reply_to_message_id)
+            return False
+        network = detect_usdt_network(address)
+        if not network:
+            self.client.send_message(
+                chat_id,
+                "地址格式不支持。USDT 监听当前只支持 TRC20 的 T 开头地址。",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return False
+        self.storage.add_address_watch(owner_user_id, network, address, label, now)
+        self.client.send_message(chat_id, "监听地址已保存。", reply_to_message_id=reply_to_message_id)
+        return True
+
+    def update_address_watch_label_from_text(
+        self,
+        chat_id: int,
+        owner_user_id: int,
+        text: str,
+        now: datetime,
+        reply_to_message_id: int | None,
+    ) -> bool:
+        address, label = self.parse_address_and_tail(text)
+        if not address:
+            self.client.send_message(chat_id, "请发送地址和备注，格式：T地址 备注", reply_to_message_id=reply_to_message_id)
+            return False
+        changed = self.storage.update_address_watch_label(owner_user_id, address, label, now)
+        self.client.send_message(
+            chat_id,
+            "地址备注已更新。" if changed else "没有找到这个监听地址。",
+            reply_to_message_id=reply_to_message_id,
+        )
+        return bool(changed)
+
+    def update_address_watch_min_amount(
+        self,
+        chat_id: int,
+        owner_user_id: int,
+        text: str,
+        now: datetime,
+        reply_to_message_id: int | None,
+    ) -> bool:
+        amount = parse_non_negative_decimal(text.strip())
+        if amount is None:
+            self.client.send_message(chat_id, "请输入大于或等于 0 的 USDT 金额，例如：10", reply_to_message_id=reply_to_message_id)
+            return False
+        self.storage.update_address_watch_settings(owner_user_id, now, min_notify_amount=str(amount))
+        label = "不限" if amount == 0 else f"{format_number(amount)} USDT"
+        self.client.send_message(chat_id, f"最小提醒金额已设置为：{label}", reply_to_message_id=reply_to_message_id)
+        return True
+
+    @staticmethod
+    def parse_address_and_tail(text: str) -> tuple[str, str | None]:
+        parts = text.strip().split(maxsplit=1)
+        if not parts:
+            return "", None
+        return parts[0].strip(), (parts[1].strip() if len(parts) > 1 and parts[1].strip() else None)
 
     def handle_ledger_entry(self, ctx: MessageContext, entry: ParsedLedgerEntry) -> None:
         group = self.storage.get_group(ctx.chat_id)
@@ -1162,11 +1286,10 @@ class LedgerBot:
             return
 
         record = self.create_record(ctx, group, entry)
-        label = "入款" if entry.kind == "deposit" else "下发"
-        reply = f"已记录{label}：{format_number(Decimal(record['amount_cny']))} / {format_number(Decimal(record['exchange_rate']))}={format_money(Decimal(record['amount_usdt']))}U"
         sent = self.client.send_message(
             ctx.chat_id,
-            reply + "\n\n" + self.build_bill_text(ctx.chat_id, self.day_key(ctx), compact=True),
+            self.build_bill_text(ctx.chat_id, self.day_key(ctx), compact=True),
+            parse_mode="HTML",
             reply_markup={
                 "inline_keyboard": [
                     self.bill_button_row(ctx.chat_id, self.day_key(ctx)),
@@ -1240,6 +1363,7 @@ class LedgerBot:
         self.client.send_message(
             ctx.chat_id,
             text,
+            parse_mode="HTML",
             reply_markup={"inline_keyboard": [self.bill_button_row(ctx.chat_id, self.day_key(ctx))]},
         )
 
@@ -1261,10 +1385,10 @@ class LedgerBot:
         shown_deposits = deposits[-limit:] if limit else deposits
         shown_payouts = payouts[-limit:] if limit else payouts
 
-        lines = [f"今日入款（{len(deposits)}笔）"]
+        lines = [f"<b>今日入款（{len(deposits)}笔）</b>"]
         lines.extend(self.format_record_line(row) for row in shown_deposits)
         lines.append("")
-        lines.append(f"今日下发（{len(payouts)}笔）")
+        lines.append(f"<b>今日下发（{len(payouts)}笔）</b>")
         lines.extend(self.format_record_line(row) for row in shown_payouts)
 
         total_cny = sum_decimal(row["amount_cny"] for row in deposits)
@@ -1302,7 +1426,7 @@ class LedgerBot:
         gross_usdt = Decimal(row["amount_usdt"])
         net_usdt = Decimal(row["net_usdt"])
         fee_rate = Decimal(row["fee_rate"])
-        subject = row["subject_name"] or row["actor_name"]
+        subject = escape(row["subject_name"] or row["actor_name"])
         if row["kind"] == "payout":
             if row["currency"] == "USDT":
                 body = f"{format_money(gross_usdt)}U"
@@ -1602,7 +1726,7 @@ class LedgerBot:
             group = self.storage.get_group(chat_id)
             day_key = business_day_key(now, group["day_cutoff_hour"], self.config.timezone)
             self.client.answer_callback_query(callback["id"])
-            self.client.send_message(chat_id, self.build_bill_text(chat_id, day_key))
+            self.client.send_message(chat_id, self.build_bill_text(chat_id, day_key), parse_mode="HTML")
 
     def handle_broadcast_callback(
         self,
@@ -1734,7 +1858,7 @@ class LedgerBot:
                     timezone=self.config.timezone,
                     usdt_contract=self.config.tron_usdt_contract,
                 )
-                if transfer is None or not should_notify_transfer(transfer.direction, settings):
+                if transfer is None:
                     continue
                 inserted = self.storage.record_chain_event_notification(
                     owner_user_id=watch["owner_user_id"],
@@ -1746,6 +1870,8 @@ class LedgerBot:
                     now=now,
                 )
                 if not inserted:
+                    continue
+                if not should_notify_transfer(transfer, settings):
                     continue
                 self.client.send_message(
                     watch["owner_user_id"],
@@ -1762,6 +1888,26 @@ class LedgerBot:
         now: datetime,
     ) -> None:
         settings = self.storage.get_address_watch_settings(owner_user_id, now)
+        if data == "watch:prompt:add":
+            self.address_watch_pending[owner_user_id] = "add"
+            self.client.answer_callback_query(callback_id, "请发送地址和备注。")
+            self.client.send_message(chat_id, "请发送要监听的 TRC20 地址，可在后面加备注：\nT地址 备注\n\n发送“取消”退出。")
+            return
+        if data == "watch:prompt:remove":
+            self.address_watch_pending[owner_user_id] = "remove"
+            self.client.answer_callback_query(callback_id, "请发送要删除的地址。")
+            self.client.send_message(chat_id, "请发送要删除的监听地址：\nT地址\n\n发送“取消”退出。")
+            return
+        if data == "watch:prompt:label":
+            self.address_watch_pending[owner_user_id] = "label"
+            self.client.answer_callback_query(callback_id, "请发送地址和备注。")
+            self.client.send_message(chat_id, "请发送要设置备注的地址和备注：\nT地址 新备注\n\n只发送地址可清空备注，发送“取消”退出。")
+            return
+        if data == "watch:prompt:min":
+            self.address_watch_pending[owner_user_id] = "min"
+            self.client.answer_callback_query(callback_id, "请发送最小提醒金额。")
+            self.client.send_message(chat_id, "请发送最小提醒金额，单位 USDT。\n例如：10\n设置 0 表示不限制。\n\n发送“取消”退出。")
+            return
         if data == "watch:mode:compact":
             self.storage.update_address_watch_settings(owner_user_id, now, display_mode="compact")
             text = "已切换精简模式。"
@@ -1897,6 +2043,16 @@ def format_signed_decimal(value: Decimal) -> str:
     if value > 0:
         return f"+{format_number(value)}"
     return format_number(value)
+
+
+def parse_non_negative_decimal(value: str) -> Decimal | None:
+    try:
+        amount = Decimal(value)
+    except InvalidOperation:
+        return None
+    if amount < 0:
+        return None
+    return amount
 
 
 def sum_decimal(values: Any) -> Decimal:
