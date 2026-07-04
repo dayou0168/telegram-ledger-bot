@@ -2,10 +2,24 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from ledger_bot.p2p_rates import parse_order_book_top
+from ledger_bot.p2p_rates import build_order_book_monitoring_body, parse_order_book_top
 
 
-def test_parse_order_book_top_buy_usdt_entries() -> None:
+def test_order_book_body_uses_sell_usdt_direction() -> None:
+    body = build_order_book_monitoring_body(
+        market="okx",
+        fiat_unit="CNY",
+        asset="USDT",
+        trade_methods=["aliPay"],
+        limit=10,
+    )
+
+    assert body["tradeType1"] == "BUY"
+    assert body["tradeType2"] == "BUY"
+    assert body["tradeMethods1"] == ["aliPay"]
+
+
+def test_parse_order_book_top_sell_usdt_entries() -> None:
     payload = {
         "success": True,
         "data": [

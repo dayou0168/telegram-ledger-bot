@@ -157,6 +157,11 @@ class Storage:
                 UNIQUE(owner_user_id, address, tx_hash, direction)
             );
 
+            CREATE TABLE IF NOT EXISTS processed_updates (
+                update_id INTEGER PRIMARY KEY,
+                processed_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS broadcast_jobs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 creator_user_id INTEGER NOT NULL,
@@ -226,6 +231,23 @@ class Storage:
             },
         )
         self.conn.commit()
+
+    def claim_update(self, update_id: int, now: datetime) -> bool:
+        cursor = self.conn.execute(
+            """
+            INSERT OR IGNORE INTO processed_updates(update_id, processed_at)
+            VALUES (?, ?)
+            """,
+            (update_id, now.isoformat()),
+        )
+        self.conn.commit()
+        return cursor.rowcount == 1
+
+    def last_processed_update_id(self) -> int | None:
+        row = self.conn.execute("SELECT MAX(update_id) AS update_id FROM processed_updates").fetchone()
+        if row is None or row["update_id"] is None:
+            return None
+        return int(row["update_id"])
 
     def list_broadcast_groups(self, *, chat_ids: list[int] | None = None) -> list[sqlite3.Row]:
         if chat_ids is not None:

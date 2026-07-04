@@ -193,3 +193,23 @@ def test_forget_group_preserves_records_but_removes_broadcast_target() -> None:
             assert [row["amount"] for row in rows] == ["100"]
         finally:
             storage.conn.close()
+
+
+def test_claim_update_is_idempotent_and_persistent() -> None:
+    with TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "bot.db"
+        storage = Storage(db_path)
+        try:
+            now = datetime(2026, 7, 4, 12, tzinfo=BEIJING_TZ)
+
+            assert storage.claim_update(100, now)
+            assert not storage.claim_update(100, now)
+            assert storage.last_processed_update_id() == 100
+        finally:
+            storage.conn.close()
+
+        storage = Storage(db_path)
+        try:
+            assert storage.last_processed_update_id() == 100
+        finally:
+            storage.conn.close()

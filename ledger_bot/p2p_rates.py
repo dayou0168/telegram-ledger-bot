@@ -113,38 +113,13 @@ class P2PRateClient:
         trade_methods: list[str] | None = None,
     ) -> list[P2POrderBookEntry]:
         trade_methods = trade_methods or []
-        body = {
-            "fiatUnit": fiat_unit,
-            "market1": market,
-            "market2": market,
-            "asset1": asset,
-            "asset2": asset,
-            "tradeMethods1": trade_methods,
-            "tradeMethods2": trade_methods,
-            # In P2P Army's order-book terminology, SELL means makers are
-            # selling USDT, so the visitor is buying USDT with fiat.
-            "tradeType1": "SELL",
-            "tradeType2": "SELL",
-            "amount1": "",
-            "amount2": "",
-            "only_merchants1": False,
-            "only_merchants2": False,
-            "only_merchants_pro1": False,
-            "only_merchants_pro2": False,
-            "user_orders1from": "",
-            "user_orders1to": "",
-            "user_orders2from": "",
-            "user_orders2to": "",
-            "user_reviews1from": "",
-            "user_reviews1to": "",
-            "user_reviews2from": "",
-            "user_reviews2to": "",
-            "price1from": "",
-            "price1to": "",
-            "price2from": "",
-            "price2to": "",
-            "limit": limit,
-        }
+        body = build_order_book_monitoring_body(
+            market=market,
+            fiat_unit=fiat_unit,
+            asset=asset,
+            trade_methods=trade_methods,
+            limit=limit,
+        )
         request = Request(
             f"{self.api_base}/p2p/order-book/monitoring",
             data=json.dumps(body).encode("utf-8"),
@@ -167,6 +142,48 @@ class P2PRateClient:
             raise P2PRateError(f"订单簿请求失败：{exc}") from exc
 
         return parse_order_book_top(payload, limit=limit)
+
+
+def build_order_book_monitoring_body(
+    *,
+    market: str,
+    fiat_unit: str,
+    asset: str,
+    trade_methods: list[str],
+    limit: int,
+) -> dict[str, Any]:
+    return {
+        "fiatUnit": fiat_unit,
+        "market1": market,
+        "market2": market,
+        "asset1": asset,
+        "asset2": asset,
+        "tradeMethods1": trade_methods,
+        "tradeMethods2": trade_methods,
+        # BUY means makers are buying USDT, so the visitor is selling
+        # USDT for fiat.
+        "tradeType1": "BUY",
+        "tradeType2": "BUY",
+        "amount1": "",
+        "amount2": "",
+        "only_merchants1": False,
+        "only_merchants2": False,
+        "only_merchants_pro1": False,
+        "only_merchants_pro2": False,
+        "user_orders1from": "",
+        "user_orders1to": "",
+        "user_orders2from": "",
+        "user_orders2to": "",
+        "user_reviews1from": "",
+        "user_reviews1to": "",
+        "user_reviews2from": "",
+        "user_reviews2to": "",
+        "price1from": "",
+        "price1to": "",
+        "price2from": "",
+        "price2to": "",
+        "limit": limit,
+    }
 
 
 def parse_p2p_rate_table(
@@ -245,7 +262,7 @@ def parse_order_book_top(payload: dict[str, Any], *, limit: int) -> list[P2POrde
             break
 
     if not entries:
-        raise P2PRateError("订单簿没有返回可用买 U 报价")
+        raise P2PRateError("订单簿没有返回可用卖 U 报价")
     return entries
 
 

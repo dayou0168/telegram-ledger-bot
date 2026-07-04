@@ -105,7 +105,8 @@ class LedgerBot:
             front_api=config.p2p_rate_front_api,
             request_timeout=config.request_timeout,
         )
-        self.offset: int | None = None
+        last_update_id = self.storage.last_processed_update_id()
+        self.offset: int | None = last_update_id + 1 if last_update_id is not None else None
         self.next_tron_poll_at = 0.0
 
     def run_forever(self) -> None:
@@ -115,7 +116,10 @@ class LedgerBot:
     def _poll_once(self) -> None:
         updates = self.client.get_updates(self.offset, self.telegram_poll_timeout())
         for update in updates:
-            self.offset = int(update["update_id"]) + 1
+            update_id = int(update["update_id"])
+            self.offset = update_id + 1
+            if not self.storage.claim_update(update_id, datetime.now(self.config.timezone)):
+                continue
             try:
                 self.handle_update(update)
             except TelegramAPIError as exc:
@@ -213,7 +217,6 @@ class LedgerBot:
                 self.client.send_message(
                     ctx.chat_id,
                     f"{text.strip()}={format_calculation_result(result)}",
-                    reply_to_message_id=ctx.message_id,
                 )
             return
 
@@ -234,7 +237,6 @@ class LedgerBot:
                 self.client.send_message(
                     ctx.chat_id,
                     "机器人已开启，请开始记账",
-                    reply_to_message_id=ctx.message_id,
                     reply_markup={"inline_keyboard": [[{"text": "🚩 使用说明", "callback_data": "help"}]]},
                 )
             case "stop":
@@ -386,16 +388,11 @@ class LedgerBot:
             self.reply(ctx, f"Z0 查询失败：{exc}")
             return
 
-        methods = self.config.p2p_rate_trade_methods
-        method_text = "、".join(methods) if methods else "全部支付方式"
-        lines = [
-            f"OKX {self.config.p2p_rate_fiat_unit}买{self.config.p2p_rate_asset} TOP10",
-            f"支付方式：{method_text}",
-        ]
+        market = self.config.p2p_rate_market.upper()
+        lines = [f"{market} OTC商家所有实时汇率 TOP 10"]
         for entry in entries:
-            limits = self.format_entry_limits(entry)
             merchant = self.trim_text(entry.merchant_name, 10)
-            lines.append(f"Z{entry.rank}  {format_number(entry.price)}  {merchant}{limits}")
+            lines.append(f"Z{entry.rank}  {format_number(entry.price)}  {merchant}")
         lines.append("")
         lines.append("发送 Z1 -0.1 或 Z1 +0.1 可按第1档偏移后设置汇率。")
         self.reply(ctx, "\n".join(lines))
@@ -435,12 +432,6 @@ class LedgerBot:
             f"当前入款汇率：{format_number(Decimal(group['deposit_exchange_rate']))}\n"
             f"当前下发汇率：{format_number(Decimal(group['payout_exchange_rate']))}"
         )
-
-    @staticmethod
-    def format_entry_limits(entry: P2POrderBookEntry) -> str:
-        if entry.limit_min is None or entry.limit_max is None:
-            return ""
-        return f"  限额{format_number(entry.limit_min)}-{format_number(entry.limit_max)}"
 
     @staticmethod
     def trim_text(value: str, max_len: int) -> str:
@@ -601,7 +592,7 @@ class LedgerBot:
                 "+0",
                 "显示账单",
                 "",
-                "撤销：回复机器人记账回执，发送“撤销入款”或“撤销下发”。",
+                "撤销：回复自己发送的原始加账消息，发送“撤销入款”或“撤销下发”。",
             ]
         )
 
@@ -1176,7 +1167,6 @@ class LedgerBot:
         sent = self.client.send_message(
             ctx.chat_id,
             reply + "\n\n" + self.build_bill_text(ctx.chat_id, self.day_key(ctx), compact=True),
-            reply_to_message_id=ctx.message_id,
             reply_markup={
                 "inline_keyboard": [
                     self.bill_button_row(ctx.chat_id, self.day_key(ctx)),
@@ -1250,7 +1240,6 @@ class LedgerBot:
         self.client.send_message(
             ctx.chat_id,
             text,
-            reply_to_message_id=ctx.message_id,
             reply_markup={"inline_keyboard": [self.bill_button_row(ctx.chat_id, self.day_key(ctx))]},
         )
 
@@ -1406,7 +1395,6 @@ class LedgerBot:
         self.client.send_message(
             ctx.chat_id,
             f"确认删除{label}？此操作会软删除流水。",
-            reply_to_message_id=ctx.message_id,
             reply_markup={
                 "inline_keyboard": [
                     [
@@ -1419,7 +1407,7 @@ class LedgerBot:
 
     def undo_by_reply_or_last(self, ctx: MessageContext, kind: str | None) -> None:
         if ctx.reply_message_id:
-            row = self.find_record_by_bot_message(ctx.chat_id, ctx.reply_message_id)
+            row = self.find_record_by_message(ctx.chat_id, ctx.reply_message_id)
             if row and (kind is None or row["kind"] == kind):
                 if not self.can_undo_record(ctx, row):
                     self.reply(ctx, "只能由加账本人回复错误记录撤销。最高权限可代处理。")
@@ -1427,24 +1415,24 @@ class LedgerBot:
                 self.storage.soft_delete_record(ctx.chat_id, row["id"], ctx.now, kind=kind)
                 self.reply(ctx, "撤销成功")
                 return
-            self.reply(ctx, "没有找到被回复消息对应的记账记录。请回复机器人记账回执。")
+            self.reply(ctx, "没有找到被回复消息对应的记账记录。请回复自己发送的原始加账消息。")
             return
         if kind is None:
             self.reply(ctx, "请回复要撤销的错误记录。")
             return
         self.reply(ctx, "请回复要撤销的错误记录。")
 
-    def find_record_by_bot_message(self, chat_id: int, message_id: int) -> Any | None:
+    def find_record_by_message(self, chat_id: int, message_id: int) -> Any | None:
         return self.storage.conn.execute(
             """
             SELECT * FROM records
             WHERE chat_id = ?
               AND deleted_at IS NULL
-              AND bot_message_id = ?
+              AND (bot_message_id = ? OR source_message_id = ?)
             ORDER BY id DESC
             LIMIT 1
             """,
-            (chat_id, message_id),
+            (chat_id, message_id, message_id),
         ).fetchone()
 
     def can_undo_record(self, ctx: MessageContext, row: Any) -> bool:
@@ -1848,7 +1836,7 @@ class LedgerBot:
         return int(group["day_cutoff_hour"]) < 0
 
     def reply(self, ctx: MessageContext, text: str) -> None:
-        self.client.send_message(ctx.chat_id, text, reply_to_message_id=ctx.message_id)
+        self.client.send_message(ctx.chat_id, text)
 
 
 def calculate_amounts(
