@@ -121,6 +121,9 @@ class LedgerBot:
         last_update_id = self.storage.last_processed_update_id()
         self.offset: int | None = last_update_id + 1 if last_update_id is not None else None
         self.next_tron_poll_at = 0.0
+        self.next_p2p_rate_refresh_at = 0.0
+        self.cached_otc_top_entries: list[P2POrderBookEntry] = []
+        self.cached_otc_top_at = 0.0
         self.address_watch_pending: dict[int, str] = {}
 
     def run_forever(self) -> None:
@@ -140,12 +143,18 @@ class LedgerBot:
                 print(f"Telegram API error: {exc}", flush=True)
             except Exception as exc:
                 print(f"Unhandled update error: {exc}", flush=True)
+        self.refresh_realtime_rates_if_due()
         self.poll_address_watches_if_due()
 
     def telegram_poll_timeout(self) -> int:
-        if self.config.tron_poll_interval_seconds <= 0:
+        intervals = [
+            value
+            for value in (self.config.tron_poll_interval_seconds, self.config.p2p_rate_refresh_seconds)
+            if value > 0
+        ]
+        if not intervals:
             return self.config.poll_timeout
-        return min(self.config.poll_timeout, max(1, self.config.tron_poll_interval_seconds))
+        return min(self.config.poll_timeout, max(1, min(intervals)))
 
     def handle_update(self, update: dict[str, Any]) -> None:
         if "message" in update:
@@ -352,14 +361,7 @@ class LedgerBot:
                 self.reply(ctx, "记账置顶已关闭。")
             case "realtime_rate_on":
                 offset = command.args.get("offset", Decimal("0"))
-                self.storage.update_group(
-                    ctx.chat_id,
-                    ctx.now,
-                    realtime_rate=1,
-                    realtime_rate_rank=None,
-                    realtime_rate_offset=str(offset),
-                )
-                self.reply(ctx, "实时汇率已开启。第三方汇率源接入后会自动同步。")
+                self.set_rate_from_otc_rank(ctx, 1, offset)
             case "set_currency":
                 self.storage.update_group(ctx.chat_id, ctx.now, currency=command.args["currency"])
                 self.reply(ctx, f"币种已设置为 {command.args['currency']}。")
@@ -411,13 +413,74 @@ class LedgerBot:
                 self.reply(ctx, "这个指令已识别，但当前版本还未启用。")
 
     def fetch_otc_top_entries(self, limit: int = 10) -> list[P2POrderBookEntry]:
-        return self.p2p_rate_client.fetch_order_book_top(
+        entries = self.p2p_rate_client.fetch_order_book_top(
             market=self.config.p2p_rate_market,
             fiat_unit=self.config.p2p_rate_fiat_unit,
             asset=self.config.p2p_rate_asset,
             trade_methods=list(self.config.p2p_rate_trade_methods),
             limit=limit,
         )
+        self.cached_otc_top_entries = entries
+        self.cached_otc_top_at = time.monotonic()
+        return entries
+
+    def cached_otc_top_entries_for_limit(self, limit: int) -> list[P2POrderBookEntry] | None:
+        ttl = max(0, int(self.config.p2p_rate_cache_ttl_seconds))
+        if ttl <= 0 or not self.cached_otc_top_entries or not self.cached_otc_top_at:
+            return None
+        if time.monotonic() - self.cached_otc_top_at > ttl:
+            return None
+        if not any(entry.rank >= limit for entry in self.cached_otc_top_entries):
+            return None
+        return self.cached_otc_top_entries
+
+    def get_otc_top_entries(self, limit: int = 10) -> list[P2POrderBookEntry]:
+        cached = self.cached_otc_top_entries_for_limit(limit)
+        if cached is not None:
+            return cached
+        return self.fetch_otc_top_entries(limit)
+
+    def refresh_realtime_rates_if_due(self) -> None:
+        interval = max(0, int(self.config.p2p_rate_refresh_seconds))
+        if interval <= 0:
+            return
+        now_monotonic = time.monotonic()
+        if now_monotonic < self.next_p2p_rate_refresh_at:
+            return
+        self.next_p2p_rate_refresh_at = now_monotonic + interval
+        try:
+            updated = self.refresh_realtime_rates()
+        except P2PRateError as exc:
+            print(f"P2P realtime rate refresh failed: {exc}", flush=True)
+            return
+        except Exception as exc:
+            print(f"P2P realtime rate refresh error: {exc}", flush=True)
+            return
+        if updated:
+            print(f"P2P realtime rate refreshed for {updated} groups.", flush=True)
+
+    def refresh_realtime_rates(self) -> int:
+        groups = self.storage.list_realtime_rate_groups()
+        if not groups:
+            return 0
+        max_rank = max(int(row["realtime_rate_rank"]) for row in groups)
+        entries = self.fetch_otc_top_entries(max(10, max_rank))
+        by_rank = {entry.rank: entry for entry in entries}
+        now = datetime.now(self.config.timezone)
+        updated = 0
+        for group in groups:
+            rank = int(group["realtime_rate_rank"])
+            entry = by_rank.get(rank)
+            if entry is None:
+                continue
+            rate = entry.price + Decimal(group["realtime_rate_offset"])
+            if rate <= 0:
+                continue
+            if Decimal(group["deposit_exchange_rate"]) == rate:
+                continue
+            self.storage.update_group(group["chat_id"], now, deposit_exchange_rate=str(rate))
+            updated += 1
+        return updated
 
     def send_otc_rates(self, ctx: MessageContext) -> None:
         try:
@@ -437,7 +500,7 @@ class LedgerBot:
 
     def set_rate_from_otc_rank(self, ctx: MessageContext, rank: int, offset: Decimal) -> None:
         try:
-            entries = self.fetch_otc_top_entries(max(10, rank))
+            entries = self.get_otc_top_entries(max(10, rank))
         except P2PRateError as exc:
             self.reply(ctx, f"设置失败：{exc}")
             return

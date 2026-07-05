@@ -72,6 +72,8 @@ P2P_RATE_MARKET=okx
 P2P_RATE_FIAT_UNIT=CNY
 P2P_RATE_ASSET=USDT
 P2P_RATE_TRADE_METHODS=aliPay
+P2P_RATE_REFRESH_SECONDS=60
+P2P_RATE_CACHE_TTL_SECONDS=180
 ```
 
 Send `我的ID` to the bot in private chat to get your Telegram ID, then put it in `BOT_HOST_USER_ID`. The bot has exactly one host. This value is required: if that host is not in a group, the bot leaves that group automatically. Sending `开始` only activates accounting; it does not promote the sender. Default operators are managed only by maintainers through `DEFAULT_OPERATOR_USER_IDS`; they can invite the bot into groups, record in any group, and use private `群发广播` / `分组广播`, but they cannot keep the bot in a group without the host present and cannot become group owner by sending `开始`.
@@ -122,6 +124,8 @@ services:
       P2P_RATE_FIAT_UNIT: "CNY"
       P2P_RATE_ASSET: "USDT"
       P2P_RATE_TRADE_METHODS: "aliPay"
+      P2P_RATE_REFRESH_SECONDS: "60"
+      P2P_RATE_CACHE_TTL_SECONDS: "180"
     ports:
       - "8080:8080"
     volumes:
@@ -197,6 +201,8 @@ P2P_RATE_MARKET=okx
 P2P_RATE_FIAT_UNIT=CNY
 P2P_RATE_ASSET=USDT
 P2P_RATE_TRADE_METHODS=aliPay
+P2P_RATE_REFRESH_SECONDS=60
+P2P_RATE_CACHE_TTL_SECONDS=180
 ```
 
 In BaoTa:

@@ -367,6 +367,19 @@ class Storage:
             )
         )
 
+    def list_realtime_rate_groups(self) -> list[sqlite3.Row]:
+        return list(
+            self.conn.execute(
+                """
+                SELECT * FROM groups
+                WHERE chat_id < 0
+                  AND realtime_rate = 1
+                  AND realtime_rate_rank IS NOT NULL
+                ORDER BY chat_id ASC
+                """
+            )
+        )
+
     def create_broadcast_job(
         self,
         *,

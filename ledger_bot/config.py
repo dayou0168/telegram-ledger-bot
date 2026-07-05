@@ -48,6 +48,8 @@ class Config:
     p2p_rate_fiat_unit: str
     p2p_rate_asset: str
     p2p_rate_trade_methods: tuple[str, ...]
+    p2p_rate_refresh_seconds: int
+    p2p_rate_cache_ttl_seconds: int
     poll_timeout: int = 50
     request_timeout: int = 70
 
@@ -102,6 +104,8 @@ def load_config() -> Config:
             for value in os.environ.get("P2P_RATE_TRADE_METHODS", "aliPay").split(",")
             if value.strip()
         ),
+        p2p_rate_refresh_seconds=int(os.environ.get("P2P_RATE_REFRESH_SECONDS", "60")),
+        p2p_rate_cache_ttl_seconds=int(os.environ.get("P2P_RATE_CACHE_TTL_SECONDS", "180")),
         poll_timeout=int(os.environ.get("BOT_POLL_TIMEOUT", "50")),
         request_timeout=int(os.environ.get("BOT_REQUEST_TIMEOUT", "70")),
     )

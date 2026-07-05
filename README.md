@@ -136,7 +136,11 @@ P2P_RATE_MARKET=okx
 P2P_RATE_FIAT_UNIT=CNY
 P2P_RATE_ASSET=USDT
 P2P_RATE_TRADE_METHODS=aliPay
+P2P_RATE_REFRESH_SECONDS=60
+P2P_RATE_CACHE_TTL_SECONDS=180
 ```
+
+后台每 `P2P_RATE_REFRESH_SECONDS` 秒只请求一次 TOP10，所有开启实时汇率的群共用这份结果，再按各群自己的 Z 档位和偏移写入该群保存汇率。加账时只使用数据库里已经保存的汇率，不等待外部接口；如果某次刷新失败，会继续沿用上一次成功保存的汇率。`P2P_RATE_CACHE_TTL_SECONDS` 只控制手动设置 Z 档位时可复用内存缓存的时间，不是加账汇率有效期。
 
 群里发送 `Z0` 会显示 `OKX OTC商家所有实时汇率 TOP 10`，不显示限额。发送 `设置汇率 Z1` 会按第 1 档价格写入当前群入款汇率；`设置汇率 Z1 -0.1` 会取第 1 档价格减 0.1；`设置汇率 Z1 +0.1` 会取第 1 档价格加 0.1。兼容简写 `Z1 -0.1`。
 
@@ -182,6 +186,8 @@ services:
       P2P_RATE_FIAT_UNIT: "CNY"
       P2P_RATE_ASSET: "USDT"
       P2P_RATE_TRADE_METHODS: "aliPay"
+      P2P_RATE_REFRESH_SECONDS: "60"
+      P2P_RATE_CACHE_TTL_SECONDS: "180"
     ports:
       - "8080:8080"
     volumes:
