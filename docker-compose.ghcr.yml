@@ -42,7 +42,7 @@ services:
       # 填写后可通过私聊菜单“⚙后台管理”打开后台，网页会要求输入这个密码。
       ADMIN_WEB_TOKEN: "换成一串随机字符"
 
-      # 选填但推荐：TronGrid API Key。
+      # 选填但推荐：Tronscan API Key。
       # 不监听 USDT 地址可以留空；监听地址较多建议填写。
       TRONGRID_API_KEY: ""
 
@@ -78,7 +78,7 @@ services:
       # PUBLIC_BILL_BOT_NAME: "LEDGER_BOT"
 
       # TRC20 监听参数。默认 1 秒轮询；机器人看到未完全确认的交易也会先通知。
-      # TRONGRID_API_BASE: "https://api.trongrid.io"
+      # TRONSCAN_API_BASE: "https://apilist.tronscanapi.com/api"
       # TRON_USDT_CONTRACT: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
       # TRON_POLL_INTERVAL_SECONDS: "1"
       # TRON_INITIAL_LOOKBACK_MINUTES: "15"

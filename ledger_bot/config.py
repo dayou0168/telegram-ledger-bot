@@ -98,7 +98,11 @@ def load_config() -> Config:
         bill_web_token=(os.environ.get("BILL_WEB_TOKEN") or "").strip() or None,
         admin_web_token=(os.environ.get("ADMIN_WEB_TOKEN") or "").strip() or None,
         telegram_bot_username=(os.environ.get("TELEGRAM_BOT_USERNAME") or "").lstrip("@") or None,
-        trongrid_api_base=os.environ.get("TRONGRID_API_BASE", "https://api.trongrid.io").rstrip("/"),
+        trongrid_api_base=(
+            os.environ.get("TRONSCAN_API_BASE")
+            or os.environ.get("TRONGRID_API_BASE")
+            or "https://apilist.tronscanapi.com/api"
+        ).rstrip("/"),
         trongrid_api_key=parse_optional_secret(os.environ.get("TRONGRID_API_KEY")),
         tron_usdt_contract=os.environ.get("TRON_USDT_CONTRACT", "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"),
         tron_poll_interval_seconds=int(os.environ.get("TRON_POLL_INTERVAL_SECONDS", "1")),

@@ -176,10 +176,10 @@ class LedgerBot:
     def run_forever(self) -> None:
         print("Ledger bot is running.", flush=True)
         print(
-            "TronGrid monitor: "
+            "TRON API monitor: "
             f"interval={self.config.tron_poll_interval_seconds}s, "
             f"api_key_loaded={'yes' if self.config.trongrid_api_key else 'no'}, "
-            "only_confirmed=false",
+            f"base={self.config.trongrid_api_base}",
             flush=True,
         )
         self.start_background_loops()
@@ -4151,12 +4151,12 @@ class LedgerBot:
         self.trongrid_error_log_after[key] = now + (60.0 if invalid_key else 15.0)
         if invalid_key:
             print(
-                "TronGrid API key rejected: HTTP 401 ApiKey not exists. "
+                "TRON API key rejected: HTTP 401 ApiKey not exists. "
                 "Check TRONGRID_API_KEY inside the running container; repeated logs are suppressed for 60s.",
                 flush=True,
             )
             return
-        print(f"TronGrid error for {address}: {exc}", flush=True)
+        print(f"TRON API error for {address}: {exc}", flush=True)
 
     def address_watch_min_timestamp_ms(self, watch: dict[str, Any], fallback_min_timestamp_ms: int) -> int:
         latest_timestamp = self.storage.latest_chain_event_timestamp(watch["owner_user_id"], watch["address"])

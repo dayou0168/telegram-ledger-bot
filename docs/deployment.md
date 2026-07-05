@@ -71,7 +71,7 @@ BILL_WEB_HOST=0.0.0.0
 BILL_WEB_PORT=8080
 BILL_WEB_TOKEN=
 ADMIN_WEB_TOKEN=
-TRONGRID_API_BASE=https://api.trongrid.io
+TRONSCAN_API_BASE=https://apilist.tronscanapi.com/api
 TRONGRID_API_KEY=
 TRON_POLL_INTERVAL_SECONDS=1
 P2P_RATE_API_BASE=https://p2p.army/api/fapi
@@ -166,7 +166,7 @@ BILL_WEB_PORT=8080
 BILL_WEB_TOKEN=
 ADMIN_WEB_TOKEN=
 
-TRONGRID_API_BASE=https://api.trongrid.io
+TRONSCAN_API_BASE=https://apilist.tronscanapi.com/api
 TRONGRID_API_KEY=
 TRON_USDT_CONTRACT=TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t
 TRON_POLL_INTERVAL_SECONDS=1
@@ -194,7 +194,7 @@ In BaoTa:
 Ledger bot is running.
 ```
 
-This bot does not need a website port mapping. It uses Telegram long polling and outbound HTTP requests to Telegram/TronGrid.
+This bot does not need a website port mapping. It uses Telegram long polling and outbound HTTP requests to Telegram/Tronscan.
 
 If BaoTa asks for Compose content directly, paste:
 

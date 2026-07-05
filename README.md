@@ -138,10 +138,10 @@ PUBLIC_BILL_URL_TEMPLATE=https://your-domain.example/day_xxb.php?firstname=&chat
 
 ### TRC20 链上监听
 
-使用 TronGrid 只读接口，不需要私钥。配置：
+使用 Tronscan 只读接口，不需要私钥。配置：
 
 ```env
-TRONGRID_API_BASE=https://api.trongrid.io
+TRONSCAN_API_BASE=https://apilist.tronscanapi.com/api
 TRONGRID_API_KEY=
 TRON_USDT_CONTRACT=TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t
 TRON_POLL_INTERVAL_SECONDS=1
@@ -150,7 +150,7 @@ TRON_INITIAL_LOOKBACK_MINUTES=15
 
 私聊点击 `🔔地址监听` 后，用面板按钮添加监听地址、设置备注和最小提醒金额。最小提醒金额表示小于这个数的 USDT 交易不提醒，设置 `0` 表示不限制。
 
-机器人会用独立后台线程定时请求 TronGrid 的 TRC20 交易接口，发现新的 USDT 收入/支出后私聊推送。默认 `TRON_POLL_INTERVAL_SECONDS=1`，并且看到未完全确认的交易也会先提醒；同一笔交易后续确认时会按交易哈希去重，不会重复提醒。主网建议配置真实的 `TRONGRID_API_KEY`。没有 key 时保持空值，不要填中文占位符或 key 名称；填写 key 后程序会通过 `TRON_PRO_API_KEY` 请求头调用 TronGrid，新版 TronGrid 后台实测使用这个下划线请求头。key 被 TronGrid 拒绝时不会降级成无 key 请求。`TRON_INITIAL_LOOKBACK_MINUTES` 只控制首次监听或没有历史记录时的回看窗口。
+机器人会用独立后台线程定时请求 Tronscan 的 TRC20 交易接口，发现新的 USDT 收入/支出后私聊推送。默认 `TRON_POLL_INTERVAL_SECONDS=1`；同一笔交易会按交易哈希去重，不会重复提醒。主网建议配置真实的 `TRONGRID_API_KEY`，这个旧变量名为了兼容已部署 Compose 继续保留，实际填写的是 Tronscan API Keys 页面里的令牌。没有 key 时保持空值，不要填中文占位符或 key 名称；填写 key 后程序会通过 `TRON-PRO-API-KEY` 请求头调用 Tronscan。key 被 Tronscan 拒绝时不会降级成无 key 请求。`TRON_INITIAL_LOOKBACK_MINUTES` 只控制首次监听或没有历史记录时的回看窗口。
 
 ### Z0 汇率查询
 

@@ -40,11 +40,53 @@ def safe_header_value(value: str | None) -> str | None:
     return cleaned
 
 
+def normalize_tronscan_transfer(row: dict[str, Any], *, contract_address: str) -> dict[str, Any]:
+    decimals = row.get("decimals")
+    token_info = row.get("tokenInfo") if isinstance(row.get("tokenInfo"), dict) else {}
+    if decimals is None:
+        decimals = token_info.get("tokenDecimal", 6)
+    return {
+        "transaction_id": row.get("hash") or row.get("transaction_id"),
+        "token_info": {
+            "symbol": token_info.get("tokenAbbr") or row.get("token_name") or "USDT",
+            "address": row.get("contract_address") or row.get("id") or contract_address,
+            "decimals": int(decimals or 6),
+        },
+        "block_timestamp": row.get("block_timestamp"),
+        "from": row.get("from"),
+        "to": row.get("to"),
+        "type": row.get("event_type") or "Transfer",
+        "value": row.get("amount") or row.get("value") or "0",
+    }
+
+
+def normalize_tronscan_account(row: dict[str, Any]) -> dict[str, Any]:
+    trc20_tokens: list[dict[str, str]] = []
+    for token in row.get("trc20token_balances") or []:
+        token_id = token.get("tokenId")
+        if not token_id:
+            continue
+        trc20_tokens.append({token_id: str(token.get("balance") or "0")})
+    return {
+        "balance": row.get("balance") or row.get("trxBalance") or 0,
+        "trc20": trc20_tokens,
+        "create_time": row.get("date_created") or row.get("create_time") or row.get("date_created_at"),
+        "latest_opration_time": row.get("latest_operation_time")
+        or row.get("latest_opration_time")
+        or row.get("latest_transfer_time"),
+        "owner_permission": row.get("ownerPermission") or row.get("owner_permission"),
+        "active_permission": row.get("activePermissions") or row.get("active_permission") or [],
+    }
+
+
 @dataclass(frozen=True)
 class TronGridClient:
-    api_base: str = "https://api.trongrid.io"
+    api_base: str = "https://apilist.tronscanapi.com/api"
     api_key: str | None = None
     request_timeout: int = 30
+
+    def uses_tronscan_api(self) -> bool:
+        return "tronscanapi.com" in self.api_base.lower()
 
     def get_json(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         query = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
@@ -54,7 +96,7 @@ class TronGridClient:
         headers = {"Accept": "application/json"}
         api_key = safe_header_value(self.api_key)
         if api_key:
-            headers["TRON_PRO_API_KEY"] = api_key
+            headers["TRON-PRO-API-KEY"] = api_key
         try:
             return self.open_json(url, headers)
         except urllib.error.HTTPError as exc:
@@ -76,6 +118,13 @@ class TronGridClient:
         min_timestamp_ms: int,
         limit: int = 200,
     ) -> list[dict[str, Any]]:
+        if self.uses_tronscan_api():
+            return self.fetch_tronscan_trc20_transfers(
+                address,
+                contract_address=contract_address,
+                min_timestamp_ms=min_timestamp_ms,
+                limit=limit,
+            )
         path = f"/v1/accounts/{urllib.parse.quote(address)}/transactions/trc20"
         params: dict[str, Any] = {
             "only_confirmed": "false",
@@ -96,7 +145,46 @@ class TronGridClient:
                 break
         return rows
 
+    def fetch_tronscan_trc20_transfers(
+        self,
+        address: str,
+        *,
+        contract_address: str,
+        min_timestamp_ms: int,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        page_limit = min(max(limit, 1), 50)
+        for direction in (1, 2):
+            start = 0
+            while len(rows) < limit:
+                data = self.get_json(
+                    "/token_trc20/transfers-with-status",
+                    {
+                        "trc20Id": contract_address,
+                        "address": address,
+                        "direction": direction,
+                        "start_timestamp": min_timestamp_ms,
+                        "start": start,
+                        "limit": page_limit,
+                        "reverse": "false",
+                    },
+                )
+                page_rows = data.get("data") or []
+                rows.extend(
+                    normalize_tronscan_transfer(row, contract_address=contract_address)
+                    for row in page_rows
+                )
+                if len(page_rows) < page_limit:
+                    break
+                start += page_limit
+        rows.sort(key=lambda row: int(row.get("block_timestamp") or 0))
+        return rows[:limit]
+
     def fetch_account(self, address: str) -> dict[str, Any] | None:
+        if self.uses_tronscan_api():
+            data = self.get_json("/account", {"address": address})
+            return normalize_tronscan_account(data)
         path = f"/v1/accounts/{urllib.parse.quote(address)}"
         data = self.get_json(path, {})
         rows = data.get("data") or []
@@ -109,6 +197,26 @@ class TronGridClient:
         contract_address: str,
         limit: int = 5,
     ) -> list[dict[str, Any]]:
+        if self.uses_tronscan_api():
+            rows: list[dict[str, Any]] = []
+            for direction in (1, 2):
+                data = self.get_json(
+                    "/token_trc20/transfers-with-status",
+                    {
+                        "trc20Id": contract_address,
+                        "address": address,
+                        "direction": direction,
+                        "start": 0,
+                        "limit": min(max(limit, 1), 50),
+                        "reverse": "true",
+                    },
+                )
+                rows.extend(
+                    normalize_tronscan_transfer(row, contract_address=contract_address)
+                    for row in (data.get("data") or [])
+                )
+            rows.sort(key=lambda row: int(row.get("block_timestamp") or 0), reverse=True)
+            return rows[:limit]
         path = f"/v1/accounts/{urllib.parse.quote(address)}/transactions/trc20"
         data = self.get_json(
             path,

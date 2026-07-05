@@ -45,7 +45,7 @@ def test_safe_header_value_trims_ascii_key() -> None:
     assert safe_header_value("  abc123  ") == "abc123"
 
 
-def test_fetch_trc20_transfers_uses_api_key_and_unconfirmed_mode() -> None:
+def test_fetch_trc20_transfers_uses_tronscan_api_key_and_timestamp() -> None:
     client = CapturingTronGridClient(api_key="  key123  ")
 
     rows = client.fetch_trc20_transfers(
@@ -55,7 +55,22 @@ def test_fetch_trc20_transfers_uses_api_key_and_unconfirmed_mode() -> None:
     )
 
     assert rows == []
-    assert client.seen_headers["TRON_PRO_API_KEY"] == "key123"
+    assert client.seen_headers["TRON-PRO-API-KEY"] == "key123"
+    assert "/token_trc20/transfers-with-status" in client.seen_url
+    assert f"trc20Id={USDT}" in client.seen_url
+    assert "start_timestamp=123" in client.seen_url
+
+
+def test_fetch_trc20_transfers_can_still_use_trongrid_base() -> None:
+    client = CapturingTronGridClient(api_base="https://api.trongrid.io", api_key="key123")
+
+    client.fetch_trc20_transfers(
+        "TGhAAySHUUcEGua33pZZ88wP3bA6XSeQuZ",
+        contract_address=USDT,
+        min_timestamp_ms=123,
+    )
+
+    assert client.seen_headers["TRON-PRO-API-KEY"] == "key123"
     assert "only_confirmed=false" in client.seen_url
     assert "min_timestamp=123" in client.seen_url
 
