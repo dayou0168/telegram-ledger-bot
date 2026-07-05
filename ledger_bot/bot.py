@@ -168,6 +168,7 @@ class LedgerBot:
         self.tron_poll_running = False
         self.host_presence_cache: dict[int, tuple[float, TelegramUser | None]] = {}
         self.host_presence_lock = threading.Lock()
+        self.trongrid_error_log_after: dict[str, float] = {}
         self.address_watch_pending: dict[int, str] = {}
         self.broadcast_pending: dict[int, dict[str, Any]] = {}
         self.broadcast_reply_pending: dict[int, dict[str, Any]] = {}
@@ -4107,7 +4108,7 @@ class LedgerBot:
                 min_timestamp_ms=min_timestamp_ms,
             )
         except TronGridError as exc:
-            print(f"TronGrid error for {watch['address']}: {exc}", flush=True)
+            self.log_trongrid_error(watch["address"], exc)
             return
 
         for row in rows:
@@ -4138,6 +4139,24 @@ class LedgerBot:
                 format_transfer_notice(transfer),
                 parse_mode="HTML",
             )
+
+    def log_trongrid_error(self, address: str, exc: TronGridError) -> None:
+        message = str(exc)
+        invalid_key = "HTTP 401" in message and "ApiKey not exists" in message
+        key = "invalid_api_key" if invalid_key else f"{address}:{message}"
+        now = time.monotonic()
+        next_log_at = self.trongrid_error_log_after.get(key, 0.0)
+        if now < next_log_at:
+            return
+        self.trongrid_error_log_after[key] = now + (60.0 if invalid_key else 15.0)
+        if invalid_key:
+            print(
+                "TronGrid API key rejected: HTTP 401 ApiKey not exists. "
+                "Check TRONGRID_API_KEY inside the running container; repeated logs are suppressed for 60s.",
+                flush=True,
+            )
+            return
+        print(f"TronGrid error for {address}: {exc}", flush=True)
 
     def address_watch_min_timestamp_ms(self, watch: dict[str, Any], fallback_min_timestamp_ms: int) -> int:
         latest_timestamp = self.storage.latest_chain_event_timestamp(watch["owner_user_id"], watch["address"])

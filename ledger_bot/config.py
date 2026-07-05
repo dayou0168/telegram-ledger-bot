@@ -99,7 +99,7 @@ def load_config() -> Config:
         admin_web_token=(os.environ.get("ADMIN_WEB_TOKEN") or "").strip() or None,
         telegram_bot_username=(os.environ.get("TELEGRAM_BOT_USERNAME") or "").lstrip("@") or None,
         trongrid_api_base=os.environ.get("TRONGRID_API_BASE", "https://api.trongrid.io").rstrip("/"),
-        trongrid_api_key=os.environ.get("TRONGRID_API_KEY") or None,
+        trongrid_api_key=parse_optional_secret(os.environ.get("TRONGRID_API_KEY")),
         tron_usdt_contract=os.environ.get("TRON_USDT_CONTRACT", "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"),
         tron_poll_interval_seconds=int(os.environ.get("TRON_POLL_INTERVAL_SECONDS", "1")),
         tron_initial_lookback_minutes=int(os.environ.get("TRON_INITIAL_LOOKBACK_MINUTES", "15")),
@@ -142,6 +142,25 @@ def parse_user_id(raw: str) -> int | None:
     if not value:
         return None
     return int(value)
+
+
+def parse_optional_secret(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    value = raw.strip().strip('"').strip("'").strip()
+    if not value:
+        return None
+    placeholders = {
+        "replace-me",
+        "your-trongrid-api-key",
+        "trongrid_api_key",
+        "trongrid-key",
+        "替换成你的trongridkey",
+        "替换成你的trongridapikey",
+    }
+    if value.lower() in placeholders:
+        return None
+    return value
 
 
 def parse_bool(raw: str) -> bool:
