@@ -75,11 +75,15 @@ def test_render_bill_page_shows_records_and_realtime_rate() -> None:
             assert "测试群" in html
             assert "支付宝1档 下浮0.10" in html
             assert "入款" in html
+            assert "Telegram 记账机器人" in html
+            assert "summary-grid" in html
+            assert "summary-card" in html
+            assert "bill-search" in html
             assert "历史账单" in html
             assert "history-dropdown" in html
             assert "07-05" in html
-            assert "target.showPicker()" in html
-            assert "max-width: 1180px" in html
+            assert "max-width: 1280px" in html
+            assert 'class="date-form"' not in html
             assert "table-layout: fixed" in html
             assert "text-align: center" in html
             assert "vertical-align: middle" in html
@@ -119,8 +123,9 @@ def test_render_bill_page_uses_group_cutoff_window() -> None:
                 timezone=BEIJING_TZ,
             )
 
-            assert 'type="datetime-local" step="1" name="begintime" value="2026-07-04T04:00:00"' in html
-            assert 'type="datetime-local" step="1" name="endtime" value="2026-07-05T04:00:00"' in html
+            assert 'type="hidden" name="begintime" value="2026-07-04 04:00:00"' in html
+            assert 'type="hidden" name="endtime" value="2026-07-05 04:00:00"' in html
+            assert 'type="datetime-local"' not in html
             assert "客户A" in html
         finally:
             storage.conn.close()
@@ -150,9 +155,9 @@ def test_render_bill_page_prefers_linked_bill_window() -> None:
                 end_time="2026-07-04 00:00:00",
             )
 
-            assert 'value="2026-07-03T00:00:00"' in html
-            assert 'value="2026-07-04T00:00:00"' in html
-            assert 'value="2026-07-03T04:00:00"' not in html
+            assert 'type="hidden" name="begintime" value="2026-07-03 00:00:00"' in html
+            assert 'type="hidden" name="endtime" value="2026-07-04 00:00:00"' in html
+            assert 'value="2026-07-03 04:00:00"' not in html
             assert "客户A" in html
         finally:
             storage.conn.close()
@@ -224,6 +229,7 @@ def test_admin_page_renders_management_sections() -> None:
         try:
             now = datetime(2026, 7, 5, 12, tzinfo=BEIJING_TZ)
             storage.ensure_group(-1001, "测试群", now)
+            storage.add_broadcast_operator(user_id=2001, created_by=0, now=now, remark="财务A")
         finally:
             storage.conn.close()
 
@@ -247,7 +253,12 @@ def test_admin_page_renders_management_sections() -> None:
         assert "已保存群组" in body
         assert "测试群" in body
         assert "saved-admin-groups" in body
+        assert "broadcast-admin-groups" in body
+        assert "broadcast-admin-operators" in body
+        assert "财务A" in body
         assert 'list="saved-admin-groups"' in body
+        assert 'list="broadcast-admin-groups"' in body
+        assert 'list="broadcast-admin-operators"' in body
 
 
 def test_admin_post_updates_whitelist_broadcast_permissions_and_replacement() -> None:

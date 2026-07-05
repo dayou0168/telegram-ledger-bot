@@ -487,12 +487,10 @@ def render_bill_page(
             search_text=search_text,
             search_type=search_type,
         )}
-        {render_legacy_forms(
+        {render_summary_cards(data, trade_methods)}
+        {render_bill_search_form(
             chat_id,
-            data.day_key,
             token,
-            cutoff_hour=int(data.group["day_cutoff_hour"]),
-            timezone=timezone,
             search_text=search_text,
             search_type=search_type,
             begin_time=data.begin_time,
@@ -506,20 +504,6 @@ def render_bill_page(
           {render_people_stats_box("统计（按操作人）", data.deposits, data.payouts, "actor")}
           {render_people_stats_box("统计（按备注）", data.deposits, data.payouts, "note")}
           {render_rate_stats_box(data.deposits)}
-          {render_summary_block(data.group, data.deposits, data.payouts, trade_methods)}
-          {render_footer_links(
-            chat_id,
-            data.day_key,
-            token,
-            int(data.group["day_cutoff_hour"]),
-            timezone,
-            search_text=search_text,
-            search_type=search_type,
-            begin_time=data.begin_time,
-            end_time=data.end_time,
-            all_days=data.all_days,
-            use_created_at_only=data.use_day_key_records,
-          )}
         </section>
       </div>
     </div>
@@ -569,6 +553,8 @@ def render_admin_page(storage: Storage, config: Config, *, message: str = "") ->
         </header>
         {notice}
         {render_group_datalist(groups)}
+        {render_broadcast_group_datalist(named_groups)}
+        {render_broadcast_operator_datalist(operators)}
         <section class="admin-grid">
           <div class="admin-card">
             <h2>地址白名单</h2>
@@ -591,29 +577,19 @@ def render_admin_page(storage: Storage, config: Config, *, message: str = "") ->
 
           <div class="admin-card">
             <h2>广播分组</h2>
-            <form method="POST" action="/admin" class="admin-form inline-form">
-              {hidden_input("action", "create_broadcast_group")}
-              <input name="group_name" placeholder="分组名，例如 财务" required>
-              <button type="submit">新建/更新分组</button>
-            </form>
-            <form method="POST" action="/admin" class="admin-form inline-form">
-              {hidden_input("action", "delete_broadcast_group")}
-              <input name="group_name" placeholder="分组名" required>
-              <button type="submit">删除分组</button>
+            <form method="POST" action="/admin" class="admin-form admin-form-actions">
+              <input name="group_name" list="broadcast-admin-groups" placeholder="选择或输入分组名，例如 财务" required>
+              <button type="submit" name="action" value="create_broadcast_group">新建/更新分组</button>
+              <button type="submit" name="action" value="delete_broadcast_group">删除分组</button>
             </form>
             <form method="POST" action="/admin" class="admin-form">
-              {hidden_input("action", "add_broadcast_members")}
-              <input name="group_name" placeholder="分组名" required>
+              <input name="group_name" list="broadcast-admin-groups" placeholder="选择或输入分组名" required>
               {render_group_multi_select(groups)}
               <textarea name="chat_ids" placeholder="也可以粘贴群ID，例如 -100111 -100222"></textarea>
-              <button type="submit">批量添加群组</button>
-            </form>
-            <form method="POST" action="/admin" class="admin-form">
-              {hidden_input("action", "remove_broadcast_members")}
-              <input name="group_name" placeholder="分组名" required>
-              {render_group_multi_select(groups)}
-              <textarea name="chat_ids" placeholder="也可以粘贴群ID，例如 -100111 -100222"></textarea>
-              <button type="submit">批量移除群组</button>
+              <div class="admin-button-row">
+                <button type="submit" name="action" value="add_broadcast_members">批量添加群组</button>
+                <button type="submit" name="action" value="remove_broadcast_members">批量移除群组</button>
+              </div>
             </form>
             {render_broadcast_group_table(storage, named_groups)}
           </div>
@@ -623,36 +599,36 @@ def render_admin_page(storage: Storage, config: Config, *, message: str = "") ->
             <p class="muted">宿主和服务器默认操作人拥有全部权限。普通广播操作人只拥有被授权的分组或单群。</p>
             <form method="POST" action="/admin" class="admin-form inline-form">
               {hidden_input("action", "add_broadcast_operator")}
-              <input name="user_id" placeholder="操作人UID" required>
+              <input name="user_id" list="broadcast-admin-operators" placeholder="选择操作人UID或输入新UID" required>
               <input name="remark" placeholder="备注，可选">
               <button type="submit">保存操作人</button>
             </form>
             <form method="POST" action="/admin" class="admin-form inline-form">
               {hidden_input("action", "disable_broadcast_operator")}
-              <input name="user_id" placeholder="操作人UID" required>
+              <input name="user_id" list="broadcast-admin-operators" placeholder="选择操作人UID" required>
               <button type="submit">禁用操作人</button>
             </form>
             <form method="POST" action="/admin" class="admin-form inline-form">
               {hidden_input("action", "grant_broadcast_permission")}
-              <input name="user_id" placeholder="操作人UID" required>
-              <input name="group_name" placeholder="分组名" required>
+              <input name="user_id" list="broadcast-admin-operators" placeholder="选择操作人UID" required>
+              <input name="group_name" list="broadcast-admin-groups" placeholder="选择分组名" required>
               <button type="submit">授权分组</button>
             </form>
             <form method="POST" action="/admin" class="admin-form inline-form">
               {hidden_input("action", "revoke_broadcast_permission")}
-              <input name="user_id" placeholder="操作人UID" required>
-              <input name="group_name" placeholder="分组名" required>
+              <input name="user_id" list="broadcast-admin-operators" placeholder="选择操作人UID" required>
+              <input name="group_name" list="broadcast-admin-groups" placeholder="选择分组名" required>
               <button type="submit">取消授权</button>
             </form>
             <form method="POST" action="/admin" class="admin-form inline-form">
               {hidden_input("action", "grant_broadcast_chat_permission")}
-              <input name="user_id" placeholder="操作人UID" required>
+              <input name="user_id" list="broadcast-admin-operators" placeholder="选择操作人UID" required>
               <input name="chat_id" list="saved-admin-groups" placeholder="输入群名搜索选择" required>
               <button type="submit">授权单群</button>
             </form>
             <form method="POST" action="/admin" class="admin-form inline-form">
               {hidden_input("action", "revoke_broadcast_chat_permission")}
-              <input name="user_id" placeholder="操作人UID" required>
+              <input name="user_id" list="broadcast-admin-operators" placeholder="选择操作人UID" required>
               <input name="chat_id" list="saved-admin-groups" placeholder="输入群名搜索选择" required>
               <button type="submit">取消单群</button>
             </form>
@@ -695,6 +671,24 @@ def render_group_datalist(rows: list[Any]) -> str:
         label = f"{title}  {row['chat_id']}"
         options.append(f'<option value="{row["chat_id"]}" label="{escape(label, quote=True)}"></option>')
     return f'<datalist id="saved-admin-groups">{"".join(options)}</datalist>'
+
+
+def render_broadcast_group_datalist(rows: list[Any]) -> str:
+    options = []
+    for row in rows:
+        name = row["name"]
+        label = f"{name}  {row['member_count']}群"
+        options.append(f'<option value="{escape(name, quote=True)}" label="{escape(label, quote=True)}"></option>')
+    return f'<datalist id="broadcast-admin-groups">{"".join(options)}</datalist>'
+
+
+def render_broadcast_operator_datalist(rows: list[Any]) -> str:
+    options = []
+    for row in rows:
+        remark = row["remark"] or "无备注"
+        label = f"{row['user_id']}  {remark}  {row['status']}"
+        options.append(f'<option value="{row["user_id"]}" label="{escape(label, quote=True)}"></option>')
+    return f'<datalist id="broadcast-admin-operators">{"".join(options)}</datalist>'
 
 
 def render_group_multi_select(rows: list[Any]) -> str:
@@ -989,6 +983,39 @@ def render_legacy_forms(
     """
 
 
+def render_bill_search_form(
+    chat_id: int,
+    token: str | None,
+    *,
+    search_text: str = "",
+    search_type: str = "bjr",
+    begin_time: str = "",
+    end_time: str = "",
+    created_at: str = "",
+) -> str:
+    token_input = hidden_input("token", token) if token else ""
+    if created_at:
+        date_inputs = hidden_input("created_at", created_at[:10])
+    else:
+        date_inputs = hidden_input("begintime", begin_time) + hidden_input("endtime", end_time)
+    return f"""
+    <form method="GET" action="/day_xxb.php" class="bill-search">
+      <input type="text" placeholder="请输入您要查询的名字或者备注关键词" name="firstname" value="{escape(search_text)}">
+      <select name="type">
+        <option value="bjr"{selected_attr(search_type, "bjr")}>按标记人</option>
+        <option value="czr"{selected_attr(search_type, "czr")}>按操作人</option>
+        <option value="bz"{selected_attr(search_type, "bz")}>按备注</option>
+      </select>
+      <button type="submit">搜索</button>
+      {hidden_input("chat_id", str(chat_id))}
+      {hidden_input("up_page", "1")}
+      {hidden_input("down_page", "1")}
+      {date_inputs}
+      {token_input}
+    </form>
+    """
+
+
 def html_datetime_value(value: str, timezone: tzinfo) -> str:
     parsed = parse_stored_datetime(value, timezone)
     if parsed is None:
@@ -1033,6 +1060,28 @@ def bill_totals(deposits: list[Any], payouts: list[Any]) -> dict[str, Decimal]:
         "balance_cny": net_in_cny - total_out_cny,
         "balance_usdt": net_in_usdt - total_out_usdt,
     }
+
+
+def render_summary_cards(data: BillPageData, trade_methods: tuple[str, ...]) -> str:
+    totals = bill_totals(data.deposits, data.payouts)
+    cards = [
+        ("总入款", f'{format_number(totals["total_cny"])} / {format_money(totals["gross_in_usdt"])}U'),
+        ("汇率", escape(bill_exchange_display(data.group, trade_methods))),
+        ("交易费率", f'{format_number(Decimal(data.group["deposit_fee_rate"]))}%'),
+        ("应下发", f'{format_money(totals["net_in_usdt"])}U'),
+        ("已下发", f'{format_money(totals["total_out_usdt"])}U'),
+        ("余额", f'{format_money(totals["balance_usdt"])}U'),
+    ]
+    body = "".join(
+        f"""
+        <div class="summary-card">
+          <span>{label}</span>
+          <strong>{value}</strong>
+        </div>
+        """
+        for label, value in cards
+    )
+    return f'<section class="summary-grid">{body}</section>'
 
 
 def render_summary_block(group: Any, deposits: list[Any], payouts: list[Any], trade_methods: tuple[str, ...]) -> str:
@@ -1234,14 +1283,6 @@ def render_bill_toolbar(
     search_text: str = "",
     search_type: str = "bjr",
 ) -> str:
-    if data.all_days:
-        prev_next = ""
-    else:
-        prev_day, next_day = adjacent_days(data.day_key)
-        prev_next = (
-            f'<a class="btn" href="{escape(legacy_created_at_path(data.chat_id, prev_day, token))}">上一天</a>'
-            f'<a class="btn" href="{escape(legacy_created_at_path(data.chat_id, next_day, token))}">下一天</a>'
-        )
     download_url = legacy_bill_path(
         data.chat_id,
         data.day_key,
@@ -1259,15 +1300,14 @@ def render_bill_toolbar(
     return f"""
     <section class="bill-toolbar">
       <div class="bill-heading">
-        <strong>{escape(data.group_title)}</strong>
-        <span>{escape(data.title_day)} · 群 ID：{data.chat_id}</span>
+        <div class="brand">Telegram 记账机器人</div>
+        <h1>{escape(data.group_title)}</h1>
+        <p>群 ID：{data.chat_id} · {escape(data.title_day)} · 北京时间</p>
       </div>
       <nav class="toolbar-actions">
-        <a class="toolbar-link" href="{escape(download_url)}">下载账单</a>
-        {render_history_menu(storage, data.chat_id, data.day_key, token)}
-        {prev_next}
         <a class="btn" href="{escape(legacy_bill_path(data.chat_id, "today", token, cutoff_hour, timezone))}">今日</a>
-        <a class="btn" href="{escape(legacy_bill_path(data.chat_id, "active", token, cutoff_hour, timezone, all_days=True))}">全部</a>
+        {render_history_menu(storage, data.chat_id, data.day_key, token)}
+        <a class="btn" href="{escape(download_url)}">下载账单</a>
       </nav>
     </section>
     """
@@ -1836,11 +1876,13 @@ def page_shell(title: str, body: str) -> str:
     }}
     .content-wrapper {{
       min-height: 100vh;
-      padding: 24px;
+      width: 100%;
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 28px 32px 36px;
     }}
     .container {{
       width: 100%;
-      max-width: 1180px;
       margin: 0 auto;
     }}
     .content {{
@@ -1850,8 +1892,7 @@ def page_shell(title: str, body: str) -> str:
       gap: 16px;
     }}
     .bill-toolbar,
-    .date-form,
-    .search-form,
+    .bill-search,
     .box,
     .statistics {{
       background: var(--panel);
@@ -1863,24 +1904,37 @@ def page_shell(title: str, body: str) -> str:
       display: flex;
       justify-content: space-between;
       gap: 16px;
-      align-items: center;
-      padding: 18px 20px;
-      margin-bottom: 12px;
-      border-top: 3px solid var(--blue);
+      align-items: flex-start;
+      padding: 4px 0 16px;
+      margin-bottom: 8px;
+      background: transparent;
+      border: 0;
+      border-radius: 0;
+      box-shadow: none;
     }}
     .bill-heading {{
       display: flex;
       flex-direction: column;
-      gap: 4px;
+      gap: 3px;
       min-width: 0;
     }}
-    .bill-heading strong {{
-      font-size: 22px;
+    .bill-heading h1 {{
+      margin: 0;
+      font-size: 28px;
+      font-weight: 800;
       line-height: 1.25;
       overflow-wrap: anywhere;
       color: var(--text);
     }}
-    .bill-heading span,
+    .bill-heading p {{
+      margin: 0;
+      color: #536782;
+    }}
+    .bill-heading .brand {{
+      color: var(--gold);
+      font-weight: 800;
+      letter-spacing: 0;
+    }}
     .muted {{
       color: var(--muted);
     }}
@@ -1903,6 +1957,33 @@ def page_shell(title: str, body: str) -> str:
     .toolbar-link:hover {{
       color: var(--gold);
       text-decoration: none;
+    }}
+    .summary-grid {{
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 18px;
+    }}
+    .summary-card {{
+      min-height: 78px;
+      padding: 15px 16px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: 0 8px 24px rgba(36, 77, 114, 0.07);
+    }}
+    .summary-card span {{
+      display: block;
+      margin-bottom: 8px;
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    .summary-card strong {{
+      display: block;
+      color: var(--text);
+      font-size: 19px;
+      line-height: 1.25;
+      overflow-wrap: anywhere;
     }}
     .history-menu {{
       position: relative;
@@ -1997,8 +2078,9 @@ def page_shell(title: str, body: str) -> str:
     }}
     .box {{
       margin: 0;
-      padding: 16px;
+      padding: 20px;
       width: 100%;
+      border-top: 5px solid #efdca9;
     }}
     .box-primary {{
       border-left: 1px solid var(--line);
@@ -2012,19 +2094,9 @@ def page_shell(title: str, body: str) -> str:
     .box-title {{
       display: inline-block;
       margin: 0;
-      font-size: 17px;
+      font-size: 22px;
       font-weight: bold;
       line-height: 1.2;
-    }}
-    .box-title::before {{
-      content: "";
-      display: inline-block;
-      width: 4px;
-      height: 16px;
-      margin-right: 8px;
-      border-radius: 99px;
-      background: var(--gold);
-      vertical-align: -2px;
     }}
     .box-body {{
       padding: 0;
@@ -2037,7 +2109,7 @@ def page_shell(title: str, body: str) -> str:
       table-layout: fixed;
     }}
     td {{
-      padding: 9px 8px !important;
+      padding: 10px 8px !important;
       overflow-wrap: anywhere;
       white-space: normal;
       text-align: center;
@@ -2046,8 +2118,8 @@ def page_shell(title: str, body: str) -> str:
     }}
     .records thead td,
     .records .table-head td {{
-      font-weight: 600;
-      color: #31435a;
+      font-weight: 800;
+      color: #172336;
       background: var(--panel-soft);
     }}
     .records td:first-child {{
@@ -2059,42 +2131,15 @@ def page_shell(title: str, body: str) -> str:
     .col-rate {{ width: 22%; }}
     .col-actor {{ width: 24%; }}
     .col-note {{ width: 16%; }}
-    .date-form {{
-      padding: 12px 14px;
-      margin-bottom: 10px;
-    }}
-    .date-form small {{
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 10px;
-    }}
-    .date-form input[type="text"],
-    .date-form input[type="date"],
-    .date-form input[type="datetime-local"] {{
-      width: 100%;
-      height: 34px;
-      font-size: 14px;
-      border-radius: 6px;
-      border: 1px solid var(--line);
-      padding: 0 10px;
-      background-color: #fff;
-      cursor: pointer;
-    }}
-    .date-form input[name="endtime"] {{
-      float: none;
-    }}
-    .date-form input[name="created_at"] {{
-      max-width: 220px;
-    }}
-    .search-form {{
+    .bill-search {{
       display: flex;
       justify-content: center;
       gap: 8px;
       width: 100%;
       padding: 12px 14px;
-      margin: 0 0 16px;
+      margin: 0 0 26px;
     }}
-    .search-form input[type="text"] {{
+    .bill-search input[type="text"] {{
       flex: 1 1 360px;
       min-width: 0;
       height: 34px;
@@ -2103,14 +2148,14 @@ def page_shell(title: str, body: str) -> str:
       padding: 0 10px;
       background-color: #fff;
     }}
-    .search-form select {{
+    .bill-search select {{
       flex: 0 0 130px;
       height: 34px;
       border-radius: 6px;
       border: 1px solid var(--line);
       background-color: #fff;
     }}
-    .search-form input[type="submit"] {{
+    .bill-search button {{
       flex: 0 0 86px;
       height: 34px;
       border-radius: 6px;
@@ -2120,7 +2165,7 @@ def page_shell(title: str, body: str) -> str:
       cursor: pointer;
       font-weight: 700;
     }}
-    .search-form input[type="submit"]:hover {{
+    .bill-search button:hover {{
       background: var(--blue-dark);
     }}
     .statistics {{
@@ -2226,6 +2271,7 @@ def page_shell(title: str, body: str) -> str:
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 12px;
+      align-items: start;
     }}
     .admin-card {{
       min-width: 0;
@@ -2274,6 +2320,15 @@ def page_shell(title: str, body: str) -> str:
     .admin-form-wide {{
       grid-column: 1 / -1;
     }}
+    .admin-form-actions {{
+      grid-template-columns: minmax(0, 1fr) auto auto;
+    }}
+    .admin-button-row {{
+      grid-column: 1 / -1;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }}
     .admin-form-hint {{
       margin: 0;
       color: var(--muted);
@@ -2309,7 +2364,7 @@ def page_shell(title: str, body: str) -> str:
       background: var(--panel-soft);
     }}
     @media (max-width: 920px) {{
-      .content-wrapper {{ padding: 12px; }}
+      .content-wrapper {{ padding: 20px 16px 28px; }}
       .content {{ grid-template-columns: 1fr; }}
       .admin-grid {{ grid-template-columns: 1fr; }}
       .admin-header {{
@@ -2321,10 +2376,14 @@ def page_shell(title: str, body: str) -> str:
         flex-direction: column;
       }}
       .toolbar-actions {{ justify-content: flex-start; }}
+      .summary-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .statistics {{ grid-template-columns: 1fr; }}
     }}
     @media (max-width: 640px) {{
       body {{ font-size: 13px; }}
+      .bill-heading h1 {{ font-size: 24px; }}
+      .summary-grid {{ grid-template-columns: 1fr; }}
+      .summary-card {{ min-height: 68px; }}
       .box {{
         padding: 14px 10px;
         margin-bottom: 12px;
@@ -2336,35 +2395,23 @@ def page_shell(title: str, body: str) -> str:
         font-size: 12px;
         padding: 8px 6px !important;
       }}
-      .date-form small {{ grid-template-columns: 1fr; }}
-      .date-form input[type="text"],
-      .date-form input[type="date"],
-      .date-form input[type="datetime-local"] {{
-        width: 100%;
-        margin-bottom: 6px;
-      }}
-      .date-form input[name="endtime"] {{
-        float: none;
-      }}
-      .search-form {{
+      .bill-search {{
         flex-wrap: wrap;
       }}
-      .search-form input[type="text"],
-      .search-form select,
-      .search-form input[type="submit"] {{
+      .bill-search input[type="text"],
+      .bill-search select,
+      .bill-search button {{
         flex: 1 1 100%;
+      }}
+      .admin-form-actions {{
+        grid-template-columns: 1fr;
+      }}
+      .admin-button-row button {{
+        flex: 1 1 160px;
       }}
     }}
   </style>
   <script>
-    document.addEventListener('pointerdown', function(event) {{
-      var target = event.target.closest('.date-form input[type="date"], .date-form input[type="datetime-local"]');
-      if (!target || typeof target.showPicker !== 'function') return;
-      if (document.activeElement !== target) target.focus();
-      try {{
-        target.showPicker();
-      }} catch (error) {{}}
-    }});
     document.addEventListener('click', function(event) {{
       var target = event.target.closest('.copyable');
       if (!target || !navigator.clipboard) return;
