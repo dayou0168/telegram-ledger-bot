@@ -4,6 +4,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone, tzinfo
 from decimal import Decimal
+from email import policy
+from email.parser import BytesParser
 import hashlib
 import hmac
 from html import escape
@@ -11,13 +13,17 @@ from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
+import mimetypes
+from pathlib import Path
 import re
 import threading
 import time
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
+import uuid
 from zipfile import ZIP_DEFLATED, ZipFile
 
+from .address_image import save_address_verification_image
 from .bot import (
     detect_usdt_network,
     format_fee_multiplier,
@@ -56,6 +62,13 @@ class BillPageData:
     use_day_key_records: bool = False
 
 
+@dataclass(frozen=True)
+class UploadedFile:
+    filename: str
+    content_type: str
+    data: bytes
+
+
 def start_bill_web_server(config: Config) -> ThreadingHTTPServer | None:
     if not config.bill_web_enabled or config.bill_web_port <= 0:
         return None
@@ -81,8 +94,14 @@ def make_bill_request_handler(config: Config) -> type[BaseHTTPRequestHandler]:
 
         def do_POST(self) -> None:
             length = int(self.headers.get("Content-Length", "0") or "0")
-            raw_body = self.rfile.read(length).decode("utf-8", errors="replace") if length > 0 else ""
-            response = handle_bill_web_post_response(config, self.path, raw_body, cookie_header=self.headers.get("Cookie", ""))
+            raw_body = self.rfile.read(length) if length > 0 else b""
+            response = handle_bill_web_post_response(
+                config,
+                self.path,
+                raw_body,
+                cookie_header=self.headers.get("Cookie", ""),
+                content_type=self.headers.get("Content-Type", ""),
+            )
             self.send_response(response.status)
             self.send_header("Content-Type", response.content_type)
             self.send_header("Content-Length", str(len(response.body)))
@@ -128,6 +147,8 @@ def handle_bill_web_response(config: Config, raw_path: str, *, cookie_header: st
         return html_response(HTTPStatus.OK, simple_page("账单服务", "<p>账单网页服务已启动。</p>"))
     if path == "/admin":
         return handle_admin_get_response(config, query, cookie_header=cookie_header)
+    if path.startswith("/uploads/"):
+        return handle_uploaded_asset_response(config, path)
 
     if not bill_web_token_allowed(config, query):
         return html_response(HTTPStatus.FORBIDDEN, simple_page("访问受限", "<p>链接无效或缺少访问令牌。</p>"))
@@ -202,13 +223,20 @@ ADMIN_COOKIE_NAME = "ledger_admin_session"
 ADMIN_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
 
 
-def handle_bill_web_post_response(config: Config, raw_path: str, raw_body: str, *, cookie_header: str = "") -> BillWebResponse:
+def handle_bill_web_post_response(
+    config: Config,
+    raw_path: str,
+    raw_body: str | bytes,
+    *,
+    cookie_header: str = "",
+    content_type: str = "application/x-www-form-urlencoded",
+) -> BillWebResponse:
     parsed = urlparse(raw_path)
     query = parse_qs(parsed.query)
     path = parsed.path.rstrip("/") or "/"
     if path != "/admin":
         return html_response(HTTPStatus.NOT_FOUND, simple_page("404", "<p>页面不存在。</p>"))
-    form = parse_qs(raw_body)
+    form, files = parse_post_body(raw_body, content_type)
     action = form_value(form, "action")
     if action == "admin_login":
         password = form_value(form, "password")
@@ -222,7 +250,7 @@ def handle_bill_web_post_response(config: Config, raw_path: str, raw_body: str, 
         return html_response(HTTPStatus.FORBIDDEN, render_admin_login_page("请先登录后台。"))
     storage = Storage(config.db_path)
     try:
-        message = apply_admin_action(storage, form, config.timezone)
+        message = apply_admin_action(storage, form, config.timezone, config=config, files=files)
     except (ValueError, KeyError) as exc:
         message = str(exc)
     finally:
@@ -311,6 +339,36 @@ def admin_session_allowed(config: Config, cookie_header: str) -> bool:
     return hmac.compare_digest(signature, expected)
 
 
+def parse_post_body(raw_body: str | bytes, content_type: str) -> tuple[dict[str, list[str]], dict[str, UploadedFile]]:
+    normalized_type = (content_type or "").split(";", 1)[0].strip().lower()
+    if normalized_type == "multipart/form-data":
+        body = raw_body if isinstance(raw_body, bytes) else raw_body.encode("utf-8")
+        return parse_multipart_form(body, content_type)
+    raw_text = raw_body.decode("utf-8", errors="replace") if isinstance(raw_body, bytes) else raw_body
+    return parse_qs(raw_text), {}
+
+
+def parse_multipart_form(body: bytes, content_type: str) -> tuple[dict[str, list[str]], dict[str, UploadedFile]]:
+    header = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8")
+    message = BytesParser(policy=policy.default).parsebytes(header + body)
+    form: dict[str, list[str]] = {}
+    files: dict[str, UploadedFile] = {}
+    if not message.is_multipart():
+        return form, files
+    for part in message.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        if not name:
+            continue
+        filename = part.get_filename()
+        payload = part.get_payload(decode=True) or b""
+        if filename:
+            files[name] = UploadedFile(filename=filename, content_type=part.get_content_type(), data=payload)
+            continue
+        charset = part.get_content_charset() or "utf-8"
+        form.setdefault(name, []).append(payload.decode(charset, errors="replace"))
+    return form, files
+
+
 def form_value(form: dict[str, list[str]], name: str, default: str = "") -> str:
     return (form.get(name) or [default])[0].strip()
 
@@ -345,7 +403,14 @@ def parse_admin_user_id(form: dict[str, list[str]]) -> int:
     return int(matches[0])
 
 
-def apply_admin_action(storage: Storage, form: dict[str, list[str]], timezone: tzinfo) -> str:
+def apply_admin_action(
+    storage: Storage,
+    form: dict[str, list[str]],
+    timezone: tzinfo,
+    *,
+    config: Config | None = None,
+    files: dict[str, UploadedFile] | None = None,
+) -> str:
     action = form_value(form, "action")
     now = datetime.now(timezone)
     if action == "add_whitelist":
@@ -356,7 +421,13 @@ def apply_admin_action(storage: Storage, form: dict[str, list[str]], timezone: t
             raise ValueError("白名单地址格式不正确，只支持 TRC20 的 T 地址。")
         storage.get_group(chat_id)
         label = form_value(form, "label") or None
-        image_url = form_value(form, "image_url") or None
+        image_url = None
+        if config is not None:
+            image_url = save_address_verification_image(
+                db_path=Path(config.db_path),
+                public_base_url=getattr(config, "public_bill_base_url", None),
+                address=address,
+            )
         storage.add_address_whitelist(
             chat_id=chat_id,
             network=network,
@@ -440,14 +511,20 @@ def apply_admin_action(storage: Storage, form: dict[str, list[str]], timezone: t
         return "单群权限已取消。" if changed else "这个用户没有该单群权限。"
     if action == "set_broadcast_replacement":
         enabled_raw = form_value(form, "enabled", "0")
+        photo = form_value(form, "photo") or None
+        upload = (files or {}).get("photo_upload")
+        if upload and upload.data:
+            if config is None:
+                raise ValueError("缺少上传配置。")
+            photo = save_admin_uploaded_image(config, upload)
         storage.update_broadcast_replacement_settings(
             now=now,
             enabled=1 if enabled_raw in {"1", "on", "true"} else 0,
             text=form_value(form, "text") or None,
-            photo=form_value(form, "photo") or None,
+            photo=photo,
             updated_by=0,
             clear_text=not bool(form_value(form, "text")),
-            clear_photo=not bool(form_value(form, "photo")),
+            clear_photo=not bool(photo),
         )
         return "广播替换设置已保存。"
     raise ValueError("未知后台操作。")
@@ -469,6 +546,48 @@ def is_download_query(query: dict[str, list[str]]) -> bool:
         if value in {"1", "true", "excel", "xlsx", "xls", "download"}:
             return True
     return (query.get("action") or [""])[0].strip().casefold() in {"download", "export"}
+
+
+def upload_dir(config: Config) -> Path:
+    return Path(config.db_path).parent / "uploads"
+
+
+def save_admin_uploaded_image(config: Config, upload: UploadedFile) -> str:
+    if len(upload.data) > 10 * 1024 * 1024:
+        raise ValueError("上传图片不能超过 10MB。")
+    content_type = upload.content_type or mimetypes.guess_type(upload.filename)[0] or ""
+    if not content_type.startswith("image/"):
+        raise ValueError("只能上传图片文件。")
+    ext = mimetypes.guess_extension(content_type) or Path(upload.filename).suffix or ".jpg"
+    ext = ext.lower()
+    if ext == ".jpe":
+        ext = ".jpg"
+    if not re.fullmatch(r"\.[a-z0-9]{2,5}", ext):
+        ext = ".jpg"
+    directory = upload_dir(config)
+    directory.mkdir(parents=True, exist_ok=True)
+    filename = f"broadcast_replacement_{int(time.time())}_{uuid.uuid4().hex[:12]}{ext}"
+    (directory / filename).write_bytes(upload.data)
+    public_base = (getattr(config, "public_bill_base_url", None) or "").rstrip("/")
+    if public_base:
+        return f"{public_base}/uploads/{filename}"
+    return f"/uploads/{filename}"
+
+
+def handle_uploaded_asset_response(config: Config, path: str) -> BillWebResponse:
+    filename = path.rsplit("/", 1)[-1]
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", filename or ""):
+        return html_response(HTTPStatus.NOT_FOUND, simple_page("404", "<p>文件不存在。</p>"))
+    file_path = upload_dir(config) / filename
+    if not file_path.exists() or not file_path.is_file():
+        return html_response(HTTPStatus.NOT_FOUND, simple_page("404", "<p>文件不存在。</p>"))
+    content_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+    return BillWebResponse(
+        HTTPStatus.OK,
+        file_path.read_bytes(),
+        content_type=content_type,
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
 
 
 def render_bill_page(
@@ -604,7 +723,6 @@ def render_admin_page(storage: Storage, config: Config, *, message: str = "") ->
           <a href="#admin-saved-groups">已保存群组</a>
         </nav>
         {notice}
-        {render_broadcast_group_datalist(named_groups)}
         <section class="admin-grid">
           <div class="admin-card admin-card-whitelist" id="admin-whitelist">
             <h2>地址白名单</h2>
@@ -613,7 +731,7 @@ def render_admin_page(storage: Storage, config: Config, *, message: str = "") ->
               {render_group_select("chat_id", groups, "选择群组", required=True)}
               <input name="address" placeholder="TRC20 地址" required>
               <input name="label" placeholder="备注，可选">
-              <input name="image_url" placeholder="图片URL，可选">
+              <input name="image_note" placeholder="地址核对图自动生成" disabled>
               <button type="submit">保存白名单</button>
             </form>
             <form method="POST" action="/admin" class="admin-form inline-form">
@@ -622,18 +740,25 @@ def render_admin_page(storage: Storage, config: Config, *, message: str = "") ->
               <input name="address" placeholder="TRC20 地址" required>
               <button type="submit">删除白名单</button>
             </form>
-            {render_whitelist_table(whitelist_rows)}
+            <div class="admin-scroll-panel">
+              {render_whitelist_table(whitelist_rows)}
+            </div>
           </div>
 
           <div class="admin-card admin-card-groups" id="admin-groups">
             <h2>广播分组</h2>
-            <form method="POST" action="/admin" class="admin-form admin-form-actions">
-              <input name="group_name" list="broadcast-admin-groups" placeholder="选择或输入分组名，例如 财务" required>
-              <button type="submit" name="action" value="create_broadcast_group">新建/更新分组</button>
-              <button type="submit" name="action" value="delete_broadcast_group">删除分组</button>
-            </form>
+            <div class="admin-action-panel">
+              <form method="POST" action="/admin" class="admin-form admin-form-actions">
+                <input name="group_name" placeholder="输入新分组名，例如 财务" required>
+                <button type="submit" name="action" value="create_broadcast_group">新建/更新分组</button>
+              </form>
+              <form method="POST" action="/admin" class="admin-form admin-form-actions">
+                {render_broadcast_group_select("group_name", named_groups, "选择要删除的分组", required=True)}
+                <button type="submit" name="action" value="delete_broadcast_group">删除分组</button>
+              </form>
+            </div>
             <form method="POST" action="/admin" class="admin-form">
-              <input name="group_name" list="broadcast-admin-groups" placeholder="选择或输入分组名" required>
+              {render_broadcast_group_select("group_name", named_groups, "选择要管理的分组", required=True)}
               {render_group_multi_select(groups)}
               <textarea name="chat_ids" placeholder="也可以粘贴群ID，例如 -100111 -100222"></textarea>
               <div class="admin-button-row">
@@ -660,7 +785,7 @@ def render_admin_page(storage: Storage, config: Config, *, message: str = "") ->
               </div>
               <label class="admin-form-wide admin-form-hint">分组权限</label>
               <div class="permission-row admin-form-wide">
-                <input name="group_name" list="broadcast-admin-groups" placeholder="选择分组名">
+                {render_broadcast_group_select("group_name", named_groups, "选择分组名")}
                 <button type="submit" name="action" value="grant_broadcast_permission">授权分组</button>
                 <button type="submit" name="action" value="revoke_broadcast_permission">取消分组</button>
               </div>
@@ -678,13 +803,14 @@ def render_admin_page(storage: Storage, config: Config, *, message: str = "") ->
           <div class="admin-card admin-card-replacement" id="admin-replacement">
             <h2>广播替换</h2>
             <p class="muted">发送广播时始终复制原消息。开启后，只有单群发送的投递消息被群成员回复时，机器人会尝试编辑那条原投递消息。</p>
-            <form method="POST" action="/admin" class="admin-form">
+            <form method="POST" action="/admin" class="admin-form" enctype="multipart/form-data">
               {hidden_input("action", "set_broadcast_replacement")}
               <select name="enabled">
                 <option value="0"{selected_attr(str(replacement["enabled"]), "0")}>关闭，不替换原投递消息</option>
                 <option value="1"{selected_attr(str(replacement["enabled"]), "1")}>开启，回复后替换原投递消息</option>
               </select>
-              <input name="photo" placeholder="固定替换图片 file_id 或 URL" value="{escape(replacement['photo'] or '', quote=True)}">
+              <input type="file" name="photo_upload" accept="image/*">
+              <input class="admin-form-wide" name="photo" placeholder="或粘贴固定替换图片 URL/file_id" value="{escape(replacement['photo'] or '', quote=True)}">
               <textarea name="text" placeholder="固定替换文字">{escape(replacement['text'] or '')}</textarea>
               <button type="submit">保存替换设置</button>
             </form>
@@ -720,12 +846,19 @@ def render_group_select(name: str, rows: list[Any], placeholder: str, *, require
     return f'<select name="{escape(name, quote=True)}" class="admin-select"{required_attr}>{"".join(options)}</select>'
 
 
-def render_broadcast_group_datalist(rows: list[Any]) -> str:
-    options = []
+def render_broadcast_group_select(
+    name: str,
+    rows: list[Any],
+    placeholder: str,
+    *,
+    required: bool = False,
+) -> str:
+    required_attr = " required" if required else ""
+    options = [f'<option value="">{escape(placeholder)}</option>']
     for row in rows:
-        name = row["name"]
-        options.append(f'<option value="{escape(name, quote=True)}"></option>')
-    return f'<datalist id="broadcast-admin-groups">{"".join(options)}</datalist>'
+        group_name = row["name"]
+        options.append(f'<option value="{escape(group_name, quote=True)}">{escape(group_name)}</option>')
+    return f'<select name="{escape(name, quote=True)}" class="admin-select"{required_attr}>{"".join(options)}</select>'
 
 
 def render_broadcast_operator_select(rows: list[Any]) -> str:
@@ -735,7 +868,7 @@ def render_broadcast_operator_select(rows: list[Any]) -> str:
         status = "启用" if row["status"] == "active" else "停用"
         label = f"{remark}（{row['user_id']}）{status}"
         options.append(f'<option value="{row["user_id"]}">{escape(label)}</option>')
-    return f'<select id="broadcast-admin-operator-select" name="user_id">{"".join(options)}</select>'
+    return f'<select id="broadcast-admin-operator-select" name="user_id" class="admin-select">{"".join(options)}</select>'
 
 
 def render_group_multi_select(rows: list[Any]) -> str:
@@ -760,7 +893,7 @@ def render_whitelist_table(rows: list[Any]) -> str:
     for row in rows:
         status = "启用" if row["enabled"] else "停用"
         title = row["chat_title"] or row["chat_id"]
-        image = f'<a href="{escape(row["image_url"], quote=True)}" target="_blank">图片</a>' if row["image_url"] else ""
+        image = f'<a href="{escape(row["image_url"], quote=True)}" target="_blank">核对图</a>' if row["image_url"] else "自动生成"
         body.append(
             "<tr>"
             f"<td>{escape(str(title))}<br><small>{row['chat_id']}</small></td>"
@@ -772,8 +905,15 @@ def render_whitelist_table(rows: list[Any]) -> str:
         )
     return f"""
     <div class="table-wrap admin-table-wrap">
-      <table class="records admin-table">
-        <thead><tr><td>群组</td><td>地址</td><td>备注</td><td>图片</td><td>状态</td></tr></thead>
+      <table class="records admin-table whitelist-table">
+        <colgroup>
+          <col class="whitelist-col-group">
+          <col class="whitelist-col-address">
+          <col class="whitelist-col-label">
+          <col class="whitelist-col-image">
+          <col class="whitelist-col-status">
+        </colgroup>
+        <thead><tr><td>群组</td><td>地址</td><td>备注</td><td>核对图</td><td>状态</td></tr></thead>
         <tbody>{''.join(body)}</tbody>
       </table>
     </div>
@@ -814,7 +954,7 @@ def render_broadcast_group_table(storage: Storage, rows: list[Any]) -> str:
 def render_operator_table(rows: list[Any]) -> str:
     if not rows:
         return '<p class="empty admin-empty">暂无广播操作人</p>'
-    body = []
+    items = []
     for row in rows:
         remark = row["remark"] or ""
         feature_form = f"""
@@ -829,21 +969,21 @@ def render_operator_table(rows: list[Any]) -> str:
           <button type="submit">保存开关</button>
         </form>
         """
-        body.append(
-            "<tr>"
-            f"<td>{row['user_id']}</td>"
-            f"<td>{escape(row['status'])}</td>"
-            f"<td>{escape(remark)}</td>"
-            f"<td>{row['created_by']}</td>"
-            f"<td>{feature_form}</td>"
-            "</tr>"
+        status_text = "启用" if row["status"] == "active" else "停用"
+        items.append(
+            '<div class="operator-item">'
+            '<div class="operator-meta">'
+            f'<strong>{escape(remark or str(row["user_id"]))}</strong>'
+            f'<span>UID：{row["user_id"]}</span>'
+            f'<span>状态：{escape(status_text)}</span>'
+            f'<span>上级：{row["created_by"]}</span>'
+            '</div>'
+            f'<div class="operator-features">{feature_form}</div>'
+            '</div>'
         )
     return f"""
-    <div class="table-wrap admin-table-wrap">
-      <table class="records admin-table">
-        <thead><tr><td>UID</td><td>状态</td><td>备注</td><td>上级</td><td>功能开关</td></tr></thead>
-        <tbody>{''.join(body)}</tbody>
-      </table>
+    <div class="operator-list">
+      {''.join(items)}
     </div>
     """
 
@@ -898,8 +1038,7 @@ def render_admin_group_table(rows: list[Any], config: Config) -> str:
         bill_link = admin_bill_link(row["chat_id"], config)
         body.append(
             "<tr>"
-            f"<td>{row['chat_id']}</td>"
-            f"<td>{escape(title)}</td>"
+            f"<td>{escape(title)}<br><small>{row['chat_id']}</small></td>"
             f"<td>{status}</td>"
             f"<td>{cutoff}</td>"
             f"<td><a href=\"{bill_link}\" target=\"_blank\">账单</a></td>"
@@ -908,7 +1047,7 @@ def render_admin_group_table(rows: list[Any], config: Config) -> str:
     return f"""
     <div class="table-wrap admin-table-wrap">
       <table class="records admin-table">
-        <thead><tr><td>群ID</td><td>群名</td><td>状态</td><td>日切</td><td>入口</td></tr></thead>
+        <thead><tr><td>群组</td><td>状态</td><td>日切</td><td>入口</td></tr></thead>
         <tbody>{''.join(body)}</tbody>
       </table>
     </div>
@@ -2403,12 +2542,13 @@ def page_shell(title: str, body: str) -> str:
       display: grid;
       grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
       grid-template-areas:
-        "whitelist replacement"
+        "whitelist whitelist"
+        "replacement replacement"
         "groups groups"
         "permissions permissions"
         "saved saved";
       gap: 14px;
-      align-items: start;
+      align-items: stretch;
     }}
     .admin-card {{
       display: block;
@@ -2436,9 +2576,10 @@ def page_shell(title: str, body: str) -> str:
     }}
     .admin-card-saved {{
       grid-area: saved;
+      width: 100%;
     }}
     .admin-card-wide {{
-      grid-column: auto;
+      grid-column: 1 / -1;
     }}
     .admin-card h2 {{
       margin: 0 0 12px;
@@ -2468,6 +2609,10 @@ def page_shell(title: str, body: str) -> str:
       background: #fff;
       font: inherit;
     }}
+    .admin-form input[type="file"] {{
+      padding: 5px 10px;
+      cursor: pointer;
+    }}
     .admin-form input:focus,
     .admin-form textarea:focus,
     .admin-form select:focus {{
@@ -2483,7 +2628,19 @@ def page_shell(title: str, body: str) -> str:
       grid-column: 1 / -1;
     }}
     .admin-form-actions {{
-      grid-template-columns: minmax(0, 1fr) auto auto;
+      grid-template-columns: minmax(0, 1fr) auto;
+      margin-bottom: 0;
+    }}
+    .admin-action-panel {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(220px, auto);
+      gap: 8px;
+      align-items: start;
+      margin-bottom: 10px;
+      padding: 10px;
+      border: 1px solid var(--line-soft);
+      border-radius: 8px;
+      background: var(--panel-soft);
     }}
     .admin-button-row {{
       grid-column: 1 / -1;
@@ -2514,12 +2671,38 @@ def page_shell(title: str, body: str) -> str:
       grid-template-columns: auto auto;
       justify-content: flex-start;
     }}
+    .operator-list {{
+      display: grid;
+      gap: 8px;
+      margin-top: 10px;
+    }}
+    .operator-item {{
+      display: grid;
+      grid-template-columns: minmax(180px, 0.35fr) minmax(0, 1fr);
+      gap: 12px;
+      align-items: center;
+      padding: 10px;
+      border: 1px solid var(--line-soft);
+      border-radius: 8px;
+      background: #fff;
+    }}
+    .operator-meta {{
+      display: grid;
+      gap: 3px;
+      min-width: 0;
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    .operator-meta strong {{
+      color: var(--text);
+      font-size: 14px;
+    }}
     .feature-form {{
       display: flex;
       flex-wrap: wrap;
       gap: 6px 10px;
       align-items: center;
-      min-width: 320px;
+      min-width: 0;
     }}
     .feature-check {{
       display: inline-flex;
@@ -2546,7 +2729,9 @@ def page_shell(title: str, body: str) -> str:
       font-weight: 700;
     }}
     .admin-multi-select {{
-      min-height: 150px !important;
+      height: 120px !important;
+      min-height: 120px !important;
+      overflow: auto;
     }}
     .admin-form button {{
       min-height: 34px;
@@ -2565,9 +2750,46 @@ def page_shell(title: str, body: str) -> str:
       border: 1px solid var(--line-soft);
       border-radius: 6px;
     }}
+    .admin-scroll-panel {{
+      max-height: 240px;
+      overflow: auto;
+      border: 1px solid var(--line-soft);
+      border-radius: 6px;
+    }}
+    .admin-scroll-panel .admin-table-wrap {{
+      max-height: none;
+      border: 0;
+      border-radius: 0;
+    }}
+    .admin-scroll-panel .admin-empty {{
+      margin: 0;
+    }}
     .admin-table td {{
       font-size: 13px;
       text-align: center;
+    }}
+    .whitelist-table {{
+      table-layout: fixed;
+      width: 100%;
+    }}
+    .whitelist-col-group {{
+      width: 18%;
+    }}
+    .whitelist-col-address {{
+      width: 44%;
+    }}
+    .whitelist-col-label {{
+      width: 18%;
+    }}
+    .whitelist-col-image {{
+      width: 10%;
+    }}
+    .whitelist-col-status {{
+      width: 10%;
+    }}
+    .whitelist-table code {{
+      white-space: nowrap;
+      word-break: normal;
     }}
     .admin-empty {{
       border: 1px dashed var(--line);
@@ -2632,10 +2854,14 @@ def page_shell(title: str, body: str) -> str:
       .admin-form-actions {{
         grid-template-columns: 1fr;
       }}
+      .admin-action-panel {{
+        grid-template-columns: 1fr;
+      }}
       .permission-form,
       .operator-picker,
       .permission-row,
-      .permission-row-compact {{
+      .permission-row-compact,
+      .operator-item {{
         grid-template-columns: 1fr;
       }}
       .admin-button-row button {{

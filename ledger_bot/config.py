@@ -101,7 +101,7 @@ def load_config() -> Config:
         trongrid_api_base=os.environ.get("TRONGRID_API_BASE", "https://api.trongrid.io").rstrip("/"),
         trongrid_api_key=os.environ.get("TRONGRID_API_KEY") or None,
         tron_usdt_contract=os.environ.get("TRON_USDT_CONTRACT", "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"),
-        tron_poll_interval_seconds=int(os.environ.get("TRON_POLL_INTERVAL_SECONDS", "5")),
+        tron_poll_interval_seconds=int(os.environ.get("TRON_POLL_INTERVAL_SECONDS", "1")),
         tron_initial_lookback_minutes=int(os.environ.get("TRON_INITIAL_LOOKBACK_MINUTES", "15")),
         p2p_rate_api_base=os.environ.get("P2P_RATE_API_BASE", "https://p2p.army/api/fapi").rstrip("/"),
         p2p_rate_front_api=os.environ.get("P2P_RATE_FRONT_API", "NextVOF2Ozuh36mW0TCv"),

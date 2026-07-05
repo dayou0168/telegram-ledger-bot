@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import time
 
 from ledger_bot.bot import LedgerBot, MessageContext
 from ledger_bot.config import Config
@@ -16,9 +17,24 @@ class FakeClient:
     def __init__(self) -> None:
         self.messages: list[dict[str, object]] = []
         self.edits: list[dict[str, object]] = []
+        self.copies: list[dict[str, object]] = []
+        self.answers: list[dict[str, object]] = []
 
     def send_message(self, chat_id: int, text: str, **kwargs) -> None:
         self.messages.append({"chat_id": chat_id, "text": text, **kwargs})
+
+    def copy_message(self, chat_id: int, from_chat_id: int, message_id: int, **kwargs) -> dict[str, object]:
+        payload = {
+            "chat_id": chat_id,
+            "from_chat_id": from_chat_id,
+            "message_id": message_id,
+            **kwargs,
+        }
+        self.copies.append(payload)
+        return {"message_id": 900 + len(self.copies)}
+
+    def answer_callback_query(self, callback_query_id: str, text: str | None = None) -> None:
+        self.answers.append({"callback_query_id": callback_query_id, "text": text})
 
     def edit_message_text(self, chat_id: int, message_id: int, text: str, **kwargs) -> dict[str, object]:
         payload = {"method": "edit_text", "chat_id": chat_id, "message_id": message_id, "text": text, **kwargs}
@@ -40,6 +56,11 @@ class FakeClient:
         payload = {"method": "edit_media", "chat_id": chat_id, "message_id": message_id, "media": media, **kwargs}
         self.edits.append(payload)
         return payload
+
+
+class InlineExecutor:
+    def submit(self, fn, *args, **kwargs):  # type: ignore[no-untyped-def]
+        return fn(*args, **kwargs)
 
 
 def make_config(
@@ -439,5 +460,118 @@ def test_group_broadcast_reply_does_not_replace_original() -> None:
 
             assert not bot.replace_direct_broadcast_original_if_needed(ctx, match)
             assert fake.edits == []
+        finally:
+            bot.storage.current().conn.close()
+
+
+def test_pending_broadcast_input_auto_sends_and_keeps_target() -> None:
+    with TemporaryDirectory() as tmp:
+        bot = LedgerBot(make_config(Path(tmp) / "bot.db"))
+        fake = FakeClient()
+        bot.client = fake
+        bot.broadcast_executor = InlineExecutor()  # type: ignore[assignment]
+        bot.notification_executor = InlineExecutor()  # type: ignore[assignment]
+        try:
+            user = TelegramUser(10, "root", "Root")
+            current = datetime(2026, 7, 4, 12, tzinfo=BEIJING_TZ)
+            bot.storage.ensure_group(-1001, "A", current)
+            bot.broadcast_pending[user.user_id] = {
+                "label": "单群：A",
+                "scope": "chat:-1001",
+                "target_ids": [-1001],
+                "notify_all": False,
+                "created_at": time.monotonic(),
+            }
+
+            handled = bot.handle_pending_broadcast_input(
+                1001,
+                user,
+                {"message_id": 77, "text": "哈哈"},
+                "哈哈",
+                current,
+                77,
+            )
+
+            assert handled
+            assert user.user_id in bot.broadcast_pending
+            assert any("已提交广播" in str(item["text"]) for item in fake.messages)
+            assert not any("确认发送广播" in str(item["text"]) for item in fake.messages)
+        finally:
+            bot.storage.current().conn.close()
+
+
+def test_broadcast_reply_notice_hides_job_and_has_actions() -> None:
+    with TemporaryDirectory() as tmp:
+        bot = LedgerBot(make_config(Path(tmp) / "bot.db"))
+        fake = FakeClient()
+        bot.client = fake
+        bot.notification_executor = InlineExecutor()  # type: ignore[assignment]
+        try:
+            current = datetime(2026, 7, 4, 12, tzinfo=BEIJING_TZ)
+            bot.storage.ensure_group(-1001, "11", current)
+            job = bot.storage.create_broadcast_job(
+                creator_user_id=10,
+                scope="chat:-1001",
+                target_chat_ids=[-1001],
+                text="原广播",
+                message_kind="text",
+                now=current,
+            )
+            bot.storage.mark_broadcast_job_target(job["id"], -1001, status="sent", sent_message_id=300, now=current)
+            ctx = MessageContext(
+                message={
+                    "message_id": 301,
+                    "text": "嘿嘿",
+                    "reply_to_message": {"message_id": 300, "text": "原广播"},
+                },
+                chat_id=-1001,
+                chat_title="11",
+                user=TelegramUser(200, "aze89", "阿泽"),
+                text="嘿嘿",
+                now=current,
+            )
+
+            bot.handle_broadcast_reply_notification(ctx)
+
+            notice = fake.messages[0]
+            assert "任务" not in str(notice["text"])
+            assert "群：" in str(notice["text"])
+            assert "人：" in str(notice["text"])
+            assert "内容：" in str(notice["text"])
+            keyboard = notice["reply_markup"]["inline_keyboard"]  # type: ignore[index]
+            assert keyboard[0][0]["text"] == "快速回复"
+            assert keyboard[1][0]["text"] == "定位回复消息"
+            assert keyboard[2][0]["text"] == "定位原投递消息"
+        finally:
+            bot.storage.current().conn.close()
+
+
+def test_broadcast_reply_quick_reply_copies_next_private_message() -> None:
+    with TemporaryDirectory() as tmp:
+        bot = LedgerBot(make_config(Path(tmp) / "bot.db"))
+        fake = FakeClient()
+        bot.client = fake
+        try:
+            user = TelegramUser(10, "root", "Root")
+            bot.handle_broadcast_reply_start_callback(1001, user, "cb1", "reply:start:-1001:301")
+            assert user.user_id in bot.broadcast_reply_pending
+
+            handled = bot.handle_broadcast_reply_pending_input(
+                1001,
+                user,
+                {"message_id": 88, "text": "收到"},
+                "收到",
+                datetime(2026, 7, 4, 12, tzinfo=BEIJING_TZ),
+                88,
+            )
+
+            assert handled
+            assert user.user_id not in bot.broadcast_reply_pending
+            assert fake.copies[-1] == {
+                "chat_id": -1001,
+                "from_chat_id": 1001,
+                "message_id": 88,
+                "reply_to_message_id": 301,
+            }
         finally:
             bot.storage.current().conn.close()

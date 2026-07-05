@@ -165,6 +165,8 @@ class Storage:
                 created_at TEXT NOT NULL,
                 UNIQUE(owner_user_id, address, tx_hash, direction)
             );
+            CREATE INDEX IF NOT EXISTS idx_chain_event_owner_address_ts
+                ON chain_event_notifications(owner_user_id, address, block_timestamp);
 
             CREATE TABLE IF NOT EXISTS processed_updates (
                 update_id INTEGER PRIMARY KEY,
@@ -1901,6 +1903,19 @@ class Storage:
         )
         self.conn.commit()
         return cursor.rowcount == 1
+
+    def latest_chain_event_timestamp(self, owner_user_id: int, address: str) -> int | None:
+        row = self.conn.execute(
+            """
+            SELECT MAX(block_timestamp) AS latest_timestamp
+            FROM chain_event_notifications
+            WHERE owner_user_id = ? AND address = ?
+            """,
+            (owner_user_id, address),
+        ).fetchone()
+        if row is None or row["latest_timestamp"] is None:
+            return None
+        return int(row["latest_timestamp"])
 
     def get_address_watch_settings(self, owner_user_id: int, now: datetime) -> sqlite3.Row:
         row = self.conn.execute(

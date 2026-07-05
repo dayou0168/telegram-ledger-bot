@@ -1,2 +1,1 @@
-# The first version uses only Python standard-library modules.
-
+Pillow>=10.0,<12.0

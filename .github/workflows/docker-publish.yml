@@ -28,6 +28,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
       - name: Compile
         run: python -m compileall ledger_bot tests
 
@@ -44,6 +47,7 @@ jobs:
               "tests.test_calculator",
               "tests.test_config",
               "tests.test_address_watch",
+              "tests.test_address_image",
               "tests.test_tron_api",
               "tests.test_storage",
               "tests.test_p2p_rates",

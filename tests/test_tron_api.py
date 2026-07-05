@@ -1,6 +1,11 @@
 from datetime import timezone
 from decimal import Decimal
+from io import BytesIO
+import urllib.error
 
+import pytest
+
+from ledger_bot.tron_api import TronGridClient, TronGridError
 from ledger_bot.tron_api import (
     format_tron_address_query,
     parse_tron_address_info,
@@ -12,12 +17,56 @@ from ledger_bot.tron_api import (
 USDT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
 
 
+class CapturingTronGridClient(TronGridClient):
+    def open_json(self, url: str, headers: dict[str, str]) -> dict:
+        object.__setattr__(self, "seen_url", url)
+        object.__setattr__(self, "seen_headers", headers)
+        return {"data": []}
+
+
+class FailingTronGridClient(TronGridClient):
+    def open_json(self, url: str, headers: dict[str, str]) -> dict:
+        calls = getattr(self, "calls", 0) + 1
+        object.__setattr__(self, "calls", calls)
+        raise urllib.error.HTTPError(
+            url,
+            401,
+            "Unauthorized",
+            hdrs=None,
+            fp=BytesIO(b'{"Error":"ApiKey not exists"}'),
+        )
+
+
 def test_safe_header_value_ignores_non_latin_placeholder() -> None:
     assert safe_header_value("替换成你的TronGridKey") is None
 
 
 def test_safe_header_value_trims_ascii_key() -> None:
     assert safe_header_value("  abc123  ") == "abc123"
+
+
+def test_fetch_trc20_transfers_uses_api_key_and_unconfirmed_mode() -> None:
+    client = CapturingTronGridClient(api_key="  key123  ")
+
+    rows = client.fetch_trc20_transfers(
+        "TGhAAySHUUcEGua33pZZ88wP3bA6XSeQuZ",
+        contract_address=USDT,
+        min_timestamp_ms=123,
+    )
+
+    assert rows == []
+    assert client.seen_headers["TRON-PRO-API-KEY"] == "key123"
+    assert "only_confirmed=false" in client.seen_url
+    assert "min_timestamp=123" in client.seen_url
+
+
+def test_trongrid_key_error_does_not_fallback_to_public_request() -> None:
+    client = FailingTronGridClient(api_key="key123")
+
+    with pytest.raises(TronGridError, match="TronGrid HTTP 401"):
+        client.get_json("/v1/accounts/T/transactions/trc20", {})
+
+    assert client.calls == 1
 
 
 def test_parse_income_transfer() -> None:

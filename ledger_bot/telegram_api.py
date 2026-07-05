@@ -89,6 +89,7 @@ class TelegramClient:
         photo: str,
         *,
         caption: str | None = None,
+        reply_to_message_id: int | None = None,
         reply_markup: dict[str, Any] | None = None,
         parse_mode: str | None = None,
     ) -> dict[str, Any]:
@@ -98,6 +99,9 @@ class TelegramClient:
         }
         if caption:
             payload["caption"] = caption
+        if reply_to_message_id:
+            payload["reply_to_message_id"] = reply_to_message_id
+            payload["allow_sending_without_reply"] = True
         if parse_mode:
             payload["parse_mode"] = parse_mode
         if reply_markup:
@@ -110,15 +114,32 @@ class TelegramClient:
             payload["text"] = text
         self.request("answerCallbackQuery", payload)
 
-    def copy_message(self, chat_id: int, from_chat_id: int, message_id: int) -> dict[str, Any]:
-        return self.request(
-            "copyMessage",
-            {
-                "chat_id": chat_id,
-                "from_chat_id": from_chat_id,
-                "message_id": message_id,
-            },
-        )
+    def copy_message(
+        self,
+        chat_id: int,
+        from_chat_id: int,
+        message_id: int,
+        *,
+        reply_to_message_id: int | None = None,
+        caption: str | None = None,
+        parse_mode: str | None = None,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "from_chat_id": from_chat_id,
+            "message_id": message_id,
+        }
+        if reply_to_message_id:
+            payload["reply_to_message_id"] = reply_to_message_id
+            payload["allow_sending_without_reply"] = True
+        if caption is not None:
+            payload["caption"] = caption
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        return self.request("copyMessage", payload)
 
     def edit_message_text(
         self,

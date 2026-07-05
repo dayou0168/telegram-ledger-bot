@@ -77,10 +77,10 @@ services:
       # PUBLIC_BILL_URL_TEMPLATE: ""
       # PUBLIC_BILL_BOT_NAME: "LEDGER_BOT"
 
-      # TRC20 监听参数。默认 5 秒轮询，主网 USDT 合约不要改。
+      # TRC20 监听参数。默认 1 秒轮询；机器人看到未完全确认的交易也会先通知。
       # TRONGRID_API_BASE: "https://api.trongrid.io"
       # TRON_USDT_CONTRACT: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
-      # TRON_POLL_INTERVAL_SECONDS: "5"
+      # TRON_POLL_INTERVAL_SECONDS: "1"
       # TRON_INITIAL_LOOKBACK_MINUTES: "15"
 
       # Z0/实时汇率。默认 OKX，USDT 卖 CNY，支付宝档位。

@@ -1,7 +1,9 @@
 from datetime import datetime
 from decimal import Decimal
+from types import SimpleNamespace
 
 from ledger_bot.address_watch import Trc20Transfer, format_transfer_notice, should_notify_transfer
+from ledger_bot.bot import LedgerBot
 
 
 def test_income_notice_format() -> None:
@@ -68,3 +70,40 @@ def test_should_notify_transfer_honors_min_amount() -> None:
     )
 
     assert should_notify_transfer(transfer, settings)
+
+
+def test_address_watch_min_timestamp_uses_latest_event_overlap() -> None:
+    bot = object.__new__(LedgerBot)
+    bot.storage = SimpleNamespace(latest_chain_event_timestamp=lambda owner_user_id, address: 120_000)
+
+    assert bot.address_watch_min_timestamp_ms({"owner_user_id": 1, "address": "TWatch"}, 10_000) == 90_000
+
+
+def test_address_watch_min_timestamp_uses_fallback_without_history() -> None:
+    bot = object.__new__(LedgerBot)
+    bot.storage = SimpleNamespace(latest_chain_event_timestamp=lambda owner_user_id, address: None)
+
+    assert bot.address_watch_min_timestamp_ms({"owner_user_id": 1, "address": "TWatch"}, 10_000) == 10_000
+
+
+def test_address_whitelist_reply_includes_chain_info() -> None:
+    bot = object.__new__(LedgerBot)
+    info = SimpleNamespace(
+        created_at=datetime(2026, 7, 6, 2, 18, 20),
+        usdt_balance=Decimal("94.85"),
+        trx_balance=Decimal("24.360329"),
+    )
+
+    lines = bot.address_whitelist_reply(
+        "TGhAAySHUUcEGua33pZZ88wP3bA6X5eQuZ",
+        {"label": None},
+        {"count": 2, "previous_sender_name": None, "current_sender_name": "阿泽"},
+        info,
+    )
+
+    text = "\n".join(lines)
+    assert "💎 <code>TGhAAySHUUcEGua33pZZ88wP3bA6X5eQuZ</code>" in text
+    assert "🌐 创建： 2026-07-06 02:18:20" in text
+    assert "├ ▣ USDT： 94.85" in text
+    assert "├ ▣ TRX： 24.360329" in text
+    assert "└✅ 状态： 白名单" in text

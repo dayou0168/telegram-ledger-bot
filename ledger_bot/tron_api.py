@@ -59,13 +59,6 @@ class TronGridClient:
             return self.open_json(url, headers)
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
-            if exc.code == 401 and api_key:
-                fallback_headers = {"Accept": "application/json"}
-                try:
-                    return self.open_json(url, fallback_headers)
-                except urllib.error.HTTPError as fallback_exc:
-                    fallback_body = fallback_exc.read().decode("utf-8", errors="replace")
-                    raise TronGridError(f"TronGrid HTTP {fallback_exc.code}: {fallback_body}") from fallback_exc
             raise TronGridError(f"TronGrid HTTP {exc.code}: {body}") from exc
         except (urllib.error.URLError, TimeoutError) as exc:
             raise TronGridError(f"TronGrid network error: {exc}") from exc
@@ -85,7 +78,7 @@ class TronGridClient:
     ) -> list[dict[str, Any]]:
         path = f"/v1/accounts/{urllib.parse.quote(address)}/transactions/trc20"
         params: dict[str, Any] = {
-            "only_confirmed": "true",
+            "only_confirmed": "false",
             "contract_address": contract_address,
             "min_timestamp": min_timestamp_ms,
             "limit": limit,

@@ -13,6 +13,7 @@ import time
 from typing import Any
 from urllib.parse import urlencode
 
+from .address_image import save_address_verification_image
 from .address_watch import format_transfer_notice, min_notify_amount, should_notify_transfer
 from .calculator import CalculatorError, calculate_expression, format_calculation_result, is_arithmetic_expression
 from .config import Config
@@ -161,16 +162,49 @@ class LedgerBot:
         self.update_futures: set[Future[None]] = set()
         self.update_futures_guard = threading.Lock()
         self.background_guard = threading.Lock()
+        self.background_loop_guard = threading.Lock()
+        self.background_loops_started = False
         self.p2p_refresh_running = False
         self.tron_poll_running = False
         self.host_presence_cache: dict[int, tuple[float, TelegramUser | None]] = {}
         self.host_presence_lock = threading.Lock()
         self.address_watch_pending: dict[int, str] = {}
         self.broadcast_pending: dict[int, dict[str, Any]] = {}
+        self.broadcast_reply_pending: dict[int, dict[str, Any]] = {}
 
     def run_forever(self) -> None:
         print("Ledger bot is running.", flush=True)
+        print(
+            "TronGrid monitor: "
+            f"interval={self.config.tron_poll_interval_seconds}s, "
+            f"api_key_loaded={'yes' if self.config.trongrid_api_key else 'no'}, "
+            "only_confirmed=false",
+            flush=True,
+        )
+        self.start_background_loops()
         run_with_backoff(self._poll_once)
+
+    def start_background_loops(self) -> None:
+        with self.background_loop_guard:
+            if self.background_loops_started:
+                return
+            self.background_loops_started = True
+        if self.config.tron_poll_interval_seconds > 0:
+            thread = threading.Thread(
+                target=self.address_watch_scheduler_loop,
+                name="ledger-address-watch-scheduler",
+                daemon=True,
+            )
+            thread.start()
+
+    def address_watch_scheduler_loop(self) -> None:
+        while True:
+            try:
+                self.poll_address_watches_if_due()
+            except Exception as exc:
+                print(f"Address watch scheduler error: {exc}", flush=True)
+            interval = max(0.2, min(1.0, self.config.tron_poll_interval_seconds / 2))
+            time.sleep(interval)
 
     def _poll_once(self) -> None:
         updates = self.client.get_updates(self.offset, self.telegram_poll_timeout())
@@ -757,6 +791,8 @@ class LedgerBot:
             return
         if self.handle_default_operator_command(chat_id, user, normalized, message_id):
             return
+        if self.handle_broadcast_reply_pending_input(chat_id, user, message, normalized, now, message_id):
+            return
         if self.handle_pending_broadcast_input(chat_id, user, message, normalized, now, message_id):
             return
         if self.message_has_forward_source(message):
@@ -1175,7 +1211,7 @@ class LedgerBot:
                 "",
                 "群内地址验证：",
                 "直接发送 TRC20 地址，机器人会回复验证次数、上次发送人和本次发送人。",
-                "地址白名单在后台管理里维护，可按群名选择，不需要手打群 ID。",
+                "地址白名单在后台管理里维护，保存后自动生成 USDT 防篡改核对图；白名单地址会回复核对图、余额和状态。",
                 "",
                 "私聊地址监听：",
                 "点击 🔔地址监听 打开按钮面板，可添加/删除监听地址、设置备注和最小提醒金额。",
@@ -1183,7 +1219,7 @@ class LedgerBot:
                 "",
                 "私聊广播：",
                 "点击 📡群发广播 或 📣分组广播，选择全部群、分组或单群。",
-                "选择目标后直接发送文字、图片、文件或图文，机器人会先生成确认按钮。",
+                "选择目标后进入连续发送；每条文字、图片、文件或图文都会直接投递，不再二次确认。",
                 "通知所有人是按钮开关，不需要写在广播内容里。",
                 "",
                 "广播管理：",
@@ -1198,6 +1234,52 @@ class LedgerBot:
                 "私聊菜单点击 ⚙后台管理，打开网页后输入 ADMIN_WEB_TOKEN 设置的后台密码。",
             ]
         )
+
+    def handle_broadcast_reply_pending_input(
+        self,
+        chat_id: int,
+        user: TelegramUser,
+        message: dict[str, Any],
+        text: str,
+        now: datetime,
+        reply_to_message_id: int,
+    ) -> bool:
+        pending = self.broadcast_reply_pending.get(user.user_id)
+        if not pending:
+            return False
+        if text in {"取消", "取消回复", "/cancel", "菜单", "/start"}:
+            self.broadcast_reply_pending.pop(user.user_id, None)
+            if text in {"取消", "取消回复", "/cancel"}:
+                self.client.send_message(chat_id, "快速回复已取消。", reply_to_message_id=reply_to_message_id)
+                return True
+            return False
+        if time.monotonic() - float(pending.get("created_at", 0)) > 30 * 60:
+            self.broadcast_reply_pending.pop(user.user_id, None)
+            self.client.send_message(chat_id, "快速回复已过期，请重新点击通知里的快速回复。", reply_to_message_id=reply_to_message_id)
+            return True
+        if not self.is_broadcastable_message(message):
+            self.client.send_message(
+                chat_id,
+                "请发送要回复到群里的文字、图片或文件。发送“取消”可退出。",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
+        target_chat_id = int(pending["target_chat_id"])
+        target_message_id = int(pending["target_message_id"])
+        try:
+            self.client.copy_message(
+                target_chat_id,
+                chat_id,
+                int(message["message_id"]),
+                reply_to_message_id=target_message_id,
+            )
+        except TelegramAPIError as exc:
+            self.broadcast_reply_pending.pop(user.user_id, None)
+            self.client.send_message(chat_id, f"回复失败：{str(exc)[:180]}", reply_to_message_id=reply_to_message_id)
+            return True
+        self.broadcast_reply_pending.pop(user.user_id, None)
+        self.client.send_message(chat_id, "已回复到群里。", reply_to_message_id=reply_to_message_id)
+        return True
 
     def handle_pending_broadcast_input(
         self,
@@ -1241,7 +1323,7 @@ class LedgerBot:
             )
             return True
 
-        self.broadcast_pending.pop(user.user_id, None)
+        pending["created_at"] = time.monotonic()
         self.create_broadcast_job_reply(
             chat_id,
             user,
@@ -1252,6 +1334,7 @@ class LedgerBot:
             notify_all,
             now,
             reply_to_message_id,
+            auto_send=True,
         )
         return True
 
@@ -1554,7 +1637,7 @@ class LedgerBot:
             named_groups = self.accessible_named_broadcast_groups(user)
             lines = [
                 "分组广播",
-                "请点击私聊菜单里的 📣分组广播，选择分组后发送广播内容。",
+                "请点击私聊菜单里的 📣分组广播，选择分组后连续发送广播内容。",
                 "分组创建、成员增删和权限分配请在 ⚙后台管理 里操作。",
                 "",
                 f"当前分组：{len(named_groups)} 个",
@@ -1568,7 +1651,7 @@ class LedgerBot:
             lines = [
                 "群发广播",
                 "请点击私聊菜单里的 📡群发广播，选择全部群、分组或单群后发送广播内容。",
-                "发送前可用按钮开启或关闭“通知所有人”，发送后还会二次确认。",
+                "选择目标后进入连续发送；发送前可用按钮开启或关闭“通知所有人”。",
                 "群组、分组和权限请在 ⚙后台管理 里操作。",
                 "",
                 f"当前已保存群组：{len(groups)} 个",
@@ -2414,6 +2497,8 @@ class LedgerBot:
         notify_all: bool,
         now: datetime,
         reply_to_message_id: int,
+        *,
+        auto_send: bool = False,
     ) -> None:
         target_chat_ids = list(dict.fromkeys(target_chat_ids))
         if not target_chat_ids:
@@ -2445,6 +2530,16 @@ class LedgerBot:
         )
         preview_text = preview if len(preview) <= 600 else preview[:600] + "..."
         notify_text = "\n通知所有人：开启" if notify_all else ""
+        if auto_send:
+            self.storage.update_broadcast_job(job["id"], now, status="sending", confirmed_at=now.isoformat())
+            self.broadcast_executor.submit(self.run_broadcast_job, int(job["id"]), chat_id)
+            self.client.send_message(
+                chat_id,
+                f"已提交广播。\n目标群：{len(target_chat_ids)} 个\n类型：{message_kind}{notify_text}\n\n继续发送下一条，或发送“取消广播”退出。",
+                reply_to_message_id=reply_to_message_id,
+                reply_markup=self.broadcast_pending_markup(notify_all),
+            )
+            return
         self.client.send_message(
             chat_id,
             f"确认发送广播？\n目标群：{len(target_chat_ids)} 个\n类型：{message_kind}{notify_text}\n\n{preview_text}",
@@ -2725,7 +2820,8 @@ class LedgerBot:
             if network != "TRC20":
                 self.reply(ctx, "地址格式不支持。白名单当前只支持 TRC20 的 T 开头地址。")
                 return True
-            label, image_url = self.parse_whitelist_tail(tail)
+            label, _image_url = self.parse_whitelist_tail(tail)
+            image_url = self.generated_address_image_url(address)
             self.storage.add_address_whitelist(
                 chat_id=ctx.chat_id,
                 network=network,
@@ -2742,14 +2838,15 @@ class LedgerBot:
         if image_match:
             if not self.require_operator(ctx):
                 return True
-            address, image_url = self.parse_address_and_tail(image_match.group(1))
-            if detect_usdt_network(address) != "TRC20" or not image_url:
-                self.reply(ctx, "格式：设置白名单图片 T地址 https://图片地址")
+            address, _tail = self.parse_address_and_tail(image_match.group(1))
+            if detect_usdt_network(address) != "TRC20":
+                self.reply(ctx, "格式：设置白名单图片 T地址")
                 return True
             existing = self.storage.get_address_whitelist(ctx.chat_id, address, enabled_only=False)
             if existing is None:
                 self.reply(ctx, "没有找到这个白名单地址，请先添加白名单地址。")
                 return True
+            image_url = self.generated_address_image_url(address)
             self.storage.add_address_whitelist(
                 chat_id=ctx.chat_id,
                 network=existing["network"],
@@ -2759,7 +2856,7 @@ class LedgerBot:
                 created_by=ctx.user.user_id,
                 now=ctx.now,
             )
-            self.reply(ctx, "白名单图片已更新。")
+            self.reply(ctx, "白名单地址核对图已重新生成。")
             return True
 
         remove_match = re.fullmatch(r"(?:删除白名单地址|移除白名单地址|白名单删除)\s+(\S+)", text)
@@ -2800,13 +2897,25 @@ class LedgerBot:
         )
         whitelist = self.storage.get_address_whitelist(ctx.chat_id, address)
         if whitelist is not None:
-            lines = self.address_whitelist_reply(address, whitelist, verification)
-            self.client.send_message(
-                ctx.chat_id,
-                "\n".join(lines),
-                reply_to_message_id=ctx.message_id,
-                parse_mode="HTML",
-            )
+            address_info = self.fetch_whitelist_address_info(address)
+            lines = self.address_whitelist_reply(address, whitelist, verification, address_info)
+            text = "\n".join(lines)
+            image_url = whitelist["image_url"]
+            if image_url and str(image_url).startswith(("http://", "https://")):
+                self.client.send_photo(
+                    ctx.chat_id,
+                    str(image_url),
+                    caption=text,
+                    reply_to_message_id=ctx.message_id,
+                    parse_mode="HTML",
+                )
+            else:
+                self.client.send_message(
+                    ctx.chat_id,
+                    text,
+                    reply_to_message_id=ctx.message_id,
+                    parse_mode="HTML",
+                )
             return True
         lines = [
             f"验证地址： <code>{escape(address)}</code>",
@@ -2823,24 +2932,59 @@ class LedgerBot:
         )
         return True
 
-    @staticmethod
-    def address_whitelist_reply(address: str, whitelist: Any, verification: dict[str, Any]) -> list[str]:
-        lines = ["<b>白名单地址</b>"]
-        if whitelist["label"]:
-            lines.append(f"备注： {escape(whitelist['label'])}")
-        lines.extend(
-            [
-                f"验证地址： <code>{escape(address)}</code>",
-                f"验证次数： {verification['count']}",
-            ]
-        )
+    def address_whitelist_reply(
+        self,
+        address: str,
+        whitelist: Any,
+        verification: dict[str, Any],
+        address_info: Any | None,
+    ) -> list[str]:
+        lines = [f"💎 <code>{escape(address)}</code>"]
+        if address_info is not None:
+            created_at = address_info.created_at.strftime("%Y-%m-%d %H:%M:%S") if address_info.created_at else "暂无"
+            lines.extend(
+                [
+                    f"🌐 创建： {escape(created_at)}",
+                    f"├ ▣ USDT： {format_number(address_info.usdt_balance)}",
+                    f"├ ▣ TRX： {format_number(address_info.trx_balance)}",
+                ]
+            )
+        else:
+            lines.append("🌐 创建： 暂无")
+            lines.append("├ ▣ USDT： 暂无")
+            lines.append("├ ▣ TRX： 暂无")
+        lines.append("└✅ 状态： 白名单")
+        lines.append(f"验证次数： {verification['count']}")
         if verification["previous_sender_name"]:
             lines.append(f"上次发送人： {escape(verification['previous_sender_name'])}")
         lines.append(f"本次发送人： {escape(verification['current_sender_name'])}")
-        if whitelist["image_url"]:
-            image_url = escape(whitelist["image_url"], quote=True)
-            lines.append(f"图片： <a href=\"{image_url}\">查看</a>")
+        if whitelist["label"]:
+            lines.append(f"备注： {escape(whitelist['label'])}")
         return lines
+
+    def fetch_whitelist_address_info(self, address: str) -> Any | None:
+        try:
+            row = self.tron_client.fetch_account(address)
+            return parse_tron_address_info(
+                row,
+                address=address,
+                timezone=self.config.timezone,
+                usdt_contract=self.config.tron_usdt_contract,
+            )
+        except TronGridError as exc:
+            print(f"Whitelist address info failed for {address}: {exc}", flush=True)
+            return None
+
+    def generated_address_image_url(self, address: str) -> str | None:
+        try:
+            return save_address_verification_image(
+                db_path=self.config.db_path,
+                public_base_url=self.config.public_bill_base_url,
+                address=address,
+            )
+        except Exception as exc:
+            print(f"Address verification image failed for {address}: {exc}", flush=True)
+            return None
 
     def handle_ledger_entry(self, ctx: MessageContext, entry: ParsedLedgerEntry) -> None:
         if not self.ensure_host_present_for_accounting(ctx):
@@ -3243,21 +3387,36 @@ class LedgerBot:
         reply_text = self.message_preview(ctx.message)
         original_link = self.telegram_message_link(ctx.chat_id, ctx.reply_message_id)
         reply_link = self.telegram_message_link(ctx.chat_id, ctx.message_id)
-        lines = [
-            "广播消息收到群内回复",
-            f"群组：{group['chat_title'] or ctx.chat_id}",
-            f"回复人：{sender}",
-            f"任务：#{match['job_id']} {match['scope']}",
-            f"回复内容：{reply_text}",
-        ]
-        if original_link:
-            lines.append(f"原消息：{original_link}")
-        if reply_link:
-            lines.append(f"回复消息：{reply_link}")
+        notice = self.format_broadcast_reply_notice(
+            group_title=str(group["chat_title"] or ctx.chat_id),
+            group_url=reply_link,
+            sender=sender,
+            sender_user_id=ctx.user.user_id,
+            reply_text=reply_text,
+        )
+        media_notice = self.format_broadcast_reply_notice(
+            group_title=str(group["chat_title"] or ctx.chat_id),
+            group_url=reply_link,
+            sender=sender,
+            sender_user_id=ctx.user.user_id,
+            reply_text=reply_text,
+            limit=420,
+        )
+        reply_markup = self.broadcast_reply_notice_markup(ctx.chat_id, ctx.message_id, reply_link, original_link)
         recipients = self.broadcast_owner_recipient_ids()
         recipients.add(int(match["creator_user_id"]))
         recipients.update(self.storage.list_broadcast_operator_ids_with_feature("reply_notifications"))
-        self.notification_executor.submit(self.send_broadcast_reply_notifications, recipients, "\n".join(lines))
+        should_copy_original = self.can_embed_notice_in_copied_reply(ctx.message)
+        self.notification_executor.submit(
+            self.send_broadcast_reply_notifications,
+            recipients,
+            ctx.chat_id,
+            ctx.message_id,
+            notice,
+            media_notice,
+            reply_markup,
+            should_copy_original,
+        )
 
     def broadcast_owner_recipient_ids(self) -> set[int]:
         recipients = set(self.config.default_operator_user_ids)
@@ -3265,12 +3424,86 @@ class LedgerBot:
             recipients.add(self.config.bot_host_user_id)
         return recipients
 
-    def send_broadcast_reply_notifications(self, recipients: set[int], text: str) -> None:
+    def send_broadcast_reply_notifications(
+        self,
+        recipients: set[int],
+        source_chat_id: int,
+        source_message_id: int,
+        text: str,
+        media_text: str,
+        reply_markup: dict[str, Any],
+        should_copy_original: bool,
+    ) -> None:
         for recipient in recipients:
             try:
-                self.client.send_message(recipient, text)
+                if should_copy_original:
+                    try:
+                        self.client.copy_message(
+                            recipient,
+                            source_chat_id,
+                            source_message_id,
+                            caption=media_text,
+                            parse_mode="HTML",
+                            reply_markup=reply_markup,
+                        )
+                        continue
+                    except TelegramAPIError:
+                        pass
+                self.client.send_message(
+                    recipient,
+                    text,
+                    parse_mode="HTML",
+                    reply_markup=reply_markup,
+                )
+                if should_copy_original:
+                    self.client.copy_message(recipient, source_chat_id, source_message_id)
             except TelegramAPIError as exc:
                 print(f"Broadcast reply notify failed for {recipient}: {exc}", flush=True)
+
+    @staticmethod
+    def html_link(label: str, url: str | None) -> str:
+        safe_label = escape(label, quote=False)
+        if not url:
+            return safe_label
+        return f'<a href="{escape(url, quote=True)}">{safe_label}</a>'
+
+    def format_broadcast_reply_notice(
+        self,
+        *,
+        group_title: str,
+        group_url: str | None,
+        sender: str,
+        sender_user_id: int,
+        reply_text: str,
+        limit: int = 1200,
+    ) -> str:
+        preview = self.trim_text(reply_text, limit)
+        return (
+            f"群：{self.html_link(group_title, group_url)}\n"
+            f"人：{self.html_link(sender, f'tg://user?id={sender_user_id}')}\n\n"
+            "内容：\n\n"
+            f"{escape(preview, quote=False)}"
+        )
+
+    @staticmethod
+    def can_embed_notice_in_copied_reply(message: dict[str, Any]) -> bool:
+        return any(kind in message for kind in ("photo", "video", "animation", "document", "audio", "voice"))
+
+    @staticmethod
+    def broadcast_reply_notice_markup(
+        target_chat_id: int,
+        reply_message_id: int,
+        reply_url: str | None,
+        original_url: str | None,
+    ) -> dict[str, Any]:
+        keyboard: list[list[dict[str, str]]] = [
+            [{"text": "快速回复", "callback_data": f"reply:start:{target_chat_id}:{reply_message_id}"}]
+        ]
+        if reply_url:
+            keyboard.append([{"text": "定位回复消息", "url": reply_url}])
+        if original_url:
+            keyboard.append([{"text": "定位原投递消息", "url": original_url}])
+        return {"inline_keyboard": keyboard}
 
     def replace_direct_broadcast_original_if_needed(self, ctx: MessageContext, match: Any) -> bool:
         if not str(match["scope"]).startswith("chat:"):
@@ -3443,6 +3676,10 @@ class LedgerBot:
             self.handle_address_watch_callback(chat_id, user.user_id, callback["id"], data, now)
             return
 
+        if data.startswith("reply:start:"):
+            self.handle_broadcast_reply_start_callback(chat_id, user, callback["id"], data)
+            return
+
         if data.startswith("broadcastui:"):
             self.handle_broadcast_ui_callback(chat_id, user, callback["id"], data, now)
             return
@@ -3495,6 +3732,37 @@ class LedgerBot:
             end = self.parse_compact_bill_time(parts[4]) if len(parts) >= 5 else None
             self.client.answer_callback_query(callback["id"])
             self.client.send_message(chat_id, self.build_bill_text(chat_id, day_key, begin=begin, end=end), parse_mode="HTML")
+
+    def handle_broadcast_reply_start_callback(
+        self,
+        chat_id: int,
+        user: TelegramUser,
+        callback_id: str,
+        data: str,
+    ) -> None:
+        if not self.can_use_broadcast(user):
+            self.client.answer_callback_query(callback_id, "没有广播权限。")
+            return
+        parts = data.split(":")
+        if len(parts) != 4:
+            self.client.answer_callback_query(callback_id, "按钮无效。")
+            return
+        try:
+            target_chat_id = int(parts[2])
+            target_message_id = int(parts[3])
+        except ValueError:
+            self.client.answer_callback_query(callback_id, "回复目标无效。")
+            return
+        self.broadcast_reply_pending[user.user_id] = {
+            "target_chat_id": target_chat_id,
+            "target_message_id": target_message_id,
+            "created_at": time.monotonic(),
+        }
+        self.client.answer_callback_query(callback_id, "已进入快速回复。")
+        self.client.send_message(
+            chat_id,
+            "请发送要回复到群里的内容。\n机器人会把你的下一条消息发送到原群，并回复那条群消息。\n发送“取消”可退出。",
+        )
 
     def handle_broadcast_ui_callback(
         self,
@@ -3596,7 +3864,7 @@ class LedgerBot:
         self.client.answer_callback_query(callback_id, "目标已选择。")
         self.client.send_message(
             chat_id,
-            f"已选择：{label}\n目标群数：{len(target_ids)}\n通知所有人：关闭\n\n请直接发送广播文字；如需发图片/文件，请发送或回复素材。",
+            f"已进入连续广播：{label}\n目标群数：{len(target_ids)}\n通知所有人：关闭\n\n接下来你发送的每条文字、图片或文件都会直接投递，不再二次确认。\n发送“取消广播”或点击下方按钮退出。",
             reply_markup=self.broadcast_pending_markup(False),
         )
 
@@ -3810,17 +4078,17 @@ class LedgerBot:
 
     def poll_address_watches(self) -> None:
         now = datetime.now(self.config.timezone)
-        min_timestamp_ms = int(
+        fallback_min_timestamp_ms = int(
             (now - timedelta(minutes=self.config.tron_initial_lookback_minutes)).timestamp() * 1000
         )
         watches = [dict(row) for row in self.storage.list_active_address_watch_targets()]
         if self.config.chain_threads <= 1 or len(watches) <= 1:
             for watch in watches:
-                self.poll_one_address_watch(watch, now, min_timestamp_ms)
+                self.poll_one_address_watch(watch, now, fallback_min_timestamp_ms)
             return
 
         futures = [
-            self.chain_executor.submit(self.poll_one_address_watch, watch, now, min_timestamp_ms)
+            self.chain_executor.submit(self.poll_one_address_watch, watch, now, fallback_min_timestamp_ms)
             for watch in watches
         ]
         for future in as_completed(futures):
@@ -3829,8 +4097,9 @@ class LedgerBot:
             except Exception as exc:
                 print(f"Address watch target error: {exc}", flush=True)
 
-    def poll_one_address_watch(self, watch: dict[str, Any], now: datetime, min_timestamp_ms: int) -> None:
+    def poll_one_address_watch(self, watch: dict[str, Any], now: datetime, fallback_min_timestamp_ms: int) -> None:
         settings = self.storage.get_address_watch_settings(watch["owner_user_id"], now)
+        min_timestamp_ms = self.address_watch_min_timestamp_ms(watch, fallback_min_timestamp_ms)
         try:
             rows = self.tron_client.fetch_trc20_transfers(
                 watch["address"],
@@ -3869,6 +4138,12 @@ class LedgerBot:
                 format_transfer_notice(transfer),
                 parse_mode="HTML",
             )
+
+    def address_watch_min_timestamp_ms(self, watch: dict[str, Any], fallback_min_timestamp_ms: int) -> int:
+        latest_timestamp = self.storage.latest_chain_event_timestamp(watch["owner_user_id"], watch["address"])
+        if latest_timestamp is None:
+            return fallback_min_timestamp_ms
+        return max(fallback_min_timestamp_ms, latest_timestamp - 30_000)
 
     def handle_address_watch_callback(
         self,

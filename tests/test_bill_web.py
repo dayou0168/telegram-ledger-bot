@@ -239,6 +239,7 @@ def test_admin_page_renders_management_sections() -> None:
         config = SimpleNamespace(
             admin_web_token="admin-secret",
             bill_web_token="bill-secret",
+            public_bill_base_url="https://bot.example.com",
             db_path=Path(tmp) / "bot.db",
             timezone=BEIJING_TZ,
             p2p_rate_trade_methods=("aliPay",),
@@ -256,11 +257,12 @@ def test_admin_page_renders_management_sections() -> None:
         assert "已保存群组" in body
         assert "admin-nav" in body
         assert "测试群" in body
-        assert "broadcast-admin-groups" in body
         assert "broadcast-admin-operator-select" in body
         assert "财务A" in body
         assert "财务A（2001）启用" in body
         assert "或输入新UID" in body
+        assert "输入新分组名" in body
+        assert "选择要管理的分组" in body
         assert "分组群发" in body
         assert "单群发送" in body
         assert "设置下级" in body
@@ -269,8 +271,9 @@ def test_admin_page_renders_management_sections() -> None:
         assert "<option value=\"-1001\">测试群</option>" in body
         assert 'class="admin-select" required' in body
         assert 'list="saved-admin-groups"' not in body
-        assert 'list="broadcast-admin-groups"' in body
+        assert 'list="broadcast-admin-groups"' not in body
         assert 'list="broadcast-admin-operators"' not in body
+        assert 'type="file" name="photo_upload" accept="image/*"' in body
         assert "只有单群发送的投递消息被群成员回复时" in body
         assert "开启，回复后替换原投递消息" in body
 
@@ -288,6 +291,7 @@ def test_admin_post_updates_whitelist_broadcast_permissions_and_replacement() ->
         config = SimpleNamespace(
             admin_web_token="admin-secret",
             bill_web_token=None,
+            public_bill_base_url="https://bot.example.com",
             db_path=db_path,
             timezone=BEIJING_TZ,
             p2p_rate_trade_methods=("aliPay",),
@@ -325,6 +329,7 @@ def test_admin_post_updates_whitelist_broadcast_permissions_and_replacement() ->
             whitelist = storage.get_address_whitelist(-100111, "TGhAAySHUUcEGua33pZZ88wP3bA6X5eQuZ")
             assert whitelist is not None
             assert whitelist["label"] == "monitor"
+            assert whitelist["image_url"].startswith("https://bot.example.com/uploads/address_check_")
             replacement = storage.get_broadcast_replacement_settings()
             assert replacement["enabled"] == 1
             assert replacement["text"] == "hello"
@@ -335,6 +340,62 @@ def test_admin_post_updates_whitelist_broadcast_permissions_and_replacement() ->
             assert operator["allow_manage_operators"] == 0
             assert operator["receive_sent_notifications"] == 0
             assert operator["receive_reply_notifications"] == 1
+        finally:
+            storage.conn.close()
+
+
+def test_admin_replacement_upload_saves_public_image_url() -> None:
+    with TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "bot.db"
+        storage = Storage(db_path)
+        storage.conn.close()
+
+        config = SimpleNamespace(
+            admin_web_token="admin-secret",
+            bill_web_token=None,
+            public_bill_base_url="https://bot.example.com",
+            db_path=db_path,
+            timezone=BEIJING_TZ,
+            p2p_rate_trade_methods=("aliPay",),
+        )
+        boundary = "----ledger-boundary"
+        png = b"\x89PNG\r\n\x1a\nfake"
+        body = (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="action"\r\n\r\n'
+            "set_broadcast_replacement\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="enabled"\r\n\r\n'
+            "1\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="text"\r\n\r\n'
+            "hello\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="photo_upload"; filename="banner.png"\r\n'
+            "Content-Type: image/png\r\n\r\n"
+        ).encode("utf-8") + png + f"\r\n--{boundary}--\r\n".encode("utf-8")
+        cookie = f"ledger_admin_session={make_admin_session_value('admin-secret')}"
+
+        response = handle_bill_web_post_response(
+            config,
+            "/admin",
+            body,
+            cookie_header=cookie,
+            content_type=f"multipart/form-data; boundary={boundary}",
+        )
+
+        assert response.status == 303
+        storage = Storage(db_path)
+        try:
+            replacement = storage.get_broadcast_replacement_settings()
+            assert replacement["enabled"] == 1
+            assert replacement["text"] == "hello"
+            assert replacement["photo"].startswith("https://bot.example.com/uploads/broadcast_replacement_")
+            upload_path = urlparse(replacement["photo"]).path
+            asset = handle_bill_web_response(config, upload_path)
+            assert asset.status == 200
+            assert asset.content_type == "image/png"
+            assert asset.body == png
         finally:
             storage.conn.close()
 

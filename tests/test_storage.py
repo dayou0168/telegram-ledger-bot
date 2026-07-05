@@ -456,6 +456,46 @@ def test_address_watch_settings_min_amount_and_label_update() -> None:
             storage.conn.close()
 
 
+def test_latest_chain_event_timestamp_per_owner_and_address() -> None:
+    with TemporaryDirectory() as tmp:
+        storage = Storage(Path(tmp) / "bot.db")
+        try:
+            now = datetime(2026, 7, 4, 12, tzinfo=BEIJING_TZ)
+            storage.record_chain_event_notification(
+                owner_user_id=1001,
+                address="TWatch",
+                tx_hash="a",
+                direction="income",
+                token_symbol="USDT",
+                block_timestamp=1_000,
+                now=now,
+            )
+            storage.record_chain_event_notification(
+                owner_user_id=1001,
+                address="TWatch",
+                tx_hash="b",
+                direction="expense",
+                token_symbol="USDT",
+                block_timestamp=2_000,
+                now=now,
+            )
+            storage.record_chain_event_notification(
+                owner_user_id=1002,
+                address="TWatch",
+                tx_hash="c",
+                direction="income",
+                token_symbol="USDT",
+                block_timestamp=3_000,
+                now=now,
+            )
+
+            assert storage.latest_chain_event_timestamp(1001, "TWatch") == 2_000
+            assert storage.latest_chain_event_timestamp(1002, "TWatch") == 3_000
+            assert storage.latest_chain_event_timestamp(1001, "TOther") is None
+        finally:
+            storage.conn.close()
+
+
 def test_address_verification_counts_per_group_and_address() -> None:
     with TemporaryDirectory() as tmp:
         storage = Storage(Path(tmp) / "bot.db")
