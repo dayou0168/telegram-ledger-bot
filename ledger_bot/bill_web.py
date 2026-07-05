@@ -563,27 +563,54 @@ def render_admin_page(storage: Storage, config: Config, *, message: str = "") ->
     chat_permissions = storage.list_broadcast_chat_permissions()
     operators = storage.list_broadcast_operators()
     replacement = storage.get_broadcast_replacement_settings(datetime.now(config.timezone))
+    active_operator_count = sum(1 for row in operators if row["status"] == "active")
     notice = f'<div class="admin-notice">{escape(message)}</div>' if message else ""
     content = f"""
     <div class="content-wrapper">
       <div class="container admin-container">
         <header class="admin-header">
-          <div>
+          <div class="admin-title">
             <div class="brand">Telegram 记账机器人</div>
             <h1>后台管理</h1>
-            <p>管理地址白名单、广播分组、分组权限和已保存群组。</p>
+            <p>集中管理地址白名单、广播分组、操作人权限、替换策略和已保存群组。</p>
           </div>
-          <a class="btn" href="/admin">刷新</a>
+          <div class="admin-header-actions">
+            <a class="btn" href="/admin">刷新</a>
+          </div>
         </header>
+        <section class="admin-summary" aria-label="后台概览">
+          <div class="admin-summary-item">
+            <span>已保存群组</span>
+            <strong>{len(groups)}</strong>
+          </div>
+          <div class="admin-summary-item">
+            <span>广播分组</span>
+            <strong>{len(named_groups)}</strong>
+          </div>
+          <div class="admin-summary-item">
+            <span>启用操作人</span>
+            <strong>{active_operator_count}</strong>
+          </div>
+          <div class="admin-summary-item">
+            <span>白名单地址</span>
+            <strong>{len(whitelist_rows)}</strong>
+          </div>
+        </section>
+        <nav class="admin-nav" aria-label="后台管理导航">
+          <a href="#admin-whitelist">地址白名单</a>
+          <a href="#admin-groups">广播分组</a>
+          <a href="#admin-permissions">广播权限</a>
+          <a href="#admin-replacement">广播替换</a>
+          <a href="#admin-saved-groups">已保存群组</a>
+        </nav>
         {notice}
-        {render_group_datalist(groups)}
         {render_broadcast_group_datalist(named_groups)}
         <section class="admin-grid">
-          <div class="admin-card">
+          <div class="admin-card admin-card-whitelist" id="admin-whitelist">
             <h2>地址白名单</h2>
             <form method="POST" action="/admin" class="admin-form">
               {hidden_input("action", "add_whitelist")}
-              <input name="chat_id" list="saved-admin-groups" placeholder="输入群名搜索选择" required>
+              {render_group_select("chat_id", groups, "选择群组", required=True)}
               <input name="address" placeholder="TRC20 地址" required>
               <input name="label" placeholder="备注，可选">
               <input name="image_url" placeholder="图片URL，可选">
@@ -591,14 +618,14 @@ def render_admin_page(storage: Storage, config: Config, *, message: str = "") ->
             </form>
             <form method="POST" action="/admin" class="admin-form inline-form">
               {hidden_input("action", "remove_whitelist")}
-              <input name="chat_id" list="saved-admin-groups" placeholder="输入群名搜索选择" required>
+              {render_group_select("chat_id", groups, "选择群组", required=True)}
               <input name="address" placeholder="TRC20 地址" required>
               <button type="submit">删除白名单</button>
             </form>
             {render_whitelist_table(whitelist_rows)}
           </div>
 
-          <div class="admin-card">
+          <div class="admin-card admin-card-groups" id="admin-groups">
             <h2>广播分组</h2>
             <form method="POST" action="/admin" class="admin-form admin-form-actions">
               <input name="group_name" list="broadcast-admin-groups" placeholder="选择或输入分组名，例如 财务" required>
@@ -617,7 +644,7 @@ def render_admin_page(storage: Storage, config: Config, *, message: str = "") ->
             {render_broadcast_group_table(storage, named_groups)}
           </div>
 
-          <div class="admin-card">
+          <div class="admin-card admin-card-permissions" id="admin-permissions">
             <h2>广播权限</h2>
             <p class="muted">宿主和服务器默认操作人拥有全部权限。普通广播操作人只拥有被授权的分组或单群。</p>
             <form method="POST" action="/admin" class="admin-form permission-form">
@@ -639,7 +666,7 @@ def render_admin_page(storage: Storage, config: Config, *, message: str = "") ->
               </div>
               <label class="admin-form-wide admin-form-hint">单群权限</label>
               <div class="permission-row admin-form-wide">
-                <input name="chat_id" list="saved-admin-groups" placeholder="输入群名搜索选择">
+                {render_group_select("chat_id", groups, "选择群组")}
                 <button type="submit" name="action" value="grant_broadcast_chat_permission">授权单群</button>
                 <button type="submit" name="action" value="revoke_broadcast_chat_permission">取消单群</button>
               </div>
@@ -648,7 +675,7 @@ def render_admin_page(storage: Storage, config: Config, *, message: str = "") ->
             {render_permission_table(permissions, chat_permissions)}
           </div>
 
-          <div class="admin-card">
+          <div class="admin-card admin-card-replacement" id="admin-replacement">
             <h2>广播替换</h2>
             <p class="muted">发送广播时始终复制原消息。开启后，只有单群发送的投递消息被群成员回复时，机器人会尝试编辑那条原投递消息。</p>
             <form method="POST" action="/admin" class="admin-form">
@@ -664,7 +691,7 @@ def render_admin_page(storage: Storage, config: Config, *, message: str = "") ->
             <p class="muted">当前状态：{'回复后替换原投递消息' if replacement['enabled'] else '关闭'}。图片原消息有固定图片时替换图片并保留原说明；没有固定图片但有固定文字时只替换说明。</p>
           </div>
 
-          <div class="admin-card admin-card-wide">
+          <div class="admin-card admin-card-wide admin-card-saved" id="admin-saved-groups">
             <h2>已保存群组</h2>
             <p class="muted">机器人被邀请进群或群内有人发言后会自动保存群组，群名会随消息自动更新。</p>
             {render_admin_group_table(groups, config)}
@@ -682,6 +709,15 @@ def render_group_datalist(rows: list[Any]) -> str:
         title = row["chat_title"] or "(未命名群)"
         options.append(f'<option value="{row["chat_id"]}">{escape(title)}</option>')
     return f'<datalist id="saved-admin-groups">{"".join(options)}</datalist>'
+
+
+def render_group_select(name: str, rows: list[Any], placeholder: str, *, required: bool = False) -> str:
+    required_attr = " required" if required else ""
+    options = [f'<option value="">{escape(placeholder)}</option>']
+    for row in rows:
+        title = row["chat_title"] or "(未命名群)"
+        options.append(f'<option value="{row["chat_id"]}">{escape(title)}</option>')
+    return f'<select name="{escape(name, quote=True)}" class="admin-select"{required_attr}>{"".join(options)}</select>'
 
 
 def render_broadcast_group_datalist(rows: list[Any]) -> str:
@@ -2262,23 +2298,32 @@ def page_shell(title: str, body: str) -> str:
       padding: 40px 33px;
     }}
     .admin-container {{
-      max-width: 1180px;
+      max-width: 1160px;
     }}
     .admin-header {{
       display: flex;
       justify-content: space-between;
       gap: 16px;
       align-items: center;
-      padding: 18px 20px;
-      margin-bottom: 12px;
+      padding: 20px 22px;
+      margin-bottom: 14px;
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 8px;
       box-shadow: var(--shadow);
     }}
+    .admin-title {{
+      min-width: 0;
+    }}
+    .admin-header-actions {{
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex: 0 0 auto;
+    }}
     .admin-header h1 {{
       margin: 2px 0 4px;
-      font-size: 22px;
+      font-size: 24px;
       line-height: 1.2;
     }}
     .admin-header p {{
@@ -2298,28 +2343,106 @@ def page_shell(title: str, body: str) -> str:
       color: #166534;
       font-weight: 600;
     }}
-    .admin-grid {{
-      columns: 2 520px;
-      column-gap: 12px;
+    .admin-summary {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 12px;
     }}
-    .admin-card {{
-      display: inline-block;
-      width: 100%;
-      margin: 0 0 12px;
-      break-inside: avoid;
-      min-width: 0;
-      padding: 16px;
+    .admin-summary-item {{
+      min-height: 72px;
+      padding: 12px 14px;
       background: var(--panel);
       border: 1px solid var(--line);
+      border-top: 3px solid #e4c078;
       border-radius: 8px;
       box-shadow: var(--shadow);
     }}
+    .admin-summary-item span {{
+      display: block;
+      margin-bottom: 4px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 700;
+    }}
+    .admin-summary-item strong {{
+      display: block;
+      font-size: 24px;
+      line-height: 1.15;
+      color: var(--text);
+    }}
+    .admin-nav {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      margin: 0 0 14px;
+      padding: 8px;
+      background: rgba(255, 255, 255, 0.65);
+      border: 1px solid var(--line-soft);
+      border-radius: 8px;
+    }}
+    .admin-nav a {{
+      display: inline-flex;
+      align-items: center;
+      min-height: 32px;
+      padding: 0 12px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel);
+      color: var(--blue-dark);
+      font-weight: 700;
+      white-space: nowrap;
+    }}
+    .admin-nav a:hover {{
+      border-color: #e4c078;
+      color: var(--gold);
+      text-decoration: none;
+    }}
+    .admin-grid {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      grid-template-areas:
+        "whitelist replacement"
+        "groups groups"
+        "permissions permissions"
+        "saved saved";
+      gap: 14px;
+      align-items: start;
+    }}
+    .admin-card {{
+      display: block;
+      width: 100%;
+      margin: 0;
+      min-width: 0;
+      padding: 18px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-top: 4px solid #e4c078;
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+    }}
+    .admin-card-whitelist {{
+      grid-area: whitelist;
+    }}
+    .admin-card-groups {{
+      grid-area: groups;
+    }}
+    .admin-card-permissions {{
+      grid-area: permissions;
+    }}
+    .admin-card-replacement {{
+      grid-area: replacement;
+    }}
+    .admin-card-saved {{
+      grid-area: saved;
+    }}
     .admin-card-wide {{
-      column-span: all;
+      grid-column: auto;
     }}
     .admin-card h2 {{
-      margin: 0 0 10px;
-      font-size: 17px;
+      margin: 0 0 12px;
+      font-size: 18px;
       line-height: 1.25;
     }}
     .admin-card p {{
@@ -2332,7 +2455,7 @@ def page_shell(title: str, body: str) -> str:
       margin-bottom: 10px;
     }}
     .admin-form.inline-form {{
-      grid-template-columns: minmax(0, 1fr) auto;
+      grid-template-columns: minmax(0, 0.9fr) minmax(0, 1fr) auto;
     }}
     .admin-form input,
     .admin-form textarea,
@@ -2344,6 +2467,12 @@ def page_shell(title: str, body: str) -> str:
       padding: 7px 10px;
       background: #fff;
       font: inherit;
+    }}
+    .admin-form input:focus,
+    .admin-form textarea:focus,
+    .admin-form select:focus {{
+      outline: 2px solid rgba(184, 135, 44, 0.22);
+      border-color: var(--gold);
     }}
     .admin-form textarea {{
       grid-column: 1 / -1;
@@ -2448,7 +2577,16 @@ def page_shell(title: str, body: str) -> str:
     @media (max-width: 920px) {{
       .content-wrapper {{ padding: 20px 16px 28px; }}
       .content {{ grid-template-columns: 1fr; }}
-      .admin-grid {{ columns: 1; }}
+      .admin-summary {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .admin-grid {{
+        grid-template-columns: 1fr;
+        grid-template-areas:
+          "whitelist"
+          "replacement"
+          "groups"
+          "permissions"
+          "saved";
+      }}
       .admin-header {{
         align-items: stretch;
         flex-direction: column;
@@ -2480,10 +2618,16 @@ def page_shell(title: str, body: str) -> str:
       .bill-search {{
         flex-wrap: wrap;
       }}
+      .admin-summary {{ grid-template-columns: 1fr; }}
+      .admin-nav a {{ flex: 1 1 120px; justify-content: center; }}
       .bill-search input[type="text"],
       .bill-search select,
       .bill-search button {{
         flex: 1 1 100%;
+      }}
+      .admin-form,
+      .admin-form.inline-form {{
+        grid-template-columns: 1fr;
       }}
       .admin-form-actions {{
         grid-template-columns: 1fr;

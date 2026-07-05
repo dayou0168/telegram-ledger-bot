@@ -254,8 +254,8 @@ def test_admin_page_renders_management_sections() -> None:
         assert "广播权限" in body
         assert "广播替换" in body
         assert "已保存群组" in body
+        assert "admin-nav" in body
         assert "测试群" in body
-        assert "saved-admin-groups" in body
         assert "broadcast-admin-groups" in body
         assert "broadcast-admin-operator-select" in body
         assert "财务A" in body
@@ -267,7 +267,8 @@ def test_admin_page_renders_management_sections() -> None:
         assert "发送通知" in body
         assert "回复通知" in body
         assert "<option value=\"-1001\">测试群</option>" in body
-        assert 'list="saved-admin-groups"' in body
+        assert 'class="admin-select" required' in body
+        assert 'list="saved-admin-groups"' not in body
         assert 'list="broadcast-admin-groups"' in body
         assert 'list="broadcast-admin-operators"' not in body
         assert "只有单群发送的投递消息被群成员回复时" in body
