@@ -96,6 +96,14 @@ https://bot.your-domain.example/bill/-100xxx/2026-07-05?begintime=2026-07-05+00%
 
 宝塔里给域名申请 SSL 后，把站点反向代理到 `http://127.0.0.1:8080`。`BILL_WEB_TOKEN` 可留空，留空时网页是公开链接；建议正式使用时设置一串随机字符。
 
+内置网页同时兼容 `/day_xxb.php` 风格参数。打开：
+
+```text
+https://bot.your-domain.example/day_xxb.php?chat_id=-100xxx&created_at=2026-07-05
+```
+
+即可查看指定日期历史账单；页面顶部会显示最近历史日期和「下载账单」按钮。下载按钮会生成 `.xlsx` 文件，文件名格式为 `账单_日期_群名_时间戳.xlsx`。也可以直接追加 `download=excel` 下载当前日期或当前时间窗口的账单。
+
 如果你已经有自己的 PHP 账单系统，也可以继续用 `.php` 地址：
 
 ```env

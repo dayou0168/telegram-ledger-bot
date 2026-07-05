@@ -121,6 +121,8 @@ BILL_WEB_TOKEN=replace-with-random-text
 
 The Telegram bill button then opens `/bill/{chat_id}/{day}` on your own domain. If `BILL_WEB_TOKEN` is empty, the bill URL is public; for production use, set a random token.
 
+The built-in web server also supports legacy-style `/day_xxb.php` links. Use `created_at=YYYY-MM-DD` to open a historical bill, and append `download=excel` to download the current bill window as an `.xlsx` file named like `账单_日期_群名_时间戳.xlsx`.
+
 The source-build path below is only needed if you want BaoTa to build the image on your server.
 
 Recommended project path:

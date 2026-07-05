@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
+from zipfile import ZipFile
 
 from ledger_bot.bot import LedgerBot
-from ledger_bot.bill_web import day_key_from_legacy_query, handle_bill_web_request, render_bill_page
+from ledger_bot.bill_web import day_key_from_legacy_query, handle_bill_web_request, handle_bill_web_response, render_bill_page
 from ledger_bot.storage import Storage
 
 
@@ -66,6 +68,10 @@ def test_render_bill_page_shows_records_and_realtime_rate() -> None:
             assert "测试群" in html
             assert "支付宝1档 下浮0.10" in html
             assert "入款" in html
+            assert "历史账单" in html
+            assert "下载账单" in html
+            assert "created_at=2026-07-05" in html
+            assert "download=excel" in html
             assert "统计（按标记人）" in html
             assert "统计（按汇率分类）" in html
             assert "客户A" in html
@@ -178,8 +184,70 @@ def test_bill_web_token_blocks_missing_token() -> None:
     assert "访问受限" in body
 
 
+def test_legacy_created_at_uses_day_key_records_without_window() -> None:
+    with TemporaryDirectory() as tmp:
+        storage = Storage(Path(tmp) / "bot.db")
+        try:
+            now = datetime(2026, 7, 5, 12, tzinfo=BEIJING_TZ)
+            storage.ensure_group(-1001, "测试群", now)
+            storage.update_group(-1001, now, day_cutoff_hour=4)
+            storage.insert_record(
+                make_bill_record(
+                    -1001,
+                    "2026-07-04",
+                    created_at=datetime(2026, 7, 4, 1, tzinfo=BEIJING_TZ),
+                )
+            )
+
+            config = SimpleNamespace(
+                bill_web_token=None,
+                db_path=Path(tmp) / "bot.db",
+                timezone=BEIJING_TZ,
+                p2p_rate_trade_methods=("aliPay",),
+            )
+            status, body = handle_bill_web_request(config, "/day_xxb.php?chat_id=-1001&created_at=2026-07-04")
+
+            assert status == 200
+            assert "客户A" in body
+            assert 'name="created_at" value="2026-07-04"' in body
+            assert 'name="begintime"' not in body
+        finally:
+            storage.conn.close()
+
+
+def test_bill_web_downloads_xlsx() -> None:
+    with TemporaryDirectory() as tmp:
+        storage = Storage(Path(tmp) / "bot.db")
+        try:
+            now = datetime(2026, 7, 5, 12, tzinfo=BEIJING_TZ)
+            storage.ensure_group(-1001, "测试群", now)
+            storage.insert_record(make_bill_record(-1001, "2026-07-05"))
+        finally:
+            storage.conn.close()
+
+        config = SimpleNamespace(
+            bill_web_token=None,
+            db_path=Path(tmp) / "bot.db",
+            timezone=BEIJING_TZ,
+            p2p_rate_trade_methods=("aliPay",),
+        )
+        response = handle_bill_web_response(config, "/day_xxb.php?chat_id=-1001&created_at=2026-07-05&download=excel")
+
+        assert response.status == 200
+        assert response.content_type == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        assert "filename*=UTF-8''" in response.headers["Content-Disposition"]
+        assert "%E8%B4%A6%E5%8D%95_2026-07-05_" in response.headers["Content-Disposition"]
+        with ZipFile(BytesIO(response.body)) as zf:
+            assert "xl/worksheets/sheet1.xml" in zf.namelist()
+            sheet = zf.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        assert "入款：1笔" in sheet
+        assert "测试群" in sheet
+        assert "客户A" in sheet
+
+
 def test_day_key_from_legacy_query() -> None:
     assert day_key_from_legacy_query({"begintime": ["2026-07-05 00:00:00"]}) == "2026-07-05"
+    assert day_key_from_legacy_query({"created_at": ["2026-07-04"]}) == "2026-07-04"
     assert day_key_from_legacy_query({"all": ["1"]}) == "active"
     assert day_key_from_legacy_query({}) == "today"
 
