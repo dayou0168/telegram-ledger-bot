@@ -69,6 +69,8 @@ def test_render_bill_page_shows_records_and_realtime_rate() -> None:
             assert "支付宝1档 下浮0.10" in html
             assert "入款" in html
             assert "历史账单" in html
+            assert "history-dropdown" in html
+            assert "07-05" in html
             assert "下载账单" in html
             assert "created_at=2026-07-05" in html
             assert "download=excel" in html
@@ -102,8 +104,8 @@ def test_render_bill_page_uses_group_cutoff_window() -> None:
                 timezone=BEIJING_TZ,
             )
 
-            assert 'value="2026-07-04 04:00:00"' in html
-            assert 'value="2026-07-05 04:00:00"' in html
+            assert 'type="datetime-local" step="1" name="begintime" value="2026-07-04T04:00:00"' in html
+            assert 'type="datetime-local" step="1" name="endtime" value="2026-07-05T04:00:00"' in html
             assert "客户A" in html
         finally:
             storage.conn.close()
@@ -133,9 +135,9 @@ def test_render_bill_page_prefers_linked_bill_window() -> None:
                 end_time="2026-07-04 00:00:00",
             )
 
-            assert 'value="2026-07-03 00:00:00"' in html
-            assert 'value="2026-07-04 00:00:00"' in html
-            assert 'value="2026-07-03 04:00:00"' not in html
+            assert 'value="2026-07-03T00:00:00"' in html
+            assert 'value="2026-07-04T00:00:00"' in html
+            assert 'value="2026-07-03T04:00:00"' not in html
             assert "客户A" in html
         finally:
             storage.conn.close()

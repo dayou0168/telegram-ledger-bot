@@ -374,14 +374,16 @@ def render_legacy_forms(
     token_input = hidden_input("token", token) if token else ""
     created_at_input = hidden_input("created_at", created_at) if created_at else ""
     if created_at:
-        date_fields = f'<input type="text" name="created_at" value="{escape(created_at)}" placeholder="日期">'
+        date_fields = f'<input type="date" name="created_at" value="{escape(created_at[:10])}" placeholder="日期">'
         search_date_inputs = created_at_input
     else:
+        begin_value = html_datetime_value(begin_time, timezone)
+        end_value = html_datetime_value(end_time, timezone)
         date_fields = f"""
-        <input type="text" name="begintime" value="{escape(begin_time)}">
-        <input type="text" name="endtime" value="{escape(end_time)}">
+        <input type="datetime-local" step="1" name="begintime" value="{escape(begin_value)}">
+        <input type="datetime-local" step="1" name="endtime" value="{escape(end_value)}">
         """
-        search_date_inputs = hidden_input("begintime", begin_time) + hidden_input("endtime", end_time)
+        search_date_inputs = hidden_input("begintime", begin_value) + hidden_input("endtime", end_value)
     return f"""
     <form method="GET" action="/day_xxb.php" class="date-form">
       <small>
@@ -409,6 +411,13 @@ def render_legacy_forms(
       </form>
     </div>
     """
+
+
+def html_datetime_value(value: str, timezone: tzinfo) -> str:
+    parsed = parse_stored_datetime(value, timezone)
+    if parsed is None:
+        return ""
+    return f"{parsed:%Y-%m-%dT%H:%M:%S}"
 
 
 def selected_attr(current: str, expected: str) -> str:
@@ -671,7 +680,6 @@ def render_bill_toolbar(
         all_days=data.all_days,
         use_created_at_only=data.use_day_key_records,
     )
-    history_links = render_history_links(storage, data.chat_id, data.day_key, token)
     return f"""
     <section class="bill-toolbar">
       <div class="bill-heading">
@@ -679,28 +687,40 @@ def render_bill_toolbar(
         <span>{escape(data.title_day)} · 群 ID：{data.chat_id}</span>
       </div>
       <nav class="toolbar-actions">
-        <a class="btn primary" href="{escape(download_url)}">下载账单</a>
+        <a class="toolbar-link" href="{escape(download_url)}">下载账单</a>
+        {render_history_menu(storage, data.chat_id, data.day_key, token)}
         {prev_next}
         <a class="btn" href="{escape(legacy_bill_path(data.chat_id, "today", token, cutoff_hour, timezone))}">今日</a>
         <a class="btn" href="{escape(legacy_bill_path(data.chat_id, "active", token, cutoff_hour, timezone, all_days=True))}">全部</a>
       </nav>
     </section>
-    <section class="history-panel">
-      <div class="history-title">历史账单</div>
-      <div class="history-list">{history_links}</div>
-    </section>
     """
 
 
-def render_history_links(storage: Storage, chat_id: int, current_day: str, token: str | None) -> str:
+def render_history_menu(storage: Storage, chat_id: int, current_day: str, token: str | None) -> str:
     days = list_bill_day_keys(storage, chat_id, limit=30)
     if not days:
-        return '<span class="muted">无历史账单</span>'
-    links = []
-    for day in days:
-        cls = "history-link active" if day == current_day else "history-link"
-        links.append(f'<a class="{cls}" href="{escape(legacy_created_at_path(chat_id, day, token))}">{escape(day)}</a>')
-    return "".join(links)
+        menu_body = '<span class="history-empty">无历史账单</span>'
+    else:
+        links = []
+        for day in days:
+            cls = "active" if day == current_day else ""
+            links.append(f'<a class="{cls}" href="{escape(legacy_created_at_path(chat_id, day, token))}">{escape(short_day_label(day))}</a>')
+        menu_body = "".join(links)
+    return f"""
+    <span class="history-menu">
+      <button type="button" class="history-trigger">历史账单⌄</button>
+      <span class="history-dropdown">{menu_body}</span>
+    </span>
+    """
+
+
+def short_day_label(day_key: str) -> str:
+    try:
+        day = datetime.strptime(day_key[:10], "%Y-%m-%d")
+    except ValueError:
+        return day_key
+    return f"{day:%m-%d}"
 
 
 def render_day_links(storage: Storage, chat_id: int, current_day: str, all_days: bool, token: str | None) -> str:
@@ -1247,11 +1267,10 @@ def page_shell(title: str, body: str) -> str:
     .content {{
       min-height: 250px;
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-columns: minmax(0, 1fr);
       gap: 16px;
     }}
     .bill-toolbar,
-    .history-panel,
     .date-form,
     .search-form,
     .box,
@@ -1289,6 +1308,76 @@ def page_shell(title: str, body: str) -> str:
       flex-wrap: wrap;
       gap: 8px;
       justify-content: flex-end;
+      align-items: center;
+    }}
+    .toolbar-link {{
+      display: inline-flex;
+      align-items: center;
+      min-height: 34px;
+      color: var(--muted);
+      font-weight: 700;
+      padding: 0 2px;
+      white-space: nowrap;
+    }}
+    .toolbar-link:hover {{
+      color: var(--text);
+      text-decoration: none;
+    }}
+    .history-menu {{
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      min-height: 34px;
+      z-index: 5;
+    }}
+    .history-trigger {{
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+      padding: 0 4px;
+      height: 34px;
+    }}
+    .history-trigger:hover,
+    .history-menu:focus-within .history-trigger {{
+      color: var(--text);
+    }}
+    .history-dropdown {{
+      display: none;
+      position: absolute;
+      top: 34px;
+      left: 0;
+      min-width: 92px;
+      max-height: 520px;
+      overflow-y: auto;
+      padding: 6px 0;
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      box-shadow: 0 12px 28px rgba(20, 42, 75, 0.16);
+    }}
+    .history-menu:hover .history-dropdown,
+    .history-menu:focus-within .history-dropdown {{
+      display: block;
+    }}
+    .history-dropdown a,
+    .history-empty {{
+      display: block;
+      padding: 3px 14px;
+      line-height: 22px;
+      color: var(--muted);
+      white-space: nowrap;
+    }}
+    .history-dropdown a:hover {{
+      background: var(--blue-soft);
+      color: var(--blue);
+      text-decoration: none;
+    }}
+    .history-dropdown a.active {{
+      color: var(--blue);
+      font-weight: 700;
     }}
     .btn {{
       display: inline-flex;
@@ -1315,43 +1404,6 @@ def page_shell(title: str, body: str) -> str:
     .btn.primary:hover {{
       background: #1d4ed8;
       color: #fff;
-    }}
-    .history-panel {{
-      display: flex;
-      align-items: flex-start;
-      gap: 12px;
-      padding: 14px 16px;
-      margin-bottom: 12px;
-    }}
-    .history-title {{
-      flex: 0 0 auto;
-      font-weight: 700;
-      line-height: 30px;
-    }}
-    .history-list {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-    }}
-    .history-link {{
-      display: inline-flex;
-      align-items: center;
-      min-height: 30px;
-      padding: 5px 10px;
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      background: var(--panel-soft);
-      color: var(--text);
-      font-weight: 600;
-    }}
-    .history-link.active {{
-      background: var(--blue-soft);
-      border-color: #93c5fd;
-      color: #1d4ed8;
-    }}
-    .history-link:hover {{
-      text-decoration: none;
-      border-color: #93c5fd;
     }}
     .panel {{
       width: 100%;
@@ -1420,7 +1472,9 @@ def page_shell(title: str, body: str) -> str:
       grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 10px;
     }}
-    .date-form input[type="text"] {{
+    .date-form input[type="text"],
+    .date-form input[type="date"],
+    .date-form input[type="datetime-local"] {{
       width: 100%;
       height: 34px;
       font-size: 14px;
@@ -1538,7 +1592,6 @@ def page_shell(title: str, body: str) -> str:
         flex-direction: column;
       }}
       .toolbar-actions {{ justify-content: flex-start; }}
-      .history-panel {{ flex-direction: column; }}
       .statistics {{ grid-template-columns: 1fr; }}
     }}
     @media (max-width: 640px) {{
@@ -1555,7 +1608,9 @@ def page_shell(title: str, body: str) -> str:
         padding: 8px 6px !important;
       }}
       .date-form small {{ grid-template-columns: 1fr; }}
-      .date-form input[type="text"] {{
+      .date-form input[type="text"],
+      .date-form input[type="date"],
+      .date-form input[type="datetime-local"] {{
         width: 100%;
         margin-bottom: 6px;
       }}
