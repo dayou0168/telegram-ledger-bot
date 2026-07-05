@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, tzinfo
+from datetime import datetime, timedelta, timezone, tzinfo
 from decimal import Decimal
 from html import escape
 from http import HTTPStatus
@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from .bot import (
+    detect_usdt_network,
     format_fee_multiplier,
     format_money,
     format_number,
@@ -74,6 +75,18 @@ def make_bill_request_handler(config: Config) -> type[BaseHTTPRequestHandler]:
         def do_HEAD(self) -> None:
             self.write_response(include_body=False)
 
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            raw_body = self.rfile.read(length).decode("utf-8", errors="replace") if length > 0 else ""
+            response = handle_bill_web_post_response(config, self.path, raw_body)
+            self.send_response(response.status)
+            self.send_header("Content-Type", response.content_type)
+            self.send_header("Content-Length", str(len(response.body)))
+            for key, value in response.headers.items():
+                self.send_header(key, value)
+            self.end_headers()
+            self.wfile.write(response.body)
+
         def write_response(self, *, include_body: bool) -> None:
             response = handle_bill_web_response(config, self.path)
             self.send_response(response.status)
@@ -109,6 +122,8 @@ def handle_bill_web_response(config: Config, raw_path: str) -> BillWebResponse:
         return html_response(HTTPStatus.OK, simple_page("OK", "<p>ok</p>"))
     if path == "/":
         return html_response(HTTPStatus.OK, simple_page("账单服务", "<p>账单网页服务已启动。</p>"))
+    if path == "/admin":
+        return handle_admin_get_response(config, query)
 
     if not bill_web_token_allowed(config, query):
         return html_response(HTTPStatus.FORBIDDEN, simple_page("访问受限", "<p>链接无效或缺少访问令牌。</p>"))
@@ -179,6 +194,48 @@ def handle_bill_web_response(config: Config, raw_path: str) -> BillWebResponse:
     return html_response(HTTPStatus.OK, body)
 
 
+def handle_bill_web_post_response(config: Config, raw_path: str, raw_body: str) -> BillWebResponse:
+    parsed = urlparse(raw_path)
+    query = parse_qs(parsed.query)
+    path = parsed.path.rstrip("/") or "/"
+    if path != "/admin":
+        return html_response(HTTPStatus.NOT_FOUND, simple_page("404", "<p>页面不存在。</p>"))
+    token = admin_token_from_query(query)
+    if not admin_web_token_allowed(config, query):
+        return html_response(HTTPStatus.FORBIDDEN, simple_page("访问受限", "<p>后台链接无效或缺少访问令牌。</p>"))
+    form = parse_qs(raw_body)
+    storage = Storage(config.db_path)
+    try:
+        message = apply_admin_action(storage, form, config.timezone)
+    except (ValueError, KeyError) as exc:
+        message = str(exc)
+    finally:
+        storage.conn.close()
+    params = {"admin_token": token, "msg": message}
+    return redirect_response("/admin?" + urlencode(params))
+
+
+def handle_admin_get_response(config: Config, query: dict[str, list[str]]) -> BillWebResponse:
+    if not admin_web_token_allowed(config, query):
+        return html_response(HTTPStatus.FORBIDDEN, simple_page("访问受限", "<p>后台链接无效或缺少访问令牌。</p>"))
+    token = admin_token_from_query(query)
+    message = (query.get("msg") or [""])[0]
+    storage = Storage(config.db_path)
+    try:
+        body = render_admin_page(storage, config, token=token, message=message)
+    finally:
+        storage.conn.close()
+    return html_response(HTTPStatus.OK, body)
+
+
+def redirect_response(location: str) -> BillWebResponse:
+    return BillWebResponse(
+        int(HTTPStatus.SEE_OTHER),
+        b"",
+        headers={"Location": location, "Cache-Control": "no-store"},
+    )
+
+
 def html_response(status: int, body: str) -> BillWebResponse:
     return BillWebResponse(int(status), body.encode("utf-8"))
 
@@ -187,6 +244,117 @@ def bill_web_token_allowed(config: Config, query: dict[str, list[str]]) -> bool:
     if not config.bill_web_token:
         return True
     return (query.get("token") or [""])[0] == config.bill_web_token
+
+
+def admin_token_from_query(query: dict[str, list[str]]) -> str:
+    return (query.get("admin_token") or query.get("token") or [""])[0]
+
+
+def admin_web_token_allowed(config: Config, query: dict[str, list[str]]) -> bool:
+    token = getattr(config, "admin_web_token", None)
+    if not token:
+        return False
+    return admin_token_from_query(query) == token
+
+
+def form_value(form: dict[str, list[str]], name: str, default: str = "") -> str:
+    return (form.get(name) or [default])[0].strip()
+
+
+def parse_admin_chat_ids(text: str) -> list[int]:
+    return [int(value) for value in re.findall(r"-\d{5,20}", text)]
+
+
+def apply_admin_action(storage: Storage, form: dict[str, list[str]], timezone: tzinfo) -> str:
+    action = form_value(form, "action")
+    now = datetime.now(timezone)
+    if action == "add_whitelist":
+        chat_id = int(form_value(form, "chat_id"))
+        address = form_value(form, "address")
+        network = detect_usdt_network(address)
+        if network != "TRC20":
+            raise ValueError("白名单地址格式不正确，只支持 TRC20 的 T 地址。")
+        storage.get_group(chat_id)
+        label = form_value(form, "label") or None
+        image_url = form_value(form, "image_url") or None
+        storage.add_address_whitelist(
+            chat_id=chat_id,
+            network=network,
+            address=address,
+            label=label,
+            image_url=image_url,
+            created_by=0,
+            now=now,
+        )
+        return "白名单地址已保存。"
+    if action == "remove_whitelist":
+        chat_id = int(form_value(form, "chat_id"))
+        address = form_value(form, "address")
+        removed = storage.remove_address_whitelist(chat_id, address, now=now)
+        return "白名单地址已删除。" if removed else "没有找到这个白名单地址。"
+    if action == "create_broadcast_group":
+        name = form_value(form, "group_name")
+        storage.create_named_broadcast_group(name, created_by=0, now=now)
+        return f"广播分组已保存：{name}"
+    if action == "delete_broadcast_group":
+        name = form_value(form, "group_name")
+        deleted = storage.delete_named_broadcast_group(name)
+        return "广播分组已删除。" if deleted else "没有找到这个广播分组。"
+    if action == "add_broadcast_members":
+        name = form_value(form, "group_name")
+        chat_ids = parse_admin_chat_ids(form_value(form, "chat_ids"))
+        added, _known_ids, missing_ids = storage.add_broadcast_group_members(name, chat_ids, now=now)
+        message = f"已添加 {added} 个群到分组。"
+        if missing_ids:
+            message += " 未保存群ID：" + " ".join(str(value) for value in missing_ids)
+        return message
+    if action == "remove_broadcast_members":
+        name = form_value(form, "group_name")
+        chat_ids = parse_admin_chat_ids(form_value(form, "chat_ids"))
+        removed = storage.remove_broadcast_group_members(name, chat_ids, now=now)
+        return f"已从分组移除 {removed} 个群。"
+    if action == "grant_broadcast_permission":
+        user_id = int(form_value(form, "user_id"))
+        group_name = form_value(form, "group_name")
+        changed = storage.grant_broadcast_group_permission(group_name, user_id=user_id, created_by=0, now=now)
+        return "分组权限已授权。" if changed else "这个用户已拥有该分组权限。"
+    if action == "revoke_broadcast_permission":
+        user_id = int(form_value(form, "user_id"))
+        group_name = form_value(form, "group_name")
+        changed = storage.revoke_broadcast_group_permission(group_name, user_id=user_id)
+        return "分组权限已取消。" if changed else "这个用户没有该分组权限。"
+    if action == "add_broadcast_operator":
+        user_id = int(form_value(form, "user_id"))
+        remark = form_value(form, "remark") or None
+        storage.add_broadcast_operator(user_id=user_id, created_by=0, remark=remark, now=now)
+        return "广播操作人已保存。"
+    if action == "disable_broadcast_operator":
+        user_id = int(form_value(form, "user_id"))
+        changed = storage.disable_broadcast_operator(user_id=user_id, now=now)
+        return "广播操作人已禁用。" if changed else "没有找到这个广播操作人。"
+    if action == "grant_broadcast_chat_permission":
+        user_id = int(form_value(form, "user_id"))
+        chat_id = int(form_value(form, "chat_id"))
+        changed = storage.grant_broadcast_chat_permission(chat_id=chat_id, user_id=user_id, created_by=0, now=now)
+        return "单群权限已授权。" if changed else "这个用户已拥有该单群权限。"
+    if action == "revoke_broadcast_chat_permission":
+        user_id = int(form_value(form, "user_id"))
+        chat_id = int(form_value(form, "chat_id"))
+        changed = storage.revoke_broadcast_chat_permission(chat_id=chat_id, user_id=user_id)
+        return "单群权限已取消。" if changed else "这个用户没有该单群权限。"
+    if action == "set_broadcast_replacement":
+        enabled_raw = form_value(form, "enabled", "0")
+        storage.update_broadcast_replacement_settings(
+            now=now,
+            enabled=1 if enabled_raw in {"1", "on", "true"} else 0,
+            text=form_value(form, "text") or None,
+            photo=form_value(form, "photo") or None,
+            updated_by=0,
+            clear_text=not bool(form_value(form, "text")),
+            clear_photo=not bool(form_value(form, "photo")),
+        )
+        return "广播替换设置已保存。"
+    raise ValueError("未知后台操作。")
 
 
 def day_key_from_legacy_query(query: dict[str, list[str]]) -> str:
@@ -285,6 +453,312 @@ def render_bill_page(
     </div>
     """
     return page_shell(f"{data.group_title} - {data.title_day}", content)
+
+
+def render_admin_page(storage: Storage, config: Config, *, token: str, message: str = "") -> str:
+    groups = storage.list_broadcast_groups()
+    whitelist_rows = storage.list_address_whitelist()
+    named_groups = storage.list_named_broadcast_groups()
+    permissions = storage.list_broadcast_group_permissions()
+    chat_permissions = storage.list_broadcast_chat_permissions()
+    operators = storage.list_broadcast_operators()
+    replacement = storage.get_broadcast_replacement_settings(datetime.now(config.timezone))
+    notice = f'<div class="admin-notice">{escape(message)}</div>' if message else ""
+    content = f"""
+    <div class="content-wrapper">
+      <div class="container admin-container">
+        <header class="admin-header">
+          <div>
+            <div class="brand">Telegram 记账机器人</div>
+            <h1>后台管理</h1>
+            <p>管理地址白名单、广播分组、分组权限和已保存群组。</p>
+          </div>
+          <a class="btn" href="/admin?admin_token={quote(token)}">刷新</a>
+        </header>
+        {notice}
+        <section class="admin-grid">
+          <div class="admin-card">
+            <h2>地址白名单</h2>
+            <form method="POST" action="/admin?admin_token={quote(token)}" class="admin-form">
+              {admin_token_input(token)}
+              {hidden_input("action", "add_whitelist")}
+              <input name="chat_id" placeholder="群ID，例如 -100111" required>
+              <input name="address" placeholder="TRC20 地址" required>
+              <input name="label" placeholder="备注，可选">
+              <input name="image_url" placeholder="图片URL，可选">
+              <button type="submit">保存白名单</button>
+            </form>
+            <form method="POST" action="/admin?admin_token={quote(token)}" class="admin-form inline-form">
+              {admin_token_input(token)}
+              {hidden_input("action", "remove_whitelist")}
+              <input name="chat_id" placeholder="群ID" required>
+              <input name="address" placeholder="TRC20 地址" required>
+              <button type="submit">删除白名单</button>
+            </form>
+            {render_whitelist_table(whitelist_rows)}
+          </div>
+
+          <div class="admin-card">
+            <h2>广播分组</h2>
+            <form method="POST" action="/admin?admin_token={quote(token)}" class="admin-form inline-form">
+              {admin_token_input(token)}
+              {hidden_input("action", "create_broadcast_group")}
+              <input name="group_name" placeholder="分组名，例如 财务" required>
+              <button type="submit">新建/更新分组</button>
+            </form>
+            <form method="POST" action="/admin?admin_token={quote(token)}" class="admin-form inline-form">
+              {admin_token_input(token)}
+              {hidden_input("action", "delete_broadcast_group")}
+              <input name="group_name" placeholder="分组名" required>
+              <button type="submit">删除分组</button>
+            </form>
+            <form method="POST" action="/admin?admin_token={quote(token)}" class="admin-form">
+              {admin_token_input(token)}
+              {hidden_input("action", "add_broadcast_members")}
+              <input name="group_name" placeholder="分组名" required>
+              <textarea name="chat_ids" placeholder="批量添加群ID，例如 -100111 -100222" required></textarea>
+              <button type="submit">批量添加群组</button>
+            </form>
+            <form method="POST" action="/admin?admin_token={quote(token)}" class="admin-form">
+              {admin_token_input(token)}
+              {hidden_input("action", "remove_broadcast_members")}
+              <input name="group_name" placeholder="分组名" required>
+              <textarea name="chat_ids" placeholder="批量移除群ID，例如 -100111 -100222" required></textarea>
+              <button type="submit">批量移除群组</button>
+            </form>
+            {render_broadcast_group_table(storage, named_groups)}
+          </div>
+
+          <div class="admin-card">
+            <h2>广播权限</h2>
+            <p class="muted">宿主和服务器默认操作人拥有全部权限。普通广播操作人只拥有被授权的分组或单群。</p>
+            <form method="POST" action="/admin?admin_token={quote(token)}" class="admin-form inline-form">
+              {admin_token_input(token)}
+              {hidden_input("action", "add_broadcast_operator")}
+              <input name="user_id" placeholder="操作人UID" required>
+              <input name="remark" placeholder="备注，可选">
+              <button type="submit">保存操作人</button>
+            </form>
+            <form method="POST" action="/admin?admin_token={quote(token)}" class="admin-form inline-form">
+              {admin_token_input(token)}
+              {hidden_input("action", "disable_broadcast_operator")}
+              <input name="user_id" placeholder="操作人UID" required>
+              <button type="submit">禁用操作人</button>
+            </form>
+            <form method="POST" action="/admin?admin_token={quote(token)}" class="admin-form inline-form">
+              {admin_token_input(token)}
+              {hidden_input("action", "grant_broadcast_permission")}
+              <input name="user_id" placeholder="操作人UID" required>
+              <input name="group_name" placeholder="分组名" required>
+              <button type="submit">授权分组</button>
+            </form>
+            <form method="POST" action="/admin?admin_token={quote(token)}" class="admin-form inline-form">
+              {admin_token_input(token)}
+              {hidden_input("action", "revoke_broadcast_permission")}
+              <input name="user_id" placeholder="操作人UID" required>
+              <input name="group_name" placeholder="分组名" required>
+              <button type="submit">取消授权</button>
+            </form>
+            <form method="POST" action="/admin?admin_token={quote(token)}" class="admin-form inline-form">
+              {admin_token_input(token)}
+              {hidden_input("action", "grant_broadcast_chat_permission")}
+              <input name="user_id" placeholder="操作人UID" required>
+              <input name="chat_id" placeholder="单群ID，例如 -100111" required>
+              <button type="submit">授权单群</button>
+            </form>
+            <form method="POST" action="/admin?admin_token={quote(token)}" class="admin-form inline-form">
+              {admin_token_input(token)}
+              {hidden_input("action", "revoke_broadcast_chat_permission")}
+              <input name="user_id" placeholder="操作人UID" required>
+              <input name="chat_id" placeholder="单群ID，例如 -100111" required>
+              <button type="submit">取消单群</button>
+            </form>
+            {render_operator_table(operators)}
+            {render_permission_table(permissions, chat_permissions)}
+          </div>
+
+          <div class="admin-card">
+            <h2>广播替换</h2>
+            <p class="muted">开启后，广播发送时会使用这里设置的图片/文字替换原始内容；关闭后按原始广播内容发送。</p>
+            <form method="POST" action="/admin?admin_token={quote(token)}" class="admin-form">
+              {admin_token_input(token)}
+              {hidden_input("action", "set_broadcast_replacement")}
+              <select name="enabled">
+                <option value="0"{selected_attr(str(replacement["enabled"]), "0")}>关闭</option>
+                <option value="1"{selected_attr(str(replacement["enabled"]), "1")}>开启</option>
+              </select>
+              <input name="photo" placeholder="图片 file_id 或 URL" value="{escape(replacement['photo'] or '', quote=True)}">
+              <textarea name="text" placeholder="替换文字，可作为图片说明">{escape(replacement['text'] or '')}</textarea>
+              <button type="submit">保存替换设置</button>
+            </form>
+            <p class="muted">当前状态：{'开启' if replacement['enabled'] else '关闭'}</p>
+          </div>
+
+          <div class="admin-card admin-card-wide">
+            <h2>已保存群组</h2>
+            <p class="muted">机器人被邀请进群或群内有人发言后会自动保存群组，群名会随消息自动更新。</p>
+            {render_admin_group_table(groups, config)}
+          </div>
+        </section>
+      </div>
+    </div>
+    """
+    return page_shell("后台管理", content)
+
+
+def admin_token_input(token: str) -> str:
+    return hidden_input("admin_token", token)
+
+
+def render_whitelist_table(rows: list[Any]) -> str:
+    if not rows:
+        return '<p class="empty admin-empty">暂无白名单地址</p>'
+    body = []
+    for row in rows:
+        status = "启用" if row["enabled"] else "停用"
+        title = row["chat_title"] or row["chat_id"]
+        image = f'<a href="{escape(row["image_url"], quote=True)}" target="_blank">图片</a>' if row["image_url"] else ""
+        body.append(
+            "<tr>"
+            f"<td>{escape(str(title))}<br><small>{row['chat_id']}</small></td>"
+            f"<td><code>{escape(row['address'])}</code></td>"
+            f"<td>{escape(row['label'] or '')}</td>"
+            f"<td>{image}</td>"
+            f"<td>{status}</td>"
+            "</tr>"
+        )
+    return f"""
+    <div class="table-wrap admin-table-wrap">
+      <table class="records admin-table">
+        <thead><tr><td>群组</td><td>地址</td><td>备注</td><td>图片</td><td>状态</td></tr></thead>
+        <tbody>{''.join(body)}</tbody>
+      </table>
+    </div>
+    """
+
+
+def render_broadcast_group_table(storage: Storage, rows: list[Any]) -> str:
+    if not rows:
+        return '<p class="empty admin-empty">暂无广播分组</p>'
+    body = []
+    for row in rows:
+        try:
+            members = storage.list_broadcast_group_members(row["name"])
+        except KeyError:
+            members = []
+        member_preview = "<br>".join(
+            f"{member['chat_id']} {escape(member['chat_title'] or '(未命名群)')}" for member in members[:8]
+        )
+        if len(members) > 8:
+            member_preview += f"<br>... 还有 {len(members) - 8} 个"
+        body.append(
+            "<tr>"
+            f"<td>{escape(row['name'])}</td>"
+            f"<td>{row['member_count']}</td>"
+            f"<td>{member_preview or '暂无群组'}</td>"
+            "</tr>"
+        )
+    return f"""
+    <div class="table-wrap admin-table-wrap">
+      <table class="records admin-table">
+        <thead><tr><td>分组</td><td>群数</td><td>群组</td></tr></thead>
+        <tbody>{''.join(body)}</tbody>
+      </table>
+    </div>
+    """
+
+
+def render_operator_table(rows: list[Any]) -> str:
+    if not rows:
+        return '<p class="empty admin-empty">暂无广播操作人</p>'
+    body = []
+    for row in rows:
+        remark = row["remark"] or ""
+        body.append(
+            "<tr>"
+            f"<td>{row['user_id']}</td>"
+            f"<td>{escape(row['status'])}</td>"
+            f"<td>{escape(remark)}</td>"
+            f"<td>{row['created_by']}</td>"
+            "</tr>"
+        )
+    return f"""
+    <div class="table-wrap admin-table-wrap">
+      <table class="records admin-table">
+        <thead><tr><td>UID</td><td>状态</td><td>备注</td><td>上级</td></tr></thead>
+        <tbody>{''.join(body)}</tbody>
+      </table>
+    </div>
+    """
+
+
+def render_permission_table(group_rows: list[Any], chat_rows: list[Any]) -> str:
+    if not group_rows and not chat_rows:
+        return '<p class="empty admin-empty">暂无单独广播权限</p>'
+    body = []
+    for row in group_rows:
+        body.append(
+            "<tr>"
+            f"<td>{row['user_id']}</td>"
+            "<td>分组</td>"
+            f"<td>{escape(row['name'])}</td>"
+            f"<td>{row['created_by']}</td>"
+            "</tr>"
+        )
+    for row in chat_rows:
+        title = row["chat_title"] or "(未命名群)"
+        body.append(
+            "<tr>"
+            f"<td>{row['user_id']}</td>"
+            "<td>单群</td>"
+            f"<td>{row['chat_id']} {escape(title)}</td>"
+            f"<td>{row['created_by']}</td>"
+            "</tr>"
+        )
+    body_html = "".join(body)
+    return f"""
+    <div class="table-wrap admin-table-wrap">
+      <table class="records admin-table">
+        <thead><tr><td>操作人UID</td><td>类型</td><td>授权目标</td><td>授权人</td></tr></thead>
+        <tbody>{body_html}</tbody>
+      </table>
+    </div>
+    """
+
+
+def render_admin_group_table(rows: list[Any], config: Config) -> str:
+    if not rows:
+        return '<p class="empty admin-empty">暂无已保存群组</p>'
+    body = []
+    for row in rows:
+        title = row["chat_title"] or "(未命名群)"
+        status = "记账开启" if row["active"] else "仅广播/暂停记账"
+        cutoff = "关闭" if int(row["day_cutoff_hour"]) < 0 else f"{int(row['day_cutoff_hour']):02d}:00"
+        bill_link = admin_bill_link(row["chat_id"], config)
+        body.append(
+            "<tr>"
+            f"<td>{row['chat_id']}</td>"
+            f"<td>{escape(title)}</td>"
+            f"<td>{status}</td>"
+            f"<td>{cutoff}</td>"
+            f"<td><a href=\"{bill_link}\" target=\"_blank\">账单</a></td>"
+            "</tr>"
+        )
+    return f"""
+    <div class="table-wrap admin-table-wrap">
+      <table class="records admin-table">
+        <thead><tr><td>群ID</td><td>群名</td><td>状态</td><td>日切</td><td>入口</td></tr></thead>
+        <tbody>{''.join(body)}</tbody>
+      </table>
+    </div>
+    """
+
+
+def admin_bill_link(chat_id: int, config: Config) -> str:
+    params = {"chat_id": str(chat_id)}
+    if config.bill_web_token:
+        params["token"] = config.bill_web_token
+    return "/day_xxb.php?" + urlencode(params)
 
 
 def load_bill_page_data(
@@ -1179,7 +1653,7 @@ def xlsx_app_props() -> str:
 
 
 def xlsx_core_props() -> str:
-    created = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    created = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     return f"""<?xml version="1.0" encoding="UTF-8" standalone="no"?>
 <cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
   <dcterms:created xsi:type="dcterms:W3CDTF">{created}</dcterms:created>
@@ -1225,17 +1699,20 @@ def page_shell(title: str, body: str) -> str:
     * {{ box-sizing: border-box; }}
     :root {{
       color-scheme: light;
-      --bg: #f3f6fb;
+      --bg: #edf2f7;
       --panel: #ffffff;
-      --panel-soft: #f8fafc;
-      --line: #d8e1ed;
-      --line-soft: #edf2f7;
-      --text: #15233b;
-      --muted: #65758b;
-      --blue: #2563eb;
-      --blue-soft: #eff6ff;
+      --panel-soft: #f6f8fb;
+      --line: #c9d5e3;
+      --line-soft: #e5ecf4;
+      --text: #172336;
+      --muted: #627188;
+      --blue: #2d5f8a;
+      --blue-dark: #244d72;
+      --blue-soft: #e7f0f8;
+      --gold: #b8872c;
+      --gold-soft: #fff6df;
       --green: #047857;
-      --shadow: 0 10px 28px rgba(20, 42, 75, 0.08);
+      --shadow: 0 12px 30px rgba(36, 77, 114, 0.10);
     }}
     body, table, input, select {{
       font-family: Arial, "Microsoft YaHei", "PingFang SC", sans-serif;
@@ -1252,7 +1729,7 @@ def page_shell(title: str, body: str) -> str:
       text-decoration: none;
     }}
     a:hover {{
-      color: #1d4ed8;
+      color: var(--gold);
       text-decoration: underline;
     }}
     .content-wrapper {{
@@ -1287,6 +1764,7 @@ def page_shell(title: str, body: str) -> str:
       align-items: center;
       padding: 18px 20px;
       margin-bottom: 12px;
+      border-top: 3px solid var(--blue);
     }}
     .bill-heading {{
       display: flex;
@@ -1298,6 +1776,7 @@ def page_shell(title: str, body: str) -> str:
       font-size: 22px;
       line-height: 1.25;
       overflow-wrap: anywhere;
+      color: var(--text);
     }}
     .bill-heading span,
     .muted {{
@@ -1320,7 +1799,7 @@ def page_shell(title: str, body: str) -> str:
       white-space: nowrap;
     }}
     .toolbar-link:hover {{
-      color: var(--text);
+      color: var(--gold);
       text-decoration: none;
     }}
     .history-menu {{
@@ -1376,8 +1855,9 @@ def page_shell(title: str, body: str) -> str:
       text-decoration: none;
     }}
     .history-dropdown a.active {{
-      color: var(--blue);
+      color: var(--gold);
       font-weight: 700;
+      background: var(--gold-soft);
     }}
     .btn {{
       display: inline-flex;
@@ -1402,7 +1882,7 @@ def page_shell(title: str, body: str) -> str:
       color: #fff;
     }}
     .btn.primary:hover {{
-      background: #1d4ed8;
+      background: var(--blue-dark);
       color: #fff;
     }}
     .panel {{
@@ -1434,6 +1914,16 @@ def page_shell(title: str, body: str) -> str:
       font-weight: bold;
       line-height: 1.2;
     }}
+    .box-title::before {{
+      content: "";
+      display: inline-block;
+      width: 4px;
+      height: 16px;
+      margin-right: 8px;
+      border-radius: 99px;
+      background: var(--gold);
+      vertical-align: -2px;
+    }}
     .box-body {{
       padding: 0;
     }}
@@ -1455,7 +1945,7 @@ def page_shell(title: str, body: str) -> str:
     .records thead td,
     .records .table-head td {{
       font-weight: 600;
-      color: #334155;
+      color: #31435a;
       background: var(--panel-soft);
     }}
     .records td:first-child {{
@@ -1522,11 +2012,14 @@ def page_shell(title: str, body: str) -> str:
       flex: 0 0 86px;
       height: 34px;
       border-radius: 6px;
-      background: var(--text);
+      background: var(--blue);
       color: #fff;
       border: 0;
       cursor: pointer;
       font-weight: 700;
+    }}
+    .search-form input[type="submit"]:hover {{
+      background: var(--blue-dark);
     }}
     .statistics {{
       grid-column: 1 / -1;
@@ -1545,7 +2038,7 @@ def page_shell(title: str, body: str) -> str:
     }}
     .statistics span {{
       font-weight: bold;
-      color: var(--text);
+      color: var(--blue);
       display: block;
       margin-top: 2px;
     }}
@@ -1572,6 +2065,7 @@ def page_shell(title: str, body: str) -> str:
     }}
     .footer-links a:hover {{
       background: var(--blue-soft);
+      color: var(--gold);
       text-decoration: none;
     }}
     .copyable {{
@@ -1579,7 +2073,7 @@ def page_shell(title: str, body: str) -> str:
       border-bottom: 1px dotted #94a3b8;
     }}
     .copied {{
-      color: var(--green);
+      color: var(--gold);
     }}
     .empty {{
       color: var(--muted);
@@ -1589,9 +2083,126 @@ def page_shell(title: str, body: str) -> str:
     .simple {{
       padding: 40px 33px;
     }}
+    .admin-container {{
+      max-width: 1180px;
+    }}
+    .admin-header {{
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: center;
+      padding: 18px 20px;
+      margin-bottom: 12px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+    }}
+    .admin-header h1 {{
+      margin: 2px 0 4px;
+      font-size: 22px;
+      line-height: 1.2;
+    }}
+    .admin-header p {{
+      margin: 0;
+      color: var(--muted);
+    }}
+    .brand {{
+      color: var(--gold);
+      font-weight: 700;
+    }}
+    .admin-notice {{
+      margin-bottom: 12px;
+      padding: 10px 12px;
+      border: 1px solid #bbf7d0;
+      border-radius: 6px;
+      background: #f0fdf4;
+      color: #166534;
+      font-weight: 600;
+    }}
+    .admin-grid {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }}
+    .admin-card {{
+      min-width: 0;
+      padding: 16px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+    }}
+    .admin-card-wide {{
+      grid-column: 1 / -1;
+    }}
+    .admin-card h2 {{
+      margin: 0 0 10px;
+      font-size: 17px;
+      line-height: 1.25;
+    }}
+    .admin-card p {{
+      margin: 0 0 10px;
+    }}
+    .admin-form {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-bottom: 10px;
+    }}
+    .admin-form.inline-form {{
+      grid-template-columns: minmax(0, 1fr) auto;
+    }}
+    .admin-form input,
+    .admin-form textarea,
+    .admin-form select {{
+      width: 100%;
+      min-height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 7px 10px;
+      background: #fff;
+      font: inherit;
+    }}
+    .admin-form textarea {{
+      grid-column: 1 / -1;
+      min-height: 70px;
+      resize: vertical;
+    }}
+    .admin-form button {{
+      min-height: 34px;
+      border: 0;
+      border-radius: 6px;
+      padding: 7px 12px;
+      background: var(--text);
+      color: #fff;
+      cursor: pointer;
+      font-weight: 700;
+      white-space: nowrap;
+    }}
+    .admin-table-wrap {{
+      max-height: 360px;
+      overflow: auto;
+      border: 1px solid var(--line-soft);
+      border-radius: 6px;
+    }}
+    .admin-table td {{
+      font-size: 13px;
+      text-align: center;
+    }}
+    .admin-empty {{
+      border: 1px dashed var(--line);
+      border-radius: 6px;
+      background: var(--panel-soft);
+    }}
     @media (max-width: 920px) {{
       .content-wrapper {{ padding: 12px; }}
       .content {{ grid-template-columns: 1fr; }}
+      .admin-grid {{ grid-template-columns: 1fr; }}
+      .admin-header {{
+        align-items: stretch;
+        flex-direction: column;
+      }}
       .bill-toolbar {{
         align-items: stretch;
         flex-direction: column;

@@ -83,6 +83,27 @@ class TelegramClient:
             payload["reply_markup"] = reply_markup
         return self.request("sendMessage", payload)
 
+    def send_photo(
+        self,
+        chat_id: int,
+        photo: str,
+        *,
+        caption: str | None = None,
+        reply_markup: dict[str, Any] | None = None,
+        parse_mode: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "photo": photo,
+        }
+        if caption:
+            payload["caption"] = caption
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        return self.request("sendPhoto", payload)
+
     def answer_callback_query(self, callback_query_id: str, text: str | None = None) -> None:
         payload: dict[str, Any] = {"callback_query_id": callback_query_id}
         if text:

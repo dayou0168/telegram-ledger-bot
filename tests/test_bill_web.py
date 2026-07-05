@@ -9,7 +9,13 @@ from urllib.parse import parse_qs, urlparse
 from zipfile import ZipFile
 
 from ledger_bot.bot import LedgerBot
-from ledger_bot.bill_web import day_key_from_legacy_query, handle_bill_web_request, handle_bill_web_response, render_bill_page
+from ledger_bot.bill_web import (
+    day_key_from_legacy_query,
+    handle_bill_web_post_response,
+    handle_bill_web_request,
+    handle_bill_web_response,
+    render_bill_page,
+)
 from ledger_bot.storage import Storage
 
 
@@ -192,6 +198,102 @@ def test_bill_web_token_blocks_missing_token() -> None:
 
     assert status == 403
     assert "访问受限" in body
+
+
+def test_admin_page_requires_admin_token() -> None:
+    config = SimpleNamespace(
+        admin_web_token="admin-secret",
+        bill_web_token=None,
+        db_path=Path("missing.db"),
+        timezone=BEIJING_TZ,
+        p2p_rate_trade_methods=("aliPay",),
+    )
+
+    response = handle_bill_web_response(config, "/admin")
+
+    assert response.status == 403
+    assert "访问受限" in response.body.decode("utf-8")
+
+
+def test_admin_page_renders_management_sections() -> None:
+    with TemporaryDirectory() as tmp:
+        storage = Storage(Path(tmp) / "bot.db")
+        try:
+            now = datetime(2026, 7, 5, 12, tzinfo=BEIJING_TZ)
+            storage.ensure_group(-1001, "测试群", now)
+        finally:
+            storage.conn.close()
+
+        config = SimpleNamespace(
+            admin_web_token="admin-secret",
+            bill_web_token="bill-secret",
+            db_path=Path(tmp) / "bot.db",
+            timezone=BEIJING_TZ,
+            p2p_rate_trade_methods=("aliPay",),
+        )
+
+        response = handle_bill_web_response(config, "/admin?admin_token=admin-secret")
+        body = response.body.decode("utf-8")
+
+        assert response.status == 200
+        assert "后台管理" in body
+        assert "地址白名单" in body
+        assert "广播权限" in body
+        assert "广播替换" in body
+        assert "已保存群组" in body
+        assert "测试群" in body
+
+
+def test_admin_post_updates_whitelist_broadcast_permissions_and_replacement() -> None:
+    with TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "bot.db"
+        storage = Storage(db_path)
+        try:
+            now = datetime(2026, 7, 5, 12, tzinfo=BEIJING_TZ)
+            storage.ensure_group(-100111, "测试群", now)
+        finally:
+            storage.conn.close()
+
+        config = SimpleNamespace(
+            admin_web_token="admin-secret",
+            bill_web_token=None,
+            db_path=db_path,
+            timezone=BEIJING_TZ,
+            p2p_rate_trade_methods=("aliPay",),
+        )
+
+        posts = [
+            "action=add_broadcast_operator&user_id=2001&remark=level1",
+            "action=create_broadcast_group&group_name=finance",
+            "action=add_broadcast_members&group_name=finance&chat_ids=-100111",
+            "action=grant_broadcast_permission&user_id=2001&group_name=finance",
+            "action=grant_broadcast_chat_permission&user_id=2001&chat_id=-100111",
+            (
+                "action=add_whitelist&chat_id=-100111"
+                "&address=TGhAAySHUUcEGua33pZZ88wP3bA6X5eQuZ"
+                "&label=monitor"
+            ),
+            "action=set_broadcast_replacement&enabled=1&text=hello&photo=file123",
+        ]
+        for raw_body in posts:
+            response = handle_bill_web_post_response(config, "/admin?admin_token=admin-secret", raw_body)
+            assert response.status == 303
+
+        storage = Storage(db_path)
+        try:
+            assert storage.get_broadcast_operator(2001)["remark"] == "level1"
+            assert storage.user_can_access_broadcast_group(2001, "finance")
+            assert storage.user_can_access_broadcast_chat(2001, -100111)
+            assert storage.target_chat_ids_for_broadcast_group("finance") == [-100111]
+            whitelist = storage.get_address_whitelist(-100111, "TGhAAySHUUcEGua33pZZ88wP3bA6X5eQuZ")
+            assert whitelist is not None
+            assert whitelist["label"] == "monitor"
+            replacement = storage.get_broadcast_replacement_settings()
+            assert replacement["enabled"] == 1
+            assert replacement["text"] == "hello"
+            assert replacement["photo"] == "file123"
+        finally:
+            storage.conn.close()
 
 
 def test_legacy_created_at_uses_day_key_records_without_window() -> None:

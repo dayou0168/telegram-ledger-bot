@@ -325,6 +325,65 @@ def test_broadcast_job_stores_source_message_and_notify_all() -> None:
             assert job["message_kind"] == "photo"
             assert job["notify_all"] == 1
             assert job["target_chat_ids"] == "[-1001, -1002]"
+            targets = storage.list_broadcast_job_targets(job["id"])
+            assert [row["target_chat_id"] for row in targets] == [-1001, -1002]
+            assert [row["status"] for row in targets] == ["pending", "pending"]
+        finally:
+            storage.conn.close()
+
+
+def test_broadcast_operator_group_and_chat_permissions() -> None:
+    with TemporaryDirectory() as tmp:
+        storage = Storage(Path(tmp) / "bot.db")
+        try:
+            now = datetime(2026, 7, 4, 12, tzinfo=BEIJING_TZ)
+            storage.ensure_group(-1001, "A", now)
+            storage.ensure_group(-1002, "B", now)
+            storage.create_named_broadcast_group("finance", created_by=10, now=now)
+            storage.add_broadcast_group_members("finance", [-1001], now=now)
+
+            operator = storage.add_broadcast_operator(user_id=20, created_by=10, remark="level1", now=now)
+            assert operator["status"] == "active"
+
+            assert storage.grant_broadcast_group_permission("finance", user_id=20, created_by=10, now=now)
+            assert storage.grant_broadcast_chat_permission(chat_id=-1002, user_id=20, created_by=10, now=now)
+
+            groups = storage.list_named_broadcast_groups_for_user(20)
+            assert [row["name"] for row in groups] == ["finance"]
+            assert storage.target_chat_ids_for_user_broadcast_groups(20) == [-1001]
+            assert storage.target_chat_ids_for_user_chat_permissions(20) == [-1002]
+            assert storage.user_has_any_broadcast_permissions(20)
+        finally:
+            storage.conn.close()
+
+
+def test_broadcast_target_records_sent_message_lookup() -> None:
+    with TemporaryDirectory() as tmp:
+        storage = Storage(Path(tmp) / "bot.db")
+        try:
+            now = datetime(2026, 7, 4, 12, tzinfo=BEIJING_TZ)
+            job = storage.create_broadcast_job(
+                creator_user_id=10,
+                scope="chat:-1001",
+                target_chat_ids=[-1001],
+                text="hello",
+                message_kind="text",
+                now=now,
+            )
+
+            storage.mark_broadcast_job_target(
+                job["id"],
+                -1001,
+                status="sent",
+                sent_message_id=88,
+                now=now,
+            )
+
+            match = storage.find_broadcast_job_by_sent_message(-1001, 88)
+            assert match is not None
+            assert match["job_id"] == job["id"]
+            assert match["creator_user_id"] == 10
+            assert match["sent_message_id"] == 88
         finally:
             storage.conn.close()
 

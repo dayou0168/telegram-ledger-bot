@@ -183,6 +183,20 @@ class Storage:
                 UNIQUE(chat_id, address)
             );
 
+            CREATE TABLE IF NOT EXISTS address_whitelist (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                network TEXT NOT NULL DEFAULT 'TRC20',
+                address TEXT NOT NULL,
+                label TEXT,
+                image_url TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_by INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(chat_id, address)
+            );
+
             CREATE TABLE IF NOT EXISTS broadcast_jobs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 creator_user_id INTEGER NOT NULL,
@@ -192,6 +206,7 @@ class Storage:
                 source_chat_id INTEGER,
                 source_message_id INTEGER,
                 message_kind TEXT NOT NULL DEFAULT 'text',
+                photo TEXT,
                 notify_all INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'pending',
                 success_count INTEGER NOT NULL DEFAULT 0,
@@ -200,6 +215,30 @@ class Storage:
                 confirmed_at TEXT,
                 completed_at TEXT,
                 updated_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS broadcast_job_targets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL,
+                target_chat_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                sent_message_id INTEGER,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(job_id, target_chat_id),
+                FOREIGN KEY(job_id) REFERENCES broadcast_jobs(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS broadcast_operators (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                display_name TEXT,
+                remark TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_by INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS broadcast_groups (
@@ -217,6 +256,32 @@ class Storage:
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (group_id, chat_id),
                 FOREIGN KEY(group_id) REFERENCES broadcast_groups(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS broadcast_group_permissions (
+                user_id INTEGER NOT NULL,
+                group_id INTEGER NOT NULL,
+                created_by INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, group_id),
+                FOREIGN KEY(group_id) REFERENCES broadcast_groups(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS broadcast_chat_permissions (
+                user_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                created_by INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, chat_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS broadcast_replacement_settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                enabled INTEGER NOT NULL DEFAULT 0,
+                text TEXT,
+                photo TEXT,
+                updated_by INTEGER,
+                updated_at TEXT NOT NULL
             );
             """
         )
@@ -254,6 +319,7 @@ class Storage:
                 "source_chat_id": "INTEGER",
                 "source_message_id": "INTEGER",
                 "message_kind": "TEXT NOT NULL DEFAULT 'text'",
+                "photo": "TEXT",
                 "notify_all": "INTEGER NOT NULL DEFAULT 0",
                 "updated_at": "TEXT",
             },
@@ -393,6 +459,7 @@ class Storage:
         source_chat_id: int | None = None,
         source_message_id: int | None = None,
         message_kind: str = "text",
+        photo: str | None = None,
         notify_all: bool = False,
         now: datetime,
     ) -> sqlite3.Row:
@@ -406,11 +473,12 @@ class Storage:
                 source_chat_id,
                 source_message_id,
                 message_kind,
+                photo,
                 notify_all,
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 creator_user_id,
@@ -420,13 +488,29 @@ class Storage:
                 source_chat_id,
                 source_message_id,
                 message_kind,
+                photo,
                 1 if notify_all else 0,
                 now.isoformat(),
                 now.isoformat(),
             ),
         )
+        job_id = int(cursor.lastrowid)
+        for target_chat_id in list(dict.fromkeys(target_chat_ids)):
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO broadcast_job_targets(
+                    job_id,
+                    target_chat_id,
+                    status,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, 'pending', ?, ?)
+                """,
+                (job_id, int(target_chat_id), now.isoformat(), now.isoformat()),
+            )
         self.conn.commit()
-        return self.get_broadcast_job(cursor.lastrowid)
+        return self.get_broadcast_job(job_id)
 
     def get_broadcast_job(self, job_id: int) -> sqlite3.Row:
         row = self.conn.execute("SELECT * FROM broadcast_jobs WHERE id = ?", (job_id,)).fetchone()
@@ -446,6 +530,81 @@ class Storage:
         self.conn.execute(f"UPDATE broadcast_jobs SET {columns} WHERE id = ?", values)
         self.conn.commit()
         return self.get_broadcast_job(job_id)
+
+    def mark_broadcast_job_target(
+        self,
+        job_id: int,
+        target_chat_id: int,
+        *,
+        status: str,
+        now: datetime,
+        sent_message_id: int | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO broadcast_job_targets(
+                job_id,
+                target_chat_id,
+                status,
+                sent_message_id,
+                error_message,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(job_id, target_chat_id) DO UPDATE SET
+                status = excluded.status,
+                sent_message_id = excluded.sent_message_id,
+                error_message = excluded.error_message,
+                updated_at = excluded.updated_at
+            """,
+            (
+                job_id,
+                target_chat_id,
+                status,
+                sent_message_id,
+                error_message,
+                now.isoformat(),
+                now.isoformat(),
+            ),
+        )
+        self.conn.commit()
+
+    def list_broadcast_job_targets(self, job_id: int) -> list[sqlite3.Row]:
+        return list(
+            self.conn.execute(
+                """
+                SELECT bjt.*, g.chat_title
+                FROM broadcast_job_targets bjt
+                LEFT JOIN groups g ON g.chat_id = bjt.target_chat_id
+                WHERE bjt.job_id = ?
+                ORDER BY bjt.id ASC
+                """,
+                (job_id,),
+            )
+        )
+
+    def find_broadcast_job_by_sent_message(self, target_chat_id: int, sent_message_id: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            """
+            SELECT
+                bjt.*,
+                bj.creator_user_id,
+                bj.scope,
+                bj.text,
+                bj.message_kind,
+                bj.created_at AS job_created_at
+            FROM broadcast_job_targets bjt
+            JOIN broadcast_jobs bj ON bj.id = bjt.job_id
+            WHERE bjt.target_chat_id = ?
+              AND bjt.sent_message_id = ?
+              AND bjt.status = 'sent'
+            ORDER BY bjt.id DESC
+            LIMIT 1
+            """,
+            (target_chat_id, sent_message_id),
+        ).fetchone()
 
     @staticmethod
     def normalize_broadcast_group_name(name: str) -> str:
@@ -479,6 +638,10 @@ class Storage:
         ).fetchone()
 
     def delete_named_broadcast_group(self, name: str) -> int:
+        group = self.get_named_broadcast_group(name)
+        if group is not None:
+            self.conn.execute("DELETE FROM broadcast_group_permissions WHERE group_id = ?", (group["id"],))
+            self.conn.execute("DELETE FROM broadcast_group_members WHERE group_id = ?", (group["id"],))
         cursor = self.conn.execute(
             "DELETE FROM broadcast_groups WHERE name_norm = ?",
             (self.normalize_broadcast_group_name(name),),
@@ -573,6 +736,337 @@ class Storage:
 
     def target_chat_ids_for_broadcast_group(self, name: str) -> list[int]:
         return [int(row["chat_id"]) for row in self.list_broadcast_group_members(name)]
+
+    def add_broadcast_operator(
+        self,
+        *,
+        user_id: int,
+        created_by: int,
+        now: datetime,
+        username: str | None = None,
+        display_name: str | None = None,
+        remark: str | None = None,
+    ) -> sqlite3.Row:
+        self.conn.execute(
+            """
+            INSERT INTO broadcast_operators(
+                user_id,
+                username,
+                display_name,
+                remark,
+                status,
+                created_by,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, 'active', ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = COALESCE(excluded.username, broadcast_operators.username),
+                display_name = COALESCE(excluded.display_name, broadcast_operators.display_name),
+                remark = COALESCE(excluded.remark, broadcast_operators.remark),
+                status = 'active',
+                updated_at = excluded.updated_at
+            """,
+            (
+                user_id,
+                username,
+                display_name,
+                remark,
+                created_by,
+                now.isoformat(),
+                now.isoformat(),
+            ),
+        )
+        self.conn.commit()
+        row = self.get_broadcast_operator(user_id, active_only=False)
+        if row is None:
+            raise KeyError(f"Broadcast operator {user_id} is missing")
+        return row
+
+    def get_broadcast_operator(self, user_id: int, *, active_only: bool = True) -> sqlite3.Row | None:
+        active_clause = "AND status = 'active'" if active_only else ""
+        return self.conn.execute(
+            f"""
+            SELECT * FROM broadcast_operators
+            WHERE user_id = ?
+            {active_clause}
+            """,
+            (user_id,),
+        ).fetchone()
+
+    def list_broadcast_operators(self, *, active_only: bool = False) -> list[sqlite3.Row]:
+        where = "WHERE status = 'active'" if active_only else ""
+        return list(
+            self.conn.execute(
+                f"""
+                SELECT * FROM broadcast_operators
+                {where}
+                ORDER BY status ASC, created_at ASC, user_id ASC
+                """
+            )
+        )
+
+    def list_child_broadcast_operators(self, manager_user_id: int, *, active_only: bool = False) -> list[sqlite3.Row]:
+        active_clause = "AND status = 'active'" if active_only else ""
+        return list(
+            self.conn.execute(
+                f"""
+                SELECT * FROM broadcast_operators
+                WHERE created_by = ?
+                {active_clause}
+                ORDER BY status ASC, created_at ASC, user_id ASC
+                """,
+                (manager_user_id,),
+            )
+        )
+
+    def update_broadcast_operator_remark(self, *, user_id: int, remark: str | None, now: datetime) -> bool:
+        cursor = self.conn.execute(
+            """
+            UPDATE broadcast_operators
+            SET remark = ?, updated_at = ?
+            WHERE user_id = ?
+            """,
+            (remark, now.isoformat(), user_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def disable_broadcast_operator(self, *, user_id: int, now: datetime) -> bool:
+        cursor = self.conn.execute(
+            """
+            UPDATE broadcast_operators
+            SET status = 'disabled', updated_at = ?
+            WHERE user_id = ? AND status <> 'disabled'
+            """,
+            (now.isoformat(), user_id),
+        )
+        self.conn.execute("DELETE FROM broadcast_group_permissions WHERE user_id = ?", (user_id,))
+        self.conn.execute("DELETE FROM broadcast_chat_permissions WHERE user_id = ?", (user_id,))
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def user_has_any_broadcast_permissions(self, user_id: int) -> bool:
+        return self.user_has_broadcast_group_permissions(user_id) or self.user_has_broadcast_chat_permissions(user_id)
+
+    def grant_broadcast_group_permission(
+        self,
+        group_name: str,
+        *,
+        user_id: int,
+        created_by: int,
+        now: datetime,
+    ) -> bool:
+        group = self.get_named_broadcast_group(group_name)
+        if group is None:
+            raise KeyError(f"Broadcast group {group_name} is missing")
+        cursor = self.conn.execute(
+            """
+            INSERT OR IGNORE INTO broadcast_group_permissions(user_id, group_id, created_by, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (user_id, group["id"], created_by, now.isoformat()),
+        )
+        self.conn.commit()
+        return cursor.rowcount == 1
+
+    def revoke_broadcast_group_permission(self, group_name: str, *, user_id: int) -> int:
+        group = self.get_named_broadcast_group(group_name)
+        if group is None:
+            raise KeyError(f"Broadcast group {group_name} is missing")
+        cursor = self.conn.execute(
+            "DELETE FROM broadcast_group_permissions WHERE user_id = ? AND group_id = ?",
+            (user_id, group["id"]),
+        )
+        self.conn.commit()
+        return cursor.rowcount
+
+    def user_has_broadcast_group_permissions(self, user_id: int) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM broadcast_group_permissions WHERE user_id = ? LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        return row is not None
+
+    def user_can_access_broadcast_group(self, user_id: int, group_name: str) -> bool:
+        group = self.get_named_broadcast_group(group_name)
+        if group is None:
+            return False
+        row = self.conn.execute(
+            """
+            SELECT 1 FROM broadcast_group_permissions
+            WHERE user_id = ? AND group_id = ?
+            LIMIT 1
+            """,
+            (user_id, group["id"]),
+        ).fetchone()
+        return row is not None
+
+    def list_named_broadcast_groups_for_user(self, user_id: int) -> list[sqlite3.Row]:
+        return list(
+            self.conn.execute(
+                """
+                SELECT bg.*, COUNT(bgm.chat_id) AS member_count
+                FROM broadcast_group_permissions p
+                JOIN broadcast_groups bg ON bg.id = p.group_id
+                LEFT JOIN broadcast_group_members bgm ON bgm.group_id = bg.id
+                WHERE p.user_id = ?
+                GROUP BY bg.id
+                ORDER BY bg.updated_at DESC, bg.id ASC
+                """,
+                (user_id,),
+            )
+        )
+
+    def target_chat_ids_for_user_broadcast_groups(self, user_id: int) -> list[int]:
+        rows = self.conn.execute(
+            """
+            SELECT DISTINCT bgm.chat_id
+            FROM broadcast_group_permissions p
+            JOIN broadcast_group_members bgm ON bgm.group_id = p.group_id
+            WHERE p.user_id = ?
+            ORDER BY bgm.chat_id ASC
+            """,
+            (user_id,),
+        )
+        return [int(row["chat_id"]) for row in rows]
+
+    def grant_broadcast_chat_permission(
+        self,
+        *,
+        chat_id: int,
+        user_id: int,
+        created_by: int,
+        now: datetime,
+    ) -> bool:
+        self.get_group(chat_id)
+        cursor = self.conn.execute(
+            """
+            INSERT OR IGNORE INTO broadcast_chat_permissions(user_id, chat_id, created_by, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (user_id, chat_id, created_by, now.isoformat()),
+        )
+        self.conn.commit()
+        return cursor.rowcount == 1
+
+    def revoke_broadcast_chat_permission(self, *, chat_id: int, user_id: int) -> int:
+        cursor = self.conn.execute(
+            "DELETE FROM broadcast_chat_permissions WHERE user_id = ? AND chat_id = ?",
+            (user_id, chat_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount
+
+    def user_has_broadcast_chat_permissions(self, user_id: int) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM broadcast_chat_permissions WHERE user_id = ? LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        return row is not None
+
+    def user_can_access_broadcast_chat(self, user_id: int, chat_id: int) -> bool:
+        row = self.conn.execute(
+            """
+            SELECT 1 FROM broadcast_chat_permissions
+            WHERE user_id = ? AND chat_id = ?
+            LIMIT 1
+            """,
+            (user_id, chat_id),
+        ).fetchone()
+        return row is not None
+
+    def target_chat_ids_for_user_chat_permissions(self, user_id: int) -> list[int]:
+        rows = self.conn.execute(
+            """
+            SELECT chat_id
+            FROM broadcast_chat_permissions
+            WHERE user_id = ?
+            ORDER BY chat_id ASC
+            """,
+            (user_id,),
+        )
+        return [int(row["chat_id"]) for row in rows]
+
+    def list_broadcast_group_permissions(self, user_id: int | None = None) -> list[sqlite3.Row]:
+        where = ""
+        params: list[Any] = []
+        if user_id is not None:
+            where = "WHERE p.user_id = ?"
+            params.append(user_id)
+        return list(
+            self.conn.execute(
+                f"""
+                SELECT p.user_id, p.created_by, p.created_at, bg.name, bg.id AS group_id
+                FROM broadcast_group_permissions p
+                JOIN broadcast_groups bg ON bg.id = p.group_id
+                {where}
+                ORDER BY p.user_id ASC, bg.name ASC
+                """,
+                params,
+            )
+        )
+
+    def list_broadcast_chat_permissions(self, user_id: int | None = None) -> list[sqlite3.Row]:
+        where = ""
+        params: list[Any] = []
+        if user_id is not None:
+            where = "WHERE p.user_id = ?"
+            params.append(user_id)
+        return list(
+            self.conn.execute(
+                f"""
+                SELECT p.user_id, p.chat_id, p.created_by, p.created_at, g.chat_title
+                FROM broadcast_chat_permissions p
+                LEFT JOIN groups g ON g.chat_id = p.chat_id
+                {where}
+                ORDER BY p.user_id ASC, p.chat_id ASC
+                """,
+                params,
+            )
+        )
+
+    def get_broadcast_replacement_settings(self, now: datetime | None = None) -> sqlite3.Row:
+        row = self.conn.execute("SELECT * FROM broadcast_replacement_settings WHERE id = 1").fetchone()
+        if row is not None:
+            return row
+        timestamp = (now or datetime.now()).isoformat()
+        self.conn.execute(
+            """
+            INSERT INTO broadcast_replacement_settings(id, enabled, text, photo, updated_at)
+            VALUES (1, 0, NULL, NULL, ?)
+            """,
+            (timestamp,),
+        )
+        self.conn.commit()
+        return self.conn.execute("SELECT * FROM broadcast_replacement_settings WHERE id = 1").fetchone()
+
+    def update_broadcast_replacement_settings(
+        self,
+        *,
+        now: datetime,
+        enabled: int | None = None,
+        text: str | None = None,
+        photo: str | None = None,
+        updated_by: int | None = None,
+        clear_text: bool = False,
+        clear_photo: bool = False,
+    ) -> sqlite3.Row:
+        self.get_broadcast_replacement_settings(now)
+        fields: dict[str, Any] = {"updated_at": now.isoformat()}
+        if enabled is not None:
+            fields["enabled"] = enabled
+        if text is not None or clear_text:
+            fields["text"] = text
+        if photo is not None or clear_photo:
+            fields["photo"] = photo
+        if updated_by is not None:
+            fields["updated_by"] = updated_by
+        columns = ", ".join(f"{name} = ?" for name in fields)
+        values = list(fields.values())
+        self.conn.execute(f"UPDATE broadcast_replacement_settings SET {columns} WHERE id = 1", values)
+        self.conn.commit()
+        return self.get_broadcast_replacement_settings(now)
 
     def _add_missing_columns(self, table: str, columns: dict[str, str]) -> None:
         existing = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
@@ -1097,6 +1591,8 @@ class Storage:
         self.conn.execute("DELETE FROM operators WHERE chat_id = ?", (chat_id,))
         self.conn.execute("DELETE FROM group_members WHERE chat_id = ?", (chat_id,))
         self.conn.execute("DELETE FROM broadcast_group_members WHERE chat_id = ?", (chat_id,))
+        self.conn.execute("DELETE FROM broadcast_chat_permissions WHERE chat_id = ?", (chat_id,))
+        self.conn.execute("DELETE FROM address_whitelist WHERE chat_id = ?", (chat_id,))
         self.conn.execute("DELETE FROM groups WHERE chat_id = ?", (chat_id,))
         self.conn.commit()
 
@@ -1104,8 +1600,116 @@ class Storage:
         self.conn.execute("DELETE FROM operators WHERE chat_id = ?", (chat_id,))
         self.conn.execute("DELETE FROM group_members WHERE chat_id = ?", (chat_id,))
         self.conn.execute("DELETE FROM broadcast_group_members WHERE chat_id = ?", (chat_id,))
+        self.conn.execute("DELETE FROM broadcast_chat_permissions WHERE chat_id = ?", (chat_id,))
+        self.conn.execute("DELETE FROM address_whitelist WHERE chat_id = ?", (chat_id,))
         self.conn.execute("DELETE FROM groups WHERE chat_id = ?", (chat_id,))
         self.conn.commit()
+
+    def add_address_whitelist(
+        self,
+        *,
+        chat_id: int,
+        network: str,
+        address: str,
+        label: str | None,
+        image_url: str | None,
+        created_by: int | None,
+        now: datetime,
+    ) -> sqlite3.Row:
+        self.conn.execute(
+            """
+            INSERT INTO address_whitelist(
+                chat_id,
+                network,
+                address,
+                label,
+                image_url,
+                enabled,
+                created_by,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
+            ON CONFLICT(chat_id, address) DO UPDATE SET
+                network = excluded.network,
+                label = excluded.label,
+                image_url = excluded.image_url,
+                enabled = 1,
+                updated_at = excluded.updated_at
+            """,
+            (
+                chat_id,
+                network,
+                address,
+                label,
+                image_url,
+                created_by,
+                now.isoformat(),
+                now.isoformat(),
+            ),
+        )
+        self.conn.commit()
+        row = self.get_address_whitelist(chat_id, address, enabled_only=False)
+        if row is None:
+            raise KeyError(f"Address whitelist row is missing: {chat_id} {address}")
+        return row
+
+    def remove_address_whitelist(self, chat_id: int, address: str, *, now: datetime | None = None) -> int:
+        cursor = self.conn.execute(
+            """
+            UPDATE address_whitelist
+            SET enabled = 0,
+                updated_at = COALESCE(?, updated_at)
+            WHERE chat_id = ? AND address = ? AND enabled = 1
+            """,
+            (now.isoformat() if now else None, chat_id, address),
+        )
+        self.conn.commit()
+        return cursor.rowcount
+
+    def get_address_whitelist(
+        self,
+        chat_id: int,
+        address: str,
+        *,
+        enabled_only: bool = True,
+    ) -> sqlite3.Row | None:
+        enabled_clause = "AND enabled = 1" if enabled_only else ""
+        return self.conn.execute(
+            f"""
+            SELECT * FROM address_whitelist
+            WHERE chat_id = ? AND address = ?
+            {enabled_clause}
+            """,
+            (chat_id, address),
+        ).fetchone()
+
+    def list_address_whitelist(
+        self,
+        chat_id: int | None = None,
+        *,
+        enabled_only: bool = False,
+    ) -> list[sqlite3.Row]:
+        where: list[str] = []
+        params: list[Any] = []
+        if chat_id is not None:
+            where.append("w.chat_id = ?")
+            params.append(chat_id)
+        if enabled_only:
+            where.append("w.enabled = 1")
+        where_sql = "WHERE " + " AND ".join(where) if where else ""
+        return list(
+            self.conn.execute(
+                f"""
+                SELECT w.*, g.chat_title
+                FROM address_whitelist w
+                LEFT JOIN groups g ON g.chat_id = w.chat_id
+                {where_sql}
+                ORDER BY w.updated_at DESC, w.id DESC
+                """,
+                params,
+            )
+        )
 
     def add_address_watch(
         self,
