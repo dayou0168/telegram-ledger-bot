@@ -160,6 +160,7 @@ class LedgerBot:
         self.host_presence_cache: dict[int, tuple[float, TelegramUser | None]] = {}
         self.host_presence_lock = threading.Lock()
         self.address_watch_pending: dict[int, str] = {}
+        self.broadcast_pending: dict[int, dict[str, Any]] = {}
 
     def run_forever(self) -> None:
         print("Ledger bot is running.", flush=True)
@@ -746,6 +747,8 @@ class LedgerBot:
             return
         if self.handle_default_operator_command(chat_id, user, normalized, message_id):
             return
+        if self.handle_pending_broadcast_input(chat_id, user, message, normalized, now, message_id):
+            return
         if self.handle_broadcast_private_command(
             message=message,
             chat_id=chat_id,
@@ -853,7 +856,7 @@ class LedgerBot:
         base = self.config.public_bill_base_url.strip().rstrip("/")
         if not base or base.endswith(".php"):
             return None
-        return f"{base}/admin?{urlencode({'admin_token': self.config.admin_web_token})}"
+        return f"{base}/admin"
 
     def send_admin_web_link(
         self,
@@ -888,19 +891,18 @@ class LedgerBot:
             return
         self.client.send_message(
             chat_id,
-            "后台管理入口：",
+            "后台管理入口：打开后请输入后台管理密码。",
             reply_to_message_id=reply_to_message_id,
-            reply_markup={
-                "inline_keyboard": [
-                    [
-                        {
-                            "text": "打开后台管理",
-                            "url": url,
-                        }
-                    ]
-                ]
-            },
+            reply_markup=self.admin_web_inline_keyboard(user),
         )
+
+    def admin_web_inline_keyboard(self, user: TelegramUser) -> dict[str, Any] | None:
+        if not self.is_broadcast_root(user):
+            return None
+        url = self.build_admin_web_url()
+        if not url:
+            return None
+        return {"inline_keyboard": [[{"text": "打开后台管理", "url": url}]]}
 
     def send_start_group_help(self, chat_id: int, reply_to_message_id: int | None = None) -> None:
         text = "把机器人添加到群并设为管理员后，在群里发送“开始”即可开始记账。"
@@ -940,35 +942,84 @@ class LedgerBot:
                 "",
                 "群内地址验证：",
                 "直接发送 TRC20 地址，机器人会回复验证次数、上次发送人和本次发送人。",
-                "添加白名单地址 Txxxx 备注 / 删除白名单地址 Txxxx / 显示白名单",
+                "地址白名单在后台管理里维护，可按群名选择，不需要手打群 ID。",
                 "",
                 "私聊地址监听：",
-                "地址监听 打开按钮面板",
-                "设置地址 Txxxx 备注 / 删除地址 Txxxx / 设置备注 Txxxx 备注 / 设置监听金额10",
-                "查询Txxxx 可查询 TRX 地址详情。",
+                "点击 🔔地址监听 打开按钮面板，可添加/删除监听地址、设置备注和最小提醒金额。",
+                "私聊直接发送 T 地址可查询 TRX 地址详情。",
                 "",
                 "私聊广播：",
-                "群发广播 广播内容",
-                "分组广播 财务 广播内容",
-                "单群广播 -100111 广播内容",
-                "回复图片/文件后发送 群发广播 或 分组广播 财务，可广播图片或图文。",
-                "通知所有人 可跟在群发广播/分组广播里一起使用。",
+                "点击 📡群发广播 或 📣分组广播，选择全部群、分组或单群。",
+                "选择目标后直接发送文字、图片、文件或图文，机器人会先生成确认按钮。",
+                "通知所有人是按钮开关，不需要写在广播内容里。",
                 "",
                 "广播管理：",
-                "群列表 / 分组列表 / 新建分组 财务",
-                "分组添加 财务 -100111 -100222 / 分组移除 财务 -100111",
-                "添加广播操作人 123456 备注",
-                "授权分组 123456 财务 / 授权单群 123456 -100111",
-                "取消授权分组 123456 财务 / 取消授权单群 123456 -100111",
+                "点击 ⚙后台管理 进入网页登录页，管理群组、分组、广播权限、地址白名单和替换内容。",
+                "后台里按群名搜索或多选群组，不需要逐个查群 ID。",
                 "",
                 "广播替换：",
-                "替换状态 / 开启广播替换 / 关闭广播替换 / 清空广播替换",
-                "设置替换文字 内容 / 回复图片发送 设置替换图片",
+                "点击 🔁广播替换 查看状态；修改图片、文字和开关请进后台管理。",
                 "",
                 "后台管理：",
-                "私聊菜单点击 ⚙后台管理；需要配置 PUBLIC_BILL_BASE_URL 和 ADMIN_WEB_TOKEN。",
+                "私聊菜单点击 ⚙后台管理，打开网页后输入 ADMIN_WEB_TOKEN 设置的后台密码。",
             ]
         )
+
+    def handle_pending_broadcast_input(
+        self,
+        chat_id: int,
+        user: TelegramUser,
+        message: dict[str, Any],
+        text: str,
+        now: datetime,
+        reply_to_message_id: int,
+    ) -> bool:
+        pending = self.broadcast_pending.get(user.user_id)
+        if not pending:
+            return False
+        if text in {"取消广播", "取消", "菜单", "/start"}:
+            self.broadcast_pending.pop(user.user_id, None)
+            if text in {"取消广播", "取消"}:
+                self.client.send_message(chat_id, "广播已取消。", reply_to_message_id=reply_to_message_id)
+                return True
+            return False
+        if time.monotonic() - float(pending.get("created_at", 0)) > 30 * 60:
+            self.broadcast_pending.pop(user.user_id, None)
+            self.client.send_message(chat_id, "广播选择已过期，请重新选择目标。", reply_to_message_id=reply_to_message_id)
+            return True
+
+        text_notify_all, body = self.extract_notify_all_option(text)
+        notify_all = bool(pending.get("notify_all")) or text_notify_all
+        source_message = None
+        if self.is_broadcastable_message(message) and self.broadcast_message_kind(message) != "text":
+            source_message = message
+            body = ""
+        elif not body:
+            if self.is_broadcastable_message(message):
+                source_message = message
+            elif self.is_broadcastable_message(message.get("reply_to_message")):
+                source_message = message.get("reply_to_message")
+        if not body and not source_message:
+            self.client.send_message(
+                chat_id,
+                "请发送广播文字，或发送/回复一条图片、文件、文字素材。发送“取消广播”可取消。",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
+
+        self.broadcast_pending.pop(user.user_id, None)
+        self.create_broadcast_job_reply(
+            chat_id,
+            user,
+            str(pending["scope"]),
+            list(pending["target_ids"]),
+            body,
+            source_message,
+            notify_all,
+            now,
+            reply_to_message_id,
+        )
+        return True
 
     def handle_broadcast_private_command(
         self,
@@ -981,16 +1032,18 @@ class LedgerBot:
         reply_to_message_id: int,
     ) -> bool:
         if text in {"📣分组广播", "分组广播"}:
-            self.send_broadcast_help(chat_id, user, grouped=True, reply_to_message_id=reply_to_message_id)
+            self.send_broadcast_group_target_menu(chat_id, user, reply_to_message_id=reply_to_message_id)
             return True
         if text in {"📡群发广播", "群发广播"}:
             if message.get("reply_to_message"):
                 self.create_broadcast_from_private(chat_id, user, "", message, now, reply_to_message_id)
             else:
-                self.send_broadcast_help(chat_id, user, grouped=False, reply_to_message_id=reply_to_message_id)
+                self.send_broadcast_target_menu(chat_id, user, reply_to_message_id=reply_to_message_id)
             return True
-        if text in {"🗂群列表", "群列表", "群组列表", "广播群列表"}:
-            self.send_broadcast_group_list(chat_id, user, reply_to_message_id=reply_to_message_id)
+        if text in {"🗂群列表", "群列表", "群组列表", "广播群列表"} or text.startswith(("群列表 ", "群组列表 ", "广播群列表 ")):
+            parts = text.split(maxsplit=1)
+            keyword = parts[1].strip() if len(parts) > 1 else ""
+            self.send_broadcast_group_list(chat_id, user, keyword=keyword, reply_to_message_id=reply_to_message_id)
             return True
         if text in {"分组列表", "广播分组", "广播分组列表"}:
             self.send_named_broadcast_group_list(chat_id, user, reply_to_message_id=reply_to_message_id)
@@ -1267,14 +1320,8 @@ class LedgerBot:
             named_groups = self.accessible_named_broadcast_groups(user)
             lines = [
                 "分组广播",
-                "新建分组：新建分组 财务",
-                "批量添加：分组添加 财务 -100111 -100222",
-                "批量移除：分组移除 财务 -100111 -100222",
-                "查看成员：分组详情 财务",
-                "文字广播：分组广播 财务 广播内容",
-                "图片广播：回复图片发送 分组广播 财务",
-                "通知所有人：分组广播 财务 通知所有人 广播内容",
-                "单群发送：单群广播 -100111 广播内容",
+                "请点击私聊菜单里的 📣分组广播，选择分组后发送广播内容。",
+                "分组创建、成员增删和权限分配请在 ⚙后台管理 里操作。",
                 "",
                 f"当前分组：{len(named_groups)} 个",
             ]
@@ -1286,12 +1333,9 @@ class LedgerBot:
             groups = self.storage.list_broadcast_groups()
             lines = [
                 "群发广播",
-                "文字广播：群发广播 广播内容",
-                "图片广播：回复图片发送 群发广播",
-                "单群发送：单群广播 -100111 广播内容",
-                "通知所有人：群发广播 通知所有人 广播内容",
-                "查看群：群列表",
-                "发送后会先生成确认按钮，点确认才会发送。",
+                "请点击私聊菜单里的 📡群发广播，选择全部群、分组或单群后发送广播内容。",
+                "发送前可用按钮开启或关闭“通知所有人”，发送后还会二次确认。",
+                "群组、分组和权限请在 ⚙后台管理 里操作。",
                 "",
                 f"当前已保存群组：{len(groups)} 个",
             ]
@@ -1301,11 +1345,106 @@ class LedgerBot:
                 lines.append(f"... 还有 {len(groups) - 20} 个，发送“群列表”查看。")
         self.client.send_message(chat_id, "\n".join(lines), reply_to_message_id=reply_to_message_id)
 
+    def send_broadcast_target_menu(
+        self,
+        chat_id: int,
+        user: TelegramUser,
+        *,
+        reply_to_message_id: int | None = None,
+    ) -> None:
+        if not self.can_use_broadcast(user):
+            self.client.send_message(chat_id, "没有广播权限。", reply_to_message_id=reply_to_message_id)
+            return
+        target_count = len(self.broadcast_target_chat_ids_for_user(user))
+        group_count = len(self.accessible_named_broadcast_groups(user))
+        self.client.send_message(
+            chat_id,
+            "请选择广播目标：",
+            reply_to_message_id=reply_to_message_id,
+            reply_markup={
+                "inline_keyboard": [
+                    [{"text": f"📡 全部已授权群（{target_count}）", "callback_data": "broadcastui:target:all"}],
+                    [{"text": f"📣 选择分组（{group_count}）", "callback_data": "broadcastui:menu:groups"}],
+                    [{"text": "🎯 选择单群", "callback_data": "broadcastui:menu:chats"}],
+                    [{"text": "取消", "callback_data": "broadcastui:cancel"}],
+                ]
+            },
+        )
+
+    def send_broadcast_group_target_menu(
+        self,
+        chat_id: int,
+        user: TelegramUser,
+        *,
+        reply_to_message_id: int | None = None,
+    ) -> None:
+        if not self.can_use_broadcast(user):
+            self.client.send_message(chat_id, "没有广播权限。", reply_to_message_id=reply_to_message_id)
+            return
+        rows = self.accessible_named_broadcast_groups(user)
+        if not rows:
+            self.client.send_message(chat_id, "当前没有可用分组，请先在后台或私聊创建分组。", reply_to_message_id=reply_to_message_id)
+            return
+        keyboard = [
+            [
+                {
+                    "text": self.broadcast_group_button_label(row),
+                    "callback_data": f"broadcastui:group:{row['id']}",
+                }
+            ]
+            for row in rows[:40]
+        ]
+        keyboard.append([{"text": "返回", "callback_data": "broadcastui:menu:main"}])
+        text = "请选择要广播的分组："
+        if len(rows) > 40:
+            text += f"\n当前只显示前 40 个分组，共 {len(rows)} 个；更多分组请在后台管理页操作。"
+        self.client.send_message(chat_id, text, reply_to_message_id=reply_to_message_id, reply_markup={"inline_keyboard": keyboard})
+
+    def send_broadcast_chat_target_menu(
+        self,
+        chat_id: int,
+        user: TelegramUser,
+        *,
+        reply_to_message_id: int | None = None,
+    ) -> None:
+        if self.is_broadcast_root(user):
+            groups = self.storage.list_broadcast_groups()
+        else:
+            accessible_ids = self.broadcast_target_chat_ids_for_user(user)
+            groups = self.storage.list_broadcast_groups(chat_ids=accessible_ids) if accessible_ids else []
+        if not groups:
+            self.client.send_message(chat_id, "当前没有可广播的群。", reply_to_message_id=reply_to_message_id)
+            return
+        keyboard = [
+            [
+                {
+                    "text": self.broadcast_chat_button_label(row),
+                    "callback_data": f"broadcastui:chat:{row['chat_id']}",
+                }
+            ]
+            for row in groups[:40]
+        ]
+        keyboard.append([{"text": "返回", "callback_data": "broadcastui:menu:main"}])
+        text = "请选择单群广播目标："
+        if len(groups) > 40:
+            text += f"\n当前只显示前 40 个群，共 {len(groups)} 个；更多群请在后台管理页操作。"
+        self.client.send_message(chat_id, text, reply_to_message_id=reply_to_message_id, reply_markup={"inline_keyboard": keyboard})
+
+    @staticmethod
+    def broadcast_group_button_label(row: Any) -> str:
+        return f"{str(row['name'])[:24]}（{row['member_count']}群）"
+
+    @staticmethod
+    def broadcast_chat_button_label(row: Any) -> str:
+        title = row["chat_title"] or "(未命名群)"
+        return f"{str(title)[:24]}（{row['chat_id']}）"
+
     def send_broadcast_group_list(
         self,
         chat_id: int,
         user: TelegramUser,
         *,
+        keyword: str = "",
         reply_to_message_id: int | None = None,
     ) -> None:
         if not self.can_use_broadcast(user):
@@ -1316,8 +1455,16 @@ class LedgerBot:
         else:
             accessible_ids = self.broadcast_target_chat_ids_for_user(user)
             groups = self.storage.list_broadcast_groups(chat_ids=accessible_ids) if accessible_ids else []
+        if keyword:
+            needle = keyword.casefold()
+            groups = [
+                row
+                for row in groups
+                if needle in str(row["chat_id"]).casefold() or needle in (row["chat_title"] or "").casefold()
+            ]
         if not groups:
-            self.client.send_message(chat_id, "当前没有已保存群组。", reply_to_message_id=reply_to_message_id)
+            text = "没有找到匹配的群组。" if keyword else "当前没有已保存群组。"
+            self.client.send_message(chat_id, text, reply_to_message_id=reply_to_message_id)
             return
         chunks: list[list[str]] = [[]]
         for row in groups:
@@ -1327,6 +1474,8 @@ class LedgerBot:
             chunks[-1].append(line)
         for index, chunk in enumerate(chunks):
             title = f"已保存群组（{len(groups)}个）"
+            if keyword:
+                title += f"｜搜索：{keyword}"
             if len(chunks) > 1:
                 title += f" {index + 1}/{len(chunks)}"
             self.client.send_message(
@@ -1386,7 +1535,7 @@ class LedgerBot:
     @staticmethod
     def format_broadcast_group(row: Any) -> str:
         title = row["chat_title"] or "(未命名群)"
-        return f"{row['chat_id']}  {title}"
+        return f"{str(title)[:50]}（{row['chat_id']}）"
 
     def accessible_named_broadcast_groups(self, user: TelegramUser) -> list[Any]:
         if self.is_broadcast_root(user):
@@ -1520,8 +1669,12 @@ class LedgerBot:
         else:
             rows = self.storage.list_child_broadcast_operators(user.user_id)
             title = "下级广播操作人："
+        reply_markup = self.admin_web_inline_keyboard(user)
         if not rows:
-            self.client.send_message(chat_id, "暂无广播操作人。", reply_to_message_id=reply_to_message_id)
+            text = "暂无广播操作人。"
+            if reply_markup:
+                text += "\n\n权限、分组和单群授权请在后台管理中操作。"
+            self.client.send_message(chat_id, text, reply_to_message_id=reply_to_message_id, reply_markup=reply_markup)
             return
         lines = [title]
         for row in rows[:80]:
@@ -1529,7 +1682,9 @@ class LedgerBot:
             lines.append(f"{row['user_id']} {row['status']}{remark} 上级:{row['created_by']}")
         if len(rows) > 80:
             lines.append(f"... 还有 {len(rows) - 80} 个")
-        self.client.send_message(chat_id, "\n".join(lines), reply_to_message_id=reply_to_message_id)
+        if reply_markup:
+            lines.extend(["", "权限、分组和单群授权请在后台管理中操作。"])
+        self.client.send_message(chat_id, "\n".join(lines), reply_to_message_id=reply_to_message_id, reply_markup=reply_markup)
 
     def send_broadcast_replacement_status(
         self,
@@ -1548,11 +1703,14 @@ class LedgerBot:
             f"文字：{settings['text'] or '未设置'}",
             f"图片：{settings['photo'] or '未设置'}",
             "",
-            "命令：开启广播替换 / 关闭广播替换 / 清空广播替换",
-            "设置文字：设置替换文字 内容",
-            "设置图片：回复图片发送 设置替换图片，或 设置替换图片 file_id/URL",
+            "修改开关、文字和图片请打开后台管理。",
         ]
-        self.client.send_message(chat_id, "\n".join(lines), reply_to_message_id=reply_to_message_id)
+        self.client.send_message(
+            chat_id,
+            "\n".join(lines),
+            reply_to_message_id=reply_to_message_id,
+            reply_markup=self.admin_web_inline_keyboard(user),
+        )
 
     def update_broadcast_replacement_from_private(
         self,
@@ -2092,10 +2250,8 @@ class LedgerBot:
             f"TRX通知：{'开启' if settings['notify_trx'] else '关闭'}",
             f"最小提醒：{min_text}",
             "",
-            "添加：设置地址 Txxxx 备注",
-            "删除：删除监听地址 Txxxx",
-            "备注：设置备注 Txxxx 备注",
-            "金额：设置监听金额 10",
+            "请使用下方按钮添加地址、删除地址、设置备注或修改最小提醒金额。",
+            "点设置地址后，直接发送：T地址 备注",
             "",
             "当前监听地址：",
         ]
@@ -2978,6 +3134,10 @@ class LedgerBot:
             self.handle_address_watch_callback(chat_id, user.user_id, callback["id"], data, now)
             return
 
+        if data.startswith("broadcastui:"):
+            self.handle_broadcast_ui_callback(chat_id, user, callback["id"], data, now)
+            return
+
         if data.startswith("broadcast:"):
             self.handle_broadcast_callback(chat_id, user, callback["id"], data, now)
             return
@@ -3026,6 +3186,124 @@ class LedgerBot:
             end = self.parse_compact_bill_time(parts[4]) if len(parts) >= 5 else None
             self.client.answer_callback_query(callback["id"])
             self.client.send_message(chat_id, self.build_bill_text(chat_id, day_key, begin=begin, end=end), parse_mode="HTML")
+
+    def handle_broadcast_ui_callback(
+        self,
+        chat_id: int,
+        user: TelegramUser,
+        callback_id: str,
+        data: str,
+        now: datetime,
+    ) -> None:
+        if not self.can_use_broadcast(user):
+            self.client.answer_callback_query(callback_id, "没有广播权限。")
+            return
+        parts = data.split(":")
+        if len(parts) < 2:
+            self.client.answer_callback_query(callback_id, "按钮无效。")
+            return
+        if data == "broadcastui:cancel":
+            self.broadcast_pending.pop(user.user_id, None)
+            self.client.answer_callback_query(callback_id, "已取消。")
+            self.client.send_message(chat_id, "广播选择已取消。")
+            return
+        if data in {"broadcastui:notify:on", "broadcastui:notify:off"}:
+            pending = self.broadcast_pending.get(user.user_id)
+            if not pending:
+                self.client.answer_callback_query(callback_id, "请先选择广播目标。")
+                return
+            pending["notify_all"] = data.endswith(":on")
+            self.client.answer_callback_query(
+                callback_id,
+                "已开启通知所有人。" if pending["notify_all"] else "已关闭通知所有人。",
+            )
+            self.client.send_message(
+                chat_id,
+                f"通知所有人：{'开启' if pending['notify_all'] else '关闭'}\n请继续发送广播内容。",
+                reply_markup=self.broadcast_pending_markup(bool(pending["notify_all"])),
+            )
+            return
+        if data == "broadcastui:menu:main":
+            self.client.answer_callback_query(callback_id)
+            self.send_broadcast_target_menu(chat_id, user)
+            return
+        if data == "broadcastui:menu:groups":
+            self.client.answer_callback_query(callback_id)
+            self.send_broadcast_group_target_menu(chat_id, user)
+            return
+        if data == "broadcastui:menu:chats":
+            self.client.answer_callback_query(callback_id)
+            self.send_broadcast_chat_target_menu(chat_id, user)
+            return
+        if data == "broadcastui:target:all":
+            target_ids = self.broadcast_target_chat_ids_for_user(user)
+            self.set_pending_broadcast_target(chat_id, user, "全部已授权群", "all", target_ids, callback_id)
+            return
+        if len(parts) == 3 and parts[1] == "group":
+            try:
+                group = self.storage.get_named_broadcast_group_by_id(int(parts[2]))
+            except ValueError:
+                group = None
+            if group is None or not self.can_use_broadcast_group(user, group["name"]):
+                self.client.answer_callback_query(callback_id, "没有这个分组的权限。")
+                return
+            target_ids = self.storage.target_chat_ids_for_broadcast_group(group["name"])
+            self.set_pending_broadcast_target(chat_id, user, f"分组：{group['name']}", f"group:{group['name']}", target_ids, callback_id)
+            return
+        if len(parts) == 3 and parts[1] == "chat":
+            try:
+                target_chat_id = int(parts[2])
+            except ValueError:
+                self.client.answer_callback_query(callback_id, "群组无效。")
+                return
+            if not self.can_use_broadcast_target(user, target_chat_id):
+                self.client.answer_callback_query(callback_id, "没有这个群的权限。")
+                return
+            group = self.storage.get_group(target_chat_id)
+            title = group["chat_title"] or target_chat_id
+            self.set_pending_broadcast_target(chat_id, user, f"单群：{title}（{target_chat_id}）", f"chat:{target_chat_id}", [target_chat_id], callback_id)
+            return
+        self.client.answer_callback_query(callback_id, "按钮无效。")
+
+    def set_pending_broadcast_target(
+        self,
+        chat_id: int,
+        user: TelegramUser,
+        label: str,
+        scope: str,
+        target_ids: list[int],
+        callback_id: str,
+    ) -> None:
+        if not target_ids:
+            self.client.answer_callback_query(callback_id, "这个目标里没有可发送的群。")
+            return
+        self.broadcast_pending[user.user_id] = {
+            "label": label,
+            "scope": scope,
+            "target_ids": target_ids,
+            "notify_all": False,
+            "created_at": time.monotonic(),
+        }
+        self.client.answer_callback_query(callback_id, "目标已选择。")
+        self.client.send_message(
+            chat_id,
+            f"已选择：{label}\n目标群数：{len(target_ids)}\n通知所有人：关闭\n\n请直接发送广播文字；如需发图片/文件，请发送或回复素材。",
+            reply_markup=self.broadcast_pending_markup(False),
+        )
+
+    @staticmethod
+    def broadcast_pending_markup(notify_all: bool) -> dict[str, Any]:
+        return {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": f"通知所有人：{'开启' if notify_all else '关闭'}",
+                        "callback_data": "broadcastui:notify:off" if notify_all else "broadcastui:notify:on",
+                    }
+                ],
+                [{"text": "取消广播", "callback_data": "broadcastui:cancel"}],
+            ]
+        }
 
     def handle_broadcast_callback(
         self,

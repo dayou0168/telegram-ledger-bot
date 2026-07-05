@@ -4,12 +4,16 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone, tzinfo
 from decimal import Decimal
+import hashlib
+import hmac
 from html import escape
 from http import HTTPStatus
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 import re
 import threading
+import time
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -78,7 +82,7 @@ def make_bill_request_handler(config: Config) -> type[BaseHTTPRequestHandler]:
         def do_POST(self) -> None:
             length = int(self.headers.get("Content-Length", "0") or "0")
             raw_body = self.rfile.read(length).decode("utf-8", errors="replace") if length > 0 else ""
-            response = handle_bill_web_post_response(config, self.path, raw_body)
+            response = handle_bill_web_post_response(config, self.path, raw_body, cookie_header=self.headers.get("Cookie", ""))
             self.send_response(response.status)
             self.send_header("Content-Type", response.content_type)
             self.send_header("Content-Length", str(len(response.body)))
@@ -88,7 +92,7 @@ def make_bill_request_handler(config: Config) -> type[BaseHTTPRequestHandler]:
             self.wfile.write(response.body)
 
         def write_response(self, *, include_body: bool) -> None:
-            response = handle_bill_web_response(config, self.path)
+            response = handle_bill_web_response(config, self.path, cookie_header=self.headers.get("Cookie", ""))
             self.send_response(response.status)
             self.send_header("Content-Type", response.content_type)
             self.send_header("Content-Length", str(len(response.body)))
@@ -104,8 +108,8 @@ def make_bill_request_handler(config: Config) -> type[BaseHTTPRequestHandler]:
     return BillRequestHandler
 
 
-def handle_bill_web_request(config: Config, raw_path: str) -> tuple[int, str]:
-    response = handle_bill_web_response(config, raw_path)
+def handle_bill_web_request(config: Config, raw_path: str, *, cookie_header: str = "") -> tuple[int, str]:
+    response = handle_bill_web_response(config, raw_path, cookie_header=cookie_header)
     try:
         body = response.body.decode("utf-8")
     except UnicodeDecodeError:
@@ -113,7 +117,7 @@ def handle_bill_web_request(config: Config, raw_path: str) -> tuple[int, str]:
     return response.status, body
 
 
-def handle_bill_web_response(config: Config, raw_path: str) -> BillWebResponse:
+def handle_bill_web_response(config: Config, raw_path: str, *, cookie_header: str = "") -> BillWebResponse:
     parsed = urlparse(raw_path)
     query = parse_qs(parsed.query)
     path = parsed.path.rstrip("/") or "/"
@@ -123,7 +127,7 @@ def handle_bill_web_response(config: Config, raw_path: str) -> BillWebResponse:
     if path == "/":
         return html_response(HTTPStatus.OK, simple_page("账单服务", "<p>账单网页服务已启动。</p>"))
     if path == "/admin":
-        return handle_admin_get_response(config, query)
+        return handle_admin_get_response(config, query, cookie_header=cookie_header)
 
     if not bill_web_token_allowed(config, query):
         return html_response(HTTPStatus.FORBIDDEN, simple_page("访问受限", "<p>链接无效或缺少访问令牌。</p>"))
@@ -194,16 +198,28 @@ def handle_bill_web_response(config: Config, raw_path: str) -> BillWebResponse:
     return html_response(HTTPStatus.OK, body)
 
 
-def handle_bill_web_post_response(config: Config, raw_path: str, raw_body: str) -> BillWebResponse:
+ADMIN_COOKIE_NAME = "ledger_admin_session"
+ADMIN_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
+
+
+def handle_bill_web_post_response(config: Config, raw_path: str, raw_body: str, *, cookie_header: str = "") -> BillWebResponse:
     parsed = urlparse(raw_path)
     query = parse_qs(parsed.query)
     path = parsed.path.rstrip("/") or "/"
     if path != "/admin":
         return html_response(HTTPStatus.NOT_FOUND, simple_page("404", "<p>页面不存在。</p>"))
-    token = admin_token_from_query(query)
-    if not admin_web_token_allowed(config, query):
-        return html_response(HTTPStatus.FORBIDDEN, simple_page("访问受限", "<p>后台链接无效或缺少访问令牌。</p>"))
     form = parse_qs(raw_body)
+    action = form_value(form, "action")
+    if action == "admin_login":
+        password = form_value(form, "password")
+        if admin_password_allowed(config, password):
+            return redirect_response(
+                "/admin",
+                headers={"Set-Cookie": make_admin_session_cookie(config.admin_web_token or "")},
+            )
+        return html_response(HTTPStatus.OK, render_admin_login_page("密码不正确，请重新输入。"))
+    if not admin_session_allowed(config, cookie_header):
+        return html_response(HTTPStatus.FORBIDDEN, render_admin_login_page("请先登录后台。"))
     storage = Storage(config.db_path)
     try:
         message = apply_admin_action(storage, form, config.timezone)
@@ -211,28 +227,31 @@ def handle_bill_web_post_response(config: Config, raw_path: str, raw_body: str) 
         message = str(exc)
     finally:
         storage.conn.close()
-    params = {"admin_token": token, "msg": message}
-    return redirect_response("/admin?" + urlencode(params))
+    return redirect_response("/admin?" + urlencode({"msg": message}))
 
 
-def handle_admin_get_response(config: Config, query: dict[str, list[str]]) -> BillWebResponse:
-    if not admin_web_token_allowed(config, query):
-        return html_response(HTTPStatus.FORBIDDEN, simple_page("访问受限", "<p>后台链接无效或缺少访问令牌。</p>"))
-    token = admin_token_from_query(query)
+def handle_admin_get_response(config: Config, query: dict[str, list[str]], *, cookie_header: str = "") -> BillWebResponse:
+    if not getattr(config, "admin_web_token", None):
+        return html_response(HTTPStatus.FORBIDDEN, simple_page("后台未开启", "<p>请先配置 ADMIN_WEB_TOKEN。</p>"))
+    if not admin_session_allowed(config, cookie_header):
+        return html_response(HTTPStatus.OK, render_admin_login_page())
     message = (query.get("msg") or [""])[0]
     storage = Storage(config.db_path)
     try:
-        body = render_admin_page(storage, config, token=token, message=message)
+        body = render_admin_page(storage, config, message=message)
     finally:
         storage.conn.close()
     return html_response(HTTPStatus.OK, body)
 
 
-def redirect_response(location: str) -> BillWebResponse:
+def redirect_response(location: str, *, headers: dict[str, str] | None = None) -> BillWebResponse:
+    response_headers = {"Location": location, "Cache-Control": "no-store"}
+    if headers:
+        response_headers.update(headers)
     return BillWebResponse(
         int(HTTPStatus.SEE_OTHER),
         b"",
-        headers={"Location": location, "Cache-Control": "no-store"},
+        headers=response_headers,
     )
 
 
@@ -246,30 +265,83 @@ def bill_web_token_allowed(config: Config, query: dict[str, list[str]]) -> bool:
     return (query.get("token") or [""])[0] == config.bill_web_token
 
 
-def admin_token_from_query(query: dict[str, list[str]]) -> str:
-    return (query.get("admin_token") or query.get("token") or [""])[0]
+def admin_password_allowed(config: Config, password: str) -> bool:
+    token = getattr(config, "admin_web_token", None)
+    return bool(token) and hmac.compare_digest(password, token)
 
 
-def admin_web_token_allowed(config: Config, query: dict[str, list[str]]) -> bool:
+def make_admin_session_cookie(token: str, *, now: int | None = None) -> str:
+    value = make_admin_session_value(token, now=now)
+    return (
+        f"{ADMIN_COOKIE_NAME}={value}; Max-Age={ADMIN_SESSION_TTL_SECONDS}; "
+        "Path=/admin; HttpOnly; SameSite=Lax; Secure"
+    )
+
+
+def make_admin_session_value(token: str, *, now: int | None = None) -> str:
+    timestamp = int(now if now is not None else time.time())
+    signature = admin_session_signature(token, timestamp)
+    return f"{timestamp}.{signature}"
+
+
+def admin_session_signature(token: str, timestamp: int) -> str:
+    return hmac.new(token.encode("utf-8"), f"admin:{timestamp}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def admin_session_allowed(config: Config, cookie_header: str) -> bool:
     token = getattr(config, "admin_web_token", None)
     if not token:
         return False
-    return admin_token_from_query(query) == token
+    cookie = SimpleCookie()
+    try:
+        cookie.load(cookie_header or "")
+    except Exception:
+        return False
+    morsel = cookie.get(ADMIN_COOKIE_NAME)
+    if morsel is None:
+        return False
+    try:
+        timestamp_text, signature = morsel.value.split(".", 1)
+        timestamp = int(timestamp_text)
+    except ValueError:
+        return False
+    if timestamp <= 0 or time.time() - timestamp > ADMIN_SESSION_TTL_SECONDS:
+        return False
+    expected = admin_session_signature(token, timestamp)
+    return hmac.compare_digest(signature, expected)
 
 
 def form_value(form: dict[str, list[str]], name: str, default: str = "") -> str:
     return (form.get(name) or [default])[0].strip()
 
 
+def form_values(form: dict[str, list[str]], name: str) -> list[str]:
+    return [value.strip() for value in form.get(name, []) if value.strip()]
+
+
 def parse_admin_chat_ids(text: str) -> list[int]:
-    return [int(value) for value in re.findall(r"-\d{5,20}", text)]
+    return [int(value) for value in re.findall(r"-?\d{5,20}", text)]
+
+
+def parse_admin_chat_ids_from_form(form: dict[str, list[str]], name: str) -> list[int]:
+    ids: list[int] = []
+    for value in form_values(form, name):
+        ids.extend(parse_admin_chat_ids(value))
+    return list(dict.fromkeys(ids))
+
+
+def parse_single_admin_chat_id(form: dict[str, list[str]], name: str) -> int:
+    ids = parse_admin_chat_ids_from_form(form, name)
+    if not ids:
+        raise ValueError("请选择或填写群组。")
+    return ids[0]
 
 
 def apply_admin_action(storage: Storage, form: dict[str, list[str]], timezone: tzinfo) -> str:
     action = form_value(form, "action")
     now = datetime.now(timezone)
     if action == "add_whitelist":
-        chat_id = int(form_value(form, "chat_id"))
+        chat_id = parse_single_admin_chat_id(form, "chat_id")
         address = form_value(form, "address")
         network = detect_usdt_network(address)
         if network != "TRC20":
@@ -288,7 +360,7 @@ def apply_admin_action(storage: Storage, form: dict[str, list[str]], timezone: t
         )
         return "白名单地址已保存。"
     if action == "remove_whitelist":
-        chat_id = int(form_value(form, "chat_id"))
+        chat_id = parse_single_admin_chat_id(form, "chat_id")
         address = form_value(form, "address")
         removed = storage.remove_address_whitelist(chat_id, address, now=now)
         return "白名单地址已删除。" if removed else "没有找到这个白名单地址。"
@@ -302,7 +374,7 @@ def apply_admin_action(storage: Storage, form: dict[str, list[str]], timezone: t
         return "广播分组已删除。" if deleted else "没有找到这个广播分组。"
     if action == "add_broadcast_members":
         name = form_value(form, "group_name")
-        chat_ids = parse_admin_chat_ids(form_value(form, "chat_ids"))
+        chat_ids = parse_admin_chat_ids_from_form(form, "chat_ids")
         added, _known_ids, missing_ids = storage.add_broadcast_group_members(name, chat_ids, now=now)
         message = f"已添加 {added} 个群到分组。"
         if missing_ids:
@@ -310,7 +382,7 @@ def apply_admin_action(storage: Storage, form: dict[str, list[str]], timezone: t
         return message
     if action == "remove_broadcast_members":
         name = form_value(form, "group_name")
-        chat_ids = parse_admin_chat_ids(form_value(form, "chat_ids"))
+        chat_ids = parse_admin_chat_ids_from_form(form, "chat_ids")
         removed = storage.remove_broadcast_group_members(name, chat_ids, now=now)
         return f"已从分组移除 {removed} 个群。"
     if action == "grant_broadcast_permission":
@@ -334,12 +406,12 @@ def apply_admin_action(storage: Storage, form: dict[str, list[str]], timezone: t
         return "广播操作人已禁用。" if changed else "没有找到这个广播操作人。"
     if action == "grant_broadcast_chat_permission":
         user_id = int(form_value(form, "user_id"))
-        chat_id = int(form_value(form, "chat_id"))
+        chat_id = parse_single_admin_chat_id(form, "chat_id")
         changed = storage.grant_broadcast_chat_permission(chat_id=chat_id, user_id=user_id, created_by=0, now=now)
         return "单群权限已授权。" if changed else "这个用户已拥有该单群权限。"
     if action == "revoke_broadcast_chat_permission":
         user_id = int(form_value(form, "user_id"))
-        chat_id = int(form_value(form, "chat_id"))
+        chat_id = parse_single_admin_chat_id(form, "chat_id")
         changed = storage.revoke_broadcast_chat_permission(chat_id=chat_id, user_id=user_id)
         return "单群权限已取消。" if changed else "这个用户没有该单群权限。"
     if action == "set_broadcast_replacement":
@@ -455,7 +527,27 @@ def render_bill_page(
     return page_shell(f"{data.group_title} - {data.title_day}", content)
 
 
-def render_admin_page(storage: Storage, config: Config, *, token: str, message: str = "") -> str:
+def render_admin_login_page(message: str = "") -> str:
+    notice = f'<div class="admin-login-error">{escape(message)}</div>' if message else ""
+    content = f"""
+    <div class="content-wrapper admin-login-wrapper">
+      <div class="admin-login-card">
+        <div class="brand">Telegram 记账机器人</div>
+        <h1>后台登录</h1>
+        <p>请输入后台管理密码。</p>
+        {notice}
+        <form method="POST" action="/admin" class="admin-login-form">
+          {hidden_input("action", "admin_login")}
+          <input type="password" name="password" placeholder="后台管理密码" autocomplete="current-password" autofocus required>
+          <button type="submit">登录后台</button>
+        </form>
+      </div>
+    </div>
+    """
+    return page_shell("后台登录", content)
+
+
+def render_admin_page(storage: Storage, config: Config, *, message: str = "") -> str:
     groups = storage.list_broadcast_groups()
     whitelist_rows = storage.list_address_whitelist()
     named_groups = storage.list_named_broadcast_groups()
@@ -473,25 +565,24 @@ def render_admin_page(storage: Storage, config: Config, *, token: str, message: 
             <h1>后台管理</h1>
             <p>管理地址白名单、广播分组、分组权限和已保存群组。</p>
           </div>
-          <a class="btn" href="/admin?admin_token={quote(token)}">刷新</a>
+          <a class="btn" href="/admin">刷新</a>
         </header>
         {notice}
+        {render_group_datalist(groups)}
         <section class="admin-grid">
           <div class="admin-card">
             <h2>地址白名单</h2>
-            <form method="POST" action="/admin?admin_token={quote(token)}" class="admin-form">
-              {admin_token_input(token)}
+            <form method="POST" action="/admin" class="admin-form">
               {hidden_input("action", "add_whitelist")}
-              <input name="chat_id" placeholder="群ID，例如 -100111" required>
+              <input name="chat_id" list="saved-admin-groups" placeholder="输入群名搜索选择" required>
               <input name="address" placeholder="TRC20 地址" required>
               <input name="label" placeholder="备注，可选">
               <input name="image_url" placeholder="图片URL，可选">
               <button type="submit">保存白名单</button>
             </form>
-            <form method="POST" action="/admin?admin_token={quote(token)}" class="admin-form inline-form">
-              {admin_token_input(token)}
+            <form method="POST" action="/admin" class="admin-form inline-form">
               {hidden_input("action", "remove_whitelist")}
-              <input name="chat_id" placeholder="群ID" required>
+              <input name="chat_id" list="saved-admin-groups" placeholder="输入群名搜索选择" required>
               <input name="address" placeholder="TRC20 地址" required>
               <button type="submit">删除白名单</button>
             </form>
@@ -500,30 +591,28 @@ def render_admin_page(storage: Storage, config: Config, *, token: str, message: 
 
           <div class="admin-card">
             <h2>广播分组</h2>
-            <form method="POST" action="/admin?admin_token={quote(token)}" class="admin-form inline-form">
-              {admin_token_input(token)}
+            <form method="POST" action="/admin" class="admin-form inline-form">
               {hidden_input("action", "create_broadcast_group")}
               <input name="group_name" placeholder="分组名，例如 财务" required>
               <button type="submit">新建/更新分组</button>
             </form>
-            <form method="POST" action="/admin?admin_token={quote(token)}" class="admin-form inline-form">
-              {admin_token_input(token)}
+            <form method="POST" action="/admin" class="admin-form inline-form">
               {hidden_input("action", "delete_broadcast_group")}
               <input name="group_name" placeholder="分组名" required>
               <button type="submit">删除分组</button>
             </form>
-            <form method="POST" action="/admin?admin_token={quote(token)}" class="admin-form">
-              {admin_token_input(token)}
+            <form method="POST" action="/admin" class="admin-form">
               {hidden_input("action", "add_broadcast_members")}
               <input name="group_name" placeholder="分组名" required>
-              <textarea name="chat_ids" placeholder="批量添加群ID，例如 -100111 -100222" required></textarea>
+              {render_group_multi_select(groups)}
+              <textarea name="chat_ids" placeholder="也可以粘贴群ID，例如 -100111 -100222"></textarea>
               <button type="submit">批量添加群组</button>
             </form>
-            <form method="POST" action="/admin?admin_token={quote(token)}" class="admin-form">
-              {admin_token_input(token)}
+            <form method="POST" action="/admin" class="admin-form">
               {hidden_input("action", "remove_broadcast_members")}
               <input name="group_name" placeholder="分组名" required>
-              <textarea name="chat_ids" placeholder="批量移除群ID，例如 -100111 -100222" required></textarea>
+              {render_group_multi_select(groups)}
+              <textarea name="chat_ids" placeholder="也可以粘贴群ID，例如 -100111 -100222"></textarea>
               <button type="submit">批量移除群组</button>
             </form>
             {render_broadcast_group_table(storage, named_groups)}
@@ -532,45 +621,39 @@ def render_admin_page(storage: Storage, config: Config, *, token: str, message: 
           <div class="admin-card">
             <h2>广播权限</h2>
             <p class="muted">宿主和服务器默认操作人拥有全部权限。普通广播操作人只拥有被授权的分组或单群。</p>
-            <form method="POST" action="/admin?admin_token={quote(token)}" class="admin-form inline-form">
-              {admin_token_input(token)}
+            <form method="POST" action="/admin" class="admin-form inline-form">
               {hidden_input("action", "add_broadcast_operator")}
               <input name="user_id" placeholder="操作人UID" required>
               <input name="remark" placeholder="备注，可选">
               <button type="submit">保存操作人</button>
             </form>
-            <form method="POST" action="/admin?admin_token={quote(token)}" class="admin-form inline-form">
-              {admin_token_input(token)}
+            <form method="POST" action="/admin" class="admin-form inline-form">
               {hidden_input("action", "disable_broadcast_operator")}
               <input name="user_id" placeholder="操作人UID" required>
               <button type="submit">禁用操作人</button>
             </form>
-            <form method="POST" action="/admin?admin_token={quote(token)}" class="admin-form inline-form">
-              {admin_token_input(token)}
+            <form method="POST" action="/admin" class="admin-form inline-form">
               {hidden_input("action", "grant_broadcast_permission")}
               <input name="user_id" placeholder="操作人UID" required>
               <input name="group_name" placeholder="分组名" required>
               <button type="submit">授权分组</button>
             </form>
-            <form method="POST" action="/admin?admin_token={quote(token)}" class="admin-form inline-form">
-              {admin_token_input(token)}
+            <form method="POST" action="/admin" class="admin-form inline-form">
               {hidden_input("action", "revoke_broadcast_permission")}
               <input name="user_id" placeholder="操作人UID" required>
               <input name="group_name" placeholder="分组名" required>
               <button type="submit">取消授权</button>
             </form>
-            <form method="POST" action="/admin?admin_token={quote(token)}" class="admin-form inline-form">
-              {admin_token_input(token)}
+            <form method="POST" action="/admin" class="admin-form inline-form">
               {hidden_input("action", "grant_broadcast_chat_permission")}
               <input name="user_id" placeholder="操作人UID" required>
-              <input name="chat_id" placeholder="单群ID，例如 -100111" required>
+              <input name="chat_id" list="saved-admin-groups" placeholder="输入群名搜索选择" required>
               <button type="submit">授权单群</button>
             </form>
-            <form method="POST" action="/admin?admin_token={quote(token)}" class="admin-form inline-form">
-              {admin_token_input(token)}
+            <form method="POST" action="/admin" class="admin-form inline-form">
               {hidden_input("action", "revoke_broadcast_chat_permission")}
               <input name="user_id" placeholder="操作人UID" required>
-              <input name="chat_id" placeholder="单群ID，例如 -100111" required>
+              <input name="chat_id" list="saved-admin-groups" placeholder="输入群名搜索选择" required>
               <button type="submit">取消单群</button>
             </form>
             {render_operator_table(operators)}
@@ -580,8 +663,7 @@ def render_admin_page(storage: Storage, config: Config, *, token: str, message: 
           <div class="admin-card">
             <h2>广播替换</h2>
             <p class="muted">开启后，广播发送时会使用这里设置的图片/文字替换原始内容；关闭后按原始广播内容发送。</p>
-            <form method="POST" action="/admin?admin_token={quote(token)}" class="admin-form">
-              {admin_token_input(token)}
+            <form method="POST" action="/admin" class="admin-form">
               {hidden_input("action", "set_broadcast_replacement")}
               <select name="enabled">
                 <option value="0"{selected_attr(str(replacement["enabled"]), "0")}>关闭</option>
@@ -606,8 +688,28 @@ def render_admin_page(storage: Storage, config: Config, *, token: str, message: 
     return page_shell("后台管理", content)
 
 
-def admin_token_input(token: str) -> str:
-    return hidden_input("admin_token", token)
+def render_group_datalist(rows: list[Any]) -> str:
+    options = []
+    for row in rows:
+        title = row["chat_title"] or "(未命名群)"
+        label = f"{title}  {row['chat_id']}"
+        options.append(f'<option value="{row["chat_id"]}" label="{escape(label, quote=True)}"></option>')
+    return f'<datalist id="saved-admin-groups">{"".join(options)}</datalist>'
+
+
+def render_group_multi_select(rows: list[Any]) -> str:
+    if not rows:
+        return '<p class="muted admin-form-hint">暂无已保存群组。</p>'
+    options = []
+    for row in rows:
+        title = row["chat_title"] or "(未命名群)"
+        options.append(f'<option value="{row["chat_id"]}">{escape(title)}（{row["chat_id"]}）</option>')
+    return f"""
+    <label class="admin-form-wide admin-form-hint">选择已保存群组，可按 Ctrl/Shift 多选</label>
+    <select name="chat_ids" class="admin-multi-select admin-form-wide" multiple size="8">
+      {''.join(options)}
+    </select>
+    """
 
 
 def render_whitelist_table(rows: list[Any]) -> str:
@@ -2168,6 +2270,17 @@ def page_shell(title: str, body: str) -> str:
       grid-column: 1 / -1;
       min-height: 70px;
       resize: vertical;
+    }}
+    .admin-form-wide {{
+      grid-column: 1 / -1;
+    }}
+    .admin-form-hint {{
+      margin: 0;
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    .admin-multi-select {{
+      min-height: 150px !important;
     }}
     .admin-form button {{
       min-height: 34px;

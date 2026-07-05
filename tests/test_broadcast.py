@@ -116,9 +116,9 @@ def test_private_admin_button_sends_admin_link_to_root() -> None:
     bot.send_admin_web_link(1001, TelegramUser(10, "root", "Root"), 77)
 
     message = fake.messages[0]
-    assert message["text"] == "后台管理入口："
+    assert message["text"] == "后台管理入口：打开后请输入后台管理密码。"
     keyboard = message["reply_markup"]["inline_keyboard"]  # type: ignore[index]
-    assert keyboard[0][0]["url"] == "https://bot.example.com/admin?admin_token=secret+token"
+    assert keyboard[0][0]["url"] == "https://bot.example.com/admin"
 
 
 def test_private_admin_button_rejects_non_root_user() -> None:
@@ -136,14 +136,17 @@ def test_private_admin_button_rejects_non_root_user() -> None:
     assert fake.messages[0]["text"] == "没有后台管理权限。"
 
 
-def test_private_help_mentions_current_broadcast_and_admin_commands() -> None:
+def test_private_help_uses_buttons_and_admin_for_non_accounting_features() -> None:
     help_text = LedgerBot.private_help_text(object.__new__(LedgerBot))
 
-    assert "单群广播 -100111 广播内容" in help_text
-    assert "授权单群 123456 -100111" in help_text
-    assert "开启广播替换" in help_text
-    assert "添加白名单地址 Txxxx 备注" in help_text
-    assert "私聊菜单点击 ⚙后台管理" in help_text
+    assert "点击 📡群发广播 或 📣分组广播" in help_text
+    assert "通知所有人是按钮开关" in help_text
+    assert "后台里按群名搜索或多选群组" in help_text
+    assert "输入 ADMIN_WEB_TOKEN 设置的后台密码" in help_text
+    assert "单群广播 -100111 广播内容" not in help_text
+    assert "授权单群 123456 -100111" not in help_text
+    assert "开启广播替换" not in help_text
+    assert "添加白名单地址 Txxxx 备注" not in help_text
     assert "自助续费" not in help_text
     assert "已预留" not in help_text
 

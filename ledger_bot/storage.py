@@ -637,6 +637,12 @@ class Storage:
             (self.normalize_broadcast_group_name(name),),
         ).fetchone()
 
+    def get_named_broadcast_group_by_id(self, group_id: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM broadcast_groups WHERE id = ?",
+            (group_id,),
+        ).fetchone()
+
     def delete_named_broadcast_group(self, name: str) -> int:
         group = self.get_named_broadcast_group(name)
         if group is not None:

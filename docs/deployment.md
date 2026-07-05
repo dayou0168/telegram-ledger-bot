@@ -69,6 +69,7 @@ BILL_WEB_ENABLED=1
 BILL_WEB_HOST=0.0.0.0
 BILL_WEB_PORT=8080
 BILL_WEB_TOKEN=
+ADMIN_WEB_TOKEN=
 TRONGRID_API_BASE=https://api.trongrid.io
 TRONGRID_API_KEY=
 TRON_POLL_INTERVAL_SECONDS=5
@@ -117,9 +118,10 @@ PUBLIC_BILL_URL_TEMPLATE=
 BILL_WEB_ENABLED=1
 BILL_WEB_PORT=8080
 BILL_WEB_TOKEN=replace-with-random-text
+ADMIN_WEB_TOKEN=replace-with-admin-password
 ```
 
-The Telegram bill button then opens `/bill/{chat_id}/{day}` on your own domain. If `BILL_WEB_TOKEN` is empty, the bill URL is public; for production use, set a random token.
+The Telegram bill button then opens `/bill/{chat_id}/{day}` on your own domain. If `BILL_WEB_TOKEN` is empty, the bill URL is public; for production use, set a random token. The admin backend is `/admin`; set `ADMIN_WEB_TOKEN` as the login password.
 
 The built-in web server also supports legacy-style `/day_xxb.php` links. Use `created_at=YYYY-MM-DD` to open a historical bill, and append `download=excel` to download the current bill window as an `.xlsx` file named like `账单_日期_群名_时间戳.xlsx`.
 
@@ -160,6 +162,7 @@ BILL_WEB_ENABLED=1
 BILL_WEB_HOST=0.0.0.0
 BILL_WEB_PORT=8080
 BILL_WEB_TOKEN=
+ADMIN_WEB_TOKEN=
 
 TRONGRID_API_BASE=https://api.trongrid.io
 TRONGRID_API_KEY=
@@ -279,13 +282,10 @@ Private chat tests:
 /start
 我的ID
 地址监听
-设置地址 TGhAAySHUUcEGua33pZZ88wP3bA6XSeQuZ 监控地址
-设置备注 TGhAAySHUUcEGua33pZZ88wP3bA6XSeQuZ 监控地址
-设置监听金额10
+点击地址监听面板里的按钮添加地址、备注和最小提醒金额
 群列表
-新建分组 财务
-分组添加 财务 -100111 -100222
-分组广播 财务 测试广播
+点击群发广播/分组广播按钮选择目标并发送测试内容
+点击后台管理进入 /admin 管理分组、权限、白名单和广播替换
 ```
 
 ## Backup

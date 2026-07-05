@@ -14,6 +14,7 @@ from ledger_bot.bill_web import (
     handle_bill_web_post_response,
     handle_bill_web_request,
     handle_bill_web_response,
+    make_admin_session_value,
     render_bill_page,
 )
 from ledger_bot.storage import Storage
@@ -200,7 +201,7 @@ def test_bill_web_token_blocks_missing_token() -> None:
     assert "访问受限" in body
 
 
-def test_admin_page_requires_admin_token() -> None:
+def test_admin_page_requires_login() -> None:
     config = SimpleNamespace(
         admin_web_token="admin-secret",
         bill_web_token=None,
@@ -211,8 +212,10 @@ def test_admin_page_requires_admin_token() -> None:
 
     response = handle_bill_web_response(config, "/admin")
 
-    assert response.status == 403
-    assert "访问受限" in response.body.decode("utf-8")
+    assert response.status == 200
+    body = response.body.decode("utf-8")
+    assert "后台登录" in body
+    assert 'name="password"' in body
 
 
 def test_admin_page_renders_management_sections() -> None:
@@ -232,7 +235,8 @@ def test_admin_page_renders_management_sections() -> None:
             p2p_rate_trade_methods=("aliPay",),
         )
 
-        response = handle_bill_web_response(config, "/admin?admin_token=admin-secret")
+        cookie = f"ledger_admin_session={make_admin_session_value('admin-secret')}"
+        response = handle_bill_web_response(config, "/admin", cookie_header=cookie)
         body = response.body.decode("utf-8")
 
         assert response.status == 200
@@ -242,6 +246,8 @@ def test_admin_page_renders_management_sections() -> None:
         assert "广播替换" in body
         assert "已保存群组" in body
         assert "测试群" in body
+        assert "saved-admin-groups" in body
+        assert 'list="saved-admin-groups"' in body
 
 
 def test_admin_post_updates_whitelist_broadcast_permissions_and_replacement() -> None:
@@ -275,8 +281,9 @@ def test_admin_post_updates_whitelist_broadcast_permissions_and_replacement() ->
             ),
             "action=set_broadcast_replacement&enabled=1&text=hello&photo=file123",
         ]
+        cookie = f"ledger_admin_session={make_admin_session_value('admin-secret')}"
         for raw_body in posts:
-            response = handle_bill_web_post_response(config, "/admin?admin_token=admin-secret", raw_body)
+            response = handle_bill_web_post_response(config, "/admin", raw_body, cookie_header=cookie)
             assert response.status == 303
 
         storage = Storage(db_path)
