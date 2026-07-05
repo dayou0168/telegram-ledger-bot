@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, tzinfo
 import json
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
 
 @dataclass(frozen=True)
@@ -48,6 +47,11 @@ class Storage:
                 all_members_can_record INTEGER NOT NULL DEFAULT 0,
                 simple_limit INTEGER,
                 day_cutoff_hour INTEGER NOT NULL DEFAULT 0,
+                pending_day_cutoff_hour INTEGER,
+                pending_day_cutoff_effective_at TEXT,
+                open_bill_day_key TEXT,
+                open_bill_begin_at TEXT,
+                open_bill_end_at TEXT,
                 pin_enabled INTEGER NOT NULL DEFAULT 0,
                 realtime_rate INTEGER NOT NULL DEFAULT 0,
                 realtime_rate_rank INTEGER,
@@ -225,6 +229,11 @@ class Storage:
                 "multiply_exchange": "INTEGER NOT NULL DEFAULT 0",
                 "show_cny": "INTEGER NOT NULL DEFAULT 1",
                 "all_members_can_record": "INTEGER NOT NULL DEFAULT 0",
+                "pending_day_cutoff_hour": "INTEGER",
+                "pending_day_cutoff_effective_at": "TEXT",
+                "open_bill_day_key": "TEXT",
+                "open_bill_begin_at": "TEXT",
+                "open_bill_end_at": "TEXT",
                 "realtime_rate": "INTEGER NOT NULL DEFAULT 0",
                 "realtime_rate_rank": "INTEGER",
                 "realtime_rate_offset": "TEXT NOT NULL DEFAULT '0'",
@@ -587,6 +596,57 @@ class Storage:
         self.conn.commit()
         return self.get_group(chat_id)
 
+    def apply_due_day_cutoff(self, chat_id: int, now: datetime, timezone: tzinfo) -> sqlite3.Row:
+        group = self.get_group(chat_id)
+        pending = group_value(group, "pending_day_cutoff_hour")
+        effective_at = parse_stored_datetime(group_value(group, "pending_day_cutoff_effective_at"), timezone)
+        if pending is None or effective_at is None or now.astimezone(timezone) < effective_at:
+            return group
+        return self.update_group(
+            chat_id,
+            now,
+            day_cutoff_hour=int(pending),
+            pending_day_cutoff_hour=None,
+            pending_day_cutoff_effective_at=None,
+        )
+
+    def set_day_cutoff_hour(self, chat_id: int, now: datetime, new_hour: int, timezone: tzinfo) -> sqlite3.Row:
+        group = self.apply_due_day_cutoff(chat_id, now, timezone)
+        old_hour = int(group["day_cutoff_hour"])
+        if new_hour == old_hour:
+            return self.update_group(
+                chat_id,
+                now,
+                pending_day_cutoff_hour=None,
+                pending_day_cutoff_effective_at=None,
+                open_bill_day_key=None,
+                open_bill_begin_at=None,
+                open_bill_end_at=None,
+            )
+        if new_hour < 0 or old_hour < 0:
+            return self.update_group(
+                chat_id,
+                now,
+                day_cutoff_hour=new_hour,
+                pending_day_cutoff_hour=None,
+                pending_day_cutoff_effective_at=None,
+                open_bill_day_key=None,
+                open_bill_begin_at=None,
+                open_bill_end_at=None,
+            )
+
+        current_key, current_start, old_end = current_bill_window_for_change(group, now, timezone)
+        effective_at = first_cutoff_boundary_at_or_after(old_end, new_hour, timezone)
+        return self.update_group(
+            chat_id,
+            now,
+            pending_day_cutoff_hour=new_hour,
+            pending_day_cutoff_effective_at=effective_at.isoformat(),
+            open_bill_day_key=current_key,
+            open_bill_begin_at=current_start.isoformat(),
+            open_bill_end_at=effective_at.isoformat(),
+        )
+
     def activate_group(self, chat_id: int, now: datetime) -> sqlite3.Row:
         group = self.get_group(chat_id)
         updates: dict[str, Any] = {"active": 1, "activated_at": now.isoformat()}
@@ -767,6 +827,20 @@ class Storage:
             )
         )
 
+    def list_records_for_period(self, chat_id: int, start: datetime, end: datetime) -> list[sqlite3.Row]:
+        return list(
+            self.conn.execute(
+                """
+                SELECT * FROM records
+                WHERE chat_id = ?
+                  AND deleted_at IS NULL
+                  AND ((created_at >= ? AND created_at < ?) OR is_balance = 1)
+                ORDER BY id ASC
+                """,
+                (chat_id, start.isoformat(), end.isoformat()),
+            )
+        )
+
     def soft_delete_record(self, chat_id: int, record_id: int, now: datetime, kind: str | None = None) -> int:
         if kind:
             cursor = self.conn.execute(
@@ -838,6 +912,21 @@ class Storage:
         self.conn.commit()
         return cursor.rowcount
 
+    def soft_delete_period(self, chat_id: int, start: datetime, end: datetime, now: datetime) -> int:
+        cursor = self.conn.execute(
+            """
+            UPDATE records SET deleted_at = ?
+            WHERE chat_id = ?
+              AND deleted_at IS NULL
+              AND is_balance = 0
+              AND created_at >= ?
+              AND created_at < ?
+            """,
+            (now.isoformat(), chat_id, start.isoformat(), end.isoformat()),
+        )
+        self.conn.commit()
+        return cursor.rowcount
+
     def soft_delete_all(self, chat_id: int, now: datetime) -> int:
         cursor = self.conn.execute(
             "UPDATE records SET deleted_at = ? WHERE chat_id = ? AND deleted_at IS NULL",
@@ -888,6 +977,52 @@ class Storage:
                     (chat_id, day_key),
                 )
             )
+        changed = 0
+        for row in rows:
+            values = _recalculate_record(row, exchange_rate)
+            self.conn.execute(
+                """
+                UPDATE records
+                SET exchange_rate = ?,
+                    amount_cny = ?,
+                    amount_usdt = ?,
+                    commission_cny = ?,
+                    net_usdt = ?
+                WHERE id = ?
+                """,
+                (
+                    values["exchange_rate"],
+                    values["amount_cny"],
+                    values["amount_usdt"],
+                    values["commission_cny"],
+                    values["net_usdt"],
+                    row["id"],
+                ),
+            )
+            changed += 1
+        self.conn.commit()
+        return changed
+
+    def update_period_exchange_rate(
+        self,
+        chat_id: int,
+        start: datetime,
+        end: datetime,
+        exchange_rate: str,
+        now: datetime,
+    ) -> int:
+        rows = list(
+            self.conn.execute(
+                """
+                SELECT * FROM records
+                WHERE chat_id = ?
+                  AND deleted_at IS NULL
+                  AND created_at >= ?
+                  AND created_at < ?
+                """,
+                (chat_id, start.isoformat(), end.isoformat()),
+            )
+        )
         changed = 0
         for row in rows:
             values = _recalculate_record(row, exchange_rate)
@@ -1085,14 +1220,79 @@ def user_from_telegram(raw: dict[str, Any]) -> TelegramUser:
     return TelegramUser(user_id=int(raw["id"]), username=username, display_name=display_name)
 
 
-def business_day_key(now: datetime, cutoff_hour: int, timezone: ZoneInfo) -> str:
+def group_value(group: Any, key: str, default: Any = None) -> Any:
+    if isinstance(group, dict):
+        return group.get(key, default)
+    try:
+        return group[key]
+    except (IndexError, KeyError, TypeError):
+        return default
+
+
+def parse_stored_datetime(value: Any, timezone: tzinfo) -> datetime | None:
+    if not value:
+        return None
+    parsed = datetime.fromisoformat(str(value))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone)
+    return parsed.astimezone(timezone)
+
+
+def current_business_day_key(now: datetime, group: Any, timezone: tzinfo) -> str:
+    override = active_open_bill_window(now, group, timezone)
+    if override is not None:
+        return override[0]
+    return business_day_key(now, int(group_value(group, "day_cutoff_hour", 0)), timezone)
+
+
+def active_open_bill_window(now: datetime, group: Any, timezone: tzinfo) -> tuple[str, datetime, datetime] | None:
+    key = group_value(group, "open_bill_day_key")
+    begin = parse_stored_datetime(group_value(group, "open_bill_begin_at"), timezone)
+    end = parse_stored_datetime(group_value(group, "open_bill_end_at"), timezone)
+    if not key or begin is None or end is None:
+        return None
+    local_now = now.astimezone(timezone)
+    if begin <= local_now < end:
+        return str(key), begin, end
+    return None
+
+
+def current_bill_window_for_change(group: Any, now: datetime, timezone: tzinfo) -> tuple[str, datetime, datetime]:
+    override = active_open_bill_window(now, group, timezone)
+    if override is not None:
+        return override
+    cutoff_hour = int(group_value(group, "day_cutoff_hour", 0))
+    key = business_day_key(now, cutoff_hour, timezone)
+    begin, end = business_day_range(key, cutoff_hour, timezone)
+    return key, begin, end
+
+
+def bill_window_for_day(group: Any, day_key: str, timezone: tzinfo, cutoff_hour: int | None = None) -> tuple[datetime, datetime]:
+    open_key = group_value(group, "open_bill_day_key")
+    begin = parse_stored_datetime(group_value(group, "open_bill_begin_at"), timezone)
+    end = parse_stored_datetime(group_value(group, "open_bill_end_at"), timezone)
+    if open_key == day_key and begin is not None and end is not None:
+        return begin, end
+    hour = int(group_value(group, "day_cutoff_hour", 0) if cutoff_hour is None else cutoff_hour)
+    return business_day_range(day_key, hour, timezone)
+
+
+def first_cutoff_boundary_at_or_after(moment: datetime, cutoff_hour: int, timezone: tzinfo) -> datetime:
+    local = moment.astimezone(timezone)
+    candidate = datetime(local.year, local.month, local.day, cutoff_hour, 0, 0, tzinfo=timezone)
+    if candidate < local:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def business_day_key(now: datetime, cutoff_hour: int, timezone: tzinfo) -> str:
     local = now.astimezone(timezone)
     if cutoff_hour >= 0 and local.hour < cutoff_hour:
         local = local - timedelta(days=1)
     return local.date().isoformat()
 
 
-def business_day_range(day_key: str, cutoff_hour: int, timezone: ZoneInfo) -> tuple[datetime, datetime]:
+def business_day_range(day_key: str, cutoff_hour: int, timezone: tzinfo) -> tuple[datetime, datetime]:
     year, month, day = [int(part) for part in day_key.split("-")]
     if cutoff_hour < 0:
         cutoff_hour = 0

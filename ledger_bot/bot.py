@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, tzinfo
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from html import escape
 import json
@@ -15,7 +15,14 @@ from .calculator import CalculatorError, calculate_expression, format_calculatio
 from .config import Config
 from .p2p_rates import P2POrderBookEntry, P2PRateClient, P2PRateError
 from .parser import ParsedCommand, ParsedLedgerEntry, parse_message
-from .storage import Storage, TelegramUser, business_day_key, business_day_range, user_from_telegram
+from .storage import (
+    Storage,
+    TelegramUser,
+    bill_window_for_day,
+    business_day_key,
+    current_business_day_key,
+    user_from_telegram,
+)
 from .telegram_api import TelegramAPIError, TelegramClient, TelegramRetryableError, run_with_backoff
 from .tron_api import (
     TronGridClient,
@@ -205,6 +212,7 @@ class LedgerBot:
             now=now,
         )
         self.storage.ensure_group(ctx.chat_id, ctx.chat_title, now)
+        self.storage.apply_due_day_cutoff(ctx.chat_id, now, self.config.timezone)
         self.storage.touch_user(ctx.chat_id, user, now)
         if ctx.reply_user:
             self.storage.touch_user(ctx.chat_id, ctx.reply_user, now)
@@ -291,10 +299,10 @@ class LedgerBot:
                 if hour != -1 and not 0 <= hour <= 23:
                     self.reply(ctx, "日切时间只能是 0 到 23，或 -1 关闭日切。")
                     return
-                self.storage.update_group(ctx.chat_id, ctx.now, day_cutoff_hour=hour)
-                self.reply(ctx, "日切已关闭。" if hour == -1 else f"设置成功，当前日切时间为：{hour}点")
+                group = self.storage.set_day_cutoff_hour(ctx.chat_id, ctx.now, hour, self.config.timezone)
+                self.reply(ctx, self.cutoff_set_reply(group, hour))
             case "cutoff_off" | "global_cutoff_off":
-                self.storage.update_group(ctx.chat_id, ctx.now, day_cutoff_hour=-1)
+                self.storage.set_day_cutoff_hour(ctx.chat_id, ctx.now, -1, self.config.timezone)
                 self.reply(ctx, "日切已关闭。")
             case "simple_mode":
                 self.storage.update_group(ctx.chat_id, ctx.now, simple_limit=int(command.args["limit"]))
@@ -322,13 +330,11 @@ class LedgerBot:
                 day_key = self.day_key(ctx)
                 rate = str(command.args["exchange_rate"])
                 group = self.storage.get_group(ctx.chat_id)
-                changed = self.storage.update_day_exchange_rate(
-                    ctx.chat_id,
-                    day_key,
-                    rate,
-                    ctx.now,
-                    all_days=self.day_cutoff_disabled(group),
-                )
+                if self.day_cutoff_disabled(group):
+                    changed = self.storage.update_day_exchange_rate(ctx.chat_id, day_key, rate, ctx.now, all_days=True)
+                else:
+                    begin, end = self.bill_window(group, day_key)
+                    changed = self.storage.update_period_exchange_rate(ctx.chat_id, begin, end, rate, ctx.now)
                 self.storage.update_group(
                     ctx.chat_id,
                     ctx.now,
@@ -1398,13 +1404,14 @@ class LedgerBot:
             return
 
         record = self.create_record(ctx, group, entry)
+        day_key = record["day_key"]
         sent = self.client.send_message(
             ctx.chat_id,
-            self.build_bill_text(ctx.chat_id, self.day_key(ctx), compact=True),
+            self.build_bill_text(ctx.chat_id, day_key, compact=True),
             parse_mode="HTML",
             reply_markup={
                 "inline_keyboard": [
-                    self.bill_button_row(ctx.chat_id, self.day_key(ctx)),
+                    self.bill_button_row(ctx.chat_id, day_key),
                 ]
             },
         )
@@ -1471,12 +1478,13 @@ class LedgerBot:
         return ctx.user.user_id, ctx.user.display_name
 
     def send_bill(self, ctx: MessageContext, *, only_user_id: int | None = None, compact: bool = False) -> None:
-        text = self.build_bill_text(ctx.chat_id, self.day_key(ctx), only_user_id=only_user_id, compact=compact)
+        day_key = self.day_key(ctx)
+        text = self.build_bill_text(ctx.chat_id, day_key, only_user_id=only_user_id, compact=compact)
         self.client.send_message(
             ctx.chat_id,
             text,
             parse_mode="HTML",
-            reply_markup={"inline_keyboard": [self.bill_button_row(ctx.chat_id, self.day_key(ctx))]},
+            reply_markup={"inline_keyboard": [self.bill_button_row(ctx.chat_id, day_key)]},
         )
 
     def build_bill_text(
@@ -1486,9 +1494,12 @@ class LedgerBot:
         *,
         only_user_id: int | None = None,
         compact: bool = False,
+        cutoff_hour: int | None = None,
+        begin: datetime | None = None,
+        end: datetime | None = None,
     ) -> str:
         group = self.storage.get_group(chat_id)
-        rows = self.storage.list_records_for_day(chat_id, day_key, all_days=self.day_cutoff_disabled(group))
+        rows = self.records_for_bill(chat_id, day_key, group, cutoff_hour=cutoff_hour, begin=begin, end=end)
         if only_user_id is not None:
             rows = [row for row in rows if row["actor_user_id"] == only_user_id or row["subject_user_id"] == only_user_id]
         deposits = [row for row in rows if row["kind"] == "deposit"]
@@ -1602,7 +1613,12 @@ class LedgerBot:
         url = self.build_bill_url(chat_id, day_key)
         if url:
             return [{"text": "🌐 完整账单", "url": url}]
-        return [{"text": "🌐 完整账单", "callback_data": "bill:full"}]
+        group = self.storage.get_group(chat_id)
+        if self.day_cutoff_disabled(group):
+            return [{"text": "🌐 完整账单", "callback_data": "bill:full:active"}]
+        begin, end = self.bill_window(group, day_key)
+        callback_data = f"bill:full:{day_key}:{self.compact_bill_time(begin)}:{self.compact_bill_time(end)}"
+        return [{"text": "🌐 完整账单", "callback_data": callback_data}]
 
     def build_bill_url(self, chat_id: int, day_key: str) -> str | None:
         group = self.storage.get_group(chat_id)
@@ -1612,7 +1628,7 @@ class LedgerBot:
             all_flag = "1"
             bill_key = "active"
         else:
-            begin, end = business_day_range(day_key, group["day_cutoff_hour"], self.config.timezone)
+            begin, end = self.bill_window(group, day_key)
             begin_time = begin.strftime("%Y-%m-%d %H:%M:%S")
             end_time = end.strftime("%Y-%m-%d %H:%M:%S")
             all_flag = ""
@@ -1649,19 +1665,34 @@ class LedgerBot:
             separator = "&" if "?" in base else "?"
             return f"{base}{separator}{urlencode(params)}"
         url = f"{base}/bill/{values['chat_id']}/{values['day_key']}"
+        params = {}
+        if values["begin_time"] or values["end_time"]:
+            params["begintime"] = values["begin_time"]
+            params["endtime"] = values["end_time"]
+        if values["all"]:
+            params["all"] = values["all"]
         if self.config.bill_web_token:
-            url = f"{url}?{urlencode({'token': self.config.bill_web_token})}"
+            params["token"] = self.config.bill_web_token
+        if params:
+            url = f"{url}?{urlencode(params)}"
         return url
 
     def ask_clear_confirm(self, ctx: MessageContext, scope: str) -> None:
         label = "今日账单" if scope == "today" else "全部账单"
+        callback_data = f"clear:{scope}"
+        if scope == "today":
+            group = self.storage.get_group(ctx.chat_id)
+            day_key = self.day_key(ctx)
+            if not self.day_cutoff_disabled(group):
+                begin, end = self.bill_window(group, day_key)
+                callback_data = f"clear:today:{day_key}:{self.compact_bill_time(begin)}:{self.compact_bill_time(end)}"
         self.client.send_message(
             ctx.chat_id,
             f"确认删除{label}？此操作会软删除流水。",
             reply_markup={
                 "inline_keyboard": [
                     [
-                        {"text": "确认删除", "callback_data": f"clear:{scope}"},
+                        {"text": "确认删除", "callback_data": callback_data},
                         {"text": "取消", "callback_data": "clear:cancel"},
                     ]
                 ]
@@ -1815,6 +1846,7 @@ class LedgerBot:
         now = datetime.now(self.config.timezone)
         user = user_from_telegram(actor)
         self.storage.ensure_group(chat_id, chat.get("title"), now)
+        self.storage.apply_due_day_cutoff(chat_id, now, self.config.timezone)
         self.storage.touch_user(chat_id, user, now)
         if chat.get("type") in {"group", "supergroup"}:
             if not self.ensure_host_present_or_leave(chat_id, chat.get("title"), user, now):
@@ -1842,30 +1874,37 @@ class LedgerBot:
         if data.startswith("clear:"):
             if not self.require_operator(fake_ctx, callback_id=callback["id"]):
                 return
-            scope = data.split(":", 1)[1]
+            parts = data.split(":")
+            scope = parts[1] if len(parts) > 1 else ""
             if scope == "cancel":
                 self.client.answer_callback_query(callback["id"], "已取消。")
                 return
             group = self.storage.get_group(chat_id)
-            day_key = business_day_key(now, group["day_cutoff_hour"], self.config.timezone)
+            day_key = parts[2] if len(parts) >= 3 and parts[2] else business_day_key(now, group["day_cutoff_hour"], self.config.timezone)
+            begin = self.parse_compact_bill_time(parts[3]) if len(parts) >= 4 else None
+            end = self.parse_compact_bill_time(parts[4]) if len(parts) >= 5 else None
             if scope == "today":
-                count = self.storage.soft_delete_day(
-                    chat_id,
-                    day_key,
-                    now,
-                    all_days=self.day_cutoff_disabled(group),
-                )
+                if self.day_cutoff_disabled(group):
+                    count = self.storage.soft_delete_day(chat_id, day_key, now, all_days=True)
+                elif begin is not None and end is not None:
+                    count = self.storage.soft_delete_period(chat_id, begin, end, now)
+                else:
+                    begin, end = self.bill_window(group, day_key)
+                    count = self.storage.soft_delete_period(chat_id, begin, end, now)
             else:
                 count = self.storage.soft_delete_all(chat_id, now)
             self.client.answer_callback_query(callback["id"], f"已删除 {count} 条。")
             self.client.send_message(chat_id, f"已删除 {count} 条账单。")
             return
 
-        if data == "bill:full":
+        if data == "bill:full" or data.startswith("bill:full:"):
             group = self.storage.get_group(chat_id)
-            day_key = business_day_key(now, group["day_cutoff_hour"], self.config.timezone)
+            parts = data.split(":")
+            day_key = parts[2] if len(parts) >= 3 and parts[2] else business_day_key(now, group["day_cutoff_hour"], self.config.timezone)
+            begin = self.parse_compact_bill_time(parts[3]) if len(parts) >= 4 else None
+            end = self.parse_compact_bill_time(parts[4]) if len(parts) >= 5 else None
             self.client.answer_callback_query(callback["id"])
-            self.client.send_message(chat_id, self.build_bill_text(chat_id, day_key), parse_mode="HTML")
+            self.client.send_message(chat_id, self.build_bill_text(chat_id, day_key, begin=begin, end=end), parse_mode="HTML")
 
     def handle_broadcast_callback(
         self,
@@ -2112,9 +2151,52 @@ class LedgerBot:
     def can_use_broadcast(self, user: TelegramUser) -> bool:
         return self.is_host(user.user_id) or self.is_default_operator(user)
 
+    def group_for_time(self, chat_id: int, now: datetime) -> Any:
+        return self.storage.apply_due_day_cutoff(chat_id, now, self.config.timezone)
+
     def day_key(self, ctx: MessageContext) -> str:
-        group = self.storage.get_group(ctx.chat_id)
-        return business_day_key(ctx.now, group["day_cutoff_hour"], self.config.timezone)
+        group = self.group_for_time(ctx.chat_id, ctx.now)
+        return current_business_day_key(ctx.now, group, self.config.timezone)
+
+    def bill_window(self, group: Any, day_key: str, cutoff_hour: int | None = None) -> tuple[datetime, datetime]:
+        return bill_window_for_day(group, day_key, self.config.timezone, cutoff_hour=cutoff_hour)
+
+    def records_for_bill(
+        self,
+        chat_id: int,
+        day_key: str,
+        group: Any,
+        *,
+        cutoff_hour: int | None = None,
+        begin: datetime | None = None,
+        end: datetime | None = None,
+    ) -> list[Any]:
+        if self.day_cutoff_disabled(group) or day_key in {"active", "all"}:
+            return self.storage.list_records_for_day(chat_id, day_key, all_days=True)
+        if begin is None or end is None:
+            begin, end = self.bill_window(group, day_key, cutoff_hour)
+        return self.storage.list_records_for_period(chat_id, begin, end)
+
+    def compact_bill_time(self, value: datetime) -> str:
+        return value.astimezone(self.config.timezone).strftime("%Y%m%d%H")
+
+    def parse_compact_bill_time(self, value: str) -> datetime | None:
+        if not value:
+            return None
+        try:
+            return datetime.strptime(value, "%Y%m%d%H").replace(tzinfo=self.config.timezone)
+        except ValueError:
+            return None
+
+    def cutoff_set_reply(self, group: Any, hour: int) -> str:
+        if hour < 0:
+            return "日切已关闭。"
+        pending = group["pending_day_cutoff_hour"]
+        effective_at = group["pending_day_cutoff_effective_at"]
+        if pending is not None and effective_at:
+            effective = datetime.fromisoformat(effective_at).astimezone(self.config.timezone)
+            return f"设置成功，当前账期将延续到 {effective:%Y-%m-%d %H:%M}，之后日切时间为：{hour}点"
+        return f"设置成功，当前日切时间为：{hour}点"
 
     @staticmethod
     def day_cutoff_disabled(group: Any) -> bool:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, tzinfo
+from collections import defaultdict
+from datetime import datetime, timedelta, tzinfo
 from decimal import Decimal
 from html import escape
 from http import HTTPStatus
@@ -19,7 +20,7 @@ from .bot import (
     sum_decimal,
 )
 from .config import Config
-from .storage import Storage, business_day_key
+from .storage import Storage, bill_window_for_day, business_day_range, current_business_day_key, parse_stored_datetime
 
 
 def start_bill_web_server(config: Config) -> ThreadingHTTPServer | None:
@@ -40,13 +41,20 @@ def make_bill_request_handler(config: Config) -> type[BaseHTTPRequestHandler]:
         server_version = "LedgerBillWeb/1.0"
 
         def do_GET(self) -> None:
+            self.write_response(include_body=True)
+
+        def do_HEAD(self) -> None:
+            self.write_response(include_body=False)
+
+        def write_response(self, *, include_body: bool) -> None:
             status, body = handle_bill_web_request(config, self.path)
             payload = body.encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
-            self.wfile.write(payload)
+            if include_body:
+                self.wfile.write(payload)
 
         def log_message(self, format: str, *args: Any) -> None:
             print(f"bill-web: {format % args}", flush=True)
@@ -68,11 +76,14 @@ def handle_bill_web_request(config: Config, raw_path: str) -> tuple[int, str]:
         return HTTPStatus.FORBIDDEN, simple_page("访问受限", "<p>链接无效或缺少访问令牌。</p>")
 
     segments = [unquote(part) for part in path.strip("/").split("/") if part]
-    if not segments or segments[0] != "bill":
+    if not segments or segments[0] not in {"bill", "day_xxb.php"}:
         return HTTPStatus.NOT_FOUND, simple_page("404", "<p>页面不存在。</p>")
 
     try:
-        if len(segments) >= 3:
+        if segments[0] == "day_xxb.php":
+            chat_id = int((query.get("chat_id") or [""])[0])
+            day_key = day_key_from_legacy_query(query)
+        elif len(segments) >= 3:
             chat_id = int(segments[1])
             day_key = segments[2]
         else:
@@ -90,6 +101,10 @@ def handle_bill_web_request(config: Config, raw_path: str) -> tuple[int, str]:
             timezone=config.timezone,
             trade_methods=config.p2p_rate_trade_methods,
             token=config.bill_web_token,
+            search_text=(query.get("firstname") or [""])[0],
+            search_type=(query.get("type") or ["bjr"])[0],
+            begin_time=(query.get("begintime") or query.get("begin_time") or [""])[0],
+            end_time=(query.get("endtime") or query.get("end_time") or [""])[0],
         )
     except KeyError:
         return HTTPStatus.NOT_FOUND, simple_page("未找到群组", "<p>没有找到这个群的账单。</p>")
@@ -104,6 +119,16 @@ def bill_web_token_allowed(config: Config, query: dict[str, list[str]]) -> bool:
     return (query.get("token") or [""])[0] == config.bill_web_token
 
 
+def day_key_from_legacy_query(query: dict[str, list[str]]) -> str:
+    if (query.get("all") or [""])[0]:
+        return "active"
+    for key in ("day_key", "date", "begintime", "begin_time"):
+        value = (query.get(key) or [""])[0]
+        if len(value) >= 10:
+            return value[:10]
+    return "today"
+
+
 def render_bill_page(
     storage: Storage,
     chat_id: int,
@@ -113,59 +138,180 @@ def render_bill_page(
     trade_methods: tuple[str, ...] = (),
     token: str | None = None,
     now: datetime | None = None,
+    search_text: str = "",
+    search_type: str = "bjr",
+    begin_time: str = "",
+    end_time: str = "",
 ) -> str:
+    now = now or datetime.now(timezone)
+    storage.apply_due_day_cutoff(chat_id, now, timezone)
     group = storage.get_group(chat_id)
     if day_key in {"today", ""}:
-        now = now or datetime.now(timezone)
-        day_key = business_day_key(now, int(group["day_cutoff_hour"]), timezone)
+        day_key = current_business_day_key(now, group, timezone)
     all_days = int(group["day_cutoff_hour"]) < 0 or day_key in {"active", "all"}
-    rows = storage.list_records_for_day(chat_id, day_key, all_days=all_days)
+    linked_begin = parse_stored_datetime(begin_time, timezone)
+    linked_end = parse_stored_datetime(end_time, timezone)
+    form_begin_time = begin_time
+    form_end_time = end_time
+    if all_days:
+        rows = storage.list_records_for_day(chat_id, day_key, all_days=True)
+    elif linked_begin is not None and linked_end is not None:
+        rows = storage.list_records_for_period(chat_id, linked_begin, linked_end)
+    else:
+        begin, end = bill_window_for_day(group, day_key, timezone)
+        rows = storage.list_records_for_period(chat_id, begin, end)
+        form_begin_time = f"{begin:%Y-%m-%d %H:%M:%S}"
+        form_end_time = f"{end:%Y-%m-%d %H:%M:%S}"
+    rows = filter_records(rows, search_text, search_type)
     deposits = [row for row in rows if row["kind"] == "deposit"]
     payouts = [row for row in rows if row["kind"] == "payout"]
 
-    summary = bill_summary(group, deposits, payouts, trade_methods)
     title_day = "全部账单" if all_days else day_key
     group_title = group["chat_title"] or str(chat_id)
-    day_links = render_day_links(storage, chat_id, day_key, all_days, token)
 
     content = f"""
-    <header class="topbar">
-      <div>
-        <div class="eyebrow">Telegram 记账机器人</div>
-        <h1>{escape(group_title)}</h1>
-        <div class="muted">群 ID：{chat_id} · {escape(title_day)}</div>
+    <div class="content-wrapper">
+      <div class="container">
+        {render_legacy_forms(
+            chat_id,
+            day_key,
+            token,
+            cutoff_hour=int(group["day_cutoff_hour"]),
+            timezone=timezone,
+            search_text=search_text,
+            search_type=search_type,
+            begin_time=form_begin_time,
+            end_time=form_end_time,
+        )}
+        <section class="content">
+          {render_record_table("入款", deposits, timezone)}
+          {render_record_table("下发", payouts, timezone)}
+          {render_people_stats_box("统计（按标记人）", deposits, payouts, "subject")}
+          {render_people_stats_box("统计（按操作人）", deposits, payouts, "actor")}
+          {render_people_stats_box("统计（按备注）", deposits, payouts, "note")}
+          {render_rate_stats_box(deposits)}
+          {render_summary_block(group, deposits, payouts, trade_methods)}
+          {render_footer_links(chat_id, day_key, token, int(group["day_cutoff_hour"]), timezone)}
+        </section>
       </div>
-      <div class="nav">{day_links}</div>
-    </header>
-
-    <section class="summary">
-      {''.join(render_summary_card(label, value) for label, value in summary)}
-    </section>
-
-    <section class="grid">
-      {render_record_table("今日入款", deposits, timezone)}
-      {render_record_table("今日下发", payouts, timezone)}
-    </section>
+    </div>
     """
     return page_shell(f"{group_title} - {title_day}", content)
 
 
-def bill_summary(group: Any, deposits: list[Any], payouts: list[Any], trade_methods: tuple[str, ...]) -> list[tuple[str, str]]:
+def filter_records(rows: list[Any], search_text: str, search_type: str) -> list[Any]:
+    needle = search_text.strip().casefold()
+    if not needle:
+        return rows
+
+    def haystack(row: Any) -> str:
+        if search_type == "czr":
+            return row["actor_name"] or ""
+        if search_type == "bz":
+            return row["note"] or ""
+        return row["subject_name"] or row["actor_name"] or ""
+
+    return [row for row in rows if needle in haystack(row).casefold()]
+
+
+def render_legacy_forms(
+    chat_id: int,
+    day_key: str,
+    token: str | None,
+    *,
+    cutoff_hour: int,
+    timezone: tzinfo,
+    search_text: str = "",
+    search_type: str = "bjr",
+    begin_time: str = "",
+    end_time: str = "",
+) -> str:
+    if not begin_time or not end_time:
+        begin_time, end_time = legacy_day_range(day_key, cutoff_hour, timezone)
+    token_input = hidden_input("token", token) if token else ""
+    return f"""
+    <form method="GET" action="/day_xxb.php" class="date-form">
+      <small>
+        <input type="text" name="begintime" value="{escape(begin_time)}">
+        <input type="text" name="endtime" value="{escape(end_time)}">
+      </small>
+      {hidden_input("chat_id", str(chat_id))}
+      {hidden_input("up_page", "1")}
+      {hidden_input("down_page", "1")}
+      {token_input}
+    </form>
+    <div align="center"><br>
+      <form method="GET" action="/day_xxb.php" class="search-form">
+        <input type="text" placeholder="请输入您要查询的名字或备注关键词" name="firstname" value="{escape(search_text)}">
+        {hidden_input("chat_id", str(chat_id))}
+        {hidden_input("up_page", "1")}
+        {hidden_input("down_page", "1")}
+        {hidden_input("begintime", begin_time)}
+        {hidden_input("endtime", end_time)}
+        {token_input}
+        <select name="type">
+          <option value="bjr"{selected_attr(search_type, "bjr")}>按标记人</option>
+          <option value="czr"{selected_attr(search_type, "czr")}>按操作人</option>
+          <option value="bz"{selected_attr(search_type, "bz")}>按备注</option>
+        </select>
+        <input type="submit" value="搜索">
+      </form>
+    </div>
+    """
+
+
+def selected_attr(current: str, expected: str) -> str:
+    return ' selected="selected"' if current == expected else ""
+
+
+def legacy_day_range(day_key: str, cutoff_hour: int, timezone: tzinfo) -> tuple[str, str]:
+    if day_key in {"active", "all", "today", ""}:
+        return "", ""
+    try:
+        begin, end = business_day_range(day_key[:10], cutoff_hour, timezone)
+    except ValueError:
+        return "", ""
+    return f"{begin:%Y-%m-%d %H:%M:%S}", f"{end:%Y-%m-%d %H:%M:%S}"
+
+
+def hidden_input(name: str, value: str | None) -> str:
+    return f'<input type="hidden" name="{escape(name)}" value="{escape(value or "")}">'
+
+
+def bill_totals(deposits: list[Any], payouts: list[Any]) -> dict[str, Decimal]:
     total_cny = sum_decimal(row["amount_cny"] for row in deposits)
     gross_in_usdt = sum_decimal(row["amount_usdt"] for row in deposits)
     net_in_usdt = sum_decimal(row["net_usdt"] for row in deposits)
+    commission_cny = sum_decimal(row["commission_cny"] for row in deposits)
+    net_in_cny = total_cny - commission_cny
+    total_out_cny = sum_decimal(row["amount_cny"] for row in payouts)
     total_out_usdt = sum_decimal(row["amount_usdt"] for row in payouts)
-    balance = net_in_usdt - total_out_usdt
+    return {
+        "total_cny": total_cny,
+        "gross_in_usdt": gross_in_usdt,
+        "commission_cny": commission_cny,
+        "net_in_cny": net_in_cny,
+        "net_in_usdt": net_in_usdt,
+        "total_out_cny": total_out_cny,
+        "total_out_usdt": total_out_usdt,
+        "balance_cny": net_in_cny - total_out_cny,
+        "balance_usdt": net_in_usdt - total_out_usdt,
+    }
+
+
+def render_summary_block(group: Any, deposits: list[Any], payouts: list[Any], trade_methods: tuple[str, ...]) -> str:
+    totals = bill_totals(deposits, payouts)
     fee_rate = Decimal(group["deposit_fee_rate"])
-    summary = [
-        ("总入款", f"{format_number(total_cny)} / {format_money(gross_in_usdt)}U"),
-        ("交易费率", f"{format_number(fee_rate)}%"),
-        ("应下发", f"{format_money(net_in_usdt)}U"),
-        ("已下发", f"{format_money(total_out_usdt)}U"),
-        ("余额", f"{format_money(balance)}U"),
-    ]
-    summary.insert(1, ("汇率", bill_exchange_display(group, trade_methods)))
-    return summary
+    return f"""
+    <div class="statistics">
+      <div>汇率：<span class="money_rate">{escape(bill_exchange_display(group, trade_methods))}</span></div>
+      <div>费率：<span class="profit_rate">{format_number(fee_rate)}%</span></div>
+      <div>总入款金额：<span class="upMoney">{format_number(totals["total_cny"])} | {format_money(totals["gross_in_usdt"])}(USDT)</span></div>
+      <div>应下发：<span class="sureDown">{format_money(totals["net_in_cny"])} | {format_money(totals["net_in_usdt"])} (USDT)</span></div>
+      <div>已下发：<span class="haveDown">{format_number(totals["total_out_cny"])} | {format_money(totals["total_out_usdt"])} (USDT)</span></div>
+      <div>未下发：<span class="noDown">{format_money(totals["balance_cny"])} | {format_money(totals["balance_usdt"])} (USDT)</span></div>
+    </div>
+    """
 
 
 def bill_exchange_display(group: Any, trade_methods: tuple[str, ...]) -> str:
@@ -185,14 +331,27 @@ def render_record_table(title: str, rows: list[Any], timezone: tzinfo) -> str:
         body = '<tr><td colspan="5" class="empty">暂无记录</td></tr>'
     return f"""
     <section class="panel">
-      <h2>{escape(title)} <span>{len(rows)}笔</span></h2>
+      <div class="box box-primary">
+        <div class="box-header">
+          <h3 class="box-title">{escape(title)} (<span>{len(rows)}</span>笔)</h3>
+        </div>
+        <div class="box-body">
       <div class="table-wrap">
-        <table>
+        <table class="records">
+          <colgroup>
+            <col class="col-time">
+            <col class="col-amount">
+            <col class="col-rate">
+            <col class="col-actor">
+            <col class="col-note">
+          </colgroup>
           <thead>
-            <tr><th>时间</th><th>金额</th><th>汇率</th><th>操作人</th><th>备注</th></tr>
+            <tr><td>时间</td><td>金额</td><td>标记人</td><td>操作人</td><td>备注</td></tr>
           </thead>
           <tbody>{body}</tbody>
         </table>
+      </div>
+        </div>
       </div>
     </section>
     """
@@ -203,13 +362,11 @@ def render_record_row(row: Any, timezone: tzinfo) -> str:
     actor = escape(row["actor_name"] or "")
     subject = escape(row["subject_name"] or row["actor_name"] or "")
     note = escape(row["note"] or "")
-    if subject and subject != actor:
-        actor = f"{actor}<br><span class=\"muted\">{subject}</span>"
     return (
         "<tr>"
-        f"<td>{created:%Y-%m-%d}<br><strong>{created:%H:%M:%S}</strong></td>"
-        f"<td>{record_amount_display(row)}</td>"
-        f"<td>{escape(format_number(Decimal(row['exchange_rate'])))}</td>"
+        f"<td>{created:%m-%d %H:%M:%S}</td>"
+        f'<td><span class="copyable">{record_amount_display(row)}</span></td>'
+        f"<td>{subject}</td>"
         f"<td>{actor}</td>"
         f"<td>{note}</td>"
         "</tr>"
@@ -226,15 +383,109 @@ def record_amount_display(row: Any) -> str:
         main = f"{format_money(gross_usdt)}U"
     elif rate == 1:
         main = format_number(amount)
+    elif row["kind"] == "payout":
+        main = f"{format_money(gross_usdt)}U/{format_number(amount)}"
+    elif fee_rate:
+        main = f"{format_number(amount)}/{format_number(rate)}*{format_fee_multiplier(fee_rate)}={format_money(net_usdt)}U"
     else:
-        main = f"{format_number(amount)} / {format_number(rate)} = {format_money(gross_usdt)}U"
-    if row["kind"] == "deposit" and fee_rate:
-        main += f"<br><span class=\"muted\">扣费后 {format_money(net_usdt)}U · {format_fee_multiplier(fee_rate)}</span>"
+        main = f"{format_number(amount)}/{format_number(rate)}={format_money(gross_usdt)}U"
     return main
 
 
-def render_summary_card(label: str, value: str) -> str:
-    return f'<div class="metric"><span>{escape(label)}</span><strong>{escape(value)}</strong></div>'
+def render_people_stats_box(title: str, deposits: list[Any], payouts: list[Any], key: str) -> str:
+    rows = people_stats(deposits, payouts, key)
+    body = "".join(
+        "<tr>"
+        f"<td>{escape(row['name'])} ({row['count']} 笔)</td>"
+        f"<td><span class='copyable'>{format_number(row['in_cny'])}</span>/<span class='copyable'>{format_money(row['in_usdt'])}</span>U</td>"
+        f"<td><span class='copyable'>{format_number(row['out_cny'])}</span>/<span class='copyable'>{format_money(row['out_usdt'])}</span>U</td>"
+        f"<td><span class='copyable'>{format_money(row['balance_cny'])}</span>/<span class='copyable'>{format_money(row['balance_usdt'])}</span>U</td>"
+        "</tr>"
+        for row in rows
+    )
+    if not body:
+        body = '<tr><td colspan="4" class="empty">暂无统计</td></tr>'
+    return render_table_box(title, f"{len(rows)} 人", "<tr><td>用户名</td><td>入款</td><td>已下发</td><td>未下发</td></tr>", body)
+
+
+def people_stats(deposits: list[Any], payouts: list[Any], key: str) -> list[dict[str, Any]]:
+    items: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {
+            "name": "",
+            "count": 0,
+            "in_cny": Decimal("0"),
+            "in_usdt": Decimal("0"),
+            "net_cny": Decimal("0"),
+            "net_usdt": Decimal("0"),
+            "out_cny": Decimal("0"),
+            "out_usdt": Decimal("0"),
+        }
+    )
+    for row in deposits:
+        name = stat_key(row, key)
+        item = items[name]
+        item["name"] = name
+        item["count"] += 1
+        item["in_cny"] += Decimal(row["amount_cny"])
+        item["in_usdt"] += Decimal(row["amount_usdt"])
+        item["net_cny"] += Decimal(row["amount_cny"]) - Decimal(row["commission_cny"])
+        item["net_usdt"] += Decimal(row["net_usdt"])
+    for row in payouts:
+        name = stat_key(row, key)
+        item = items[name]
+        item["name"] = name
+        item["count"] += 1
+        item["out_cny"] += Decimal(row["amount_cny"])
+        item["out_usdt"] += Decimal(row["amount_usdt"])
+    result = []
+    for item in items.values():
+        item["balance_cny"] = item["net_cny"] - item["out_cny"]
+        item["balance_usdt"] = item["net_usdt"] - item["out_usdt"]
+        result.append(item)
+    return sorted(result, key=lambda row: row["name"])
+
+
+def stat_key(row: Any, key: str) -> str:
+    if key == "actor":
+        return row["actor_name"] or "未命名"
+    if key == "note":
+        return row["note"] or ""
+    return row["subject_name"] or row["actor_name"] or "未命名"
+
+
+def render_rate_stats_box(deposits: list[Any]) -> str:
+    grouped: dict[str, dict[str, Decimal]] = defaultdict(lambda: {"amount": Decimal("0"), "usdt": Decimal("0")})
+    for row in deposits:
+        rate = f"{Decimal(row['exchange_rate']):.4f}"
+        grouped[rate]["amount"] += Decimal(row["amount_cny"])
+        grouped[rate]["usdt"] += Decimal(row["amount_usdt"])
+    body = "".join(
+        f"<tr><td>{escape(rate)}</td><td>{format_number(values['amount'])}</td><td>{format_money(values['usdt'])} U</td></tr>"
+        for rate, values in sorted(grouped.items())
+    )
+    if not body:
+        body = '<tr><td colspan="3" class="empty">暂无统计</td></tr>'
+    return render_table_box("统计（按汇率分类）", "", "<tr><td>汇率</td><td>入款</td><td>换算U</td></tr>", body)
+
+
+def render_table_box(title: str, suffix: str, header: str, body: str) -> str:
+    suffix_text = f" ({escape(suffix)})" if suffix else ""
+    return f"""
+    <section class="panel">
+      <div class="box box-primary">
+        <div class="box-header">
+          <h3 class="box-title">{escape(title)}{suffix_text}</h3>
+        </div>
+        <div class="box-body">
+          <div class="table-wrap">
+            <table class="records">
+              <tbody>{header}{body}</tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+    """
 
 
 def render_day_links(storage: Storage, chat_id: int, current_day: str, all_days: bool, token: str | None) -> str:
@@ -249,11 +500,44 @@ def render_day_links(storage: Storage, chat_id: int, current_day: str, all_days:
     return "".join(links)
 
 
+def render_footer_links(chat_id: int, day_key: str, token: str | None, cutoff_hour: int, timezone: tzinfo) -> str:
+    prev_day, next_day = adjacent_days(day_key)
+    links = [
+        '<li><a href="#">下载excel</a></li>',
+        f'<li><a href="{escape(bill_path_for_day(chat_id, prev_day, token, cutoff_hour, timezone))}">上一天</a></li>',
+        f'<li><a href="{escape(bill_path_for_day(chat_id, next_day, token, cutoff_hour, timezone))}">下一天</a></li>',
+        f'<li><a href="{escape(bill_path(chat_id, "active", token))}">查看全部账单汇总</a></li>',
+    ]
+    return f'<ul class="footer-links">{"".join(links)}</ul>'
+
+
+def adjacent_days(day_key: str) -> tuple[str, str]:
+    try:
+        day = datetime.strptime(day_key[:10], "%Y-%m-%d")
+    except ValueError:
+        day = datetime.now()
+    return f"{day - timedelta(days=1):%Y-%m-%d}", f"{day + timedelta(days=1):%Y-%m-%d}"
+
+
 def bill_path(chat_id: int, day_key: str, token: str | None = None) -> str:
     path = f"/bill/{chat_id}/{day_key}"
+    params = {}
     if token:
-        path = f"{path}?{urlencode({'token': token})}"
+        params["token"] = token
+    if params:
+        path = f"{path}?{urlencode(params)}"
     return path
+
+
+def bill_path_for_day(chat_id: int, day_key: str, token: str | None, cutoff_hour: int, timezone: tzinfo) -> str:
+    begin_time, end_time = legacy_day_range(day_key, cutoff_hour, timezone)
+    params = {
+        "begintime": begin_time,
+        "endtime": end_time,
+    }
+    if token:
+        params["token"] = token
+    return f"/bill/{chat_id}/{day_key}?{urlencode(params)}"
 
 
 def list_bill_day_keys(storage: Storage, chat_id: int) -> list[str]:
@@ -282,92 +566,224 @@ def page_shell(title: str, body: str) -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{escape(title)}</title>
   <style>
-    :root {{
-      color-scheme: light;
-      --bg: #f5f7fb;
-      --panel: #ffffff;
-      --line: #dce3ee;
-      --text: #172033;
-      --muted: #667085;
-      --accent: #0f766e;
-    }}
     * {{ box-sizing: border-box; }}
+    body, table, input, select {{
+      font-family: Arial, Helvetica, sans-serif;
+      color: #333;
+    }}
     body {{
       margin: 0;
-      background: var(--bg);
-      color: var(--text);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+      background: #f9f9f9;
       font-size: 14px;
-      line-height: 1.5;
+      line-height: 1.42857143;
     }}
-    .topbar {{
-      display: flex;
-      justify-content: space-between;
-      gap: 24px;
-      padding: 28px clamp(16px, 4vw, 44px) 18px;
-      align-items: flex-end;
-    }}
-    h1 {{ margin: 0; font-size: 26px; font-weight: 700; }}
-    h2 {{ margin: 0 0 12px; font-size: 18px; }}
-    h2 span {{ color: var(--muted); font-size: 14px; font-weight: 500; }}
-    .eyebrow {{ color: var(--accent); font-weight: 700; margin-bottom: 4px; }}
-    .muted {{ color: var(--muted); }}
-    .nav {{ display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }}
-    .nav a, .nav span {{
-      display: inline-flex;
-      align-items: center;
-      min-height: 34px;
-      padding: 0 12px;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: var(--panel);
-      color: var(--text);
+    a {{
+      color: #337ab7;
       text-decoration: none;
     }}
-    .summary {{
-      display: grid;
-      grid-template-columns: repeat(6, minmax(120px, 1fr));
-      gap: 10px;
-      padding: 0 clamp(16px, 4vw, 44px) 18px;
+    a:hover {{
+      color: #23527c;
+      text-decoration: underline;
     }}
-    .metric {{
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 12px 14px;
+    .content-wrapper {{
+      margin-left: 0;
+      background-color: #f9f9f9;
+      padding: 5px;
     }}
-    .metric span {{ display: block; color: var(--muted); margin-bottom: 4px; }}
-    .metric strong {{ display: block; font-size: 16px; overflow-wrap: anywhere; }}
-    .grid {{
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 14px;
-      padding: 0 clamp(16px, 4vw, 44px) 40px;
+    .container {{
+      width: 100%;
+      max-width: none;
+      margin-right: auto;
+      margin-left: auto;
+      padding-right: 0;
+      padding-left: 0;
+      overflow-x: auto;
+    }}
+    .content {{
+      min-height: 250px;
+      padding: 0;
+      margin-right: auto;
+      margin-left: auto;
     }}
     .panel {{
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 16px;
-      min-width: 0;
+      width: 100%;
+      margin: 0;
+      padding: 0;
+      background: transparent;
+      border: 0;
+      box-shadow: none;
+    }}
+    .box {{
+      position: relative;
+      border: 1px solid #e0e0e0;
+      border-radius: 5px;
+      background: #fff;
+      margin-bottom: 20px;
+      padding: 20px;
+      width: 100%;
+    }}
+    .box-primary {{
+      border-left: 4px solid #007bff;
+    }}
+    .box-header {{
+      color: #444;
+      display: block;
+      padding-bottom: 10px;
+      border-bottom: 1px solid #e0e0e0;
+      margin-bottom: 20px;
+    }}
+    .box-title {{
+      display: inline-block;
+      margin: 0;
+      font-size: 18px;
+      font-weight: bold;
+      line-height: 1;
+      color: #333;
+    }}
+    .box-body {{
+      border-top-left-radius: 0;
+      border-top-right-radius: 0;
+      border-bottom-right-radius: 3px;
+      border-bottom-left-radius: 3px;
+      padding: 0;
     }}
     .table-wrap {{ overflow-x: auto; }}
-    table {{ width: 100%; border-collapse: collapse; min-width: 640px; }}
-    th, td {{ text-align: left; padding: 10px 8px; border-top: 1px solid var(--line); vertical-align: top; }}
-    th {{ color: var(--muted); font-weight: 600; background: #f8fafc; }}
-    td strong {{ font-weight: 700; }}
-    .empty {{ color: var(--muted); text-align: center; padding: 26px 8px; }}
-    .simple {{ padding: 40px clamp(16px, 4vw, 44px); }}
-    @media (max-width: 1100px) {{
-      .summary {{ grid-template-columns: repeat(3, minmax(120px, 1fr)); }}
-      .grid {{ grid-template-columns: 1fr; }}
+    table {{
+      width: 100%;
+      max-width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+    }}
+    td {{
+      max-width: 25%;
+      padding: 6px 0 !important;
+      word-wrap: break-word;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      vertical-align: top;
+      border-top: 1px solid #ddd;
+    }}
+    .records tr:first-child td {{
+      border-top: 0;
+      font-weight: 600;
+    }}
+    .col-time {{ width: 18%; }}
+    .col-amount {{ width: 32%; }}
+    .col-rate {{ width: 18%; }}
+    .col-actor {{ width: 22%; }}
+    .col-note {{ width: 10%; }}
+    .date-form small {{
+      display: block;
+      overflow: hidden;
+    }}
+    .date-form input[type="text"] {{
+      width: 48%;
+      height: 25px;
+      font-size: 14px;
+      border-radius: 0;
+      border: 1px solid #ccc;
+      padding-left: 10px;
+      background-color: #fff;
+    }}
+    .date-form input[name="endtime"] {{
+      float: right;
+    }}
+    .search-form {{
+      display: flex;
+      justify-content: center;
+      width: 100%;
+      margin: 0 0 10px;
+    }}
+    .search-form input[type="text"] {{
+      width: 60%;
+      height: 25px;
+      border-radius: 0;
+      border: 1px solid #ccc;
+      padding-left: 10px;
+      background-color: #fff;
+    }}
+    .search-form select {{
+      width: 22%;
+      height: 25px;
+      border-radius: 0;
+      border: 1px solid #ccc;
+      background-color: #fff;
+    }}
+    .search-form input[type="submit"] {{
+      width: 15%;
+      height: 25px;
+      border-radius: 0;
+      background: #0066cc;
+      color: #fff;
+      border: 0;
+      cursor: pointer;
+    }}
+    .statistics {{
+      padding: 0 10px 10px;
+    }}
+    .statistics div {{
+      margin: 10px 0;
+      font-size: 14px;
+      color: #555;
+    }}
+    .statistics span {{
+      font-weight: bold;
+      color: #333;
+    }}
+    .footer-links {{
+      margin: 0 0 24px 22px;
+      padding: 0;
+    }}
+    .footer-links li {{
+      margin: 6px 0;
+    }}
+    .copyable {{
+      cursor: pointer;
+    }}
+    .empty {{
+      color: #777;
+      text-align: center;
+      padding: 18px 0 !important;
+    }}
+    .simple {{
+      padding: 40px 33px;
     }}
     @media (max-width: 640px) {{
-      .topbar {{ display: block; }}
-      .nav {{ justify-content: flex-start; margin-top: 14px; }}
-      .summary {{ grid-template-columns: 1fr 1fr; }}
+      body {{ font-size: 12px; }}
+      .box {{
+        padding: 14px 10px;
+        margin-bottom: 12px;
+      }}
+      .box-title {{
+        font-size: 16px;
+      }}
+      td {{
+        white-space: normal;
+        font-size: 12px;
+      }}
+      .date-form input[type="text"] {{
+        width: 100%;
+        margin-bottom: 6px;
+      }}
+      .date-form input[name="endtime"] {{
+        float: none;
+      }}
+      .search-form input[type="text"] {{ width: 58%; }}
+      .search-form select {{ width: 24%; }}
+      .search-form input[type="submit"] {{ width: 18%; }}
     }}
   </style>
+  <script>
+    document.addEventListener('click', function(event) {{
+      var target = event.target.closest('.copyable');
+      if (!target || !navigator.clipboard) return;
+      navigator.clipboard.writeText(target.textContent.trim()).then(function() {{
+        target.classList.add('copied');
+        setTimeout(function() {{ target.classList.remove('copied'); }}, 600);
+      }}).catch(function() {{}});
+    }});
+  </script>
 </head>
 <body>
 {body}

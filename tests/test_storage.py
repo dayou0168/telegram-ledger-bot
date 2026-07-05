@@ -4,13 +4,20 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from ledger_bot.storage import Storage, TelegramUser, business_day_key
+from ledger_bot.storage import Storage, TelegramUser, business_day_key, current_business_day_key
 
 
 BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 
-def make_record(chat_id: int, day_key: str, *, amount: str = "100", is_balance: int = 0) -> dict[str, object]:
+def make_record(
+    chat_id: int,
+    day_key: str,
+    *,
+    amount: str = "100",
+    is_balance: int = 0,
+    created_at: datetime | None = None,
+) -> dict[str, object]:
     return {
         "chat_id": chat_id,
         "kind": "deposit",
@@ -30,7 +37,7 @@ def make_record(chat_id: int, day_key: str, *, amount: str = "100", is_balance: 
         "is_balance": is_balance,
         "source_message_id": None,
         "day_key": day_key,
-        "created_at": datetime(2026, 7, 4, 12, tzinfo=BEIJING_TZ).isoformat(),
+        "created_at": (created_at or datetime(2026, 7, 4, 12, tzinfo=BEIJING_TZ)).isoformat(),
     }
 
 
@@ -51,6 +58,90 @@ def test_beijing_midnight_business_day_key() -> None:
 
     assert business_day_key(datetime(2026, 7, 4, 23, 59, tzinfo=tz), 0, tz) == "2026-07-04"
     assert business_day_key(datetime(2026, 7, 5, 0, 0, tzinfo=tz), 0, tz) == "2026-07-05"
+
+
+def test_cutoff_change_waits_until_next_new_boundary_after_open_bill() -> None:
+    with TemporaryDirectory() as tmp:
+        storage = Storage(Path(tmp) / "bot.db")
+        try:
+            now = datetime(2026, 7, 3, 12, tzinfo=BEIJING_TZ)
+            storage.ensure_group(-100, "测试群", now)
+            storage.update_group(-100, now, day_cutoff_hour=4)
+
+            group = storage.set_day_cutoff_hour(-100, now, 0, BEIJING_TZ)
+
+            assert group["day_cutoff_hour"] == 4
+            assert group["pending_day_cutoff_hour"] == 0
+            assert group["open_bill_day_key"] == "2026-07-03"
+            assert group["open_bill_begin_at"] == "2026-07-03T04:00:00+08:00"
+            assert group["open_bill_end_at"] == "2026-07-05T00:00:00+08:00"
+            assert current_business_day_key(datetime(2026, 7, 4, 12, tzinfo=BEIJING_TZ), group, BEIJING_TZ) == "2026-07-03"
+
+            storage.insert_record(
+                make_record(
+                    -100,
+                    "2026-07-03",
+                    amount="100",
+                    created_at=datetime(2026, 7, 3, 5, tzinfo=BEIJING_TZ),
+                )
+            )
+            storage.insert_record(
+                make_record(
+                    -100,
+                    "2026-07-03",
+                    amount="200",
+                    created_at=datetime(2026, 7, 4, 1, tzinfo=BEIJING_TZ),
+                )
+            )
+            storage.insert_record(
+                make_record(
+                    -100,
+                    "2026-07-03",
+                    amount="300",
+                    created_at=datetime(2026, 7, 4, 23, tzinfo=BEIJING_TZ),
+                )
+            )
+            rows = storage.list_records_for_period(
+                -100,
+                datetime(2026, 7, 3, 4, tzinfo=BEIJING_TZ),
+                datetime(2026, 7, 5, 0, tzinfo=BEIJING_TZ),
+            )
+
+            assert [row["amount"] for row in rows] == ["100", "200", "300"]
+
+            group = storage.apply_due_day_cutoff(-100, datetime(2026, 7, 5, 0, tzinfo=BEIJING_TZ), BEIJING_TZ)
+
+            assert group["day_cutoff_hour"] == 0
+            assert group["pending_day_cutoff_hour"] is None
+            assert current_business_day_key(datetime(2026, 7, 5, 0, tzinfo=BEIJING_TZ), group, BEIJING_TZ) == "2026-07-05"
+        finally:
+            storage.conn.close()
+
+
+def test_cutoff_change_from_midnight_to_four_waits_until_next_four_boundary() -> None:
+    with TemporaryDirectory() as tmp:
+        storage = Storage(Path(tmp) / "bot.db")
+        try:
+            now = datetime(2026, 7, 3, 12, tzinfo=BEIJING_TZ)
+            storage.ensure_group(-100, "测试群", now)
+            storage.update_group(-100, now, day_cutoff_hour=0)
+
+            group = storage.set_day_cutoff_hour(-100, now, 4, BEIJING_TZ)
+
+            assert group["day_cutoff_hour"] == 0
+            assert group["pending_day_cutoff_hour"] == 4
+            assert group["open_bill_day_key"] == "2026-07-03"
+            assert group["open_bill_begin_at"] == "2026-07-03T00:00:00+08:00"
+            assert group["open_bill_end_at"] == "2026-07-04T04:00:00+08:00"
+            assert current_business_day_key(datetime(2026, 7, 4, 1, tzinfo=BEIJING_TZ), group, BEIJING_TZ) == "2026-07-03"
+
+            group = storage.apply_due_day_cutoff(-100, datetime(2026, 7, 4, 4, tzinfo=BEIJING_TZ), BEIJING_TZ)
+
+            assert group["day_cutoff_hour"] == 4
+            assert group["pending_day_cutoff_hour"] is None
+            assert current_business_day_key(datetime(2026, 7, 4, 4, tzinfo=BEIJING_TZ), group, BEIJING_TZ) == "2026-07-04"
+        finally:
+            storage.conn.close()
 
 
 def test_cutoff_off_lists_and_clears_current_open_bill() -> None:

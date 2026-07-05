@@ -4,15 +4,17 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlparse
 
-from ledger_bot.bill_web import handle_bill_web_request, render_bill_page
+from ledger_bot.bot import LedgerBot
+from ledger_bot.bill_web import day_key_from_legacy_query, handle_bill_web_request, render_bill_page
 from ledger_bot.storage import Storage
 
 
 BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 
-def make_bill_record(chat_id: int, day_key: str) -> dict[str, object]:
+def make_bill_record(chat_id: int, day_key: str, *, created_at: datetime | None = None) -> dict[str, object]:
     return {
         "chat_id": chat_id,
         "kind": "deposit",
@@ -32,7 +34,7 @@ def make_bill_record(chat_id: int, day_key: str) -> dict[str, object]:
         "is_balance": 0,
         "source_message_id": None,
         "day_key": day_key,
-        "created_at": datetime(2026, 7, 5, 12, tzinfo=BEIJING_TZ).isoformat(),
+        "created_at": (created_at or datetime(2026, 7, 5, 12, tzinfo=BEIJING_TZ)).isoformat(),
     }
 
 
@@ -63,9 +65,101 @@ def test_render_bill_page_shows_records_and_realtime_rate() -> None:
 
             assert "测试群" in html
             assert "支付宝1档 下浮0.10" in html
-            assert "今日入款" in html
+            assert "入款" in html
+            assert "统计（按标记人）" in html
+            assert "统计（按汇率分类）" in html
             assert "客户A" in html
             assert "测试备注" in html
+        finally:
+            storage.conn.close()
+
+
+def test_render_bill_page_uses_group_cutoff_window() -> None:
+    with TemporaryDirectory() as tmp:
+        storage = Storage(Path(tmp) / "bot.db")
+        try:
+            now = datetime(2026, 7, 5, 12, tzinfo=BEIJING_TZ)
+            storage.ensure_group(-1001, "测试群", now)
+            storage.update_group(-1001, now, day_cutoff_hour=4)
+            storage.insert_record(
+                make_bill_record(
+                    -1001,
+                    "2026-07-04",
+                    created_at=datetime(2026, 7, 4, 12, tzinfo=BEIJING_TZ),
+                )
+            )
+
+            html = render_bill_page(
+                storage,
+                -1001,
+                "2026-07-04",
+                timezone=BEIJING_TZ,
+            )
+
+            assert 'value="2026-07-04 04:00:00"' in html
+            assert 'value="2026-07-05 04:00:00"' in html
+            assert "客户A" in html
+        finally:
+            storage.conn.close()
+
+
+def test_render_bill_page_prefers_linked_bill_window() -> None:
+    with TemporaryDirectory() as tmp:
+        storage = Storage(Path(tmp) / "bot.db")
+        try:
+            now = datetime(2026, 7, 5, 12, tzinfo=BEIJING_TZ)
+            storage.ensure_group(-1001, "测试群", now)
+            storage.update_group(-1001, now, day_cutoff_hour=4)
+            storage.insert_record(
+                make_bill_record(
+                    -1001,
+                    "2026-07-03",
+                    created_at=datetime(2026, 7, 3, 12, tzinfo=BEIJING_TZ),
+                )
+            )
+
+            html = render_bill_page(
+                storage,
+                -1001,
+                "2026-07-03",
+                timezone=BEIJING_TZ,
+                begin_time="2026-07-03 00:00:00",
+                end_time="2026-07-04 00:00:00",
+            )
+
+            assert 'value="2026-07-03 00:00:00"' in html
+            assert 'value="2026-07-04 00:00:00"' in html
+            assert 'value="2026-07-03 04:00:00"' not in html
+            assert "客户A" in html
+        finally:
+            storage.conn.close()
+
+
+def test_render_bill_page_filters_legacy_search() -> None:
+    with TemporaryDirectory() as tmp:
+        storage = Storage(Path(tmp) / "bot.db")
+        try:
+            now = datetime(2026, 7, 5, 12, tzinfo=BEIJING_TZ)
+            storage.ensure_group(-1001, "测试群", now)
+            storage.insert_record(make_bill_record(-1001, "2026-07-05"))
+            other = make_bill_record(-1001, "2026-07-05")
+            other["subject_name"] = "客户B"
+            other["note"] = "其他备注"
+            storage.insert_record(other)
+
+            html = render_bill_page(
+                storage,
+                -1001,
+                "2026-07-05",
+                timezone=BEIJING_TZ,
+                search_text="测试",
+                search_type="bz",
+            )
+
+            assert "客户A" in html
+            assert "客户B" not in html
+            assert 'value="测试"' in html
+            assert '<option value="bz" selected="selected">按备注</option>' in html
         finally:
             storage.conn.close()
 
@@ -82,3 +176,73 @@ def test_bill_web_token_blocks_missing_token() -> None:
 
     assert status == 403
     assert "访问受限" in body
+
+
+def test_day_key_from_legacy_query() -> None:
+    assert day_key_from_legacy_query({"begintime": ["2026-07-05 00:00:00"]}) == "2026-07-05"
+    assert day_key_from_legacy_query({"all": ["1"]}) == "active"
+    assert day_key_from_legacy_query({}) == "today"
+
+
+def test_builtin_bill_url_freezes_business_window() -> None:
+    bot = object.__new__(LedgerBot)
+    bot.storage = SimpleNamespace(get_group=lambda chat_id: {"day_cutoff_hour": 0})
+    bot.config = SimpleNamespace(
+        public_bill_url_template=None,
+        public_bill_base_url="https://bot.example",
+        public_bill_bot_name="LEDGER_BOT",
+        bill_web_token="secret",
+        timezone=BEIJING_TZ,
+    )
+
+    url = bot.build_bill_url(-1001, "2026-07-03")
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+
+    assert parsed.path == "/bill/-1001/2026-07-03"
+    assert query["begintime"] == ["2026-07-03 00:00:00"]
+    assert query["endtime"] == ["2026-07-04 00:00:00"]
+    assert query["token"] == ["secret"]
+
+
+def test_builtin_bill_url_freezes_four_oclock_window_before_cutoff_change() -> None:
+    bot = object.__new__(LedgerBot)
+    bot.storage = SimpleNamespace(get_group=lambda chat_id: {"day_cutoff_hour": 4})
+    bot.config = SimpleNamespace(
+        public_bill_url_template=None,
+        public_bill_base_url="https://bot.example",
+        public_bill_bot_name="LEDGER_BOT",
+        bill_web_token=None,
+        timezone=BEIJING_TZ,
+    )
+
+    url = bot.build_bill_url(-1001, "2026-07-03")
+    query = parse_qs(urlparse(url).query)
+
+    assert query["begintime"] == ["2026-07-03 04:00:00"]
+    assert query["endtime"] == ["2026-07-04 04:00:00"]
+
+
+def test_builtin_bill_url_uses_extended_open_bill_window() -> None:
+    bot = object.__new__(LedgerBot)
+    bot.storage = SimpleNamespace(
+        get_group=lambda chat_id: {
+            "day_cutoff_hour": 4,
+            "open_bill_day_key": "2026-07-03",
+            "open_bill_begin_at": "2026-07-03T04:00:00+08:00",
+            "open_bill_end_at": "2026-07-05T00:00:00+08:00",
+        }
+    )
+    bot.config = SimpleNamespace(
+        public_bill_url_template=None,
+        public_bill_base_url="https://bot.example",
+        public_bill_bot_name="LEDGER_BOT",
+        bill_web_token=None,
+        timezone=BEIJING_TZ,
+    )
+
+    url = bot.build_bill_url(-1001, "2026-07-03")
+    query = parse_qs(urlparse(url).query)
+
+    assert query["begintime"] == ["2026-07-03 04:00:00"]
+    assert query["endtime"] == ["2026-07-05 00:00:00"]
