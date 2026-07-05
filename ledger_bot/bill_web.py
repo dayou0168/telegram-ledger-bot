@@ -337,6 +337,14 @@ def parse_single_admin_chat_id(form: dict[str, list[str]], name: str) -> int:
     return ids[0]
 
 
+def parse_admin_user_id(form: dict[str, list[str]]) -> int:
+    raw = form_value(form, "new_user_id") or form_value(form, "user_id")
+    matches = re.findall(r"(?<![-\d])\d{4,20}(?!\d)", raw)
+    if not matches:
+        raise ValueError("请选择或填写操作人 UID。")
+    return int(matches[0])
+
+
 def apply_admin_action(storage: Storage, form: dict[str, list[str]], timezone: tzinfo) -> str:
     action = form_value(form, "action")
     now = datetime.now(timezone)
@@ -386,31 +394,35 @@ def apply_admin_action(storage: Storage, form: dict[str, list[str]], timezone: t
         removed = storage.remove_broadcast_group_members(name, chat_ids, now=now)
         return f"已从分组移除 {removed} 个群。"
     if action == "grant_broadcast_permission":
-        user_id = int(form_value(form, "user_id"))
+        user_id = parse_admin_user_id(form)
         group_name = form_value(form, "group_name")
+        if not group_name:
+            raise ValueError("请选择要授权的广播分组。")
         changed = storage.grant_broadcast_group_permission(group_name, user_id=user_id, created_by=0, now=now)
         return "分组权限已授权。" if changed else "这个用户已拥有该分组权限。"
     if action == "revoke_broadcast_permission":
-        user_id = int(form_value(form, "user_id"))
+        user_id = parse_admin_user_id(form)
         group_name = form_value(form, "group_name")
+        if not group_name:
+            raise ValueError("请选择要取消授权的广播分组。")
         changed = storage.revoke_broadcast_group_permission(group_name, user_id=user_id)
         return "分组权限已取消。" if changed else "这个用户没有该分组权限。"
     if action == "add_broadcast_operator":
-        user_id = int(form_value(form, "user_id"))
+        user_id = parse_admin_user_id(form)
         remark = form_value(form, "remark") or None
         storage.add_broadcast_operator(user_id=user_id, created_by=0, remark=remark, now=now)
         return "广播操作人已保存。"
     if action == "disable_broadcast_operator":
-        user_id = int(form_value(form, "user_id"))
+        user_id = parse_admin_user_id(form)
         changed = storage.disable_broadcast_operator(user_id=user_id, now=now)
         return "广播操作人已禁用。" if changed else "没有找到这个广播操作人。"
     if action == "grant_broadcast_chat_permission":
-        user_id = int(form_value(form, "user_id"))
+        user_id = parse_admin_user_id(form)
         chat_id = parse_single_admin_chat_id(form, "chat_id")
         changed = storage.grant_broadcast_chat_permission(chat_id=chat_id, user_id=user_id, created_by=0, now=now)
         return "单群权限已授权。" if changed else "这个用户已拥有该单群权限。"
     if action == "revoke_broadcast_chat_permission":
-        user_id = int(form_value(form, "user_id"))
+        user_id = parse_admin_user_id(form)
         chat_id = parse_single_admin_chat_id(form, "chat_id")
         changed = storage.revoke_broadcast_chat_permission(chat_id=chat_id, user_id=user_id)
         return "单群权限已取消。" if changed else "这个用户没有该单群权限。"
@@ -554,7 +566,6 @@ def render_admin_page(storage: Storage, config: Config, *, message: str = "") ->
         {notice}
         {render_group_datalist(groups)}
         {render_broadcast_group_datalist(named_groups)}
-        {render_broadcast_operator_datalist(operators)}
         <section class="admin-grid">
           <div class="admin-card">
             <h2>地址白名单</h2>
@@ -597,40 +608,29 @@ def render_admin_page(storage: Storage, config: Config, *, message: str = "") ->
           <div class="admin-card">
             <h2>广播权限</h2>
             <p class="muted">宿主和服务器默认操作人拥有全部权限。普通广播操作人只拥有被授权的分组或单群。</p>
-            <form method="POST" action="/admin" class="admin-form inline-form">
-              {hidden_input("action", "add_broadcast_operator")}
-              <input name="user_id" list="broadcast-admin-operators" placeholder="选择操作人UID或输入新UID" required>
-              <input name="remark" placeholder="备注，可选">
-              <button type="submit">保存操作人</button>
-            </form>
-            <form method="POST" action="/admin" class="admin-form inline-form">
-              {hidden_input("action", "disable_broadcast_operator")}
-              <input name="user_id" list="broadcast-admin-operators" placeholder="选择操作人UID" required>
-              <button type="submit">禁用操作人</button>
-            </form>
-            <form method="POST" action="/admin" class="admin-form inline-form">
-              {hidden_input("action", "grant_broadcast_permission")}
-              <input name="user_id" list="broadcast-admin-operators" placeholder="选择操作人UID" required>
-              <input name="group_name" list="broadcast-admin-groups" placeholder="选择分组名" required>
-              <button type="submit">授权分组</button>
-            </form>
-            <form method="POST" action="/admin" class="admin-form inline-form">
-              {hidden_input("action", "revoke_broadcast_permission")}
-              <input name="user_id" list="broadcast-admin-operators" placeholder="选择操作人UID" required>
-              <input name="group_name" list="broadcast-admin-groups" placeholder="选择分组名" required>
-              <button type="submit">取消授权</button>
-            </form>
-            <form method="POST" action="/admin" class="admin-form inline-form">
-              {hidden_input("action", "grant_broadcast_chat_permission")}
-              <input name="user_id" list="broadcast-admin-operators" placeholder="选择操作人UID" required>
-              <input name="chat_id" list="saved-admin-groups" placeholder="输入群名搜索选择" required>
-              <button type="submit">授权单群</button>
-            </form>
-            <form method="POST" action="/admin" class="admin-form inline-form">
-              {hidden_input("action", "revoke_broadcast_chat_permission")}
-              <input name="user_id" list="broadcast-admin-operators" placeholder="选择操作人UID" required>
-              <input name="chat_id" list="saved-admin-groups" placeholder="输入群名搜索选择" required>
-              <button type="submit">取消单群</button>
+            <form method="POST" action="/admin" class="admin-form permission-form">
+              <label class="admin-form-wide admin-form-hint">操作人</label>
+              <div class="operator-picker admin-form-wide">
+                {render_broadcast_operator_select(operators)}
+                <input name="new_user_id" placeholder="或输入新UID">
+                <input name="remark" placeholder="备注，可选">
+              </div>
+              <div class="permission-row permission-row-compact admin-form-wide">
+                <button type="submit" name="action" value="add_broadcast_operator">保存操作人</button>
+                <button type="submit" name="action" value="disable_broadcast_operator">禁用操作人</button>
+              </div>
+              <label class="admin-form-wide admin-form-hint">分组权限</label>
+              <div class="permission-row admin-form-wide">
+                <input name="group_name" list="broadcast-admin-groups" placeholder="选择分组名">
+                <button type="submit" name="action" value="grant_broadcast_permission">授权分组</button>
+                <button type="submit" name="action" value="revoke_broadcast_permission">取消分组</button>
+              </div>
+              <label class="admin-form-wide admin-form-hint">单群权限</label>
+              <div class="permission-row admin-form-wide">
+                <input name="chat_id" list="saved-admin-groups" placeholder="输入群名搜索选择">
+                <button type="submit" name="action" value="grant_broadcast_chat_permission">授权单群</button>
+                <button type="submit" name="action" value="revoke_broadcast_chat_permission">取消单群</button>
+              </div>
             </form>
             {render_operator_table(operators)}
             {render_permission_table(permissions, chat_permissions)}
@@ -638,18 +638,18 @@ def render_admin_page(storage: Storage, config: Config, *, message: str = "") ->
 
           <div class="admin-card">
             <h2>广播替换</h2>
-            <p class="muted">开启后，广播发送时会使用这里设置的图片/文字替换原始内容；关闭后按原始广播内容发送。</p>
+            <p class="muted">发送广播时始终复制原消息。开启后，只有单群发送的投递消息被群成员回复时，机器人会尝试编辑那条原投递消息。</p>
             <form method="POST" action="/admin" class="admin-form">
               {hidden_input("action", "set_broadcast_replacement")}
               <select name="enabled">
-                <option value="0"{selected_attr(str(replacement["enabled"]), "0")}>关闭</option>
-                <option value="1"{selected_attr(str(replacement["enabled"]), "1")}>开启</option>
+                <option value="0"{selected_attr(str(replacement["enabled"]), "0")}>关闭，不替换原投递消息</option>
+                <option value="1"{selected_attr(str(replacement["enabled"]), "1")}>开启，回复后替换原投递消息</option>
               </select>
-              <input name="photo" placeholder="图片 file_id 或 URL" value="{escape(replacement['photo'] or '', quote=True)}">
-              <textarea name="text" placeholder="替换文字，可作为图片说明">{escape(replacement['text'] or '')}</textarea>
+              <input name="photo" placeholder="固定替换图片 file_id 或 URL" value="{escape(replacement['photo'] or '', quote=True)}">
+              <textarea name="text" placeholder="固定替换文字">{escape(replacement['text'] or '')}</textarea>
               <button type="submit">保存替换设置</button>
             </form>
-            <p class="muted">当前状态：{'开启' if replacement['enabled'] else '关闭'}</p>
+            <p class="muted">当前状态：{'回复后替换原投递消息' if replacement['enabled'] else '关闭'}。图片原消息有固定图片时替换图片并保留原说明；没有固定图片但有固定文字时只替换说明。</p>
           </div>
 
           <div class="admin-card admin-card-wide">
@@ -668,8 +668,7 @@ def render_group_datalist(rows: list[Any]) -> str:
     options = []
     for row in rows:
         title = row["chat_title"] or "(未命名群)"
-        label = f"{title}  {row['chat_id']}"
-        options.append(f'<option value="{row["chat_id"]}" label="{escape(label, quote=True)}"></option>')
+        options.append(f'<option value="{row["chat_id"]}">{escape(title)}</option>')
     return f'<datalist id="saved-admin-groups">{"".join(options)}</datalist>'
 
 
@@ -677,18 +676,18 @@ def render_broadcast_group_datalist(rows: list[Any]) -> str:
     options = []
     for row in rows:
         name = row["name"]
-        label = f"{name}  {row['member_count']}群"
-        options.append(f'<option value="{escape(name, quote=True)}" label="{escape(label, quote=True)}"></option>')
+        options.append(f'<option value="{escape(name, quote=True)}"></option>')
     return f'<datalist id="broadcast-admin-groups">{"".join(options)}</datalist>'
 
 
-def render_broadcast_operator_datalist(rows: list[Any]) -> str:
-    options = []
+def render_broadcast_operator_select(rows: list[Any]) -> str:
+    options = ['<option value="">选择操作人UID</option>']
     for row in rows:
         remark = row["remark"] or "无备注"
-        label = f"{row['user_id']}  {remark}  {row['status']}"
-        options.append(f'<option value="{row["user_id"]}" label="{escape(label, quote=True)}"></option>')
-    return f'<datalist id="broadcast-admin-operators">{"".join(options)}</datalist>'
+        status = "启用" if row["status"] == "active" else "停用"
+        label = f"{remark}（{row['user_id']}）{status}"
+        options.append(f'<option value="{row["user_id"]}">{escape(label)}</option>')
+    return f'<select id="broadcast-admin-operator-select" name="user_id">{"".join(options)}</select>'
 
 
 def render_group_multi_select(rows: list[Any]) -> str:
@@ -697,7 +696,7 @@ def render_group_multi_select(rows: list[Any]) -> str:
     options = []
     for row in rows:
         title = row["chat_title"] or "(未命名群)"
-        options.append(f'<option value="{row["chat_id"]}">{escape(title)}（{row["chat_id"]}）</option>')
+        options.append(f'<option value="{row["chat_id"]}">{escape(title)}</option>')
     return f"""
     <label class="admin-form-wide admin-form-hint">选择已保存群组，可按 Ctrl/Shift 多选</label>
     <select name="chat_ids" class="admin-multi-select admin-form-wide" multiple size="8">
@@ -743,7 +742,7 @@ def render_broadcast_group_table(storage: Storage, rows: list[Any]) -> str:
         except KeyError:
             members = []
         member_preview = "<br>".join(
-            f"{member['chat_id']} {escape(member['chat_title'] or '(未命名群)')}" for member in members[:8]
+            escape(member["chat_title"] or "(未命名群)") for member in members[:8]
         )
         if len(members) > 8:
             member_preview += f"<br>... 还有 {len(members) - 8} 个"
@@ -1297,6 +1296,13 @@ def render_bill_toolbar(
         all_days=data.all_days,
         use_created_at_only=data.use_day_key_records,
     )
+    prev_day, next_day = adjacent_days(data.day_key)
+    adjacent_links = ""
+    if not data.all_days:
+        adjacent_links = f"""
+        <a class="btn" href="{escape(legacy_created_at_path(data.chat_id, prev_day, token))}">上一天</a>
+        <a class="btn" href="{escape(legacy_created_at_path(data.chat_id, next_day, token))}">下一天</a>
+        """
     return f"""
     <section class="bill-toolbar">
       <div class="bill-heading">
@@ -1306,6 +1312,7 @@ def render_bill_toolbar(
       </div>
       <nav class="toolbar-actions">
         <a class="btn" href="{escape(legacy_bill_path(data.chat_id, "today", token, cutoff_hour, timezone))}">今日</a>
+        {adjacent_links}
         {render_history_menu(storage, data.chat_id, data.day_key, token)}
         <a class="btn" href="{escape(download_url)}">下载账单</a>
       </nav>
@@ -1325,7 +1332,7 @@ def render_history_menu(storage: Storage, chat_id: int, current_day: str, token:
         menu_body = "".join(links)
     return f"""
     <span class="history-menu">
-      <button type="button" class="history-trigger">历史账单⌄</button>
+      <button type="button" class="btn history-trigger">历史账单⌄</button>
       <span class="history-dropdown">{menu_body}</span>
     </span>
     """
@@ -1993,14 +2000,8 @@ def page_shell(title: str, body: str) -> str:
       z-index: 5;
     }}
     .history-trigger {{
-      border: 0;
-      background: transparent;
-      color: var(--muted);
       font: inherit;
-      font-weight: 700;
       cursor: pointer;
-      padding: 0 4px;
-      height: 34px;
     }}
     .history-trigger:hover,
     .history-menu:focus-within .history-trigger {{
@@ -2009,7 +2010,7 @@ def page_shell(title: str, body: str) -> str:
     .history-dropdown {{
       display: none;
       position: absolute;
-      top: 34px;
+      top: 40px;
       left: 0;
       min-width: 92px;
       max-height: 520px;
@@ -2268,12 +2269,14 @@ def page_shell(title: str, body: str) -> str:
       font-weight: 600;
     }}
     .admin-grid {{
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 12px;
-      align-items: start;
+      columns: 2 520px;
+      column-gap: 12px;
     }}
     .admin-card {{
+      display: inline-block;
+      width: 100%;
+      margin: 0 0 12px;
+      break-inside: avoid;
       min-width: 0;
       padding: 16px;
       background: var(--panel);
@@ -2282,7 +2285,7 @@ def page_shell(title: str, body: str) -> str:
       box-shadow: var(--shadow);
     }}
     .admin-card-wide {{
-      grid-column: 1 / -1;
+      column-span: all;
     }}
     .admin-card h2 {{
       margin: 0 0 10px;
@@ -2329,10 +2332,34 @@ def page_shell(title: str, body: str) -> str:
       flex-wrap: wrap;
       gap: 8px;
     }}
+    .permission-form {{
+      grid-template-columns: minmax(0, 1fr) minmax(0, 0.75fr);
+      padding: 10px;
+      border: 1px solid var(--line-soft);
+      border-radius: 8px;
+      background: var(--panel-soft);
+    }}
+    .operator-picker {{
+      display: grid;
+      grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr) minmax(0, 0.9fr);
+      gap: 8px;
+      align-items: center;
+    }}
+    .permission-row {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      gap: 8px;
+      align-items: center;
+    }}
+    .permission-row-compact {{
+      grid-template-columns: auto auto;
+      justify-content: flex-start;
+    }}
     .admin-form-hint {{
       margin: 0;
       color: var(--muted);
       font-size: 13px;
+      font-weight: 700;
     }}
     .admin-multi-select {{
       min-height: 150px !important;
@@ -2366,7 +2393,7 @@ def page_shell(title: str, body: str) -> str:
     @media (max-width: 920px) {{
       .content-wrapper {{ padding: 20px 16px 28px; }}
       .content {{ grid-template-columns: 1fr; }}
-      .admin-grid {{ grid-template-columns: 1fr; }}
+      .admin-grid {{ columns: 1; }}
       .admin-header {{
         align-items: stretch;
         flex-direction: column;
@@ -2404,6 +2431,12 @@ def page_shell(title: str, body: str) -> str:
         flex: 1 1 100%;
       }}
       .admin-form-actions {{
+        grid-template-columns: 1fr;
+      }}
+      .permission-form,
+      .operator-picker,
+      .permission-row,
+      .permission-row-compact {{
         grid-template-columns: 1fr;
       }}
       .admin-button-row button {{

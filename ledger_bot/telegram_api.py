@@ -120,6 +120,65 @@ class TelegramClient:
             },
         )
 
+    def edit_message_text(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        *,
+        reply_markup: dict[str, Any] | None = None,
+        parse_mode: str | None = None,
+        disable_web_page_preview: bool = True,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "disable_web_page_preview": disable_web_page_preview,
+        }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        return self.request("editMessageText", payload)
+
+    def edit_message_caption(
+        self,
+        chat_id: int,
+        message_id: int,
+        caption: str,
+        *,
+        reply_markup: dict[str, Any] | None = None,
+        parse_mode: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "caption": caption,
+        }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        return self.request("editMessageCaption", payload)
+
+    def edit_message_media(
+        self,
+        chat_id: int,
+        message_id: int,
+        media: dict[str, Any],
+        *,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "media": media,
+        }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        return self.request("editMessageMedia", payload)
+
     def get_chat_member(self, chat_id: int, user_id: int) -> dict[str, Any]:
         return self.request("getChatMember", {"chat_id": chat_id, "user_id": user_id})
 

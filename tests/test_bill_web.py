@@ -80,6 +80,9 @@ def test_render_bill_page_shows_records_and_realtime_rate() -> None:
             assert "summary-card" in html
             assert "bill-search" in html
             assert "历史账单" in html
+            assert "上一天" in html
+            assert "下一天" in html
+            assert 'class="btn history-trigger"' in html
             assert "history-dropdown" in html
             assert "07-05" in html
             assert "max-width: 1280px" in html
@@ -254,11 +257,16 @@ def test_admin_page_renders_management_sections() -> None:
         assert "测试群" in body
         assert "saved-admin-groups" in body
         assert "broadcast-admin-groups" in body
-        assert "broadcast-admin-operators" in body
+        assert "broadcast-admin-operator-select" in body
         assert "财务A" in body
+        assert "财务A（2001）启用" in body
+        assert "或输入新UID" in body
+        assert "<option value=\"-1001\">测试群</option>" in body
         assert 'list="saved-admin-groups"' in body
         assert 'list="broadcast-admin-groups"' in body
-        assert 'list="broadcast-admin-operators"' in body
+        assert 'list="broadcast-admin-operators"' not in body
+        assert "只有单群发送的投递消息被群成员回复时" in body
+        assert "开启，回复后替换原投递消息" in body
 
 
 def test_admin_post_updates_whitelist_broadcast_permissions_and_replacement() -> None:
@@ -280,13 +288,13 @@ def test_admin_post_updates_whitelist_broadcast_permissions_and_replacement() ->
         )
 
         posts = [
-            "action=add_broadcast_operator&user_id=2001&remark=level1",
+            "action=add_broadcast_operator&new_user_id=2001&remark=level1",
             "action=create_broadcast_group&group_name=finance",
-            "action=add_broadcast_members&group_name=finance&chat_ids=-100111",
+            "action=add_broadcast_members&group_name=finance&chat_ids=%E6%B5%8B%E8%AF%95%E7%BE%A4%EF%BC%88-100111%EF%BC%89",
             "action=grant_broadcast_permission&user_id=2001&group_name=finance",
-            "action=grant_broadcast_chat_permission&user_id=2001&chat_id=-100111",
+            "action=grant_broadcast_chat_permission&user_id=2001&chat_id=%E6%B5%8B%E8%AF%95%E7%BE%A4%EF%BC%88-100111%EF%BC%89",
             (
-                "action=add_whitelist&chat_id=-100111"
+                "action=add_whitelist&chat_id=%E6%B5%8B%E8%AF%95%E7%BE%A4%EF%BC%88-100111%EF%BC%89"
                 "&address=TGhAAySHUUcEGua33pZZ88wP3bA6X5eQuZ"
                 "&label=monitor"
             ),

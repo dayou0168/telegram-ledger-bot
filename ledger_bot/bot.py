@@ -74,6 +74,8 @@ MANAGEMENT_COMMANDS = {
     "leave_group",
 }
 
+USER_PICKER_REQUEST_ID = 7001
+
 
 @dataclass
 class MessageContext:
@@ -734,11 +736,15 @@ class LedgerBot:
         normalized = text.strip()
         message_id = int(message["message_id"])
 
+        if self.handle_user_shared_lookup(chat_id, user, message, message_id):
+            return
         if normalized in {"/start", "菜单", "功能", "返回菜单"}:
             self.send_private_menu(chat_id, message_id)
             return
         if normalized in {"我的ID", "/id", "id", "ID"}:
             self.client.send_message(chat_id, f"你的 Telegram ID：{user.user_id}", reply_to_message_id=message_id)
+            return
+        if self.handle_uid_lookup_command(chat_id, user, message, normalized, message_id):
             return
         if normalized in {"⚙后台管理", "后台管理", "打开后台"}:
             self.send_admin_web_link(chat_id, user, message_id)
@@ -748,6 +754,9 @@ class LedgerBot:
         if self.handle_default_operator_command(chat_id, user, normalized, message_id):
             return
         if self.handle_pending_broadcast_input(chat_id, user, message, normalized, now, message_id):
+            return
+        if self.message_has_forward_source(message):
+            self.send_uid_lookup(chat_id, user, message, reply_to_message_id=message_id)
             return
         if self.handle_broadcast_private_command(
             message=message,
@@ -774,6 +783,226 @@ class LedgerBot:
             return
 
         self.send_private_menu(chat_id, message_id)
+
+    def handle_uid_lookup_command(
+        self,
+        chat_id: int,
+        user: TelegramUser,
+        message: dict[str, Any],
+        text: str,
+        reply_to_message_id: int,
+    ) -> bool:
+        if text not in {
+            "查UID",
+            "查询UID",
+            "查uid",
+            "查询uid",
+            "查ID",
+            "查询ID",
+            "查id",
+            "查询id",
+            "UID",
+            "uid",
+            "🔎查询UID",
+            "选择用户UID",
+            "选择用户查UID",
+            "查用户UID",
+        }:
+            return False
+        if message.get("reply_to_message"):
+            self.send_uid_lookup(chat_id, user, message["reply_to_message"], reply_to_message_id=reply_to_message_id)
+        elif self.can_pick_user_uid(user):
+            self.send_user_picker(chat_id, user, reply_to_message_id)
+        else:
+            self.send_uid_lookup(chat_id, user, message, reply_to_message_id=reply_to_message_id)
+        return True
+
+    def can_pick_user_uid(self, user: TelegramUser) -> bool:
+        return self.can_create_broadcast_child_operator(user)
+
+    def send_user_picker(
+        self,
+        chat_id: int,
+        user: TelegramUser,
+        reply_to_message_id: int | None = None,
+    ) -> None:
+        if not self.can_pick_user_uid(user):
+            self.client.send_message(chat_id, "你只能查询自己的 UID。", reply_to_message_id=reply_to_message_id)
+            return
+        self.client.send_message(
+            chat_id,
+            "点击下方「选择用户」按钮，选择后机器人会显示对方 UID。",
+            reply_to_message_id=reply_to_message_id,
+            reply_markup=self.user_picker_keyboard(),
+        )
+
+    @staticmethod
+    def user_picker_keyboard() -> dict[str, Any]:
+        return {
+            "keyboard": [
+                [
+                    {
+                        "text": "选择用户",
+                        "request_users": {
+                            "request_id": USER_PICKER_REQUEST_ID,
+                            "user_is_bot": False,
+                            "max_quantity": 1,
+                            "request_name": True,
+                            "request_username": True,
+                        },
+                    }
+                ]
+            ],
+            "resize_keyboard": True,
+            "one_time_keyboard": True,
+            "input_field_placeholder": "点击按钮选择用户",
+        }
+
+    @staticmethod
+    def remove_keyboard() -> dict[str, bool]:
+        return {"remove_keyboard": True}
+
+    def handle_user_shared_lookup(
+        self,
+        chat_id: int,
+        user: TelegramUser,
+        message: dict[str, Any],
+        reply_to_message_id: int,
+    ) -> bool:
+        shared_users = self.shared_uid_users(message)
+        if not shared_users:
+            return False
+        if not self.can_pick_user_uid(user):
+            self.client.send_message(
+                chat_id,
+                "你不能创建下级操作人，无法使用选择用户查 UID。",
+                reply_to_message_id=reply_to_message_id,
+                reply_markup=self.remove_keyboard(),
+            )
+            return True
+        text = "已选择用户\n\n" + "\n\n".join(self.format_shared_uid_user(item) for item in shared_users)
+        self.client.send_message(
+            chat_id,
+            text,
+            reply_to_message_id=reply_to_message_id,
+            reply_markup=self.remove_keyboard(),
+        )
+        return True
+
+    @staticmethod
+    def shared_uid_users(message: dict[str, Any]) -> list[dict[str, Any]]:
+        users_shared = message.get("users_shared") or {}
+        users = users_shared.get("users") or []
+        if users:
+            return list(users)
+        user_shared = message.get("user_shared") or {}
+        if user_shared.get("user_id") is not None:
+            return [user_shared]
+        return []
+
+    @staticmethod
+    def format_shared_uid_user(raw: dict[str, Any]) -> str:
+        user_id = raw.get("user_id") or raw.get("id") or "未知"
+        name = " ".join(str(raw.get(part) or "").strip() for part in ("first_name", "last_name")).strip()
+        username = raw.get("username")
+        lines = []
+        if name:
+            lines.append(f"用户：{name}")
+        lines.append(f"UID：{user_id}")
+        if username:
+            lines.append(f"用户名：@{username}")
+        return "\n".join(lines)
+
+    def send_uid_lookup(
+        self,
+        chat_id: int,
+        current_user: TelegramUser,
+        message: dict[str, Any],
+        *,
+        reply_to_message_id: int | None = None,
+    ) -> None:
+        self.client.send_message(
+            chat_id,
+            self.format_uid_lookup(message, current_user),
+            reply_to_message_id=reply_to_message_id,
+        )
+
+    @classmethod
+    def format_uid_lookup(cls, message: dict[str, Any], current_user: TelegramUser) -> str:
+        lines = ["UID 查询"]
+        if sender := message.get("from"):
+            lines.extend(["", *cls.telegram_user_lines("消息发送人", sender)])
+        else:
+            lines.extend(["", f"当前查询人：{current_user.display_name}", f"当前查询人UID：{current_user.user_id}"])
+        source_lines = cls.forward_source_lines(message)
+        if source_lines:
+            lines.extend(["", *source_lines])
+        elif message.get("reply_to_message"):
+            reply = message["reply_to_message"]
+            if reply_sender := reply.get("from"):
+                lines.extend(["", *cls.telegram_user_lines("被回复用户", reply_sender)])
+        elif not message.get("from"):
+            lines.append("没有识别到可查询的消息来源。")
+        if not source_lines and not message.get("reply_to_message") and message.get("from"):
+            lines.append("")
+            lines.append("提示：也可以把消息转发给机器人，或回复一条消息发送“查UID”。")
+        return "\n".join(lines)
+
+    @staticmethod
+    def message_has_forward_source(message: dict[str, Any]) -> bool:
+        return any(
+            key in message
+            for key in ("forward_origin", "forward_from", "forward_from_chat", "forward_sender_name")
+        )
+
+    @classmethod
+    def forward_source_lines(cls, message: dict[str, Any]) -> list[str]:
+        origin = message.get("forward_origin") or {}
+        if origin:
+            origin_type = origin.get("type")
+            if origin_type == "user" and origin.get("sender_user"):
+                return cls.telegram_user_lines("转发来源用户", origin["sender_user"])
+            if origin_type == "hidden_user":
+                name = origin.get("sender_user_name") or "未知"
+                return [f"转发来源用户：{name}", "转发来源UID：不可获取（对方隐藏转发来源）"]
+            if origin_type in {"chat", "channel"}:
+                chat = origin.get("sender_chat") or origin.get("chat") or {}
+                lines = cls.telegram_chat_lines("转发来源", chat)
+                if origin.get("message_id") is not None:
+                    lines.append(f"原消息ID：{origin['message_id']}")
+                if origin.get("author_signature"):
+                    lines.append(f"署名：{origin['author_signature']}")
+                return lines
+        if message.get("forward_from"):
+            return cls.telegram_user_lines("转发来源用户", message["forward_from"])
+        if message.get("forward_from_chat"):
+            return cls.telegram_chat_lines("转发来源", message["forward_from_chat"])
+        if message.get("forward_sender_name"):
+            return [
+                f"转发来源用户：{message['forward_sender_name']}",
+                "转发来源UID：不可获取（对方隐藏转发来源）",
+            ]
+        return []
+
+    @staticmethod
+    def telegram_user_lines(label: str, raw: dict[str, Any]) -> list[str]:
+        name = " ".join(str(raw.get(part) or "").strip() for part in ("first_name", "last_name")).strip()
+        if not name:
+            name = str(raw.get("username") or raw.get("id") or "未知")
+        lines = [f"{label}：{name}", f"{label}UID：{raw.get('id', '未知')}"]
+        if raw.get("username"):
+            lines.append(f"{label}用户名：@{raw['username']}")
+        return lines
+
+    @staticmethod
+    def telegram_chat_lines(label: str, raw: dict[str, Any]) -> list[str]:
+        title = raw.get("title") or raw.get("username") or raw.get("id") or "未知"
+        lines = [f"{label}：{title}", f"{label}ID：{raw.get('id', '未知')}"]
+        if raw.get("username"):
+            lines.append(f"{label}用户名：@{raw['username']}")
+        if raw.get("type"):
+            lines.append(f"{label}类型：{raw['type']}")
+        return lines
 
     def handle_default_operator_command(
         self,
@@ -843,7 +1072,7 @@ class LedgerBot:
                     [{"text": "📡群发广播"}, {"text": "📣分组广播"}],
                     [{"text": "🔔地址监听"}, {"text": "🗂群列表"}],
                     [{"text": "👥广播权限"}, {"text": "🔁广播替换"}],
-                    [{"text": "⚙后台管理"}],
+                    [{"text": "🔎查询UID"}, {"text": "⚙后台管理"}],
                 ],
                 "resize_keyboard": True,
                 "one_time_keyboard": False,
@@ -956,9 +1185,10 @@ class LedgerBot:
                 "广播管理：",
                 "点击 ⚙后台管理 进入网页登录页，管理群组、分组、广播权限、地址白名单和替换内容。",
                 "后台里按群名搜索或多选群组，不需要逐个查群 ID。",
+                "点击 🔎查询UID 可用 Telegram 原生选择用户功能获取 UID；也可以转发消息给机器人自动识别。",
                 "",
                 "广播替换：",
-                "点击 🔁广播替换 查看状态；修改图片、文字和开关请进后台管理。",
+                "点击 🔁广播替换 查看状态；它只作用于单群发送被回复后的原投递消息，修改图片、文字和开关请进后台管理。",
                 "",
                 "后台管理：",
                 "私聊菜单点击 ⚙后台管理，打开网页后输入 ADMIN_WEB_TOKEN 设置的后台密码。",
@@ -1410,7 +1640,7 @@ class LedgerBot:
         if self.is_broadcast_root(user):
             groups = self.storage.list_broadcast_groups()
         else:
-            accessible_ids = self.broadcast_target_chat_ids_for_user(user)
+            accessible_ids = self.direct_broadcast_chat_ids_for_user(user)
             groups = self.storage.list_broadcast_groups(chat_ids=accessible_ids) if accessible_ids else []
         if not groups:
             self.client.send_message(chat_id, "当前没有可广播的群。", reply_to_message_id=reply_to_message_id)
@@ -1568,6 +1798,19 @@ class LedgerBot:
             return True
         return chat_id in set(self.storage.target_chat_ids_for_user_broadcast_groups(user.user_id))
 
+    def direct_broadcast_chat_ids_for_user(self, user: TelegramUser) -> list[int]:
+        if self.is_broadcast_root(user):
+            return [int(row["chat_id"]) for row in self.storage.list_broadcast_groups()]
+        return self.storage.target_chat_ids_for_user_chat_permissions(user.user_id)
+
+    def can_use_direct_broadcast_target(self, user: TelegramUser, chat_id: int) -> bool:
+        saved = bool(self.storage.list_broadcast_groups(chat_ids=[chat_id]))
+        if not saved:
+            return False
+        if self.is_broadcast_root(user):
+            return True
+        return self.storage.user_can_access_broadcast_chat(user.user_id, chat_id)
+
     def is_active_broadcast_operator(self, user_id: int) -> bool:
         return self.storage.get_broadcast_operator(user_id) is not None
 
@@ -1698,11 +1941,13 @@ class LedgerBot:
             return
         settings = self.storage.get_broadcast_replacement_settings(datetime.now(self.config.timezone))
         lines = [
-            "广播替换设置：",
-            f"状态：{'开启' if settings['enabled'] else '关闭'}",
-            f"文字：{settings['text'] or '未设置'}",
-            f"图片：{settings['photo'] or '未设置'}",
+            "单群回复替换设置：",
+            f"状态：{'回复后替换原投递消息' if settings['enabled'] else '关闭'}",
+            f"固定文字：{settings['text'] or '未设置'}",
+            f"固定图片：{settings['photo'] or '未设置'}",
             "",
+            "发送广播时始终复制原消息；只有单群发送的投递消息被群成员回复后，才会尝试编辑那条原投递消息。",
+            "文字原消息会替换成固定文字；图片原消息有固定图片时替换图片并保留原说明，没有固定图片但有固定文字时只替换说明。",
             "修改开关、文字和图片请打开后台管理。",
         ]
         self.client.send_message(
@@ -1737,7 +1982,7 @@ class LedgerBot:
         )
         self.client.send_message(
             chat_id,
-            f"广播替换已更新：{'开启' if settings['enabled'] else '关闭'}",
+            f"单群回复替换已更新：{'回复后替换原投递消息' if settings['enabled'] else '关闭'}",
             reply_to_message_id=reply_to_message_id,
         )
 
@@ -1766,7 +2011,7 @@ class LedgerBot:
             photo=photo,
             updated_by=user.user_id,
         )
-        self.client.send_message(chat_id, "广播替换图片已更新。", reply_to_message_id=reply_to_message_id)
+        self.client.send_message(chat_id, "单群回复替换图片已更新。", reply_to_message_id=reply_to_message_id)
 
     @staticmethod
     def extract_replied_photo_file_id(message: dict[str, Any]) -> str | None:
@@ -1843,7 +2088,7 @@ class LedgerBot:
         if not self.can_manage_broadcast_operator(user, target_user_id):
             self.client.send_message(chat_id, "只能给自己可管理的广播操作人分配权限。", reply_to_message_id=reply_to_message_id)
             return
-        if not self.can_use_broadcast_target(user, target_chat_id):
+        if not self.can_use_direct_broadcast_target(user, target_chat_id):
             self.client.send_message(chat_id, "只能分配自己已有的单群广播权限。", reply_to_message_id=reply_to_message_id)
             return
         try:
@@ -1870,7 +2115,7 @@ class LedgerBot:
         if not self.can_manage_broadcast_operator(user, target_user_id):
             self.client.send_message(chat_id, "只能取消自己可管理的广播操作人权限。", reply_to_message_id=reply_to_message_id)
             return
-        if not self.can_use_broadcast_target(user, target_chat_id):
+        if not self.can_use_direct_broadcast_target(user, target_chat_id):
             self.client.send_message(chat_id, "只能取消自己可管理的单群广播权限。", reply_to_message_id=reply_to_message_id)
             return
         changed = self.storage.revoke_broadcast_chat_permission(chat_id=target_chat_id, user_id=target_user_id)
@@ -1915,7 +2160,7 @@ class LedgerBot:
             self.client.send_message(chat_id, "只能查看自己可管理的广播操作人权限。", reply_to_message_id=reply_to_message_id)
             return
         rows = self.storage.list_broadcast_chat_permissions(target_user_id)
-        rows = [row for row in rows if self.can_use_broadcast_target(user, int(row["chat_id"]))]
+        rows = [row for row in rows if self.can_use_direct_broadcast_target(user, int(row["chat_id"]))]
         if not rows:
             self.client.send_message(chat_id, f"{target_user_id} 暂未分配单群权限。", reply_to_message_id=reply_to_message_id)
             return
@@ -2045,7 +2290,7 @@ class LedgerBot:
                 reply_to_message_id=reply_to_message_id,
             )
             return
-        if not self.can_use_broadcast_target(user, target_chat_id):
+        if not self.can_use_direct_broadcast_target(user, target_chat_id):
             self.client.send_message(chat_id, "没有这个群的广播权限，或这个群尚未保存。", reply_to_message_id=reply_to_message_id)
             return
         self.create_broadcast_job_reply(
@@ -2152,11 +2397,6 @@ class LedgerBot:
             message_kind = self.broadcast_message_kind(source_message)
             preview = self.broadcast_preview(source_message)
             job_text = preview
-        replacement = self.broadcast_replacement_payload(now)
-        if replacement is not None:
-            message_kind, job_text, photo, preview = replacement
-            source_chat_id = None
-            source_message_id = None
         job = self.storage.create_broadcast_job(
             creator_user_id=user.user_id,
             scope=scope,
@@ -2170,11 +2410,10 @@ class LedgerBot:
             now=now,
         )
         preview_text = preview if len(preview) <= 600 else preview[:600] + "..."
-        replacement_text = "\n广播替换：开启" if replacement is not None else ""
         notify_text = "\n通知所有人：开启" if notify_all else ""
         self.client.send_message(
             chat_id,
-            f"确认发送广播？\n目标群：{len(target_chat_ids)} 个\n类型：{message_kind}{replacement_text}{notify_text}\n\n{preview_text}",
+            f"确认发送广播？\n目标群：{len(target_chat_ids)} 个\n类型：{message_kind}{notify_text}\n\n{preview_text}",
             reply_to_message_id=reply_to_message_id,
             reply_markup={
                 "inline_keyboard": [
@@ -2185,19 +2424,6 @@ class LedgerBot:
                 ]
             },
         )
-
-    def broadcast_replacement_payload(self, now: datetime) -> tuple[str, str, str | None, str] | None:
-        settings = self.storage.get_broadcast_replacement_settings(now)
-        if not settings["enabled"]:
-            return None
-        text = (settings["text"] or "").strip()
-        photo = (settings["photo"] or "").strip()
-        if not text and not photo:
-            return None
-        if photo:
-            preview = "[替换图片] " + text if text else "[替换图片]"
-            return "replacement_photo", text, photo, preview
-        return "replacement_text", text, None, text
 
     @staticmethod
     def broadcast_message_kind(message: dict[str, Any] | None) -> str:
@@ -2976,6 +3202,7 @@ class LedgerBot:
         match = self.storage.find_broadcast_job_by_sent_message(ctx.chat_id, ctx.reply_message_id)
         if match is None:
             return
+        self.replace_direct_broadcast_original_if_needed(ctx, match)
         sender = f"@{ctx.user.username}" if ctx.user.username else ctx.user.display_name
         group = self.storage.get_group(ctx.chat_id)
         reply_text = self.message_preview(ctx.message)
@@ -3000,6 +3227,44 @@ class LedgerBot:
                 self.client.send_message(recipient, "\n".join(lines))
             except TelegramAPIError as exc:
                 print(f"Broadcast reply notify failed for {recipient}: {exc}", flush=True)
+
+    def replace_direct_broadcast_original_if_needed(self, ctx: MessageContext, match: Any) -> bool:
+        if not str(match["scope"]).startswith("chat:"):
+            return False
+        original = ctx.message.get("reply_to_message") or {}
+        if not original:
+            return False
+        settings = self.storage.get_broadcast_replacement_settings(ctx.now)
+        if not settings["enabled"]:
+            return False
+        text = (settings["text"] or "").strip()
+        photo = (settings["photo"] or "").strip()
+        try:
+            if original.get("photo") and photo:
+                media: dict[str, Any] = {
+                    "type": "photo",
+                    "media": photo,
+                }
+                if original.get("caption"):
+                    media["caption"] = original["caption"]
+                return bool(self.client.edit_message_media(ctx.chat_id, ctx.reply_message_id, media))
+            if original.get("photo"):
+                if original.get("caption") and text:
+                    return bool(self.client.edit_message_caption(ctx.chat_id, ctx.reply_message_id, text))
+                return False
+            if not text:
+                return False
+            if original.get("text"):
+                return bool(self.client.edit_message_text(ctx.chat_id, ctx.reply_message_id, text))
+            if original.get("caption"):
+                return bool(self.client.edit_message_caption(ctx.chat_id, ctx.reply_message_id, text))
+            return False
+        except TelegramAPIError as exc:
+            print(
+                f"Direct broadcast original replacement failed for {ctx.chat_id}/{ctx.reply_message_id}: {exc}",
+                flush=True,
+            )
+            return False
 
     @staticmethod
     def message_preview(message: dict[str, Any]) -> str:
@@ -3256,7 +3521,7 @@ class LedgerBot:
             except ValueError:
                 self.client.answer_callback_query(callback_id, "群组无效。")
                 return
-            if not self.can_use_broadcast_target(user, target_chat_id):
+            if not self.can_use_direct_broadcast_target(user, target_chat_id):
                 self.client.answer_callback_query(callback_id, "没有这个群的权限。")
                 return
             group = self.storage.get_group(target_chat_id)

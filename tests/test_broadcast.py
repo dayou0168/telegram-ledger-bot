@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from ledger_bot.bot import LedgerBot
+from ledger_bot.bot import LedgerBot, MessageContext
 from ledger_bot.config import Config
 from ledger_bot.storage import TelegramUser
 
@@ -15,9 +15,31 @@ BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 class FakeClient:
     def __init__(self) -> None:
         self.messages: list[dict[str, object]] = []
+        self.edits: list[dict[str, object]] = []
 
     def send_message(self, chat_id: int, text: str, **kwargs) -> None:
         self.messages.append({"chat_id": chat_id, "text": text, **kwargs})
+
+    def edit_message_text(self, chat_id: int, message_id: int, text: str, **kwargs) -> dict[str, object]:
+        payload = {"method": "edit_text", "chat_id": chat_id, "message_id": message_id, "text": text, **kwargs}
+        self.edits.append(payload)
+        return payload
+
+    def edit_message_caption(self, chat_id: int, message_id: int, caption: str, **kwargs) -> dict[str, object]:
+        payload = {
+            "method": "edit_caption",
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "caption": caption,
+            **kwargs,
+        }
+        self.edits.append(payload)
+        return payload
+
+    def edit_message_media(self, chat_id: int, message_id: int, media: dict[str, object], **kwargs) -> dict[str, object]:
+        payload = {"method": "edit_media", "chat_id": chat_id, "message_id": message_id, "media": media, **kwargs}
+        self.edits.append(payload)
+        return payload
 
 
 def make_config(
@@ -96,6 +118,7 @@ def test_private_menu_only_shows_available_features() -> None:
         "🗂群列表",
         "👥广播权限",
         "🔁广播替换",
+        "🔎查询UID",
         "⚙后台管理",
     ]
     assert "💵自助续费" not in labels
@@ -136,12 +159,68 @@ def test_private_admin_button_rejects_non_root_user() -> None:
     assert fake.messages[0]["text"] == "没有后台管理权限。"
 
 
+def test_uid_lookup_formats_forward_origin_user() -> None:
+    text = LedgerBot.format_uid_lookup(
+        {
+            "message_id": 9,
+            "from": {"id": 100, "first_name": "Root"},
+            "forward_origin": {
+                "type": "user",
+                "sender_user": {"id": 200, "first_name": "Alice", "username": "alice"},
+            },
+        },
+        TelegramUser(100, "root", "Root"),
+    )
+
+    assert "消息发送人UID：100" in text
+    assert "转发来源用户UID：200" in text
+    assert "转发来源用户用户名：@alice" in text
+
+
+def test_user_picker_keyboard_and_shared_uid_flow() -> None:
+    bot = object.__new__(LedgerBot)
+    fake = FakeClient()
+    bot.client = fake
+    bot.config = make_config(Path("unused.db"))
+    bot.storage = object()
+
+    bot.send_user_picker(1001, TelegramUser(10, "root", "Root"), 77)
+
+    message = fake.messages[0]
+    assert message["text"] == "点击下方「选择用户」按钮，选择后机器人会显示对方 UID。"
+    keyboard = message["reply_markup"]["keyboard"]  # type: ignore[index]
+    request_users = keyboard[0][0]["request_users"]
+    assert request_users["user_is_bot"] is False
+    assert request_users["request_name"] is True
+    assert request_users["request_username"] is True
+
+    fake.messages.clear()
+    handled = bot.handle_user_shared_lookup(
+        1001,
+        TelegramUser(10, "root", "Root"),
+        {
+            "message_id": 88,
+            "users_shared": {
+                "users": [{"user_id": 200, "first_name": "Alice", "username": "alice"}]
+            },
+        },
+        88,
+    )
+
+    assert handled
+    assert "已选择用户" in fake.messages[0]["text"]
+    assert "UID：200" in fake.messages[0]["text"]
+    assert "用户名：@alice" in fake.messages[0]["text"]
+    assert fake.messages[0]["reply_markup"] == {"remove_keyboard": True}
+
+
 def test_private_help_uses_buttons_and_admin_for_non_accounting_features() -> None:
     help_text = LedgerBot.private_help_text(object.__new__(LedgerBot))
 
     assert "点击 📡群发广播 或 📣分组广播" in help_text
     assert "通知所有人是按钮开关" in help_text
     assert "后台里按群名搜索或多选群组" in help_text
+    assert "点击 🔎查询UID" in help_text
     assert "输入 ADMIN_WEB_TOKEN 设置的后台密码" in help_text
     assert "单群广播 -100111 广播内容" not in help_text
     assert "授权单群 123456 -100111" not in help_text
@@ -166,8 +245,6 @@ def test_broadcast_permissions_support_group_and_single_chat_acl() -> None:
     with TemporaryDirectory() as tmp:
         bot = LedgerBot(make_config(Path(tmp) / "bot.db"))
         try:
-            from datetime import datetime
-
             current = datetime(2026, 7, 4, 12, tzinfo=BEIJING_TZ)
             bot.storage.ensure_group(-1001, "A", current)
             bot.storage.ensure_group(-1002, "B", current)
@@ -190,6 +267,160 @@ def test_broadcast_permissions_support_group_and_single_chat_acl() -> None:
             assert bot.can_use_broadcast_group(level1, "finance")
             assert bot.can_use_broadcast_target(level1, -1001)
             assert bot.can_use_broadcast_target(level1, -1002)
+            assert not bot.can_use_direct_broadcast_target(level1, -1001)
+            assert bot.can_use_direct_broadcast_target(level1, -1002)
+            assert bot.direct_broadcast_chat_ids_for_user(level1) == [-1002]
             assert not bot.can_use_broadcast_target(child, -1001)
+            assert not bot.can_use_direct_broadcast_target(child, -1001)
+        finally:
+            bot.storage.current().conn.close()
+
+
+def test_broadcast_replacement_does_not_override_job_payload() -> None:
+    with TemporaryDirectory() as tmp:
+        bot = LedgerBot(make_config(Path(tmp) / "bot.db"))
+        fake = FakeClient()
+        bot.client = fake
+        try:
+            current = datetime(2026, 7, 4, 12, tzinfo=BEIJING_TZ)
+            bot.storage.update_broadcast_replacement_settings(
+                now=current,
+                enabled=1,
+                text="固定文字",
+                photo="replacement-file-id",
+                updated_by=10,
+            )
+
+            bot.create_broadcast_job_reply(
+                1001,
+                TelegramUser(10, "root", "Root"),
+                "chat:-1001",
+                [-1001],
+                "",
+                {"message_id": 55, "photo": [{"file_id": "original-file-id"}], "caption": "原图说明"},
+                False,
+                current,
+                99,
+            )
+
+            confirmation = fake.messages[0]["text"]
+            assert "类型：photo" in confirmation
+            assert "[图片] 原图说明" in confirmation
+            assert "覆盖" not in confirmation
+
+            job = bot.storage.current().conn.execute("SELECT * FROM broadcast_jobs ORDER BY id DESC LIMIT 1").fetchone()
+            assert job is not None
+            assert job["scope"] == "chat:-1001"
+            assert job["source_chat_id"] == 1001
+            assert job["source_message_id"] == 55
+            assert job["message_kind"] == "photo"
+            assert job["photo"] is None
+            assert job["text"] == "[图片] 原图说明"
+        finally:
+            bot.storage.current().conn.close()
+
+
+def test_direct_broadcast_reply_replaces_original_photo() -> None:
+    with TemporaryDirectory() as tmp:
+        bot = LedgerBot(make_config(Path(tmp) / "bot.db"))
+        fake = FakeClient()
+        bot.client = fake
+        try:
+            current = datetime(2026, 7, 4, 12, tzinfo=BEIJING_TZ)
+            bot.storage.update_broadcast_replacement_settings(
+                now=current,
+                enabled=1,
+                photo="replacement-file-id",
+                updated_by=10,
+            )
+            job = bot.storage.create_broadcast_job(
+                creator_user_id=10,
+                scope="chat:-1001",
+                target_chat_ids=[-1001],
+                text="[图片] 原图说明",
+                source_chat_id=1001,
+                source_message_id=55,
+                message_kind="photo",
+                now=current,
+            )
+            bot.storage.mark_broadcast_job_target(job["id"], -1001, status="sent", sent_message_id=300, now=current)
+            match = bot.storage.find_broadcast_job_by_sent_message(-1001, 300)
+            assert match is not None
+
+            ctx = MessageContext(
+                message={
+                    "message_id": 301,
+                    "reply_to_message": {
+                        "message_id": 300,
+                        "photo": [{"file_id": "original-file-id"}],
+                        "caption": "原图说明",
+                    },
+                },
+                chat_id=-1001,
+                chat_title="A",
+                user=TelegramUser(200, "bob", "Bob"),
+                text="收到",
+                now=current,
+            )
+
+            assert bot.replace_direct_broadcast_original_if_needed(ctx, match)
+            assert fake.edits == [
+                {
+                    "method": "edit_media",
+                    "chat_id": -1001,
+                    "message_id": 300,
+                    "media": {"type": "photo", "media": "replacement-file-id", "caption": "原图说明"},
+                }
+            ]
+        finally:
+            bot.storage.current().conn.close()
+
+
+def test_group_broadcast_reply_does_not_replace_original() -> None:
+    with TemporaryDirectory() as tmp:
+        bot = LedgerBot(make_config(Path(tmp) / "bot.db"))
+        fake = FakeClient()
+        bot.client = fake
+        try:
+            current = datetime(2026, 7, 4, 12, tzinfo=BEIJING_TZ)
+            bot.storage.update_broadcast_replacement_settings(
+                now=current,
+                enabled=1,
+                text="固定文字",
+                photo="replacement-file-id",
+                updated_by=10,
+            )
+            job = bot.storage.create_broadcast_job(
+                creator_user_id=10,
+                scope="group:finance",
+                target_chat_ids=[-1001],
+                text="[图片] 原图说明",
+                source_chat_id=1001,
+                source_message_id=55,
+                message_kind="photo",
+                now=current,
+            )
+            bot.storage.mark_broadcast_job_target(job["id"], -1001, status="sent", sent_message_id=300, now=current)
+            match = bot.storage.find_broadcast_job_by_sent_message(-1001, 300)
+            assert match is not None
+
+            ctx = MessageContext(
+                message={
+                    "message_id": 301,
+                    "reply_to_message": {
+                        "message_id": 300,
+                        "photo": [{"file_id": "original-file-id"}],
+                        "caption": "原图说明",
+                    },
+                },
+                chat_id=-1001,
+                chat_title="A",
+                user=TelegramUser(200, "bob", "Bob"),
+                text="收到",
+                now=current,
+            )
+
+            assert not bot.replace_direct_broadcast_original_if_needed(ctx, match)
+            assert fake.edits == []
         finally:
             bot.storage.current().conn.close()
