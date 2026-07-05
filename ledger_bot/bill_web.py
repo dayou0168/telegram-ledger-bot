@@ -1482,6 +1482,7 @@ def page_shell(title: str, body: str) -> str:
       border: 1px solid var(--line);
       padding: 0 10px;
       background-color: #fff;
+      cursor: pointer;
     }}
     .date-form input[name="endtime"] {{
       float: none;
@@ -1628,6 +1629,14 @@ def page_shell(title: str, body: str) -> str:
     }}
   </style>
   <script>
+    document.addEventListener('pointerdown', function(event) {{
+      var target = event.target.closest('.date-form input[type="date"], .date-form input[type="datetime-local"]');
+      if (!target || typeof target.showPicker !== 'function') return;
+      if (document.activeElement !== target) target.focus();
+      try {{
+        target.showPicker();
+      }} catch (error) {{}}
+    }});
     document.addEventListener('click', function(event) {{
       var target = event.target.closest('.copyable');
       if (!target || !navigator.clipboard) return;
