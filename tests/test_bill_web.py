@@ -74,6 +74,11 @@ def test_render_bill_page_shows_records_and_realtime_rate() -> None:
             assert "target.showPicker()" in html
             assert "max-width: 1180px" in html
             assert "table-layout: fixed" in html
+            assert "text-align: center" in html
+            assert "vertical-align: middle" in html
+            assert "border: 1px solid var(--line-soft)" in html
+            assert "border-left: 1px solid var(--line)" in html
+            assert "border-left: 4px solid var(--blue)" not in html
             assert "下载账单" in html
             assert "created_at=2026-07-05" in html
             assert "download=excel" in html

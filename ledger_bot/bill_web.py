@@ -1419,7 +1419,7 @@ def page_shell(title: str, body: str) -> str:
       width: 100%;
     }}
     .box-primary {{
-      border-left: 4px solid var(--blue);
+      border-left: 1px solid var(--line);
     }}
     .box-header {{
       display: block;
@@ -1448,8 +1448,9 @@ def page_shell(title: str, body: str) -> str:
       padding: 9px 8px !important;
       overflow-wrap: anywhere;
       white-space: normal;
-      vertical-align: top;
-      border-top: 1px solid var(--line-soft);
+      text-align: center;
+      vertical-align: middle;
+      border: 1px solid var(--line-soft);
     }}
     .records thead td,
     .records .table-head td {{
