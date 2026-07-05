@@ -636,6 +636,18 @@ class Storage:
             )
 
         current_key, current_start, old_end = current_bill_window_for_change(group, now, timezone)
+        if not self.period_has_records(chat_id, current_start, old_end):
+            return self.update_group(
+                chat_id,
+                now,
+                day_cutoff_hour=new_hour,
+                pending_day_cutoff_hour=None,
+                pending_day_cutoff_effective_at=None,
+                open_bill_day_key=None,
+                open_bill_begin_at=None,
+                open_bill_end_at=None,
+            )
+
         effective_at = first_cutoff_boundary_at_or_after(old_end, new_hour, timezone)
         return self.update_group(
             chat_id,
@@ -840,6 +852,21 @@ class Storage:
                 (chat_id, start.isoformat(), end.isoformat()),
             )
         )
+
+    def period_has_records(self, chat_id: int, start: datetime, end: datetime) -> bool:
+        row = self.conn.execute(
+            """
+            SELECT 1 FROM records
+            WHERE chat_id = ?
+              AND deleted_at IS NULL
+              AND is_balance = 0
+              AND created_at >= ?
+              AND created_at < ?
+            LIMIT 1
+            """,
+            (chat_id, start.isoformat(), end.isoformat()),
+        ).fetchone()
+        return row is not None
 
     def soft_delete_record(self, chat_id: int, record_id: int, now: datetime, kind: str | None = None) -> int:
         if kind:
