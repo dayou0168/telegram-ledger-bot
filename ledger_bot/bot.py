@@ -234,7 +234,7 @@ class LedgerBot:
 
         match command.name:
             case "start":
-                self.storage.activate_group(ctx.chat_id, ctx.user, ctx.now)
+                self.storage.activate_group(ctx.chat_id, ctx.now)
                 self.client.send_message(
                     ctx.chat_id,
                     "机器人已开启，请开始记账",
@@ -1587,7 +1587,7 @@ class LedgerBot:
     def show_operators(self, ctx: MessageContext) -> None:
         rows = self.storage.list_operators(ctx.chat_id)
         if not rows:
-            self.reply(ctx, "当前没有操作员。发送“开始”的用户会成为最高权限。")
+            self.reply(ctx, "当前没有单群操作员。宿主拥有最高权限，可发送“添加操作员 @user”设置操作员。")
             return
         lines = ["当前权限人："]
         for row in rows:

@@ -510,14 +510,12 @@ class Storage:
         self.conn.commit()
         return self.get_group(chat_id)
 
-    def activate_group(self, chat_id: int, user: TelegramUser, now: datetime) -> sqlite3.Row:
+    def activate_group(self, chat_id: int, now: datetime) -> sqlite3.Row:
         group = self.get_group(chat_id)
         updates: dict[str, Any] = {"active": 1, "activated_at": now.isoformat()}
-        if not group["owner_user_id"]:
-            updates["owner_user_id"] = user.user_id
+        if not group["trial_started_at"]:
             updates["trial_started_at"] = now.isoformat()
             updates["trial_until"] = (now + timedelta(hours=12)).isoformat()
-            self.add_operator(chat_id, user, added_by=user.user_id, role="owner", now=now)
         return self.update_group(chat_id, now, **updates)
 
     def touch_user(self, chat_id: int, user: TelegramUser, now: datetime) -> None:

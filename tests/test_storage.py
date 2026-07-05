@@ -113,6 +113,22 @@ def test_set_group_owner_replaces_previous_owner_role() -> None:
             storage.conn.close()
 
 
+def test_activate_group_does_not_promote_first_starter() -> None:
+    with TemporaryDirectory() as tmp:
+        storage = Storage(Path(tmp) / "bot.db")
+        try:
+            now = datetime(2026, 7, 4, 12, tzinfo=BEIJING_TZ)
+            storage.ensure_group(-100123, "测试群", now)
+
+            group = storage.activate_group(-100123, now)
+
+            assert group["active"] == 1
+            assert group["owner_user_id"] is None
+            assert storage.list_operators(-100123) == []
+        finally:
+            storage.conn.close()
+
+
 def test_named_broadcast_group_bulk_add_remove_and_title_refresh() -> None:
     with TemporaryDirectory() as tmp:
         storage = Storage(Path(tmp) / "bot.db")

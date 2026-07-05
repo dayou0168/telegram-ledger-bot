@@ -56,8 +56,11 @@ BOT_DB_PATH=data/ledger_bot.db
 BOT_TIMEZONE=Asia/Shanghai
 BOT_HOST_USER_ID=123456789
 DEFAULT_OPERATOR_USER_IDS=
+PUBLIC_BILL_BASE_URL=
+PUBLIC_BILL_URL_TEMPLATE=
+PUBLIC_BILL_BOT_NAME=LEDGER_BOT
 TRONGRID_API_BASE=https://api.trongrid.io
-TRONGRID_API_KEY=your-trongrid-key
+TRONGRID_API_KEY=
 TRON_POLL_INTERVAL_SECONDS=5
 P2P_RATE_API_BASE=https://p2p.army/api/fapi
 P2P_RATE_FRONT_API=NextVOF2Ozuh36mW0TCv
@@ -67,7 +70,7 @@ P2P_RATE_ASSET=USDT
 P2P_RATE_TRADE_METHODS=aliPay
 ```
 
-Send `我的ID` to the bot in private chat to get your Telegram ID, then put it in `BOT_HOST_USER_ID`. The bot has exactly one host. This value is required: if that host is not in a group, the bot leaves that group automatically. Default operators are managed only by maintainers through `DEFAULT_OPERATOR_USER_IDS`; they can invite the bot into groups, record in any group, and use private `群发广播` / `分组广播`, but they cannot keep the bot in a group without the host present.
+Send `我的ID` to the bot in private chat to get your Telegram ID, then put it in `BOT_HOST_USER_ID`. The bot has exactly one host. This value is required: if that host is not in a group, the bot leaves that group automatically. Sending `开始` only activates accounting; it does not promote the sender. Default operators are managed only by maintainers through `DEFAULT_OPERATOR_USER_IDS`; they can invite the bot into groups, record in any group, and use private `群发广播` / `分组广播`, but they cannot keep the bot in a group without the host present and cannot become group owner by sending `开始`.
 
 Useful commands:
 
@@ -97,8 +100,11 @@ services:
       BOT_TIMEZONE: "Asia/Shanghai"
       BOT_HOST_USER_ID: "replace-with-your-telegram-id"
       DEFAULT_OPERATOR_USER_IDS: ""
+      PUBLIC_BILL_BASE_URL: ""
+      PUBLIC_BILL_URL_TEMPLATE: ""
+      PUBLIC_BILL_BOT_NAME: "LEDGER_BOT"
       TRONGRID_API_BASE: "https://api.trongrid.io"
-      TRONGRID_API_KEY: "replace-with-your-trongrid-key"
+      TRONGRID_API_KEY: ""
       TRON_USDT_CONTRACT: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
       TRON_POLL_INTERVAL_SECONDS: "5"
       TRON_INITIAL_LOOKBACK_MINUTES: "15"
@@ -141,9 +147,12 @@ BOT_DB_PATH=data/ledger_bot.db
 BOT_TIMEZONE=Asia/Shanghai
 BOT_HOST_USER_ID=123456789
 DEFAULT_OPERATOR_USER_IDS=
+PUBLIC_BILL_BASE_URL=
+PUBLIC_BILL_URL_TEMPLATE=
+PUBLIC_BILL_BOT_NAME=LEDGER_BOT
 
 TRONGRID_API_BASE=https://api.trongrid.io
-TRONGRID_API_KEY=your-trongrid-key
+TRONGRID_API_KEY=
 TRON_USDT_CONTRACT=TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t
 TRON_POLL_INTERVAL_SECONDS=5
 TRON_INITIAL_LOOKBACK_MINUTES=15
@@ -250,13 +259,17 @@ Then test in the group:
 显示账单
 ```
 
+Permission check: the configured `BOT_HOST_USER_ID` must be in the group. A default operator may send `开始`, but that does not make the default operator the highest permission user.
+
 Private chat tests:
 
 ```text
 /start
 我的ID
 地址监听
-添加监听地址 TGhAAySHUUcEGua33pZZ88wP3bA6XSeQuZ 监控地址
+设置地址 TGhAAySHUUcEGua33pZZ88wP3bA6XSeQuZ 监控地址
+设置备注 TGhAAySHUUcEGua33pZZ88wP3bA6XSeQuZ 监控地址
+设置监听金额10
 群列表
 新建分组 财务
 分组添加 财务 -100111 -100222
