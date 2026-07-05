@@ -54,7 +54,7 @@ class TronGridClient:
         headers = {"Accept": "application/json"}
         api_key = safe_header_value(self.api_key)
         if api_key:
-            headers["TRON-PRO-API-KEY"] = api_key
+            headers["TRON_PRO_API_KEY"] = api_key
         try:
             return self.open_json(url, headers)
         except urllib.error.HTTPError as exc:

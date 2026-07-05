@@ -55,7 +55,7 @@ def test_fetch_trc20_transfers_uses_api_key_and_unconfirmed_mode() -> None:
     )
 
     assert rows == []
-    assert client.seen_headers["TRON-PRO-API-KEY"] == "key123"
+    assert client.seen_headers["TRON_PRO_API_KEY"] == "key123"
     assert "only_confirmed=false" in client.seen_url
     assert "min_timestamp=123" in client.seen_url
 
