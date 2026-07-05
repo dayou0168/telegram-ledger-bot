@@ -2486,9 +2486,6 @@ def calculate_amounts(
     if currency == "USDT":
         amount_usdt = amount
         amount_cny = amount * rate
-    elif kind == "payout" and payout_mode == "coin":
-        amount_usdt = amount
-        amount_cny = amount * rate
     elif multiply_exchange:
         amount_cny = amount
         amount_usdt = amount * rate

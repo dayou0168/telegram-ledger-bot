@@ -35,6 +35,21 @@ def test_payout_with_multiplier_and_rate() -> None:
     assert parsed.exchange_rate == Decimal("7.1")
 
 
+def test_bare_payout_without_u_suffix_is_rejected() -> None:
+    for text in ["下发100", "下发 100"]:
+        parsed = parse_message(text)
+        assert parsed is None
+
+
+def test_payout_u_suffix_is_usdt() -> None:
+    for text in ["下发100U", "下发 100U", "下发100u"]:
+        parsed = parse_message(text)
+        assert isinstance(parsed, ParsedLedgerEntry)
+        assert parsed.kind == "payout"
+        assert parsed.amount == Decimal("100")
+        assert parsed.currency == "USDT"
+
+
 def test_close_alias() -> None:
     parsed = parse_message("关闭")
     assert isinstance(parsed, ParsedCommand)

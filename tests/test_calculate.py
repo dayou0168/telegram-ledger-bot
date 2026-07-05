@@ -48,3 +48,35 @@ def test_fee_keeps_gross_and_net_separate() -> None:
     assert amount_usdt == Decimal("100.000000")
     assert net_usdt == Decimal("97.000000")
     assert commission == Decimal("30.000000")
+
+
+def test_payout_cny_conversion_stays_cny_even_in_coin_mode() -> None:
+    amount_cny, amount_usdt, net_usdt, commission = calculate_amounts(
+        kind="payout",
+        amount=Decimal("100"),
+        currency="CNY",
+        rate=Decimal("10"),
+        fee_rate=Decimal("0"),
+        payout_mode="coin",
+        multiply_exchange=False,
+    )
+    assert amount_cny == Decimal("100.000000")
+    assert amount_usdt == Decimal("10.000000")
+    assert net_usdt == Decimal("10.000000")
+    assert commission == Decimal("0.000000")
+
+
+def test_payout_with_u_suffix_is_usdt() -> None:
+    amount_cny, amount_usdt, net_usdt, commission = calculate_amounts(
+        kind="payout",
+        amount=Decimal("100"),
+        currency="USDT",
+        rate=Decimal("10"),
+        fee_rate=Decimal("0"),
+        payout_mode="cny",
+        multiply_exchange=False,
+    )
+    assert amount_cny == Decimal("1000.000000")
+    assert amount_usdt == Decimal("100.000000")
+    assert net_usdt == Decimal("100.000000")
+    assert commission == Decimal("0.000000")

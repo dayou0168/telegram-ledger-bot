@@ -204,6 +204,8 @@ def _parse_payout(text: str) -> ParsedLedgerEntry | None:
     currency = "USDT" if match.group(2) else "CNY"
     multiplier = _decimal(match.group(3)) if match.group(3) else Decimal("1")
     exchange_rate = _decimal(match.group(4)) if match.group(4) else None
+    if currency != "USDT" and multiplier == 1 and exchange_rate is None:
+        return None
     subject, _fee_rate, note, is_balance = _parse_tail(match.group(5) or "")
     return ParsedLedgerEntry(
         kind="payout",
