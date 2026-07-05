@@ -50,6 +50,12 @@ class Config:
     p2p_rate_trade_methods: tuple[str, ...]
     p2p_rate_refresh_seconds: int
     p2p_rate_cache_ttl_seconds: int
+    worker_threads: int
+    chain_threads: int
+    rate_threads: int
+    broadcast_threads: int
+    query_threads: int
+    host_check_ttl_seconds: int
     poll_timeout: int = 50
     request_timeout: int = 70
 
@@ -106,6 +112,12 @@ def load_config() -> Config:
         ),
         p2p_rate_refresh_seconds=int(os.environ.get("P2P_RATE_REFRESH_SECONDS", "60")),
         p2p_rate_cache_ttl_seconds=int(os.environ.get("P2P_RATE_CACHE_TTL_SECONDS", "180")),
+        worker_threads=max(1, int(os.environ.get("BOT_WORKER_THREADS", "8"))),
+        chain_threads=max(1, int(os.environ.get("BOT_CHAIN_THREADS", os.environ.get("BOT_MONITOR_THREADS", "8")))),
+        rate_threads=max(1, int(os.environ.get("BOT_RATE_THREADS", "1"))),
+        broadcast_threads=max(1, int(os.environ.get("BOT_BROADCAST_THREADS", "4"))),
+        query_threads=max(1, int(os.environ.get("BOT_QUERY_THREADS", "2"))),
+        host_check_ttl_seconds=max(0, int(os.environ.get("BOT_HOST_CHECK_TTL_SECONDS", "300"))),
         poll_timeout=int(os.environ.get("BOT_POLL_TIMEOUT", "50")),
         request_timeout=int(os.environ.get("BOT_REQUEST_TIMEOUT", "70")),
     )

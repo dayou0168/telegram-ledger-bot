@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, tzinfo
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from html import escape
 import json
 import re
+import threading
 import time
 from typing import Any
 from urllib.parse import urlencode
@@ -18,6 +21,7 @@ from .parser import ParsedCommand, ParsedLedgerEntry, parse_message
 from .storage import (
     Storage,
     TelegramUser,
+    ThreadLocalStorage,
     bill_window_for_day,
     business_day_key,
     current_business_day_key,
@@ -102,7 +106,7 @@ class MessageContext:
 class LedgerBot:
     def __init__(self, config: Config):
         self.config = config
-        self.storage = Storage(config.db_path)
+        self.storage = ThreadLocalStorage(config.db_path)
         self.client = TelegramClient(
             token=config.bot_token,
             api_base=config.telegram_api_base,
@@ -124,6 +128,37 @@ class LedgerBot:
         self.next_p2p_rate_refresh_at = 0.0
         self.cached_otc_top_entries: list[P2POrderBookEntry] = []
         self.cached_otc_top_at = 0.0
+        self.p2p_cache_lock = threading.Lock()
+        self.update_executor = ThreadPoolExecutor(
+            max_workers=config.worker_threads,
+            thread_name_prefix="ledger-worker",
+        )
+        self.chain_executor = ThreadPoolExecutor(
+            max_workers=config.chain_threads,
+            thread_name_prefix="ledger-chain",
+        )
+        self.rate_executor = ThreadPoolExecutor(
+            max_workers=config.rate_threads,
+            thread_name_prefix="ledger-rate",
+        )
+        self.broadcast_executor = ThreadPoolExecutor(
+            max_workers=config.broadcast_threads,
+            thread_name_prefix="ledger-broadcast",
+        )
+        self.query_executor = ThreadPoolExecutor(
+            max_workers=config.query_threads,
+            thread_name_prefix="ledger-query",
+        )
+        self.update_queues: dict[str, deque[dict[str, Any]]] = {}
+        self.active_update_queues: set[str] = set()
+        self.update_queue_guard = threading.Lock()
+        self.update_futures: set[Future[None]] = set()
+        self.update_futures_guard = threading.Lock()
+        self.background_guard = threading.Lock()
+        self.p2p_refresh_running = False
+        self.tron_poll_running = False
+        self.host_presence_cache: dict[int, tuple[float, TelegramUser | None]] = {}
+        self.host_presence_lock = threading.Lock()
         self.address_watch_pending: dict[int, str] = {}
 
     def run_forever(self) -> None:
@@ -137,14 +172,69 @@ class LedgerBot:
             self.offset = update_id + 1
             if not self.storage.claim_update(update_id, datetime.now(self.config.timezone)):
                 continue
-            try:
-                self.handle_update(update)
-            except TelegramAPIError as exc:
-                print(f"Telegram API error: {exc}", flush=True)
-            except Exception as exc:
-                print(f"Unhandled update error: {exc}", flush=True)
+            self.submit_update(update)
         self.refresh_realtime_rates_if_due()
         self.poll_address_watches_if_due()
+
+    def submit_update(self, update: dict[str, Any]) -> None:
+        key = self.update_lock_key(update)
+        should_start = False
+        with self.update_queue_guard:
+            queue = self.update_queues.setdefault(key, deque())
+            queue.append(update)
+            if key not in self.active_update_queues:
+                self.active_update_queues.add(key)
+                should_start = True
+        if not should_start:
+            return
+        future = self.update_executor.submit(self.process_update_queue, key)
+        with self.update_futures_guard:
+            self.update_futures.add(future)
+        future.add_done_callback(self.update_future_done)
+
+    def update_future_done(self, future: Future[None]) -> None:
+        with self.update_futures_guard:
+            self.update_futures.discard(future)
+        try:
+            future.result()
+        except Exception as exc:
+            print(f"Unhandled worker error: {exc}", flush=True)
+
+    def process_update_queue(self, key: str) -> None:
+        while True:
+            with self.update_queue_guard:
+                queue = self.update_queues.get(key)
+                if not queue:
+                    self.update_queues.pop(key, None)
+                    self.active_update_queues.discard(key)
+                    return
+                update = queue.popleft()
+            self.process_claimed_update(update)
+
+    def process_claimed_update(self, update: dict[str, Any]) -> None:
+        try:
+            self.handle_update(update)
+        except TelegramAPIError as exc:
+            print(f"Telegram API error: {exc}", flush=True)
+        except Exception as exc:
+            print(f"Unhandled update error: {exc}", flush=True)
+
+    @staticmethod
+    def update_lock_key(update: dict[str, Any]) -> str:
+        if message := update.get("message"):
+            chat = message.get("chat") or {}
+            return f"chat:{chat.get('id', 'unknown')}"
+        if callback := update.get("callback_query"):
+            message = callback.get("message") or {}
+            chat = message.get("chat") or {}
+            if "id" in chat:
+                return f"chat:{chat['id']}"
+            user = callback.get("from") or {}
+            return f"user:{user.get('id', 'unknown')}"
+        if membership := update.get("my_chat_member"):
+            chat = membership.get("chat") or {}
+            return f"chat:{chat.get('id', 'unknown')}"
+        return f"update:{update.get('update_id', 'unknown')}"
 
     def telegram_poll_timeout(self) -> int:
         intervals = [
@@ -402,7 +492,7 @@ class LedgerBot:
             case "set_rate_from_otc_rank":
                 self.set_rate_from_otc_rank(ctx, int(command.args["rank"]), command.args["offset"])
             case "otc":
-                self.send_otc_rates(ctx)
+                self.submit_rate_task(self.send_otc_rates, ctx)
             case "rate_query":
                 self.reply(ctx, self.format_current_rate(group))
             case "external_query":
@@ -420,25 +510,38 @@ class LedgerBot:
             trade_methods=list(self.config.p2p_rate_trade_methods),
             limit=limit,
         )
-        self.cached_otc_top_entries = entries
-        self.cached_otc_top_at = time.monotonic()
+        with self.p2p_cache_lock:
+            self.cached_otc_top_entries = entries
+            self.cached_otc_top_at = time.monotonic()
         return entries
 
     def cached_otc_top_entries_for_limit(self, limit: int) -> list[P2POrderBookEntry] | None:
         ttl = max(0, int(self.config.p2p_rate_cache_ttl_seconds))
-        if ttl <= 0 or not self.cached_otc_top_entries or not self.cached_otc_top_at:
-            return None
-        if time.monotonic() - self.cached_otc_top_at > ttl:
-            return None
-        if not any(entry.rank >= limit for entry in self.cached_otc_top_entries):
-            return None
-        return self.cached_otc_top_entries
+        with self.p2p_cache_lock:
+            if ttl <= 0 or not self.cached_otc_top_entries or not self.cached_otc_top_at:
+                return None
+            if time.monotonic() - self.cached_otc_top_at > ttl:
+                return None
+            if not any(entry.rank >= limit for entry in self.cached_otc_top_entries):
+                return None
+            return list(self.cached_otc_top_entries)
 
     def get_otc_top_entries(self, limit: int = 10) -> list[P2POrderBookEntry]:
         cached = self.cached_otc_top_entries_for_limit(limit)
         if cached is not None:
             return cached
         return self.fetch_otc_top_entries(limit)
+
+    def submit_rate_task(self, func: Any, *args: Any, **kwargs: Any) -> None:
+        future = self.rate_executor.submit(func, *args, **kwargs)
+        future.add_done_callback(self.rate_future_done)
+
+    @staticmethod
+    def rate_future_done(future: Future[Any]) -> None:
+        try:
+            future.result()
+        except Exception as exc:
+            print(f"Rate task error: {exc}", flush=True)
 
     def refresh_realtime_rates_if_due(self) -> None:
         interval = max(0, int(self.config.p2p_rate_refresh_seconds))
@@ -448,6 +551,18 @@ class LedgerBot:
         if now_monotonic < self.next_p2p_rate_refresh_at:
             return
         self.next_p2p_rate_refresh_at = now_monotonic + interval
+        with self.background_guard:
+            if self.p2p_refresh_running:
+                return
+            self.p2p_refresh_running = True
+        future = self.rate_executor.submit(self.run_realtime_rate_refresh)
+        future.add_done_callback(lambda _: self.mark_p2p_refresh_done())
+
+    def mark_p2p_refresh_done(self) -> None:
+        with self.background_guard:
+            self.p2p_refresh_running = False
+
+    def run_realtime_rate_refresh(self) -> None:
         try:
             updated = self.refresh_realtime_rates()
         except P2PRateError as exc:
@@ -539,8 +654,19 @@ class LedgerBot:
         address = extract_tron_address(query)
         if not address:
             return False
-        self.send_tron_address_query(ctx.chat_id, address, reply_to_message_id=ctx.message_id)
+        self.submit_query(self.send_tron_address_query, ctx.chat_id, address, reply_to_message_id=ctx.message_id)
         return True
+
+    def submit_query(self, func: Any, *args: Any, **kwargs: Any) -> None:
+        future = self.query_executor.submit(func, *args, **kwargs)
+        future.add_done_callback(self.query_future_done)
+
+    @staticmethod
+    def query_future_done(future: Future[Any]) -> None:
+        try:
+            future.result()
+        except Exception as exc:
+            print(f"Query task error: {exc}", flush=True)
 
     def send_tron_address_query(
         self,
@@ -644,7 +770,7 @@ class LedgerBot:
         if self.handle_address_watch_command(chat_id, user.user_id, normalized, now, message_id):
             return
         if address := extract_tron_address(normalized):
-            self.send_tron_address_query(chat_id, address, reply_to_message_id=message_id)
+            self.submit_query(self.send_tron_address_query, chat_id, address, reply_to_message_id=message_id)
             return
 
         self.send_private_menu(chat_id, message_id)
@@ -1873,24 +1999,51 @@ class LedgerBot:
         if host_user_id is None:
             return None
         if actor.user_id == host_user_id:
+            self.cache_host_presence(chat_id, actor)
             return actor
+        cached = self.cached_host_presence(chat_id)
+        if cached is not None:
+            return cached
         try:
             member = self.client.get_chat_member(chat_id, host_user_id)
         except TelegramRetryableError:
             raise
         except TelegramAPIError as exc:
             print(f"Could not verify host {host_user_id} in {chat_id}: {exc}", flush=True)
-            return None
+            return self.cached_host_presence(chat_id, allow_expired=True)
         status = member.get("status")
         if status in {"left", "kicked"}:
+            self.cache_host_presence(chat_id, None)
             return None
         user_data = member.get("user")
         if not user_data:
+            self.cache_host_presence(chat_id, None)
             return None
         host_user = user_from_telegram(user_data)
         self.storage.touch_user(chat_id, host_user, now)
+        self.cache_host_presence(chat_id, host_user)
         return host_user
         return None
+
+    def cached_host_presence(self, chat_id: int, *, allow_expired: bool = False) -> TelegramUser | None:
+        ttl = self.config.host_check_ttl_seconds
+        if ttl <= 0 and not allow_expired:
+            return None
+        with self.host_presence_lock:
+            cached = self.host_presence_cache.get(chat_id)
+        if cached is None:
+            return None
+        expires_at, user = cached
+        if allow_expired or expires_at >= time.monotonic():
+            return user
+        return None
+
+    def cache_host_presence(self, chat_id: int, user: TelegramUser | None) -> None:
+        ttl = self.config.host_check_ttl_seconds
+        if ttl <= 0:
+            return
+        with self.host_presence_lock:
+            self.host_presence_cache[chat_id] = (time.monotonic() + ttl, user)
 
     def format_expiration(self, group: Any) -> str:
         if not group["trial_until"]:
@@ -2007,16 +2160,36 @@ class LedgerBot:
 
         self.client.answer_callback_query(callback_id, "开始发送。")
         self.storage.update_broadcast_job(job["id"], now, status="sending", confirmed_at=now.isoformat())
-        success, failure = self.deliver_broadcast_job(job)
+        self.broadcast_executor.submit(self.run_broadcast_job, int(job["id"]), chat_id)
+
+    def run_broadcast_job(self, job_id: int, reply_chat_id: int) -> None:
+        try:
+            job = self.storage.get_broadcast_job(job_id)
+        except KeyError:
+            return
+        try:
+            success, failure = self.deliver_broadcast_job(job)
+        except Exception as exc:
+            print(f"Broadcast job {job_id} error: {exc}", flush=True)
+            failed_at = datetime.now(self.config.timezone)
+            self.storage.update_broadcast_job(
+                job_id,
+                failed_at,
+                status="failed",
+                completed_at=failed_at.isoformat(),
+            )
+            self.client.send_message(reply_chat_id, "广播失败：后台任务异常，已停止发送。")
+            return
+        completed_at = datetime.now(self.config.timezone)
         self.storage.update_broadcast_job(
-            job["id"],
-            datetime.now(self.config.timezone),
+            job_id,
+            completed_at,
             status="completed",
             success_count=success,
             failure_count=failure,
-            completed_at=datetime.now(self.config.timezone).isoformat(),
+            completed_at=completed_at.isoformat(),
         )
-        self.client.send_message(chat_id, f"广播完成：成功 {success} 个，失败 {failure} 个。")
+        self.client.send_message(reply_chat_id, f"广播完成：成功 {success} 个，失败 {failure} 个。")
 
     def deliver_broadcast_job(self, job: Any) -> tuple[int, int]:
         target_chat_ids = [int(value) for value in json.loads(job["target_chat_ids"])]
@@ -2072,53 +2245,84 @@ class LedgerBot:
         if now_monotonic < self.next_tron_poll_at:
             return
         self.next_tron_poll_at = now_monotonic + self.config.tron_poll_interval_seconds
-        self.poll_address_watches()
+        with self.background_guard:
+            if self.tron_poll_running:
+                return
+            self.tron_poll_running = True
+        future = self.chain_executor.submit(self.run_address_watch_poll)
+        future.add_done_callback(lambda _: self.mark_address_watch_poll_done())
+
+    def mark_address_watch_poll_done(self) -> None:
+        with self.background_guard:
+            self.tron_poll_running = False
+
+    def run_address_watch_poll(self) -> None:
+        try:
+            self.poll_address_watches()
+        except Exception as exc:
+            print(f"Address watch poll error: {exc}", flush=True)
 
     def poll_address_watches(self) -> None:
         now = datetime.now(self.config.timezone)
         min_timestamp_ms = int(
             (now - timedelta(minutes=self.config.tron_initial_lookback_minutes)).timestamp() * 1000
         )
-        for watch in self.storage.list_active_address_watch_targets():
-            settings = self.storage.get_address_watch_settings(watch["owner_user_id"], now)
-            try:
-                rows = self.tron_client.fetch_trc20_transfers(
-                    watch["address"],
-                    contract_address=self.config.tron_usdt_contract,
-                    min_timestamp_ms=min_timestamp_ms,
-                )
-            except TronGridError as exc:
-                print(f"TronGrid error for {watch['address']}: {exc}", flush=True)
-                continue
+        watches = [dict(row) for row in self.storage.list_active_address_watch_targets()]
+        if self.config.chain_threads <= 1 or len(watches) <= 1:
+            for watch in watches:
+                self.poll_one_address_watch(watch, now, min_timestamp_ms)
+            return
 
-            for row in rows:
-                transfer = parse_usdt_transfer(
-                    row,
-                    watched_address=watch["address"],
-                    watched_label=watch["label"],
-                    timezone=self.config.timezone,
-                    usdt_contract=self.config.tron_usdt_contract,
-                )
-                if transfer is None:
-                    continue
-                inserted = self.storage.record_chain_event_notification(
-                    owner_user_id=watch["owner_user_id"],
-                    address=watch["address"],
-                    tx_hash=transfer.tx_hash,
-                    direction=transfer.direction,
-                    token_symbol="USDT",
-                    block_timestamp=int(row["block_timestamp"]),
-                    now=now,
-                )
-                if not inserted:
-                    continue
-                if not should_notify_transfer(transfer, settings):
-                    continue
-                self.client.send_message(
-                    watch["owner_user_id"],
-                    format_transfer_notice(transfer),
-                    parse_mode="HTML",
-                )
+        futures = [
+            self.chain_executor.submit(self.poll_one_address_watch, watch, now, min_timestamp_ms)
+            for watch in watches
+        ]
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as exc:
+                print(f"Address watch target error: {exc}", flush=True)
+
+    def poll_one_address_watch(self, watch: dict[str, Any], now: datetime, min_timestamp_ms: int) -> None:
+        settings = self.storage.get_address_watch_settings(watch["owner_user_id"], now)
+        try:
+            rows = self.tron_client.fetch_trc20_transfers(
+                watch["address"],
+                contract_address=self.config.tron_usdt_contract,
+                min_timestamp_ms=min_timestamp_ms,
+            )
+        except TronGridError as exc:
+            print(f"TronGrid error for {watch['address']}: {exc}", flush=True)
+            return
+
+        for row in rows:
+            transfer = parse_usdt_transfer(
+                row,
+                watched_address=watch["address"],
+                watched_label=watch["label"],
+                timezone=self.config.timezone,
+                usdt_contract=self.config.tron_usdt_contract,
+            )
+            if transfer is None:
+                continue
+            inserted = self.storage.record_chain_event_notification(
+                owner_user_id=watch["owner_user_id"],
+                address=watch["address"],
+                tx_hash=transfer.tx_hash,
+                direction=transfer.direction,
+                token_symbol="USDT",
+                block_timestamp=int(row["block_timestamp"]),
+                now=now,
+            )
+            if not inserted:
+                continue
+            if not should_notify_transfer(transfer, settings):
+                continue
+            self.client.send_message(
+                watch["owner_user_id"],
+                format_transfer_notice(transfer),
+                parse_mode="HTML",
+            )
 
     def handle_address_watch_callback(
         self,

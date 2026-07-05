@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, tzinfo
 import json
 from pathlib import Path
+import threading
 from typing import Any
 
 
@@ -22,9 +23,11 @@ class TelegramUser:
 class Storage:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(path)
+        self.conn = sqlite3.connect(path, timeout=30)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
+        self.conn.execute("PRAGMA busy_timeout = 30000")
+        self.conn.execute("PRAGMA journal_mode = WAL")
         self.migrate()
 
     def migrate(self) -> None:
@@ -1249,6 +1252,22 @@ class Storage:
         self.conn.execute(f"UPDATE address_watch_settings SET {columns} WHERE owner_user_id = ?", values)
         self.conn.commit()
         return self.get_address_watch_settings(owner_user_id, now)
+
+
+class ThreadLocalStorage:
+    def __init__(self, path: Path):
+        self.path = path
+        self.local = threading.local()
+
+    def current(self) -> Storage:
+        storage = getattr(self.local, "storage", None)
+        if storage is None:
+            storage = Storage(self.path)
+            self.local.storage = storage
+        return storage
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.current(), name)
 
 
 def user_from_telegram(raw: dict[str, Any]) -> TelegramUser:

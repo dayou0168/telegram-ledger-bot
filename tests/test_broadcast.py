@@ -15,3 +15,14 @@ def test_broadcast_preview_for_photo_caption() -> None:
     assert LedgerBot.broadcast_message_kind(message) == "photo"
     assert LedgerBot.broadcast_preview(message) == "[图片] 活动通知"
     assert LedgerBot.is_broadcastable_message(message)
+
+
+def test_update_lock_key_serializes_same_chat_only() -> None:
+    first = {"update_id": 1, "message": {"chat": {"id": -1001}}}
+    second = {"update_id": 2, "message": {"chat": {"id": -1001}}}
+    other = {"update_id": 3, "message": {"chat": {"id": -1002}}}
+    callback = {"update_id": 4, "callback_query": {"message": {"chat": {"id": -1001}}}}
+
+    assert LedgerBot.update_lock_key(first) == LedgerBot.update_lock_key(second)
+    assert LedgerBot.update_lock_key(first) == LedgerBot.update_lock_key(callback)
+    assert LedgerBot.update_lock_key(first) != LedgerBot.update_lock_key(other)

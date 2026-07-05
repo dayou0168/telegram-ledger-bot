@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import threading
 import time
 from types import SimpleNamespace
 
@@ -130,6 +131,7 @@ def test_refresh_realtime_rates_updates_groups_from_one_shared_fetch() -> None:
             bot.p2p_rate_client = fake_client
             bot.cached_otc_top_entries = []
             bot.cached_otc_top_at = 0.0
+            bot.p2p_cache_lock = threading.Lock()
             bot.config = SimpleNamespace(
                 timezone=BEIJING_TZ,
                 p2p_rate_market="okx",
@@ -170,6 +172,7 @@ def test_otc_top_entries_use_cache_within_ttl() -> None:
     bot.p2p_rate_client = FailingP2PClient()
     bot.cached_otc_top_entries = entries
     bot.cached_otc_top_at = time.monotonic()
+    bot.p2p_cache_lock = threading.Lock()
     bot.config = SimpleNamespace(p2p_rate_cache_ttl_seconds=180)
 
     assert bot.get_otc_top_entries(10) == entries
