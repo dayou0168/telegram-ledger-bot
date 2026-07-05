@@ -90,6 +90,8 @@ def make_config(
         tron_usdt_contract="TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
         tron_poll_interval_seconds=0,
         tron_initial_lookback_minutes=15,
+        tronscan_global_scan_pages=1,
+        tron_address_backfill_seconds=60,
         p2p_rate_api_base="https://example.invalid",
         p2p_rate_front_api="",
         p2p_rate_market="okx",

@@ -43,6 +43,8 @@ class Config:
     tron_usdt_contract: str
     tron_poll_interval_seconds: int
     tron_initial_lookback_minutes: int
+    tronscan_global_scan_pages: int
+    tron_address_backfill_seconds: int
     p2p_rate_api_base: str
     p2p_rate_front_api: str
     p2p_rate_market: str
@@ -107,6 +109,8 @@ def load_config() -> Config:
         tron_usdt_contract=os.environ.get("TRON_USDT_CONTRACT", "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"),
         tron_poll_interval_seconds=int(os.environ.get("TRON_POLL_INTERVAL_SECONDS", "1")),
         tron_initial_lookback_minutes=int(os.environ.get("TRON_INITIAL_LOOKBACK_MINUTES", "15")),
+        tronscan_global_scan_pages=max(1, int(os.environ.get("TRONSCAN_GLOBAL_SCAN_PAGES", "1"))),
+        tron_address_backfill_seconds=max(0, int(os.environ.get("TRON_ADDRESS_BACKFILL_SECONDS", "60"))),
         p2p_rate_api_base=os.environ.get("P2P_RATE_API_BASE", "https://p2p.army/api/fapi").rstrip("/"),
         p2p_rate_front_api=os.environ.get("P2P_RATE_FRONT_API", "NextVOF2Ozuh36mW0TCv"),
         p2p_rate_market=os.environ.get("P2P_RATE_MARKET", "okx"),

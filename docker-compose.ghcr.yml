@@ -77,11 +77,17 @@ services:
       # PUBLIC_BILL_URL_TEMPLATE: ""
       # PUBLIC_BILL_BOT_NAME: "LEDGER_BOT"
 
-      # TRC20 监听参数。默认 1 秒轮询；机器人看到未完全确认的交易也会先通知。
+      # TRC20 监听参数。
+      # 默认每秒做一次全局 USDT 最新流水扫描，所有监听地址共用这一次请求。
       # TRONSCAN_API_BASE: "https://apilist.tronscanapi.com/api"
       # TRON_USDT_CONTRACT: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
       # TRON_POLL_INTERVAL_SECONDS: "1"
       # TRON_INITIAL_LOOKBACK_MINUTES: "15"
+      # 每轮全局扫描页数。每页 50 条，默认 1 页，调用量最低。
+      # 如果全网 USDT 很拥堵且担心漏单，可调成 2 或 3，但调用量会同步增加。
+      # TRONSCAN_GLOBAL_SCAN_PAGES: "1"
+      # 按地址低频回补间隔，单位秒。用于补漏，不影响秒级主扫描；设为 0 可关闭。
+      # TRON_ADDRESS_BACKFILL_SECONDS: "60"
 
       # Z0/实时汇率。默认 OKX，USDT 卖 CNY，支付宝档位。
       # P2P_RATE_API_BASE: "https://p2p.army/api/fapi"

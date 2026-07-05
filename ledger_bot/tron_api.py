@@ -49,14 +49,14 @@ def normalize_tronscan_transfer(row: dict[str, Any], *, contract_address: str) -
         "transaction_id": row.get("hash") or row.get("transaction_id"),
         "token_info": {
             "symbol": token_info.get("tokenAbbr") or row.get("token_name") or "USDT",
-            "address": row.get("contract_address") or row.get("id") or contract_address,
+            "address": row.get("contract_address") or row.get("id") or token_info.get("tokenId") or contract_address,
             "decimals": int(decimals or 6),
         },
-        "block_timestamp": row.get("block_timestamp"),
-        "from": row.get("from"),
-        "to": row.get("to"),
+        "block_timestamp": row.get("block_timestamp") or row.get("block_ts"),
+        "from": row.get("from") or row.get("from_address"),
+        "to": row.get("to") or row.get("to_address"),
         "type": row.get("event_type") or "Transfer",
-        "value": row.get("amount") or row.get("value") or "0",
+        "value": row.get("amount") or row.get("quant") or row.get("value") or "0",
     }
 
 
@@ -180,6 +180,36 @@ class TronGridClient:
                 start += page_limit
         rows.sort(key=lambda row: int(row.get("block_timestamp") or 0))
         return rows[:limit]
+
+    def fetch_tronscan_global_trc20_transfers(
+        self,
+        *,
+        contract_address: str,
+        min_timestamp_ms: int,
+        pages: int = 1,
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        page_limit = 50
+        for page in range(max(1, pages)):
+            data = self.get_json(
+                "/token_trc20/transfers",
+                {
+                    "contract_address": contract_address,
+                    "start_timestamp": min_timestamp_ms,
+                    "start": page * page_limit,
+                    "limit": page_limit,
+                    "sort": "-timestamp",
+                },
+            )
+            page_rows = data.get("token_transfers") or []
+            rows.extend(
+                normalize_tronscan_transfer(row, contract_address=contract_address)
+                for row in page_rows
+            )
+            if len(page_rows) < page_limit:
+                break
+        rows.sort(key=lambda row: int(row.get("block_timestamp") or 0))
+        return rows
 
     def fetch_account(self, address: str) -> dict[str, Any] | None:
         if self.uses_tronscan_api():

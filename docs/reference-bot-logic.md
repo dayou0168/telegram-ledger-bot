@@ -120,6 +120,6 @@ type=bjr
 - USDT 收入提醒格式：交易类型、交易金额、出账地址、入账地址、交易时间、交易哈希。
 - USDT 支出提醒格式：交易类型、交易金额为负数、出账地址、入账地址、交易时间、交易哈希。
 - 交易哈希显示为缩略文本，链接到 `https://tronscan.org/#/transaction/{hash}`。
-- TRC20 链上监听使用 Tronscan API：按监听地址请求 `/api/token_trc20/transfers-with-status`，分别拉取收入和支出方向，过滤 USDT 合约后去重推送。
+- TRC20 链上监听使用 Tronscan API：主扫描请求 `/api/token_trc20/transfers` 获取 USDT 全网最新流水，再在本地匹配所有监听地址；低频回补再按地址请求 `/api/token_trc20/transfers-with-status`，过滤 USDT 合约后去重推送。
 - 群内直接发送单个 TRC20 地址时，机器人回复原消息，显示 `验证地址`、同群同地址累计 `验证次数`、`上次发送人`、`本次发送人`；第一次没有上次发送人时只显示本次发送人。
 - `查询Txxxx` 查询 TRX 地址，显示 TRX/USDT 余额、创建时间、活跃时间、权限摘要和最近 USDT 流水；私聊直接发送 T 地址也触发查询，群里直接发送单个 T 地址优先作为地址验证。

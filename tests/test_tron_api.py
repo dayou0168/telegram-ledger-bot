@@ -75,6 +75,23 @@ def test_fetch_trc20_transfers_can_still_use_trongrid_base() -> None:
     assert "min_timestamp=123" in client.seen_url
 
 
+def test_fetch_tronscan_global_trc20_transfers_uses_one_contract_scan() -> None:
+    client = CapturingTronGridClient(api_key="key123")
+
+    rows = client.fetch_tronscan_global_trc20_transfers(
+        contract_address=USDT,
+        min_timestamp_ms=123,
+        pages=1,
+    )
+
+    assert rows == []
+    assert client.seen_headers["TRON-PRO-API-KEY"] == "key123"
+    assert "/token_trc20/transfers" in client.seen_url
+    assert f"contract_address={USDT}" in client.seen_url
+    assert "start_timestamp=123" in client.seen_url
+    assert "limit=50" in client.seen_url
+
+
 def test_trongrid_key_error_does_not_fallback_to_public_request() -> None:
     client = FailingTronGridClient(api_key="key123")
 

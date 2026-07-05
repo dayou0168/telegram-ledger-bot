@@ -128,6 +128,7 @@ class LedgerBot:
         last_update_id = self.storage.last_processed_update_id()
         self.offset: int | None = last_update_id + 1 if last_update_id is not None else None
         self.next_tron_poll_at = 0.0
+        self.next_tron_address_backfill_at = 0.0
         self.next_p2p_rate_refresh_at = 0.0
         self.cached_otc_top_entries: list[P2POrderBookEntry] = []
         self.cached_otc_top_at = 0.0
@@ -179,7 +180,9 @@ class LedgerBot:
             "TRON API monitor: "
             f"interval={self.config.tron_poll_interval_seconds}s, "
             f"api_key_loaded={'yes' if self.config.trongrid_api_key else 'no'}, "
-            f"base={self.config.trongrid_api_base}",
+            f"base={self.config.trongrid_api_base}, "
+            f"global_pages={self.config.tronscan_global_scan_pages}, "
+            f"backfill={self.config.tron_address_backfill_seconds}s",
             flush=True,
         )
         self.start_background_loops()
@@ -4083,6 +4086,27 @@ class LedgerBot:
             (now - timedelta(minutes=self.config.tron_initial_lookback_minutes)).timestamp() * 1000
         )
         watches = [dict(row) for row in self.storage.list_active_address_watch_targets()]
+        if not watches:
+            return
+        if self.tron_client.uses_tronscan_api():
+            self.poll_tronscan_global_address_watches(watches, now, fallback_min_timestamp_ms)
+            if self.config.tron_address_backfill_seconds <= 0:
+                return
+            now_monotonic = time.monotonic()
+            if now_monotonic < self.next_tron_address_backfill_at:
+                return
+            self.next_tron_address_backfill_at = now_monotonic + self.config.tron_address_backfill_seconds
+            self.poll_address_watch_targets(watches, now, fallback_min_timestamp_ms)
+            return
+
+        self.poll_address_watch_targets(watches, now, fallback_min_timestamp_ms)
+
+    def poll_address_watch_targets(
+        self,
+        watches: list[dict[str, Any]],
+        now: datetime,
+        fallback_min_timestamp_ms: int,
+    ) -> None:
         if self.config.chain_threads <= 1 or len(watches) <= 1:
             for watch in watches:
                 self.poll_one_address_watch(watch, now, fallback_min_timestamp_ms)
@@ -4098,6 +4122,51 @@ class LedgerBot:
             except Exception as exc:
                 print(f"Address watch target error: {exc}", flush=True)
 
+    def poll_tronscan_global_address_watches(
+        self,
+        watches: list[dict[str, Any]],
+        now: datetime,
+        fallback_min_timestamp_ms: int,
+    ) -> None:
+        watched_by_address: dict[str, list[dict[str, Any]]] = {}
+        min_timestamp_ms = fallback_min_timestamp_ms
+        for watch in watches:
+            watched_by_address.setdefault(watch["address"], []).append(watch)
+            watch_min_timestamp = self.address_watch_min_timestamp_ms(watch, fallback_min_timestamp_ms)
+            min_timestamp_ms = min(min_timestamp_ms, watch_min_timestamp)
+        try:
+            rows = self.tron_client.fetch_tronscan_global_trc20_transfers(
+                contract_address=self.config.tron_usdt_contract,
+                min_timestamp_ms=min_timestamp_ms,
+                pages=self.config.tronscan_global_scan_pages,
+            )
+        except TronGridError as exc:
+            self.log_trongrid_error("global-usdt-scan", exc)
+            return
+
+        for row in rows:
+            matched_watches: list[dict[str, Any]] = []
+            from_address = row.get("from")
+            to_address = row.get("to")
+            if from_address in watched_by_address:
+                matched_watches.extend(watched_by_address[from_address])
+            if to_address in watched_by_address:
+                matched_watches.extend(watched_by_address[to_address])
+            if not matched_watches:
+                continue
+            seen: set[tuple[int, str]] = set()
+            for watch in matched_watches:
+                key = (int(watch["owner_user_id"]), watch["address"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                if int(row.get("block_timestamp") or 0) < self.address_watch_min_timestamp_ms(
+                    watch,
+                    fallback_min_timestamp_ms,
+                ):
+                    continue
+                self.process_address_watch_transfer_row(watch, row, now)
+
     def poll_one_address_watch(self, watch: dict[str, Any], now: datetime, fallback_min_timestamp_ms: int) -> None:
         settings = self.storage.get_address_watch_settings(watch["owner_user_id"], now)
         min_timestamp_ms = self.address_watch_min_timestamp_ms(watch, fallback_min_timestamp_ms)
@@ -4112,33 +4181,44 @@ class LedgerBot:
             return
 
         for row in rows:
-            transfer = parse_usdt_transfer(
-                row,
-                watched_address=watch["address"],
-                watched_label=watch["label"],
-                timezone=self.config.timezone,
-                usdt_contract=self.config.tron_usdt_contract,
-            )
-            if transfer is None:
-                continue
-            inserted = self.storage.record_chain_event_notification(
-                owner_user_id=watch["owner_user_id"],
-                address=watch["address"],
-                tx_hash=transfer.tx_hash,
-                direction=transfer.direction,
-                token_symbol="USDT",
-                block_timestamp=int(row["block_timestamp"]),
-                now=now,
-            )
-            if not inserted:
-                continue
-            if not should_notify_transfer(transfer, settings):
-                continue
-            self.client.send_message(
-                watch["owner_user_id"],
-                format_transfer_notice(transfer),
-                parse_mode="HTML",
-            )
+            self.process_address_watch_transfer_row(watch, row, now, settings=settings)
+
+    def process_address_watch_transfer_row(
+        self,
+        watch: dict[str, Any],
+        row: dict[str, Any],
+        now: datetime,
+        *,
+        settings: Any | None = None,
+    ) -> None:
+        settings = settings or self.storage.get_address_watch_settings(watch["owner_user_id"], now)
+        transfer = parse_usdt_transfer(
+            row,
+            watched_address=watch["address"],
+            watched_label=watch["label"],
+            timezone=self.config.timezone,
+            usdt_contract=self.config.tron_usdt_contract,
+        )
+        if transfer is None:
+            return
+        inserted = self.storage.record_chain_event_notification(
+            owner_user_id=watch["owner_user_id"],
+            address=watch["address"],
+            tx_hash=transfer.tx_hash,
+            direction=transfer.direction,
+            token_symbol="USDT",
+            block_timestamp=int(row["block_timestamp"]),
+            now=now,
+        )
+        if not inserted:
+            return
+        if not should_notify_transfer(transfer, settings):
+            return
+        self.client.send_message(
+            watch["owner_user_id"],
+            format_transfer_notice(transfer),
+            parse_mode="HTML",
+        )
 
     def log_trongrid_error(self, address: str, exc: TronGridError) -> None:
         message = str(exc)
