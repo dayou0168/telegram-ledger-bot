@@ -257,3 +257,31 @@ def test_address_watch_settings_min_amount_and_label_update() -> None:
             assert row["label"] == "新备注"
         finally:
             storage.conn.close()
+
+
+def test_address_verification_counts_per_group_and_address() -> None:
+    with TemporaryDirectory() as tmp:
+        storage = Storage(Path(tmp) / "bot.db")
+        try:
+            now = datetime(2026, 7, 4, 12, tzinfo=BEIJING_TZ)
+            alice = TelegramUser(1001, "alice", "Alice")
+            bob = TelegramUser(1002, "bob", "Bob")
+            address = "TM1zJaWxmQmPhkdJpcKUh2H6iuz87rMh5W"
+
+            first = storage.record_address_verification(chat_id=-1001, address=address, sender=alice, now=now)
+            second = storage.record_address_verification(chat_id=-1001, address=address, sender=bob, now=now)
+            third = storage.record_address_verification(chat_id=-1001, address=address, sender=alice, now=now)
+            other_group = storage.record_address_verification(chat_id=-1002, address=address, sender=bob, now=now)
+
+            assert first["count"] == 1
+            assert first["previous_sender_name"] is None
+            assert first["current_sender_name"] == "@alice"
+            assert second["count"] == 2
+            assert second["previous_sender_name"] == "@alice"
+            assert second["current_sender_name"] == "@bob"
+            assert third["count"] == 3
+            assert third["previous_sender_name"] == "@bob"
+            assert third["current_sender_name"] == "@alice"
+            assert other_group["count"] == 1
+        finally:
+            storage.conn.close()

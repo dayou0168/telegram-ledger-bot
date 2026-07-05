@@ -50,6 +50,7 @@ class Storage:
                 day_cutoff_hour INTEGER NOT NULL DEFAULT 0,
                 pin_enabled INTEGER NOT NULL DEFAULT 0,
                 realtime_rate INTEGER NOT NULL DEFAULT 0,
+                realtime_rate_rank INTEGER,
                 realtime_rate_offset TEXT NOT NULL DEFAULT '0',
                 activated_at TEXT,
                 trial_started_at TEXT,
@@ -163,6 +164,18 @@ class Storage:
                 processed_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS address_verifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                address TEXT NOT NULL,
+                count INTEGER NOT NULL DEFAULT 0,
+                last_sender_user_id INTEGER NOT NULL,
+                last_sender_name TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(chat_id, address)
+            );
+
             CREATE TABLE IF NOT EXISTS broadcast_jobs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 creator_user_id INTEGER NOT NULL,
@@ -212,6 +225,8 @@ class Storage:
                 "multiply_exchange": "INTEGER NOT NULL DEFAULT 0",
                 "show_cny": "INTEGER NOT NULL DEFAULT 1",
                 "all_members_can_record": "INTEGER NOT NULL DEFAULT 0",
+                "realtime_rate": "INTEGER NOT NULL DEFAULT 0",
+                "realtime_rate_rank": "INTEGER",
                 "realtime_rate_offset": "TEXT NOT NULL DEFAULT '0'",
             },
         )
@@ -255,6 +270,68 @@ class Storage:
         if row is None or row["update_id"] is None:
             return None
         return int(row["update_id"])
+
+    def record_address_verification(
+        self,
+        *,
+        chat_id: int,
+        address: str,
+        sender: TelegramUser,
+        now: datetime,
+    ) -> dict[str, Any]:
+        sender_name = f"@{sender.username}" if sender.username else sender.display_name
+        existing = self.conn.execute(
+            "SELECT * FROM address_verifications WHERE chat_id = ? AND address = ?",
+            (chat_id, address),
+        ).fetchone()
+        if existing is None:
+            self.conn.execute(
+                """
+                INSERT INTO address_verifications(
+                    chat_id,
+                    address,
+                    count,
+                    last_sender_user_id,
+                    last_sender_name,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, 1, ?, ?, ?, ?)
+                """,
+                (
+                    chat_id,
+                    address,
+                    sender.user_id,
+                    sender_name,
+                    now.isoformat(),
+                    now.isoformat(),
+                ),
+            )
+            self.conn.commit()
+            return {"count": 1, "previous_sender_name": None, "current_sender_name": sender_name}
+
+        new_count = int(existing["count"]) + 1
+        previous_sender_name = existing["last_sender_name"]
+        self.conn.execute(
+            """
+            UPDATE address_verifications
+            SET count = ?,
+                last_sender_user_id = ?,
+                last_sender_name = ?,
+                updated_at = ?
+            WHERE chat_id = ? AND address = ?
+            """,
+            (
+                new_count,
+                sender.user_id,
+                sender_name,
+                now.isoformat(),
+                chat_id,
+                address,
+            ),
+        )
+        self.conn.commit()
+        return {"count": new_count, "previous_sender_name": previous_sender_name, "current_sender_name": sender_name}
 
     def list_broadcast_groups(self, *, chat_ids: list[int] | None = None) -> list[sqlite3.Row]:
         if chat_ids is not None:

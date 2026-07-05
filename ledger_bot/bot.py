@@ -17,7 +17,13 @@ from .p2p_rates import P2POrderBookEntry, P2PRateClient, P2PRateError
 from .parser import ParsedCommand, ParsedLedgerEntry, parse_message
 from .storage import Storage, TelegramUser, business_day_key, business_day_range, user_from_telegram
 from .telegram_api import TelegramAPIError, TelegramClient, TelegramRetryableError, run_with_backoff
-from .tron_api import TronGridClient, TronGridError, parse_usdt_transfer
+from .tron_api import (
+    TronGridClient,
+    TronGridError,
+    format_tron_address_query,
+    parse_tron_address_info,
+    parse_usdt_transfer,
+)
 
 
 MANAGEMENT_COMMANDS = {
@@ -208,6 +214,9 @@ class LedgerBot:
         if not text:
             return
 
+        if self.handle_group_address_verification(ctx):
+            return
+
         parsed = parse_message(text)
         if parsed is None:
             if is_arithmetic_expression(text):
@@ -265,7 +274,14 @@ class LedgerBot:
                 self.storage.update_group(ctx.chat_id, ctx.now, payout_fee_rate=str(command.args["fee_rate"]))
                 self.reply(ctx, f"下发费率已设置为 {format_number(command.args['fee_rate'])}%。")
             case "set_deposit_exchange_rate":
-                self.storage.update_group(ctx.chat_id, ctx.now, deposit_exchange_rate=str(command.args["exchange_rate"]))
+                self.storage.update_group(
+                    ctx.chat_id,
+                    ctx.now,
+                    deposit_exchange_rate=str(command.args["exchange_rate"]),
+                    realtime_rate=0,
+                    realtime_rate_rank=None,
+                    realtime_rate_offset="0",
+                )
                 self.reply(ctx, f"固定汇率设置成功，当前固定汇率为： {format_number(command.args['exchange_rate'])}")
             case "set_payout_exchange_rate":
                 self.storage.update_group(ctx.chat_id, ctx.now, payout_exchange_rate=str(command.args["exchange_rate"]))
@@ -313,7 +329,14 @@ class LedgerBot:
                     ctx.now,
                     all_days=self.day_cutoff_disabled(group),
                 )
-                self.storage.update_group(ctx.chat_id, ctx.now, deposit_exchange_rate=rate)
+                self.storage.update_group(
+                    ctx.chat_id,
+                    ctx.now,
+                    deposit_exchange_rate=rate,
+                    realtime_rate=0,
+                    realtime_rate_rank=None,
+                    realtime_rate_offset="0",
+                )
                 self.reply(ctx, f"已同步今日账单汇率为 {format_number(Decimal(rate))}，更新 {changed} 条。")
             case "pin_on":
                 self.storage.update_group(ctx.chat_id, ctx.now, pin_enabled=1)
@@ -323,7 +346,13 @@ class LedgerBot:
                 self.reply(ctx, "记账置顶已关闭。")
             case "realtime_rate_on":
                 offset = command.args.get("offset", Decimal("0"))
-                self.storage.update_group(ctx.chat_id, ctx.now, realtime_rate=1, realtime_rate_offset=str(offset))
+                self.storage.update_group(
+                    ctx.chat_id,
+                    ctx.now,
+                    realtime_rate=1,
+                    realtime_rate_rank=None,
+                    realtime_rate_offset=str(offset),
+                )
                 self.reply(ctx, "实时汇率已开启。第三方汇率源接入后会自动同步。")
             case "set_currency":
                 self.storage.update_group(ctx.chat_id, ctx.now, currency=command.args["currency"])
@@ -369,7 +398,9 @@ class LedgerBot:
             case "rate_query":
                 self.reply(ctx, self.format_current_rate(group))
             case "external_query":
-                self.reply(ctx, "查询接口还未接入。可以先正常记账，OTC/银行卡/地址查询会作为独立模块添加。")
+                if self.handle_external_query(ctx, command.args["query"]):
+                    return
+                self.reply(ctx, "查询接口还未接入。当前已支持 TRX 地址查询，发送：查询Txxxx")
             case _:
                 self.reply(ctx, "这个指令已识别，但当前版本还未启用。")
 
@@ -421,6 +452,7 @@ class LedgerBot:
             ctx.now,
             deposit_exchange_rate=str(rate),
             realtime_rate=1,
+            realtime_rate_rank=rank,
             realtime_rate_offset=str(offset),
         )
         self.reply(
@@ -432,6 +464,58 @@ class LedgerBot:
         return (
             f"当前入款汇率：{format_number(Decimal(group['deposit_exchange_rate']))}\n"
             f"当前下发汇率：{format_number(Decimal(group['payout_exchange_rate']))}"
+        )
+
+    def handle_external_query(self, ctx: MessageContext, query: str) -> bool:
+        address = extract_tron_address(query)
+        if not address:
+            return False
+        self.send_tron_address_query(ctx.chat_id, address, reply_to_message_id=ctx.message_id)
+        return True
+
+    def send_tron_address_query(
+        self,
+        chat_id: int,
+        address: str,
+        *,
+        reply_to_message_id: int | None = None,
+    ) -> None:
+        try:
+            account = self.tron_client.fetch_account(address)
+            transfer_rows = self.tron_client.fetch_recent_trc20_transfers(
+                address,
+                contract_address=self.config.tron_usdt_contract,
+                limit=5,
+            )
+        except TronGridError as exc:
+            self.client.send_message(chat_id, f"TRX 地址查询失败：{exc}", reply_to_message_id=reply_to_message_id)
+            return
+
+        info = parse_tron_address_info(
+            account,
+            address=address,
+            timezone=self.config.timezone,
+            usdt_contract=self.config.tron_usdt_contract,
+        )
+        transfers = [
+            transfer
+            for row in transfer_rows
+            if (
+                transfer := parse_usdt_transfer(
+                    row,
+                    watched_address=address,
+                    watched_label=None,
+                    timezone=self.config.timezone,
+                    usdt_contract=self.config.tron_usdt_contract,
+                )
+            )
+            is not None
+        ]
+        self.client.send_message(
+            chat_id,
+            format_tron_address_query(info, transfers),
+            reply_to_message_id=reply_to_message_id,
+            parse_mode="HTML",
         )
 
     @staticmethod
@@ -489,6 +573,9 @@ class LedgerBot:
             self.client.send_message(chat_id, "账单统计已预留：后续可按群、日期、操作人、备注汇总。", reply_to_message_id=message_id)
             return
         if self.handle_address_watch_command(chat_id, user.user_id, normalized, now, message_id):
+            return
+        if address := extract_tron_address(normalized):
+            self.send_tron_address_query(chat_id, address, reply_to_message_id=message_id)
             return
 
         self.send_private_menu(chat_id, message_id)
@@ -1271,6 +1358,31 @@ class LedgerBot:
             return "", None
         return parts[0].strip(), (parts[1].strip() if len(parts) > 1 and parts[1].strip() else None)
 
+    def handle_group_address_verification(self, ctx: MessageContext) -> bool:
+        address = ctx.text.strip()
+        if detect_usdt_network(address) != "TRC20":
+            return False
+        verification = self.storage.record_address_verification(
+            chat_id=ctx.chat_id,
+            address=address,
+            sender=ctx.user,
+            now=ctx.now,
+        )
+        lines = [
+            f"验证地址： <code>{escape(address)}</code>",
+            f"验证次数： {verification['count']}",
+        ]
+        if verification["previous_sender_name"]:
+            lines.append(f"上次发送人： {escape(verification['previous_sender_name'])}")
+        lines.append(f"本次发送人： {escape(verification['current_sender_name'])}")
+        self.client.send_message(
+            ctx.chat_id,
+            "\n".join(lines),
+            reply_to_message_id=ctx.message_id,
+            parse_mode="HTML",
+        )
+        return True
+
     def handle_ledger_entry(self, ctx: MessageContext, entry: ParsedLedgerEntry) -> None:
         group = self.storage.get_group(ctx.chat_id)
         if not group["active"]:
@@ -1410,7 +1522,7 @@ class LedgerBot:
         lines.extend([
             "",
             total_line,
-            f"汇率：{format_number(exchange)}",
+            *self.bill_exchange_lines(group, exchange),
             f"交易费率：{format_number(fee_rate)}%",
             "",
             f"应下发：{due}",
@@ -1418,6 +1530,30 @@ class LedgerBot:
             f"余额：{balance_text}",
         ])
         return "\n".join(lines)
+
+    def bill_exchange_lines(self, group: Any, exchange: Decimal) -> list[str]:
+        if group["realtime_rate"]:
+            rank = group["realtime_rate_rank"]
+            if rank is not None:
+                return [
+                    "实时汇率：",
+                    join_non_empty(
+                        self.realtime_rate_method_label() + f"{int(rank)}档",
+                        format_realtime_offset_label(group["realtime_rate_offset"]),
+                    ),
+                ]
+            return [
+                "实时汇率：",
+                join_non_empty(
+                    self.realtime_rate_method_label() + "实时价",
+                    format_realtime_offset_label(group["realtime_rate_offset"]),
+                ),
+            ]
+        return [f"汇率：{format_number(exchange)}"]
+
+    def realtime_rate_method_label(self) -> str:
+        method = self.config.p2p_rate_trade_methods[0] if self.config.p2p_rate_trade_methods else "aliPay"
+        return p2p_trade_method_label(method)
 
     def format_record_line(self, row: Any) -> str:
         created = datetime.fromisoformat(row["created_at"]).astimezone(self.config.timezone)
@@ -2045,6 +2181,32 @@ def format_signed_decimal(value: Decimal) -> str:
     return format_number(value)
 
 
+def format_realtime_offset_label(value: Any) -> str:
+    offset = Decimal(str(value or "0"))
+    if offset == 0:
+        return ""
+    direction = "上浮" if offset > 0 else "下浮"
+    return f"{direction}{format_fixed_2(abs(offset))}"
+
+
+def p2p_trade_method_label(value: str) -> str:
+    normalized = value.replace("_", "").replace("-", "").lower()
+    labels = {
+        "alipay": "支付宝",
+        "ali": "支付宝",
+        "wxpay": "微信",
+        "wechat": "微信",
+        "wechatpay": "微信",
+        "bank": "银行卡",
+        "bankcard": "银行卡",
+    }
+    return labels.get(normalized, value)
+
+
+def join_non_empty(*parts: str) -> str:
+    return " ".join(part for part in parts if part)
+
+
 def parse_non_negative_decimal(value: str) -> Decimal | None:
     try:
         amount = Decimal(value)
@@ -2066,3 +2228,8 @@ def detect_usdt_network(address: str) -> str | None:
     if re.fullmatch(r"T[1-9A-HJ-NP-Za-km-z]{33}", address):
         return "TRC20"
     return None
+
+
+def extract_tron_address(text: str) -> str | None:
+    match = re.search(r"T[1-9A-HJ-NP-Za-km-z]{33}", text)
+    return match.group(0) if match else None

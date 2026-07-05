@@ -1,5 +1,7 @@
 from decimal import Decimal
+from types import SimpleNamespace
 
+from ledger_bot.bot import LedgerBot, extract_tron_address, format_realtime_offset_label, p2p_trade_method_label
 from ledger_bot.parser import ParsedCommand, ParsedLedgerEntry, parse_message
 
 
@@ -96,3 +98,42 @@ def test_z_rank_sets_rate_with_offset() -> None:
     assert parsed.name == "set_rate_from_otc_rank"
     assert parsed.args["rank"] == 1
     assert parsed.args["offset"] == Decimal("-0")
+
+
+def test_query_tron_address_is_external_query() -> None:
+    address = "TGhAAySHUUcEGua33pZZ88wP3bA6XSeQuZ"
+    parsed = parse_message(f"查询{address}")
+
+    assert isinstance(parsed, ParsedCommand)
+    assert parsed.name == "external_query"
+    assert parsed.args["query"] == address
+    assert extract_tron_address(f"查询 {address}") == address
+
+
+def test_realtime_rate_display_helpers() -> None:
+    assert p2p_trade_method_label("aliPay") == "支付宝"
+    assert format_realtime_offset_label(Decimal("-0.1")) == "下浮0.10"
+    assert format_realtime_offset_label(Decimal("+0.1")) == "上浮0.10"
+    assert format_realtime_offset_label(Decimal("-0")) == ""
+    assert format_realtime_offset_label(Decimal("+0")) == ""
+
+
+def test_bill_realtime_rate_lines_show_rank_and_offset() -> None:
+    bot = object.__new__(LedgerBot)
+    bot.config = SimpleNamespace(p2p_rate_trade_methods=("aliPay",))
+
+    lines = LedgerBot.bill_exchange_lines(
+        bot,
+        {"realtime_rate": 1, "realtime_rate_rank": 1, "realtime_rate_offset": "-0.1"},
+        Decimal("6.63"),
+    )
+
+    assert lines == ["实时汇率：", "支付宝1档 下浮0.10"]
+
+    lines = LedgerBot.bill_exchange_lines(
+        bot,
+        {"realtime_rate": 1, "realtime_rate_rank": 1, "realtime_rate_offset": "-0"},
+        Decimal("6.73"),
+    )
+
+    assert lines == ["实时汇率：", "支付宝1档"]
