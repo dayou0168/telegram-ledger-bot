@@ -14,6 +14,10 @@ services:
       PUBLIC_BILL_BASE_URL: ""
       PUBLIC_BILL_URL_TEMPLATE: ""
       PUBLIC_BILL_BOT_NAME: "LEDGER_BOT"
+      BILL_WEB_ENABLED: "1"
+      BILL_WEB_HOST: "0.0.0.0"
+      BILL_WEB_PORT: "8080"
+      BILL_WEB_TOKEN: ""
       TRONGRID_API_BASE: "https://api.trongrid.io"
       TRONGRID_API_KEY: ""
       TRON_USDT_CONTRACT: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
@@ -25,6 +29,8 @@ services:
       P2P_RATE_FIAT_UNIT: "CNY"
       P2P_RATE_ASSET: "USDT"
       P2P_RATE_TRADE_METHODS: "aliPay"
+    ports:
+      - "8080:8080"
     volumes:
       - ledger_bot_data:/app/data
 

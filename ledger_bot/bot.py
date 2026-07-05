@@ -1648,7 +1648,10 @@ class LedgerBot:
             }
             separator = "&" if "?" in base else "?"
             return f"{base}{separator}{urlencode(params)}"
-        return f"{base}/bill/{values['chat_id']}/{values['day_key']}"
+        url = f"{base}/bill/{values['chat_id']}/{values['day_key']}"
+        if self.config.bill_web_token:
+            url = f"{url}?{urlencode({'token': self.config.bill_web_token})}"
+        return url
 
     def ask_clear_confirm(self, ctx: MessageContext, scope: str) -> None:
         label = "今日账单" if scope == "today" else "全部账单"

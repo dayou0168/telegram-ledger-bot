@@ -16,5 +16,6 @@ RUN useradd --create-home --shell /usr/sbin/nologin botuser \
 
 USER botuser
 
-CMD ["python", "-m", "ledger_bot"]
+EXPOSE 8080
 
+CMD ["python", "-m", "ledger_bot"]

@@ -59,6 +59,10 @@ DEFAULT_OPERATOR_USER_IDS=
 PUBLIC_BILL_BASE_URL=
 PUBLIC_BILL_URL_TEMPLATE=
 PUBLIC_BILL_BOT_NAME=LEDGER_BOT
+BILL_WEB_ENABLED=1
+BILL_WEB_HOST=0.0.0.0
+BILL_WEB_PORT=8080
+BILL_WEB_TOKEN=
 TRONGRID_API_BASE=https://api.trongrid.io
 TRONGRID_API_KEY=
 TRON_POLL_INTERVAL_SECONDS=5
@@ -103,6 +107,10 @@ services:
       PUBLIC_BILL_BASE_URL: ""
       PUBLIC_BILL_URL_TEMPLATE: ""
       PUBLIC_BILL_BOT_NAME: "LEDGER_BOT"
+      BILL_WEB_ENABLED: "1"
+      BILL_WEB_HOST: "0.0.0.0"
+      BILL_WEB_PORT: "8080"
+      BILL_WEB_TOKEN: ""
       TRONGRID_API_BASE: "https://api.trongrid.io"
       TRONGRID_API_KEY: ""
       TRON_USDT_CONTRACT: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
@@ -114,6 +122,8 @@ services:
       P2P_RATE_FIAT_UNIT: "CNY"
       P2P_RATE_ASSET: "USDT"
       P2P_RATE_TRADE_METHODS: "aliPay"
+    ports:
+      - "8080:8080"
     volumes:
       - ledger_bot_data:/app/data
 
@@ -122,6 +132,27 @@ volumes:
 ```
 
 Docker will create the persistent volume automatically. The SQLite database stays in `ledger_bot_data`.
+
+## Built-in bill website
+
+The image serves bill pages on port `8080` when `BILL_WEB_ENABLED=1`.
+
+For Baota/Nginx:
+
+1. Point your domain, for example `bot.example.com`, to the server IP.
+2. Create a Baota website for that domain and apply for an SSL certificate.
+3. Add a reverse proxy from the HTTPS site to `http://127.0.0.1:8080`.
+4. Set:
+
+```env
+PUBLIC_BILL_BASE_URL=https://bot.example.com
+PUBLIC_BILL_URL_TEMPLATE=
+BILL_WEB_ENABLED=1
+BILL_WEB_PORT=8080
+BILL_WEB_TOKEN=replace-with-random-text
+```
+
+The Telegram bill button then opens `/bill/{chat_id}/{day}` on your own domain. If `BILL_WEB_TOKEN` is empty, the bill URL is public; for production use, set a random token.
 
 The source-build path below is only needed if you want BaoTa to build the image on your server.
 
@@ -150,6 +181,10 @@ DEFAULT_OPERATOR_USER_IDS=
 PUBLIC_BILL_BASE_URL=
 PUBLIC_BILL_URL_TEMPLATE=
 PUBLIC_BILL_BOT_NAME=LEDGER_BOT
+BILL_WEB_ENABLED=1
+BILL_WEB_HOST=0.0.0.0
+BILL_WEB_PORT=8080
+BILL_WEB_TOKEN=
 
 TRONGRID_API_BASE=https://api.trongrid.io
 TRONGRID_API_KEY=

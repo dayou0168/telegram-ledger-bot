@@ -39,6 +39,7 @@ jobs:
           modules = [
               "tests.test_parser",
               "tests.test_broadcast",
+              "tests.test_bill_web",
               "tests.test_calculate",
               "tests.test_calculator",
               "tests.test_config",

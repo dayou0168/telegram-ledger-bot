@@ -66,22 +66,33 @@ TELEGRAM_API_BASE=http://telegram-bot-api:8081
 
 不要把 `/bot<TOKEN>/sendMessage` 这类完整接口路径填进去，程序会自动拼接。
 
-### 完整账单链接
+### 完整账单网页
 
-如果你有自己的账单网页，配置：
+镜像内置账单网页服务，默认监听容器 `8080` 端口。配置自己的域名后：
 
 ```env
-PUBLIC_BILL_BASE_URL=https://your-domain.example/day_xxb.php
-PUBLIC_BILL_BOT_NAME=YOUR_BOT_CODE
+PUBLIC_BILL_BASE_URL=https://bot.your-domain.example
+PUBLIC_BILL_URL_TEMPLATE=
+BILL_WEB_ENABLED=1
+BILL_WEB_HOST=0.0.0.0
+BILL_WEB_PORT=8080
+BILL_WEB_TOKEN=change-this-random-token
 ```
 
 机器人会给每个群生成类似这样的独立链接：
 
 ```text
-https://your-domain.example/day_xxb.php?firstname=&chat_id=-100xxx&up_page=1&down_page=1&created_at=&begintime=2026-07-04+00%3A00%3A00&endtime=2026-07-05+00%3A00%3A00&all=&phpname=YOUR_BOT_CODE&type=bjr
+https://bot.your-domain.example/bill/-100xxx/2026-07-05?token=change-this-random-token
 ```
 
-核心隔离字段是 `chat_id`，不同群会打开不同账单。
+宝塔里给域名申请 SSL 后，把站点反向代理到 `http://127.0.0.1:8080`。`BILL_WEB_TOKEN` 可留空，留空时网页是公开链接；建议正式使用时设置一串随机字符。
+
+如果你已经有自己的 PHP 账单系统，也可以继续用 `.php` 地址：
+
+```env
+PUBLIC_BILL_BASE_URL=https://your-domain.example/day_xxb.php
+PUBLIC_BILL_BOT_NAME=YOUR_BOT_CODE
+```
 
 如果你的网页参数和示例机器人完全一致，也可以直接配置完整模板：
 
@@ -155,6 +166,10 @@ services:
       PUBLIC_BILL_BASE_URL: ""
       PUBLIC_BILL_URL_TEMPLATE: ""
       PUBLIC_BILL_BOT_NAME: "LEDGER_BOT"
+      BILL_WEB_ENABLED: "1"
+      BILL_WEB_HOST: "0.0.0.0"
+      BILL_WEB_PORT: "8080"
+      BILL_WEB_TOKEN: ""
       TRONGRID_API_BASE: "https://api.trongrid.io"
       TRONGRID_API_KEY: ""
       TRON_USDT_CONTRACT: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
@@ -166,6 +181,8 @@ services:
       P2P_RATE_FIAT_UNIT: "CNY"
       P2P_RATE_ASSET: "USDT"
       P2P_RATE_TRADE_METHODS: "aliPay"
+    ports:
+      - "8080:8080"
     volumes:
       - ledger_bot_data:/app/data
 

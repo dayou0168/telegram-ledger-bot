@@ -32,6 +32,10 @@ class Config:
     public_bill_base_url: str | None
     public_bill_url_template: str | None
     public_bill_bot_name: str
+    bill_web_enabled: bool
+    bill_web_host: str
+    bill_web_port: int
+    bill_web_token: str | None
     telegram_bot_username: str | None
     trongrid_api_base: str
     trongrid_api_key: str | None
@@ -66,6 +70,8 @@ def load_config() -> Config:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is missing. Put it in .env first.")
 
     db_path = Path(os.environ.get("BOT_DB_PATH", "data/ledger_bot.db"))
+    public_bill_base_url = os.environ.get("PUBLIC_BILL_BASE_URL") or None
+    public_bill_url_template = os.environ.get("PUBLIC_BILL_URL_TEMPLATE") or None
     return Config(
         bot_token=token,
         telegram_api_base=os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/"),
@@ -73,9 +79,13 @@ def load_config() -> Config:
         timezone_name=os.environ.get("BOT_TIMEZONE", "Asia/Shanghai"),
         bot_host_user_id=parse_user_id(os.environ.get("BOT_HOST_USER_ID", "")),
         default_operator_user_ids=parse_user_ids(os.environ.get("DEFAULT_OPERATOR_USER_IDS", "")),
-        public_bill_base_url=os.environ.get("PUBLIC_BILL_BASE_URL") or None,
-        public_bill_url_template=os.environ.get("PUBLIC_BILL_URL_TEMPLATE") or None,
+        public_bill_base_url=public_bill_base_url,
+        public_bill_url_template=public_bill_url_template,
         public_bill_bot_name=os.environ.get("PUBLIC_BILL_BOT_NAME", "LEDGER_BOT"),
+        bill_web_enabled=parse_bool(os.environ.get("BILL_WEB_ENABLED", "1")),
+        bill_web_host=os.environ.get("BILL_WEB_HOST", "0.0.0.0"),
+        bill_web_port=int(os.environ.get("BILL_WEB_PORT", "8080")),
+        bill_web_token=(os.environ.get("BILL_WEB_TOKEN") or "").strip() or None,
         telegram_bot_username=(os.environ.get("TELEGRAM_BOT_USERNAME") or "").lstrip("@") or None,
         trongrid_api_base=os.environ.get("TRONGRID_API_BASE", "https://api.trongrid.io").rstrip("/"),
         trongrid_api_key=os.environ.get("TRONGRID_API_KEY") or None,
@@ -112,3 +122,7 @@ def parse_user_id(raw: str) -> int | None:
     if not value:
         return None
     return int(value)
+
+
+def parse_bool(raw: str) -> bool:
+    return raw.strip().lower() in {"1", "true", "yes", "on", "enabled"}
