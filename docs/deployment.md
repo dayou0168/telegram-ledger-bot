@@ -96,56 +96,7 @@ docker compose down
 
 If you use the prebuilt GitHub Container Registry image, BaoTa only needs a Compose script. You do not need to upload source code.
 
-Paste this Compose content and replace the token/key values:
-
-```yaml
-services:
-  ledger-bot:
-    image: ghcr.io/dayou0168/telegram-ledger-bot:latest
-    container_name: ledger-bot
-    restart: unless-stopped
-    environment:
-      TELEGRAM_BOT_TOKEN: "replace-with-your-token"
-      TELEGRAM_BOT_USERNAME: "replace-with-your-bot-username"
-      TELEGRAM_API_BASE: "https://api.telegram.org"
-      BOT_DB_PATH: "data/ledger_bot.db"
-      BOT_TIMEZONE: "Asia/Shanghai"
-      BOT_HOST_USER_ID: "replace-with-your-telegram-id"
-      DEFAULT_OPERATOR_USER_IDS: ""
-      BOT_WORKER_THREADS: "8"
-      BOT_CHAIN_THREADS: "8"
-      BOT_RATE_THREADS: "1"
-      BOT_BROADCAST_THREADS: "4"
-      BOT_QUERY_THREADS: "2"
-      BOT_HOST_CHECK_TTL_SECONDS: "300"
-      PUBLIC_BILL_BASE_URL: ""
-      PUBLIC_BILL_URL_TEMPLATE: ""
-      PUBLIC_BILL_BOT_NAME: "LEDGER_BOT"
-      BILL_WEB_ENABLED: "1"
-      BILL_WEB_HOST: "0.0.0.0"
-      BILL_WEB_PORT: "8080"
-      BILL_WEB_TOKEN: ""
-      TRONGRID_API_BASE: "https://api.trongrid.io"
-      TRONGRID_API_KEY: ""
-      TRON_USDT_CONTRACT: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
-      TRON_POLL_INTERVAL_SECONDS: "5"
-      TRON_INITIAL_LOOKBACK_MINUTES: "15"
-      P2P_RATE_API_BASE: "https://p2p.army/api/fapi"
-      P2P_RATE_FRONT_API: "NextVOF2Ozuh36mW0TCv"
-      P2P_RATE_MARKET: "okx"
-      P2P_RATE_FIAT_UNIT: "CNY"
-      P2P_RATE_ASSET: "USDT"
-      P2P_RATE_TRADE_METHODS: "aliPay"
-      P2P_RATE_REFRESH_SECONDS: "60"
-      P2P_RATE_CACHE_TTL_SECONDS: "180"
-    ports:
-      - "8080:8080"
-    volumes:
-      - ledger_bot_data:/app/data
-
-volumes:
-  ledger_bot_data:
-```
+Use the repository file `docker-compose.ghcr.yml`. It is the BaoTa-ready Compose script, with Chinese comments for every setting and placeholders for the values that must be filled.
 
 Docker will create the persistent volume automatically. The SQLite database stays in `ledger_bot_data`.
 

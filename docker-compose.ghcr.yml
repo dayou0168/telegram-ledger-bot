@@ -1,46 +1,151 @@
+# 宝塔 Docker Compose 预构建镜像版
+# 使用方法：
+# 1. 在宝塔 Docker -> Compose 中新建项目。
+# 2. 直接粘贴本文件内容。
+# 3. 至少替换 TELEGRAM_BOT_TOKEN、TELEGRAM_BOT_USERNAME、BOT_HOST_USER_ID。
+# 4. 如果要使用网页账单，把 PUBLIC_BILL_BASE_URL 改成自己的 HTTPS 域名。
+# 5. 如果要更稳定的 TRC20 监听，填写 TRONGRID_API_KEY。
+
 services:
   ledger-bot:
+    # 固定使用 GitHub 自动构建发布的最新版镜像。
     image: ghcr.io/dayou0168/telegram-ledger-bot:latest
+
+    # 容器名称，宝塔里看到的名字就是这个。
     container_name: ledger-bot
+
+    # 容器异常退出或服务器重启后自动恢复。
     restart: unless-stopped
+
     environment:
-      TELEGRAM_BOT_TOKEN: "replace-with-your-token"
-      TELEGRAM_BOT_USERNAME: "replace-with-your-bot-username"
+      # 必填：BotFather 给你的机器人 Token。
+      # 示例格式：123456789:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+      TELEGRAM_BOT_TOKEN: "123456:replace-me"
+
+      # 必填：机器人用户名，不要带 @。
+      # 例如机器人链接是 https://t.me/tianze_ledger_bot，这里填 tianze_ledger_bot。
+      TELEGRAM_BOT_USERNAME: "your_bot_username"
+
+      # Telegram 官方 Bot API 地址。没有自建 Bot API Server 就保持默认。
       TELEGRAM_API_BASE: "https://api.telegram.org"
+
+      # 数据库在容器内的位置。保持默认即可，下面 volumes 会持久化到 Docker 卷。
       BOT_DB_PATH: "data/ledger_bot.db"
+
+      # 所有账单、日切、网页时间都使用北京时间。
       BOT_TIMEZONE: "Asia/Shanghai"
-      BOT_HOST_USER_ID: "replace-with-your-telegram-id"
+
+      # 必填：唯一宿主的 Telegram 数字 ID。
+      # 获取方式：私聊机器人发送 我的ID，然后把返回的数字填这里。
+      # 机器人只允许一个宿主；宿主不在群里时，机器人会自动退群。
+      BOT_HOST_USER_ID: "123456789"
+
+      # 可选：程序默认操作人 Telegram 数字 ID，多个用英文逗号分隔。
+      # 这些人可以邀请机器人、记账、广播，但不能代替宿主留在群里。
+      # 没有默认操作人就留空：""。
       DEFAULT_OPERATOR_USER_IDS: ""
+
+      # 实时消息池：处理群内加账、撤销、设置等 Telegram 消息。
+      # 同一群 FIFO 排队，保证账本顺序；不同群可并发。
       BOT_WORKER_THREADS: "8"
+
+      # 链上监听池：并行扫描 TRC20 USDT 监听地址。
+      # 监听地址很多时可以调大，例如 12 或 16；接口限流时调小。
       BOT_CHAIN_THREADS: "8"
+
+      # 汇率池：处理 Z0 查询和实时汇率后台刷新。
+      # 默认 1 即可，因为实时汇率全局每分钟只拉一次 TOP10。
       BOT_RATE_THREADS: "1"
+
+      # 广播池：最多同时跑几个群发/分组广播任务。
+      # 单个广播任务内部仍然逐群发送，避免 Telegram 限流。
       BOT_BROADCAST_THREADS: "4"
+
+      # 查询池：处理 TRX 地址查询等外部查询，避免拖慢群内加账。
       BOT_QUERY_THREADS: "2"
+
+      # 宿主在群检测缓存秒数。
+      # 设置 300 表示 5 分钟内不重复调用 Telegram getChatMember 检查宿主。
       BOT_HOST_CHECK_TTL_SECONDS: "300"
+
+      # 网页账单域名。使用内置网页账单时填你的 HTTPS 域名。
+      # 示例：https://bot.tianze8.cc
+      # 如果暂时不用网页账单，可以留空。
       PUBLIC_BILL_BASE_URL: ""
+
+      # 高级选项：自定义完整账单 URL 模板。
+      # 使用内置网页账单时保持空值。
       PUBLIC_BILL_URL_TEMPLATE: ""
+
+      # 外部 PHP 账单系统识别用 Bot 名称；使用内置网页账单时保持默认即可。
       PUBLIC_BILL_BOT_NAME: "LEDGER_BOT"
+
+      # 是否启动内置网页账单服务。1 开启，0 关闭。
       BILL_WEB_ENABLED: "1"
+
+      # 网页账单服务监听地址。容器内保持 0.0.0.0。
       BILL_WEB_HOST: "0.0.0.0"
+
+      # 网页账单服务端口。下面 ports 会把服务器 8080 映射进容器。
       BILL_WEB_PORT: "8080"
+
+      # 可选：网页账单访问令牌。
+      # 设置后账单链接会带 token，网页也会校验；留空则账单 URL 公开可访问。
+      # 示例：tianze-random-20260705
       BILL_WEB_TOKEN: ""
+
+      # TronGrid API 地址。保持默认即可。
       TRONGRID_API_BASE: "https://api.trongrid.io"
+
+      # 可选但推荐：TronGrid API Key。
+      # 没有 Key 可以留空；监听地址较多或想更稳定秒提醒，建议申请后填写。
       TRONGRID_API_KEY: ""
+
+      # TRC20 USDT 合约地址，主网固定值，不要改。
       TRON_USDT_CONTRACT: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+
+      # 链上监听轮询间隔，单位秒。
+      # 5 秒比较稳；想更快可设 2 或 3，但需要真实 TronGrid Key。
       TRON_POLL_INTERVAL_SECONDS: "5"
+
+      # 监听回看窗口，单位分钟。用于避免服务短暂重启后漏掉交易。
       TRON_INITIAL_LOOKBACK_MINUTES: "15"
+
+      # Z0/实时汇率接口地址。默认查询 OKX OTC 商家 USDT 卖 CNY TOP10。
       P2P_RATE_API_BASE: "https://p2p.army/api/fapi"
+
+      # P2P 接口前端标识，保持默认即可。
       P2P_RATE_FRONT_API: "NextVOF2Ozuh36mW0TCv"
+
+      # 汇率市场。默认 okx。
       P2P_RATE_MARKET: "okx"
+
+      # 法币单位。默认 CNY。
       P2P_RATE_FIAT_UNIT: "CNY"
+
+      # 币种。默认 USDT。
       P2P_RATE_ASSET: "USDT"
+
+      # 支付方式。默认 aliPay，也就是支付宝档位。
       P2P_RATE_TRADE_METHODS: "aliPay"
+
+      # 实时汇率后台刷新频率，单位秒。
+      # 每 60 秒全局只请求一次 TOP10，所有群共用结果。
       P2P_RATE_REFRESH_SECONDS: "60"
+
+      # 手动设置 Z 档位时可复用内存缓存的时间，单位秒。
+      # 这不是加账汇率有效期；加账永远使用数据库里已保存的汇率。
       P2P_RATE_CACHE_TTL_SECONDS: "180"
+
     ports:
+      # 服务器 8080 -> 容器 8080。
+      # 宝塔/Nginx 反向代理时，目标地址填 http://127.0.0.1:8080。
       - "8080:8080"
+
     volumes:
+      # 持久化数据库。删除/重建容器不会丢账本。
       - ledger_bot_data:/app/data
 
 volumes:
+  # Docker 自动创建的数据卷，里面保存 ledger_bot.db。
   ledger_bot_data:

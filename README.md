@@ -160,56 +160,7 @@ python -m ledger_bot
 
 服务器部署见 [docs/deployment.md](docs/deployment.md)，推荐优先用 Docker Compose。
 
-如果使用预构建镜像，宝塔 Docker Compose 可以直接使用：
-
-```yaml
-services:
-  ledger-bot:
-    image: ghcr.io/dayou0168/telegram-ledger-bot:latest
-    container_name: ledger-bot
-    restart: unless-stopped
-    environment:
-      TELEGRAM_BOT_TOKEN: "replace-with-your-token"
-      TELEGRAM_BOT_USERNAME: "replace-with-your-bot-username"
-      TELEGRAM_API_BASE: "https://api.telegram.org"
-      BOT_DB_PATH: "data/ledger_bot.db"
-      BOT_TIMEZONE: "Asia/Shanghai"
-      BOT_HOST_USER_ID: "replace-with-your-telegram-id"
-      DEFAULT_OPERATOR_USER_IDS: ""
-      BOT_WORKER_THREADS: "8"
-      BOT_CHAIN_THREADS: "8"
-      BOT_RATE_THREADS: "1"
-      BOT_BROADCAST_THREADS: "4"
-      BOT_QUERY_THREADS: "2"
-      BOT_HOST_CHECK_TTL_SECONDS: "300"
-      PUBLIC_BILL_BASE_URL: ""
-      PUBLIC_BILL_URL_TEMPLATE: ""
-      PUBLIC_BILL_BOT_NAME: "LEDGER_BOT"
-      BILL_WEB_ENABLED: "1"
-      BILL_WEB_HOST: "0.0.0.0"
-      BILL_WEB_PORT: "8080"
-      BILL_WEB_TOKEN: ""
-      TRONGRID_API_BASE: "https://api.trongrid.io"
-      TRONGRID_API_KEY: ""
-      TRON_USDT_CONTRACT: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
-      TRON_POLL_INTERVAL_SECONDS: "5"
-      TRON_INITIAL_LOOKBACK_MINUTES: "15"
-      P2P_RATE_API_BASE: "https://p2p.army/api/fapi"
-      P2P_RATE_FRONT_API: "NextVOF2Ozuh36mW0TCv"
-      P2P_RATE_MARKET: "okx"
-      P2P_RATE_FIAT_UNIT: "CNY"
-      P2P_RATE_ASSET: "USDT"
-      P2P_RATE_TRADE_METHODS: "aliPay"
-      P2P_RATE_REFRESH_SECONDS: "60"
-      P2P_RATE_CACHE_TTL_SECONDS: "180"
-    ports:
-      - "8080:8080"
-    volumes:
-      - ledger_bot_data:/app/data
-
-volumes:
-  ledger_bot_data:
-```
+如果使用预构建镜像，宝塔 Docker Compose 可以直接使用仓库里的 [docker-compose.ghcr.yml](docker-compose.ghcr.yml)。这个文件已经把每个配置项都用中文批注出来，并把必填内容的示例放进去了。
 
 ## 还没接入的外部功能
 
