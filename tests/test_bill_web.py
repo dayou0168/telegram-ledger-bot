@@ -72,6 +72,8 @@ def test_render_bill_page_shows_records_and_realtime_rate() -> None:
             assert "history-dropdown" in html
             assert "07-05" in html
             assert "target.showPicker()" in html
+            assert "max-width: 1180px" in html
+            assert "table-layout: fixed" in html
             assert "下载账单" in html
             assert "created_at=2026-07-05" in html
             assert "download=excel" in html

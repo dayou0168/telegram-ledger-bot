@@ -1261,7 +1261,7 @@ def page_shell(title: str, body: str) -> str:
     }}
     .container {{
       width: 100%;
-      max-width: 1480px;
+      max-width: 1180px;
       margin: 0 auto;
     }}
     .content {{
@@ -1442,7 +1442,7 @@ def page_shell(title: str, body: str) -> str:
       width: 100%;
       max-width: 100%;
       border-collapse: collapse;
-      table-layout: auto;
+      table-layout: fixed;
     }}
     td {{
       padding: 9px 8px !important;
@@ -1457,12 +1457,15 @@ def page_shell(title: str, body: str) -> str:
       color: #334155;
       background: var(--panel-soft);
     }}
+    .records td:first-child {{
+      white-space: nowrap;
+    }}
     .records tbody tr:hover td {{ background: #fbfdff; }}
-    .col-time {{ width: 18%; }}
-    .col-amount {{ width: 32%; }}
-    .col-rate {{ width: 18%; }}
-    .col-actor {{ width: 22%; }}
-    .col-note {{ width: 10%; }}
+    .col-time {{ width: 14%; }}
+    .col-amount {{ width: 24%; }}
+    .col-rate {{ width: 22%; }}
+    .col-actor {{ width: 24%; }}
+    .col-note {{ width: 16%; }}
     .date-form {{
       padding: 12px 14px;
       margin-bottom: 10px;
