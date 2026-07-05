@@ -56,6 +56,7 @@ class Config:
     rate_threads: int
     broadcast_threads: int
     query_threads: int
+    notification_threads: int
     host_check_ttl_seconds: int
     poll_timeout: int = 50
     request_timeout: int = 70
@@ -119,6 +120,7 @@ def load_config() -> Config:
         rate_threads=max(1, int(os.environ.get("BOT_RATE_THREADS", "1"))),
         broadcast_threads=max(1, int(os.environ.get("BOT_BROADCAST_THREADS", "4"))),
         query_threads=max(1, int(os.environ.get("BOT_QUERY_THREADS", "2"))),
+        notification_threads=max(1, int(os.environ.get("BOT_NOTIFICATION_THREADS", "4"))),
         host_check_ttl_seconds=max(0, int(os.environ.get("BOT_HOST_CHECK_TTL_SECONDS", "300"))),
         poll_timeout=int(os.environ.get("BOT_POLL_TIMEOUT", "50")),
         request_timeout=int(os.environ.get("BOT_REQUEST_TIMEOUT", "70")),

@@ -236,6 +236,11 @@ class Storage:
                 display_name TEXT,
                 remark TEXT,
                 status TEXT NOT NULL DEFAULT 'active',
+                allow_group_broadcast INTEGER NOT NULL DEFAULT 1,
+                allow_direct_send INTEGER NOT NULL DEFAULT 1,
+                allow_manage_operators INTEGER NOT NULL DEFAULT 1,
+                receive_sent_notifications INTEGER NOT NULL DEFAULT 0,
+                receive_reply_notifications INTEGER NOT NULL DEFAULT 0,
                 created_by INTEGER NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -311,6 +316,16 @@ class Storage:
             "records",
             {
                 "bot_message_id": "INTEGER",
+            },
+        )
+        self._add_missing_columns(
+            "broadcast_operators",
+            {
+                "allow_group_broadcast": "INTEGER NOT NULL DEFAULT 1",
+                "allow_direct_send": "INTEGER NOT NULL DEFAULT 1",
+                "allow_manage_operators": "INTEGER NOT NULL DEFAULT 1",
+                "receive_sent_notifications": "INTEGER NOT NULL DEFAULT 0",
+                "receive_reply_notifications": "INTEGER NOT NULL DEFAULT 0",
             },
         )
         self._add_missing_columns(
@@ -838,6 +853,41 @@ class Storage:
         self.conn.commit()
         return cursor.rowcount > 0
 
+    def update_broadcast_operator_features(
+        self,
+        *,
+        user_id: int,
+        now: datetime,
+        allow_group_broadcast: int,
+        allow_direct_send: int,
+        allow_manage_operators: int,
+        receive_sent_notifications: int,
+        receive_reply_notifications: int,
+    ) -> bool:
+        cursor = self.conn.execute(
+            """
+            UPDATE broadcast_operators
+            SET allow_group_broadcast = ?,
+                allow_direct_send = ?,
+                allow_manage_operators = ?,
+                receive_sent_notifications = ?,
+                receive_reply_notifications = ?,
+                updated_at = ?
+            WHERE user_id = ?
+            """,
+            (
+                1 if allow_group_broadcast else 0,
+                1 if allow_direct_send else 0,
+                1 if allow_manage_operators else 0,
+                1 if receive_sent_notifications else 0,
+                1 if receive_reply_notifications else 0,
+                now.isoformat(),
+                user_id,
+            ),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
     def disable_broadcast_operator(self, *, user_id: int, now: datetime) -> bool:
         cursor = self.conn.execute(
             """
@@ -851,6 +901,27 @@ class Storage:
         self.conn.execute("DELETE FROM broadcast_chat_permissions WHERE user_id = ?", (user_id,))
         self.conn.commit()
         return cursor.rowcount > 0
+
+    def list_broadcast_operator_ids_with_feature(self, feature: str) -> set[int]:
+        feature_columns = {
+            "group_broadcast": "allow_group_broadcast",
+            "direct_send": "allow_direct_send",
+            "manage_operators": "allow_manage_operators",
+            "sent_notifications": "receive_sent_notifications",
+            "reply_notifications": "receive_reply_notifications",
+        }
+        column = feature_columns.get(feature)
+        if column is None:
+            return set()
+        rows = self.conn.execute(
+            f"""
+            SELECT user_id
+            FROM broadcast_operators
+            WHERE status = 'active'
+              AND {column} = 1
+            """
+        )
+        return {int(row["user_id"]) for row in rows}
 
     def user_has_any_broadcast_permissions(self, user_id: int) -> bool:
         return self.user_has_broadcast_group_permissions(user_id) or self.user_has_broadcast_chat_permissions(user_id)

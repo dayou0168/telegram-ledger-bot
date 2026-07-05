@@ -82,6 +82,7 @@ def make_config(
         rate_threads=1,
         broadcast_threads=1,
         query_threads=1,
+        notification_threads=1,
         host_check_ttl_seconds=300,
     )
 
@@ -272,6 +273,22 @@ def test_broadcast_permissions_support_group_and_single_chat_acl() -> None:
             assert bot.direct_broadcast_chat_ids_for_user(level1) == [-1002]
             assert not bot.can_use_broadcast_target(child, -1001)
             assert not bot.can_use_direct_broadcast_target(child, -1001)
+
+            bot.storage.update_broadcast_operator_features(
+                user_id=20,
+                now=current,
+                allow_group_broadcast=0,
+                allow_direct_send=1,
+                allow_manage_operators=0,
+                receive_sent_notifications=1,
+                receive_reply_notifications=1,
+            )
+
+            assert not bot.can_create_broadcast_child_operator(level1)
+            assert not bot.can_use_broadcast_group(level1, "finance")
+            assert bot.can_use_direct_broadcast_target(level1, -1002)
+            assert bot.storage.list_broadcast_operator_ids_with_feature("sent_notifications") == {20}
+            assert bot.storage.list_broadcast_operator_ids_with_feature("reply_notifications") == {20}
         finally:
             bot.storage.current().conn.close()
 

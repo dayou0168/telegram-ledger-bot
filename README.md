@@ -65,12 +65,13 @@ BOT_CHAIN_THREADS=8
 BOT_RATE_THREADS=1
 BOT_BROADCAST_THREADS=4
 BOT_QUERY_THREADS=2
+BOT_NOTIFICATION_THREADS=4
 BOT_HOST_CHECK_TTL_SECONDS=300
 ```
 
 先私聊机器人发送 `我的ID` 获取你的 Telegram ID，再填入 `BOT_HOST_USER_ID`。机器人只允许配置一个宿主。宿主必须在机器人所在群内，否则机器人会自动退群。默认操作人可在 `.env` 的 `DEFAULT_OPERATOR_USER_IDS` 里用英文逗号分隔，只有维护程序的人员能通过改服务器配置添加或删除。
 
-并发池说明：`BOT_WORKER_THREADS` 处理 Telegram 实时消息，同一群会按 FIFO 队列串行、不同群可并发；`BOT_CHAIN_THREADS` 处理 USDT/TRX 链上监听并并行扫描监听地址；`BOT_RATE_THREADS` 处理 Z0 和实时汇率刷新；`BOT_BROADCAST_THREADS` 处理群发/分组广播，默认最多同时跑 4 个广播任务，单个广播任务内部仍按目标群逐个发送，避免触发 Telegram 限流；`BOT_QUERY_THREADS` 处理 TRX 地址查询等外部查询。广播、链上监听、汇率刷新、查询互相隔离，避免某一类慢任务拖住其他版块。`BOT_HOST_CHECK_TTL_SECONDS` 控制每个群宿主在群检测的缓存时间，减少每条消息都调用 Telegram 管理接口。
+并发池说明：`BOT_WORKER_THREADS` 处理 Telegram 实时消息，同一群会按 FIFO 队列串行、不同群可并发；`BOT_CHAIN_THREADS` 处理 USDT/TRX 链上监听并并行扫描监听地址；`BOT_RATE_THREADS` 处理 Z0 和实时汇率刷新；`BOT_BROADCAST_THREADS` 处理群发/分组广播，默认最多同时跑 4 个广播任务，单个广播任务内部仍按目标群逐个发送，避免触发 Telegram 限流；`BOT_QUERY_THREADS` 处理 TRX 地址查询等外部查询；`BOT_NOTIFICATION_THREADS` 处理广播发送通知、回复通知和通知素材复制。广播、链上监听、汇率刷新、查询、通知互相隔离，避免某一类慢任务拖住其他版块。`BOT_HOST_CHECK_TTL_SECONDS` 控制每个群宿主在群检测的缓存时间，减少每条消息都调用 Telegram 管理接口。
 
 如果你用自建 Telegram Bot API Server，`TELEGRAM_API_BASE` 填服务根地址即可，例如：
 

@@ -65,6 +65,7 @@ services:
       # BOT_RATE_THREADS: "1"
       # BOT_BROADCAST_THREADS: "4"
       # BOT_QUERY_THREADS: "2"
+      # BOT_NOTIFICATION_THREADS: "4"
       # BOT_HOST_CHECK_TTL_SECONDS: "300"
 
       # 网页账单服务。默认已开启，容器内监听 8080。

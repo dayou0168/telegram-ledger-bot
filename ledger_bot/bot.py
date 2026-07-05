@@ -151,6 +151,10 @@ class LedgerBot:
             max_workers=config.query_threads,
             thread_name_prefix="ledger-query",
         )
+        self.notification_executor = ThreadPoolExecutor(
+            max_workers=config.notification_threads,
+            thread_name_prefix="ledger-notify",
+        )
         self.update_queues: dict[str, deque[dict[str, Any]]] = {}
         self.active_update_queues: set[str] = set()
         self.update_queue_guard = threading.Lock()
@@ -1768,24 +1772,39 @@ class LedgerBot:
         return f"{str(title)[:50]}（{row['chat_id']}）"
 
     def accessible_named_broadcast_groups(self, user: TelegramUser) -> list[Any]:
+        if not self.can_group_broadcast(user):
+            return []
         if self.is_broadcast_root(user):
             return self.storage.list_named_broadcast_groups()
         return self.storage.list_named_broadcast_groups_for_user(user.user_id)
 
+    def can_group_broadcast(self, user: TelegramUser) -> bool:
+        if self.is_broadcast_root(user):
+            return True
+        operator = self.storage.get_broadcast_operator(user.user_id)
+        return operator is not None and int(operator["allow_group_broadcast"]) == 1
+
+    def can_direct_broadcast(self, user: TelegramUser) -> bool:
+        if self.is_broadcast_root(user):
+            return True
+        operator = self.storage.get_broadcast_operator(user.user_id)
+        return operator is not None and int(operator["allow_direct_send"]) == 1
+
     def can_use_broadcast_group(self, user: TelegramUser, group_name: str) -> bool:
         if self.is_broadcast_root(user):
             return True
-        if not self.can_use_broadcast(user):
+        if not self.can_group_broadcast(user):
             return False
         return self.storage.user_can_access_broadcast_group(user.user_id, group_name)
 
     def broadcast_target_chat_ids_for_user(self, user: TelegramUser) -> list[int]:
         if self.is_broadcast_root(user):
             return [int(row["chat_id"]) for row in self.storage.list_broadcast_groups()]
-        ids = [
-            *self.storage.target_chat_ids_for_user_broadcast_groups(user.user_id),
-            *self.storage.target_chat_ids_for_user_chat_permissions(user.user_id),
-        ]
+        ids = []
+        if self.can_group_broadcast(user):
+            ids.extend(self.storage.target_chat_ids_for_user_broadcast_groups(user.user_id))
+        if self.can_direct_broadcast(user):
+            ids.extend(self.storage.target_chat_ids_for_user_chat_permissions(user.user_id))
         return list(dict.fromkeys(ids))
 
     def can_use_broadcast_target(self, user: TelegramUser, chat_id: int) -> bool:
@@ -1801,6 +1820,8 @@ class LedgerBot:
     def direct_broadcast_chat_ids_for_user(self, user: TelegramUser) -> list[int]:
         if self.is_broadcast_root(user):
             return [int(row["chat_id"]) for row in self.storage.list_broadcast_groups()]
+        if not self.can_direct_broadcast(user):
+            return []
         return self.storage.target_chat_ids_for_user_chat_permissions(user.user_id)
 
     def can_use_direct_broadcast_target(self, user: TelegramUser, chat_id: int) -> bool:
@@ -1809,6 +1830,8 @@ class LedgerBot:
             return False
         if self.is_broadcast_root(user):
             return True
+        if not self.can_direct_broadcast(user):
+            return False
         return self.storage.user_can_access_broadcast_chat(user.user_id, chat_id)
 
     def is_active_broadcast_operator(self, user_id: int) -> bool:
@@ -1820,7 +1843,7 @@ class LedgerBot:
         operator = self.storage.get_broadcast_operator(user.user_id)
         return operator is not None and (
             int(operator["created_by"]) == 0 or self.is_broadcast_root_id(int(operator["created_by"]))
-        )
+        ) and int(operator["allow_manage_operators"]) == 1
 
     def can_manage_broadcast_operator(self, user: TelegramUser, target_user_id: int) -> bool:
         if self.is_broadcast_root(user):
@@ -1922,12 +1945,23 @@ class LedgerBot:
         lines = [title]
         for row in rows[:80]:
             remark = f" {row['remark']}" if row["remark"] else ""
-            lines.append(f"{row['user_id']} {row['status']}{remark} 上级:{row['created_by']}")
+            flags = (
+                f"分组:{self.on_off(row['allow_group_broadcast'])} "
+                f"单群:{self.on_off(row['allow_direct_send'])} "
+                f"下级:{self.on_off(row['allow_manage_operators'])} "
+                f"发通:{self.on_off(row['receive_sent_notifications'])} "
+                f"回通:{self.on_off(row['receive_reply_notifications'])}"
+            )
+            lines.append(f"{row['user_id']} {row['status']}{remark} 上级:{row['created_by']} {flags}")
         if len(rows) > 80:
             lines.append(f"... 还有 {len(rows) - 80} 个")
         if reply_markup:
             lines.extend(["", "权限、分组和单群授权请在后台管理中操作。"])
         self.client.send_message(chat_id, "\n".join(lines), reply_to_message_id=reply_to_message_id, reply_markup=reply_markup)
+
+    @staticmethod
+    def on_off(value: Any) -> str:
+        return "开" if int(value or 0) else "关"
 
     def send_broadcast_replacement_status(
         self,
@@ -3202,7 +3236,8 @@ class LedgerBot:
         match = self.storage.find_broadcast_job_by_sent_message(ctx.chat_id, ctx.reply_message_id)
         if match is None:
             return
-        self.replace_direct_broadcast_original_if_needed(ctx, match)
+        match_data = dict(match)
+        self.notification_executor.submit(self.replace_direct_broadcast_original_if_needed, ctx, match_data)
         sender = f"@{ctx.user.username}" if ctx.user.username else ctx.user.display_name
         group = self.storage.get_group(ctx.chat_id)
         reply_text = self.message_preview(ctx.message)
@@ -3219,12 +3254,21 @@ class LedgerBot:
             lines.append(f"原消息：{original_link}")
         if reply_link:
             lines.append(f"回复消息：{reply_link}")
-        recipients = {int(match["creator_user_id"])}
+        recipients = self.broadcast_owner_recipient_ids()
+        recipients.add(int(match["creator_user_id"]))
+        recipients.update(self.storage.list_broadcast_operator_ids_with_feature("reply_notifications"))
+        self.notification_executor.submit(self.send_broadcast_reply_notifications, recipients, "\n".join(lines))
+
+    def broadcast_owner_recipient_ids(self) -> set[int]:
+        recipients = set(self.config.default_operator_user_ids)
         if self.config.bot_host_user_id is not None:
             recipients.add(self.config.bot_host_user_id)
+        return recipients
+
+    def send_broadcast_reply_notifications(self, recipients: set[int], text: str) -> None:
         for recipient in recipients:
             try:
-                self.client.send_message(recipient, "\n".join(lines))
+                self.client.send_message(recipient, text)
             except TelegramAPIError as exc:
                 print(f"Broadcast reply notify failed for {recipient}: {exc}", flush=True)
 
@@ -3637,6 +3681,8 @@ class LedgerBot:
             failure_count=failure,
             completed_at=completed_at.isoformat(),
         )
+        if success > 0:
+            self.notification_executor.submit(self.send_broadcast_sent_notifications, dict(job), success, failure)
         self.client.send_message(reply_chat_id, f"广播完成：成功 {success} 个，失败 {failure} 个。")
 
     def deliver_broadcast_job(self, job: Any) -> tuple[int, int]:
@@ -3685,6 +3731,37 @@ class LedgerBot:
                 int(job["source_message_id"]),
             )
         return self.client.send_message(target_chat_id, job["text"])
+
+    def send_broadcast_sent_notifications(self, job: dict[str, Any], success: int, failure: int) -> None:
+        creator_user_id = int(job["creator_user_id"])
+        recipients = self.broadcast_owner_recipient_ids()
+        recipients.update(self.storage.list_broadcast_operator_ids_with_feature("sent_notifications"))
+        recipients.discard(creator_user_id)
+        if not recipients:
+            return
+        creator = self.storage.get_broadcast_operator(creator_user_id, active_only=False)
+        creator_label = str(creator_user_id)
+        if creator is not None:
+            creator_label = creator["remark"] or creator["display_name"] or creator["username"] or creator_label
+        notice = (
+            "操作人发送广播\n\n"
+            f"操作人：{creator_label} ({creator_user_id})\n"
+            f"任务：#{job['id']} {job['scope']}\n"
+            f"成功：{success}\n"
+            f"失败：{failure}\n"
+            f"内容：{job['text'] or '[素材消息]'}"
+        )
+        for recipient in recipients:
+            try:
+                self.client.send_message(recipient, notice)
+                if job.get("source_chat_id") and job.get("source_message_id"):
+                    self.client.copy_message(
+                        recipient,
+                        int(job["source_chat_id"]),
+                        int(job["source_message_id"]),
+                    )
+            except TelegramAPIError as exc:
+                print(f"Broadcast sent notify failed for {recipient}: {exc}", flush=True)
 
     def send_notify_all_to_chat(self, chat_id: int) -> None:
         rows = self.storage.recent_members(chat_id, limit=200)

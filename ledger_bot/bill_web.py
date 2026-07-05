@@ -416,6 +416,18 @@ def apply_admin_action(storage: Storage, form: dict[str, list[str]], timezone: t
         user_id = parse_admin_user_id(form)
         changed = storage.disable_broadcast_operator(user_id=user_id, now=now)
         return "广播操作人已禁用。" if changed else "没有找到这个广播操作人。"
+    if action == "update_broadcast_operator_features":
+        user_id = parse_admin_user_id(form)
+        changed = storage.update_broadcast_operator_features(
+            user_id=user_id,
+            now=now,
+            allow_group_broadcast=1 if form_value(form, "allow_group_broadcast") else 0,
+            allow_direct_send=1 if form_value(form, "allow_direct_send") else 0,
+            allow_manage_operators=1 if form_value(form, "allow_manage_operators") else 0,
+            receive_sent_notifications=1 if form_value(form, "receive_sent_notifications") else 0,
+            receive_reply_notifications=1 if form_value(form, "receive_reply_notifications") else 0,
+        )
+        return "操作人功能开关已保存。" if changed else "没有找到这个广播操作人。"
     if action == "grant_broadcast_chat_permission":
         user_id = parse_admin_user_id(form)
         chat_id = parse_single_admin_chat_id(form, "chat_id")
@@ -769,22 +781,40 @@ def render_operator_table(rows: list[Any]) -> str:
     body = []
     for row in rows:
         remark = row["remark"] or ""
+        feature_form = f"""
+        <form method="POST" action="/admin" class="feature-form">
+          {hidden_input("action", "update_broadcast_operator_features")}
+          <input type="hidden" name="user_id" value="{row['user_id']}">
+          {feature_checkbox("allow_group_broadcast", "分组群发", row["allow_group_broadcast"])}
+          {feature_checkbox("allow_direct_send", "单群发送", row["allow_direct_send"])}
+          {feature_checkbox("allow_manage_operators", "设置下级", row["allow_manage_operators"])}
+          {feature_checkbox("receive_sent_notifications", "发送通知", row["receive_sent_notifications"])}
+          {feature_checkbox("receive_reply_notifications", "回复通知", row["receive_reply_notifications"])}
+          <button type="submit">保存开关</button>
+        </form>
+        """
         body.append(
             "<tr>"
             f"<td>{row['user_id']}</td>"
             f"<td>{escape(row['status'])}</td>"
             f"<td>{escape(remark)}</td>"
             f"<td>{row['created_by']}</td>"
+            f"<td>{feature_form}</td>"
             "</tr>"
         )
     return f"""
     <div class="table-wrap admin-table-wrap">
       <table class="records admin-table">
-        <thead><tr><td>UID</td><td>状态</td><td>备注</td><td>上级</td></tr></thead>
+        <thead><tr><td>UID</td><td>状态</td><td>备注</td><td>上级</td><td>功能开关</td></tr></thead>
         <tbody>{''.join(body)}</tbody>
       </table>
     </div>
     """
+
+
+def feature_checkbox(name: str, label: str, value: Any) -> str:
+    checked = " checked" if int(value or 0) else ""
+    return f'<label class="feature-check"><input type="checkbox" name="{name}" value="1"{checked}> {label}</label>'
 
 
 def render_permission_table(group_rows: list[Any], chat_rows: list[Any]) -> str:
@@ -2354,6 +2384,31 @@ def page_shell(title: str, body: str) -> str:
     .permission-row-compact {{
       grid-template-columns: auto auto;
       justify-content: flex-start;
+    }}
+    .feature-form {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px 10px;
+      align-items: center;
+      min-width: 320px;
+    }}
+    .feature-check {{
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      color: var(--text);
+      font-size: 13px;
+      white-space: nowrap;
+    }}
+    .feature-check input {{
+      width: 14px;
+      height: 14px;
+      min-height: 14px;
+    }}
+    .feature-form button {{
+      min-height: 30px;
+      padding: 0 10px;
+      width: auto;
     }}
     .admin-form-hint {{
       margin: 0;

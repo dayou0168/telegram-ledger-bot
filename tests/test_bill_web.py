@@ -261,6 +261,11 @@ def test_admin_page_renders_management_sections() -> None:
         assert "财务A" in body
         assert "财务A（2001）启用" in body
         assert "或输入新UID" in body
+        assert "分组群发" in body
+        assert "单群发送" in body
+        assert "设置下级" in body
+        assert "发送通知" in body
+        assert "回复通知" in body
         assert "<option value=\"-1001\">测试群</option>" in body
         assert 'list="saved-admin-groups"' in body
         assert 'list="broadcast-admin-groups"' in body
@@ -289,6 +294,11 @@ def test_admin_post_updates_whitelist_broadcast_permissions_and_replacement() ->
 
         posts = [
             "action=add_broadcast_operator&new_user_id=2001&remark=level1",
+            (
+                "action=update_broadcast_operator_features&user_id=2001"
+                "&allow_direct_send=1"
+                "&receive_reply_notifications=1"
+            ),
             "action=create_broadcast_group&group_name=finance",
             "action=add_broadcast_members&group_name=finance&chat_ids=%E6%B5%8B%E8%AF%95%E7%BE%A4%EF%BC%88-100111%EF%BC%89",
             "action=grant_broadcast_permission&user_id=2001&group_name=finance",
@@ -318,6 +328,12 @@ def test_admin_post_updates_whitelist_broadcast_permissions_and_replacement() ->
             assert replacement["enabled"] == 1
             assert replacement["text"] == "hello"
             assert replacement["photo"] == "file123"
+            operator = storage.get_broadcast_operator(2001)
+            assert operator["allow_group_broadcast"] == 0
+            assert operator["allow_direct_send"] == 1
+            assert operator["allow_manage_operators"] == 0
+            assert operator["receive_sent_notifications"] == 0
+            assert operator["receive_reply_notifications"] == 1
         finally:
             storage.conn.close()
 
