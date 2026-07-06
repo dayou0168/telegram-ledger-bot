@@ -159,7 +159,7 @@ func recordAmountExpr(record storage.Record) string {
 func recordAmountExprHTML(record storage.Record, link string) string {
 	amount := formatRecordAmount(record.Amount)
 	if strings.EqualFold(record.Currency, "USDT") {
-		return linkedRecordText(amount, link) + "U"
+		return linkedRecordText(amount+"U", link)
 	}
 	rate := formatRecordRate(record.Rate)
 	if rate == "" {

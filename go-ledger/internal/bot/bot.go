@@ -252,6 +252,20 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg telegram.Message, us
 	if msg.UsersShared != nil {
 		return b.handleUsersShared(ctx, msg)
 	}
+	if state, ok := b.privateStates.Get(formatID(user.ID)); ok {
+		switch state.Mode {
+		case "quick_reply":
+			return b.handleQuickReplyMaterial(ctx, msg, user, state)
+		case "watch_add", "watch_remove", "watch_min", "watch_target_min", "watch_target_label":
+			if text == "菜单" || text == "/start" || text == "返回" || text == "取消" {
+				b.privateStates.Delete(formatID(user.ID))
+				return b.sendPrivateMenu(ctx, msg.Chat.ID, msg.MessageID)
+			}
+			return b.handleAddressWatchState(ctx, msg, user, state, text, now)
+		default:
+			return b.handleBroadcastMaterial(ctx, msg, user, state, now)
+		}
+	}
 	if text == "/start" || text == "菜单" || text == "" {
 		return b.sendPrivateMenu(ctx, msg.Chat.ID, msg.MessageID)
 	}
@@ -278,16 +292,6 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg telegram.Message, us
 	if text == "取消" || text == "返回" {
 		b.privateStates.Delete(formatID(user.ID))
 		return b.sendPrivateMenu(ctx, msg.Chat.ID, msg.MessageID)
-	}
-	if state, ok := b.privateStates.Get(formatID(user.ID)); ok {
-		switch state.Mode {
-		case "quick_reply":
-			return b.handleQuickReplyMaterial(ctx, msg, user, state)
-		case "watch_add", "watch_remove", "watch_min", "watch_target_min", "watch_target_label":
-			return b.handleAddressWatchState(ctx, msg, user, state, text, now)
-		default:
-			return b.handleBroadcastMaterial(ctx, msg, user, state, now)
-		}
 	}
 	if match := watchAddPattern.FindStringSubmatch(text); match != nil {
 		return b.addWatchFromPrivate(ctx, msg, user, match[1], match[2], now)
@@ -360,21 +364,22 @@ func (b *Bot) handleMyChatMember(ctx context.Context, upd telegram.ChatMemberUpd
 }
 
 func (b *Bot) sendPrivateMenu(ctx context.Context, chatID int64, replyTo int64) error {
-	keyboard := telegram.ReplyKeyboardMarkup{
+	_, err := b.tg.SendMessage(ctx, chatID, "请选择功能：", map[string]any{
+		"reply_to_message_id": replyTo,
+		"reply_markup":        privateMenuKeyboard(),
+	})
+	return err
+}
+
+func privateMenuKeyboard() telegram.ReplyKeyboardMarkup {
+	return telegram.ReplyKeyboardMarkup{
 		Keyboard: [][]telegram.KeyboardButton{
 			{{Text: "✍开始记账"}, {Text: "📃详细说明"}},
-			{{Text: "📡群发广播"}, {Text: "📣分组广播"}},
-			{{Text: "🔔地址监听"}, {Text: "🗂群列表"}},
-			{{Text: "👥广播权限"}, {Text: "🔁广播替换"}},
+			{{Text: "📡群发广播"}, {Text: "🔔地址监听"}},
 			{{Text: "🔎查询UID"}, {Text: "⚙后台管理"}},
 		},
 		ResizeKeyboard: true,
 	}
-	_, err := b.tg.SendMessage(ctx, chatID, "请选择功能：", map[string]any{
-		"reply_to_message_id": replyTo,
-		"reply_markup":        keyboard,
-	})
-	return err
 }
 
 func (b *Bot) sendGroupMessageAsync(ctx context.Context, chatID int64, text string, replyTo int64) {

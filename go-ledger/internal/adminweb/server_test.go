@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
 )
@@ -88,6 +89,44 @@ func TestBillTemplateRendersPythonStyleSections(t *testing.T) {
 	for _, want := range wants {
 		if !strings.Contains(html, want) {
 			t.Fatalf("bill template missing %q", want)
+		}
+	}
+}
+
+func TestBillHistoryTriggerUsesButtonFont(t *testing.T) {
+	if strings.Contains(billHTML, ".history-trigger{font:inherit") {
+		t.Fatal("history trigger should not reset button font styling")
+	}
+	if !strings.Contains(billHTML, ".history-trigger{cursor:pointer;font-family:inherit;font-size:14px;font-weight:600") {
+		t.Fatal("history trigger should match toolbar button typography")
+	}
+}
+
+func TestAdminTemplateRendersSearchableTallSavedGroups(t *testing.T) {
+	var buf bytes.Buffer
+	err := adminTemplate.Execute(&buf, pageData{
+		Version: "2.1.0",
+		Groups: []storage.Group{{
+			ChatID:    -1003720457420,
+			Title:     "测试群",
+			UpdatedAt: time.Date(2026, 7, 6, 14, 24, 0, 0, time.UTC),
+		}},
+		ChatNames: map[int64]string{-1003720457420: "测试群"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := buf.String()
+	wants := []string{
+		`id="saved-group-search"`,
+		`class="scroll tall"`,
+		`id="saved-group-rows"`,
+		`data-search="测试群 -1003720457420"`,
+		`querySelectorAll('#saved-group-rows tr[data-search]')`,
+	}
+	for _, want := range wants {
+		if !strings.Contains(html, want) {
+			t.Fatalf("admin template missing %q", want)
 		}
 	}
 }

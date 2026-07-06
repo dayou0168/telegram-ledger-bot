@@ -99,6 +99,24 @@ func TestRecordLineShowsDefaultRateFormula(t *testing.T) {
 	}
 }
 
+func TestRecordLineLinksUSDTAmountWithUnit(t *testing.T) {
+	loc := time.FixedZone("Asia/Shanghai", 8*3600)
+	record := storage.Record{
+		ChatID:          -1003720457420,
+		SourceMessageID: 70,
+		Kind:            "payout",
+		Currency:        "USDT",
+		Amount:          "10",
+		ResultUSDT:      "10",
+		SubjectName:     "阿泽",
+		CreatedAt:       time.Date(2026, 7, 6, 21, 36, 25, 0, loc),
+	}
+	line := recordLine(record, loc)
+	if !strings.Contains(line, `>10U</a>`) || strings.Contains(line, `>10</a>U`) {
+		t.Fatalf("USDT amount and unit should be one clickable link: %s", line)
+	}
+}
+
 func TestLedgerSubjectFromReplyMessage(t *testing.T) {
 	msg := telegram.Message{
 		From: &telegram.User{ID: 1, FirstName: "阿泽", Username: "aze89"},

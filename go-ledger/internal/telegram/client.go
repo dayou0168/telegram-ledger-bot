@@ -92,6 +92,14 @@ func (c *Client) AnswerCallback(ctx context.Context, callbackID, text string) er
 	return c.call(ctx, http.MethodPost, "answerCallbackQuery", nil, payload, nil)
 }
 
+func (c *Client) DeleteMessage(ctx context.Context, chatID, messageID int64) error {
+	payload := map[string]any{
+		"chat_id":    chatID,
+		"message_id": messageID,
+	}
+	return c.call(ctx, http.MethodPost, "deleteMessage", nil, payload, nil)
+}
+
 func (c *Client) LeaveChat(ctx context.Context, chatID int64) error {
 	return c.call(ctx, http.MethodPost, "leaveChat", nil, map[string]any{"chat_id": chatID}, nil)
 }

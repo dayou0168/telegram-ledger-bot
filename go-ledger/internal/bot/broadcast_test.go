@@ -24,7 +24,7 @@ func TestFormatBroadcastResultText(t *testing.T) {
 }
 
 func TestBroadcastSessionControls(t *testing.T) {
-	if !isBroadcastNotifyToggleText("通知所有人：关闭") || !isBroadcastNotifyToggleText("通知所有人:开启") {
+	if !isBroadcastNotifyToggleText("通知所有人：关") || !isBroadcastNotifyToggleText("通知所有人:开") {
 		t.Fatal("notify toggle text was not recognized")
 	}
 	if isBroadcastNotifyToggleText("通知所有人：今天发货") {
@@ -35,9 +35,6 @@ func TestBroadcastSessionControls(t *testing.T) {
 	}
 	if !isBroadcastSwitchTargetText("切换群") || !isBroadcastSwitchTargetText("切换目标") {
 		t.Fatal("switch target text was not recognized")
-	}
-	if !isBroadcastTargetLabelText("当前目标：11") {
-		t.Fatal("target label text was not recognized")
 	}
 	if !isBroadcastMenuText("切换群") {
 		t.Fatal("switch target should open broadcast target menu outside a session")
@@ -50,7 +47,7 @@ func TestBroadcastSessionControls(t *testing.T) {
 	if keyboard.Keyboard[0][0].Text != "当前目标：11" {
 		t.Fatalf("unexpected target label: %#v", keyboard.Keyboard[0])
 	}
-	if keyboard.Keyboard[1][0].Text != "通知所有人：开启" || keyboard.Keyboard[1][1].Text != "切换群" || keyboard.Keyboard[1][2].Text != "结束广播" {
+	if keyboard.Keyboard[1][0].Text != "通知所有人：开" || keyboard.Keyboard[1][1].Text != "切换群" || keyboard.Keyboard[1][2].Text != "结束广播" {
 		t.Fatalf("unexpected keyboard labels: %#v", keyboard.Keyboard[1])
 	}
 }

@@ -1314,7 +1314,7 @@ h2{font-size:21px;margin:0 0 12px}.hint{color:var(--muted);margin:0 0 12px;line-
 input,select,textarea{border:1px solid #b8c8dc;border-radius:6px;background:#fff;color:var(--ink);min-height:38px;padding:8px 10px;font-size:14px;min-width:0}
 select[multiple]{min-height:150px}.full{width:100%}
 table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid #dce5ef;padding:10px;text-align:center;vertical-align:middle}th{background:#f4f7fb;font-weight:800}
-.scroll{max-height:280px;overflow:auto;border:1px solid #dce5ef;border-radius:6px}.scroll table{margin:0;border:0}.scroll th:first-child,.scroll td:first-child{border-left:0}.scroll th:last-child,.scroll td:last-child{border-right:0}.scroll th{position:sticky;top:0;z-index:1}
+.table-tools{display:flex;gap:8px;align-items:center;margin:8px 0 10px}.table-tools input{flex:1;width:100%}.scroll{max-height:280px;overflow:auto;border:1px solid #dce5ef;border-radius:6px}.scroll.tall{max-height:520px}.scroll table{margin:0;border:0}.scroll th:first-child,.scroll td:first-child{border-left:0}.scroll th:last-child,.scroll td:last-child{border-right:0}.scroll th{position:sticky;top:0;z-index:1}
 .pill{display:inline-block;border:1px solid #d5e1ec;background:#f7fafc;border-radius:999px;padding:3px 9px;color:#40566f}
 .actions{display:flex;gap:8px;flex-wrap:wrap}.mini{height:32px;padding:0 10px}
 @media(max-width:900px){.top{align-items:flex-start;flex-direction:column}.row,.row.two{grid-template-columns:1fr}.btn{width:100%}}
@@ -1332,8 +1332,9 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 <div class="card">
 <h2>已保存群组</h2>
 <p class="hint">机器人被邀请进群，或群内有人发言后会自动保存群名；群改名后也会更新。</p>
-<div class="scroll"><table><thead><tr><th>群名</th><th>群ID</th><th>更新时间</th></tr></thead><tbody>
-{{range .Groups}}<tr><td>{{chatLabel .}}</td><td>{{.ChatID}}</td><td>{{.UpdatedAt.Format "2006-01-02 15:04"}}</td></tr>{{else}}<tr><td colspan="3">暂无群组</td></tr>{{end}}
+<div class="table-tools"><input id="saved-group-search" type="search" placeholder="搜索群名或群ID"></div>
+<div class="scroll tall"><table><thead><tr><th>群名</th><th>群ID</th><th>更新时间</th></tr></thead><tbody id="saved-group-rows">
+{{range .Groups}}<tr data-search="{{chatLabel .}} {{.ChatID}}"><td>{{chatLabel .}}</td><td>{{.ChatID}}</td><td>{{.UpdatedAt.Format "2006-01-02 15:04"}}</td></tr>{{else}}<tr><td colspan="3">暂无群组</td></tr>{{end}}
 </tbody></table></div>
 </div>
 
@@ -1415,6 +1416,17 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 </form>
 </div>
 </section>
+<script>
+const groupSearch=document.getElementById('saved-group-search');
+if(groupSearch){
+  groupSearch.addEventListener('input',function(){
+    const q=this.value.trim().toLowerCase();
+    document.querySelectorAll('#saved-group-rows tr[data-search]').forEach(function(row){
+      row.style.display=row.dataset.search.toLowerCase().includes(q)?'':'none';
+    });
+  });
+}
+</script>
 </main></body></html>`
 
 const billHTML = `<!doctype html>
@@ -1430,7 +1442,7 @@ const billHTML = `<!doctype html>
 .bill-toolbar,.bill-search,.box{background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:var(--shadow)}.bill-toolbar{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;padding:4px 0 16px;margin-bottom:8px;background:transparent;border:0;border-radius:0;box-shadow:none}
 .bill-heading{display:flex;flex-direction:column;gap:3px;min-width:0}.bill-heading .brand{color:var(--gold);font-weight:800}.bill-heading h1{margin:0;font-size:28px;font-weight:800;line-height:1.25;overflow-wrap:anywhere}.bill-heading p{margin:0;color:#536782}
 .toolbar-actions{display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end;align-items:center}.btn{display:inline-flex;align-items:center;justify-content:center;min-height:34px;padding:7px 12px;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--text);font-weight:600;white-space:nowrap}.btn:hover{background:var(--blue-soft);text-decoration:none}.btn.primary{border-color:var(--blue);background:var(--blue);color:#fff}.btn.primary:hover{background:var(--blue-dark);color:#fff}
-.history-menu{position:relative;display:inline-flex;align-items:center;min-height:34px;z-index:5}.history-trigger{font:inherit;cursor:pointer}.history-dropdown{display:none;position:absolute;top:40px;left:0;min-width:92px;max-height:520px;overflow-y:auto;padding:6px 0;background:#fff;border:1px solid var(--line);border-radius:4px;box-shadow:0 12px 28px rgba(20,42,75,.16)}.history-menu:hover .history-dropdown,.history-menu:focus-within .history-dropdown{display:block}.history-dropdown a,.history-empty{display:block;padding:3px 14px;line-height:22px;color:var(--muted);white-space:nowrap}.history-dropdown a:hover{background:var(--blue-soft);color:var(--blue);text-decoration:none}.history-dropdown a.active{color:var(--gold);font-weight:700;background:var(--gold-soft)}
+.history-menu{position:relative;display:inline-flex;align-items:center;min-height:34px;z-index:5}.history-trigger{cursor:pointer;font-family:inherit;font-size:14px;font-weight:600;line-height:1.2}.history-dropdown{display:none;position:absolute;top:40px;left:0;min-width:92px;max-height:520px;overflow-y:auto;padding:6px 0;background:#fff;border:1px solid var(--line);border-radius:4px;box-shadow:0 12px 28px rgba(20,42,75,.16)}.history-menu:hover .history-dropdown,.history-menu:focus-within .history-dropdown{display:block}.history-dropdown a,.history-empty{display:block;padding:3px 14px;line-height:22px;color:var(--muted);white-space:nowrap}.history-dropdown a:hover{background:var(--blue-soft);color:var(--blue);text-decoration:none}.history-dropdown a.active{color:var(--gold);font-weight:700;background:var(--gold-soft)}
 .summary-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin-bottom:18px}.summary-card{min-height:78px;padding:15px 16px;background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:var(--shadow)}.summary-card span{display:block;margin-bottom:8px;color:var(--muted);font-size:13px}.summary-card strong{display:block;color:var(--text);font-size:19px;line-height:1.25;overflow-wrap:anywhere}
 .bill-search{display:flex;justify-content:center;gap:8px;width:100%;padding:12px 14px;margin:0 0 26px}.bill-search input[type=text]{flex:1 1 360px;min-width:0;height:34px;border-radius:6px;border:1px solid var(--line);padding:0 10px;background:#fff}.bill-search select{flex:0 0 130px;height:34px;border-radius:6px;border:1px solid var(--line);background:#fff}.bill-search button{flex:0 0 86px;height:34px;border-radius:6px;background:var(--blue);color:#fff;border:0;cursor:pointer;font-weight:700}.bill-search button:hover{background:var(--blue-dark)}
 .panel{width:100%;margin:0;padding:0;background:transparent;border:0;box-shadow:none}.box{margin:0;padding:20px;width:100%;border-top:5px solid #efdca9}.box-primary{border-left:1px solid var(--line)}.box-header{display:block;padding-bottom:12px;border-bottom:1px solid var(--line-soft);margin-bottom:8px}.box-title{display:inline-block;margin:0;font-size:22px;font-weight:bold;line-height:1.2}.box-body{padding:0}.table-wrap{overflow-x:auto}

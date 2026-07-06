@@ -236,23 +236,18 @@ func (b *Bot) handleBroadcastMaterial(ctx context.Context, msg telegram.Message,
 	}
 	if isBroadcastSwitchTargetText(msg.Text) {
 		b.privateStates.Delete(formatID(user.ID))
-		return b.sendBroadcastMenu(ctx, msg, user, "群发广播")
+		err := b.sendBroadcastMenu(ctx, msg, user, "群发广播")
+		b.deleteMessageBestEffort(ctx, msg.Chat.ID, msg.MessageID)
+		return err
 	}
 	if isBroadcastTargetLabelText(msg.Text) {
+		b.deleteMessageBestEffort(ctx, msg.Chat.ID, msg.MessageID)
 		return nil
 	}
 	if isBroadcastNotifyToggleText(msg.Text) {
 		state.NotifyAll = !state.NotifyAll
 		b.privateStates.Set(formatID(user.ID), state)
-		status := "关闭"
-		if state.NotifyAll {
-			status = "开启"
-		}
-		_, err := b.tg.SendMessage(ctx, msg.Chat.ID, "通知所有人："+status, map[string]any{
-			"reply_to_message_id": msg.MessageID,
-			"reply_markup":        broadcastSessionKeyboard(state.TargetName, state.NotifyAll),
-		})
-		return err
+		return b.refreshBroadcastSessionKeyboard(ctx, msg, state)
 	}
 	targets := append([]int64(nil), state.ChatIDs...)
 	sourceChatID := msg.Chat.ID
@@ -352,9 +347,9 @@ func formatBroadcastReadyText(name string, count int, notifyAll bool) string {
 }
 
 func broadcastSessionKeyboard(targetName string, notifyAll bool) telegram.ReplyKeyboardMarkup {
-	label := "通知所有人：关闭"
+	statusLabel := "通知所有人：关"
 	if notifyAll {
-		label = "通知所有人：开启"
+		statusLabel = "通知所有人：开"
 	}
 	targetLabel := "当前目标：" + strings.TrimSpace(targetName)
 	if strings.TrimSpace(targetName) == "" {
@@ -363,7 +358,7 @@ func broadcastSessionKeyboard(targetName string, notifyAll bool) telegram.ReplyK
 	return telegram.ReplyKeyboardMarkup{
 		Keyboard: [][]telegram.KeyboardButton{
 			{{Text: targetLabel}},
-			{{Text: label}, {Text: "切换群"}, {Text: "结束广播"}},
+			{{Text: statusLabel}, {Text: "切换群"}, {Text: "结束广播"}},
 		},
 		ResizeKeyboard: true,
 	}
@@ -382,7 +377,9 @@ func broadcastReadyKeyboard(notifyAll bool) telegram.InlineKeyboardMarkup {
 
 func isBroadcastNotifyToggleText(text string) bool {
 	switch strings.TrimSpace(text) {
-	case "通知所有人", "通知所有人：关闭", "通知所有人：开启", "通知所有人:关闭", "通知所有人:开启":
+	case "通知所有人", "切换通知", "开启通知", "关闭通知", "开启通知所有人", "关闭通知所有人",
+		"通知所有人：关", "通知所有人：开", "通知所有人:关", "通知所有人:开",
+		"通知所有人：关闭", "通知所有人：开启", "通知所有人:关闭", "通知所有人:开启":
 		return true
 	default:
 		return false
@@ -409,6 +406,27 @@ func isBroadcastSwitchTargetText(text string) bool {
 
 func isBroadcastTargetLabelText(text string) bool {
 	return strings.HasPrefix(strings.TrimSpace(text), "当前目标：")
+}
+
+func (b *Bot) refreshBroadcastSessionKeyboard(ctx context.Context, msg telegram.Message, state privateState) error {
+	refresh, err := b.tg.SendMessage(ctx, msg.Chat.ID, "状态已更新", map[string]any{
+		"reply_markup": broadcastSessionKeyboard(state.TargetName, state.NotifyAll),
+	})
+	if err != nil {
+		return err
+	}
+	b.deleteMessageBestEffort(ctx, msg.Chat.ID, msg.MessageID)
+	b.deleteMessageBestEffort(ctx, msg.Chat.ID, refresh.MessageID)
+	return nil
+}
+
+func (b *Bot) deleteMessageBestEffort(ctx context.Context, chatID, messageID int64) {
+	if messageID <= 0 {
+		return
+	}
+	if err := b.tg.DeleteMessage(ctx, chatID, messageID); err != nil {
+		log.Printf("delete private control message %d/%d: %v", chatID, messageID, err)
+	}
 }
 
 func (b *Bot) canUseBroadcast(ctx context.Context, userID int64) bool {
