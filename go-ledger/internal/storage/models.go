@@ -18,6 +18,9 @@ type Group struct {
 	PayoutRate          string
 	DepositExchangeRate string
 	PayoutExchangeRate  string
+	ExchangeRateSource  string
+	ExchangeRateRank    int
+	ExchangeRateOffset  string
 	FeeRate             string
 	CutoffHour          int
 	AllMembersCanRecord bool

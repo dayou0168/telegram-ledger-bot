@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"fmt"
+	"html"
 	"log"
 	"math/big"
 	"strings"
@@ -19,6 +20,7 @@ func (b *Bot) handleTRXAddressQuery(ctx context.Context, msg telegram.Message, a
 		text := b.queryTRXAddressText(jobCtx, address)
 		if _, err := b.tg.SendMessage(jobCtx, chatID, text, map[string]any{
 			"reply_to_message_id": replyTo,
+			"parse_mode":          "HTML",
 		}); err != nil {
 			log.Printf("send trx address query: %v", err)
 		}
@@ -30,18 +32,19 @@ func (b *Bot) queryTRXAddressText(ctx context.Context, address string) string {
 	account, accountErr := b.tron.FetchAccount(ctx, address, b.cfg.USDTContract)
 	transfers, transferErr := b.tron.FetchAddressUSDTTransfers(ctx, address, b.cfg.USDTContract, 5)
 	if accountErr != nil && transferErr != nil {
-		return "TRX 地址查询失败：" + accountErr.Error()
+		return "TRX 地址查询失败：" + html.EscapeString(accountErr.Error())
 	}
 	var out strings.Builder
-	out.WriteString("TRX 地址查询\n")
-	out.WriteString("地址：")
-	out.WriteString(address)
+	out.WriteString("<b>TRX 地址查询</b>\n\n")
+	out.WriteString("查询地址： ")
+	out.WriteString(formatCode(address))
 	out.WriteByte('\n')
 	if accountErr == nil {
-		out.WriteString("USDT：")
-		out.WriteString(formatTokenAmount(account.USDTBalance, firstPositive(account.USDTDecimals, 6), 2))
-		out.WriteString("\nTRX：")
+		out.WriteString("TRX余额： ")
 		out.WriteString(formatTokenAmount(account.BalanceSun, 6, 6))
+		out.WriteString(" TRX\nUSDT余额： ")
+		out.WriteString(formatTokenAmount(account.USDTBalance, firstPositive(account.USDTDecimals, 6), 2))
+		out.WriteString(" USDT")
 		if account.CreatedAt > 0 {
 			out.WriteString("\n创建时间：")
 			out.WriteString(formatMilliTime(account.CreatedAt, b.loc))
@@ -62,10 +65,10 @@ func (b *Bot) queryTRXAddressText(ctx context.Context, address string) string {
 		out.WriteString(formatInt(int(account.TotalTransactionCount)))
 	} else {
 		out.WriteString("账户详情：暂不可用，")
-		out.WriteString(accountErr.Error())
+		out.WriteString(html.EscapeString(accountErr.Error()))
 	}
 	if transferErr == nil && len(transfers) > 0 {
-		out.WriteString("\n\n最近 USDT 流水：")
+		out.WriteString("\n\n<b>最近流水</b>")
 		for i, transfer := range transfers {
 			out.WriteByte('\n')
 			out.WriteString(formatInt(i + 1))
@@ -74,7 +77,7 @@ func (b *Bot) queryTRXAddressText(ctx context.Context, address string) string {
 		}
 	} else if transferErr != nil {
 		out.WriteString("\n\n最近 USDT 流水：暂不可用，")
-		out.WriteString(transferErr.Error())
+		out.WriteString(html.EscapeString(transferErr.Error()))
 	}
 	return out.String()
 }
@@ -89,14 +92,19 @@ func formatTransferLine(address string, transfer tron.Transfer, loc *time.Locati
 		sign = "-"
 	}
 	amount := formatTokenAmount(transfer.Value, firstPositive(transfer.TokenDecimals, 6), 2)
-	return fmt.Sprintf("%s %s%sU  对方:%s  %s  %s",
+	return fmt.Sprintf("%s %s%s USDT  对方 %s  %s  <a href=\"https://tronscan.org/#/transaction/%s\">%s</a>",
 		direction,
 		sign,
 		amount,
-		shortAddress(peer),
+		formatCode(shortAddress(peer)),
 		formatMilliTime(transfer.BlockTimestamp, loc),
+		html.EscapeString(transfer.Hash),
 		shortHash(transfer.Hash),
 	)
+}
+
+func formatCode(value string) string {
+	return "<code>" + html.EscapeString(value) + "</code>"
 }
 
 func formatTokenAmount(raw string, decimals int, precision int) string {

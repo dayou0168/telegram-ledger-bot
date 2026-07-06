@@ -78,7 +78,6 @@ Go 版使用两层队列：
 - `group_cache`: 群基础信息、群名、记账状态，TTL 60 秒，写操作主动失效。
 - `user_touch_cache`: 群成员最近触达，TTL 180 秒，减少高频 touch 写入。
 - `operator_cache`: 权限判断，TTL 10 秒，权限变更主动失效。
-- `host_presence_cache`: 宿主是否在群，TTL 默认 600 秒，后台刷新。
 - `watch_target_cache`: 地址监听目标，TTL 3 秒，增删监听地址主动失效。
 - `watch_settings_cache`: 监听开关和最小金额，TTL 3 秒，设置变更主动失效。
 - `rate_cache`: Z0 TOP10 和实时汇率，全局缓存，默认 60 秒刷新。

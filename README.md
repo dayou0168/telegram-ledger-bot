@@ -19,8 +19,8 @@
 - 机器人只有一个宿主，宿主由服务器配置 `BOT_HOST_USER_ID` 指定；宿主是最高权限。
 - 默认操作人只由维护人员修改服务器配置 `DEFAULT_OPERATOR_USER_IDS` 添加/删除。默认操作人可以邀请机器人进群、在任意群记账、使用群发广播和分组广播，但不会因为发送 `开始` 或拥有默认权限而变成本群最高权限。
 - 宿主可以在群内发送 `添加操作员 @user` / `删除操作员 @user` 设置单群操作人。
-- 机器人被邀请进群或群里有人发言时会按 `chat_id` 保存群组，群名变更后会自动更新；记账群在发送 `开始` 或发生记账动作时会校验唯一宿主是否在群内，不在则自动退群。
-- 只用于广播、不需要记账的群可以不发送 `开始`，宿主不在群内也可以作为广播目标保存；如果已经开启过记账，发送 `停止` 或 `关闭` 即可暂停记账，群仍会保留在群发/分组广播列表中。
+- 机器人被邀请进群或群里有人发言时会按 `chat_id` 保存群组，群名变更后会自动更新；不会因为宿主不在群内而自动退群。
+- 只用于广播、不需要记账的群可以不发送 `开始`；如果已经开启过记账，发送 `停止` 或 `关闭` 即可暂停记账，群仍会保留在群发/分组广播列表中。
 - 私聊点击 `📡群发广播` 或 `📣分组广播` 后，可用按钮选择全部群、分组或单群；选择目标后进入连续发送模式，文字、图片、文件或图文都会直接投递，不再二次确认。
 - 广播分组、分组成员、单群授权、广播操作人和广播替换都放到后台管理页操作，后台可按群名搜索或多选群组，避免手动查群 ID。
 - 广播权限和记账权限分开：宿主/默认操作人拥有全部广播权限；一级广播操作人可以继续创建一层下级，并把自己已有的分组或单群权限分配给下级。
@@ -56,23 +56,23 @@ Copy-Item .env.example .env
 TELEGRAM_BOT_TOKEN=123456:replace-me
 TELEGRAM_BOT_USERNAME=your_bot_username
 TELEGRAM_API_BASE=https://api.telegram.org
-BOT_DB_PATH=data/ledger_bot.db
+DATABASE_URL=postgres://ledger:change_this_strong_password@postgres:5432/ledger_bot?sslmode=disable
 BOT_TIMEZONE=Asia/Shanghai
 BOT_HOST_USER_ID=123456789
 DEFAULT_OPERATOR_USER_IDS=
 BOT_WORKER_THREADS=16
 BOT_CONTROL_THREADS=6
 BOT_CHAIN_THREADS=12
-BOT_RATE_THREADS=1
+BOT_RATE_THREADS=2
 BOT_BROADCAST_THREADS=4
 BOT_QUERY_THREADS=4
 BOT_NOTIFICATION_THREADS=6
-BOT_HOST_CHECK_TTL_SECONDS=600
+BOT_QUEUE_SIZE=4096
 ```
 
-先私聊机器人发送 `我的ID` 获取你的 Telegram ID，再填入 `BOT_HOST_USER_ID`。机器人只允许配置一个宿主。宿主必须在机器人所在群内，否则机器人会自动退群。默认操作人可在 `.env` 的 `DEFAULT_OPERATOR_USER_IDS` 里用英文逗号分隔，只有维护程序的人员能通过改服务器配置添加或删除。
+先私聊机器人发送 `我的ID` 获取你的 Telegram ID，再填入 `BOT_HOST_USER_ID`。机器人只允许配置一个宿主。默认操作人可在 `.env` 的 `DEFAULT_OPERATOR_USER_IDS` 里用英文逗号分隔，只有维护程序的人员能通过改服务器配置添加或删除。
 
-并发池说明：默认按日本 4 核 8G 服务器优化。`BOT_WORKER_THREADS` 处理群内记账、撤销、群内设置等实时消息，同一群会按 FIFO 队列串行、不同群可并发；`BOT_CONTROL_THREADS` 处理私聊菜单、后台入口、广播控制台等私聊交互；`BOT_CHAIN_THREADS` 处理 USDT/TRX 链上监听并并行扫描监听地址；`BOT_RATE_THREADS` 处理 Z0 和实时汇率刷新；`BOT_BROADCAST_THREADS` 处理群发/分组广播，默认最多同时跑 4 个广播任务，单个广播任务内部仍按目标群逐个发送，避免触发 Telegram 限流；`BOT_QUERY_THREADS` 处理 TRX 地址查询等外部查询；`BOT_NOTIFICATION_THREADS` 处理广播发送通知、回复通知和通知素材复制。群内记账、私聊控制、广播、链上监听、汇率刷新、查询、通知互相隔离，避免某一类慢任务拖住其他版块。`BOT_HOST_CHECK_TTL_SECONDS` 控制每个群宿主在群检测的缓存时间，减少每条消息都调用 Telegram 管理接口。
+并发池说明：默认按日本 4 核 8G 服务器优化。`BOT_WORKER_THREADS` 处理群内记账、撤销、群内设置等实时消息，同一群会按 FIFO 队列串行、不同群可并发；`BOT_CONTROL_THREADS` 处理私聊菜单、后台入口、广播控制台等私聊交互；`BOT_CHAIN_THREADS` 处理 USDT/TRX 链上监听并并行扫描监听地址；`BOT_RATE_THREADS` 处理 Z0 和实时汇率刷新；`BOT_BROADCAST_THREADS` 处理群发/分组广播，默认最多同时跑 4 个广播任务，单个广播任务内部仍按目标群逐个发送，避免触发 Telegram 限流；`BOT_QUERY_THREADS` 处理 TRX 地址查询等外部查询；`BOT_NOTIFICATION_THREADS` 处理广播发送通知、回复通知和通知素材复制。群内记账、私聊控制、广播、链上监听、汇率刷新、查询、通知互相隔离，避免某一类慢任务拖住其他版块。
 
 如果你用自建 Telegram Bot API Server，`TELEGRAM_API_BASE` 填服务根地址即可，例如：
 
@@ -84,25 +84,23 @@ TELEGRAM_API_BASE=http://telegram-bot-api:8081
 
 ### 完整账单网页
 
-镜像内置账单网页服务，默认监听容器 `8080` 端口。配置自己的域名后：
+Go 版镜像内置账单网页和后台服务，默认监听容器 `8080` 端口。配置自己的域名后：
 
 ```env
 PUBLIC_BILL_BASE_URL=https://bot.your-domain.example
-PUBLIC_BILL_URL_TEMPLATE=
-BILL_WEB_ENABLED=1
-BILL_WEB_HOST=0.0.0.0
-BILL_WEB_PORT=8080
-BILL_WEB_TOKEN=change-this-random-token
+ADMIN_WEB_ENABLED=1
+ADMIN_WEB_HOST=0.0.0.0
+ADMIN_WEB_PORT=8080
 ADMIN_WEB_TOKEN=change-this-admin-token
 ```
 
 机器人会给每个群生成类似这样的独立链接：
 
 ```text
-https://bot.your-domain.example/bill/-100xxx/2026-07-05?begintime=2026-07-05+00%3A00%3A00&endtime=2026-07-06+00%3A00%3A00&token=change-this-random-token
+https://bot.your-domain.example/b/-100xxx/20260705
 ```
 
-宝塔里给域名申请 SSL 后，把站点反向代理到 `http://127.0.0.1:8080`。`BILL_WEB_TOKEN` 可留空，留空时网页是公开链接；建议正式使用时设置一串随机字符。`ADMIN_WEB_TOKEN` 是 `/admin` 后台登录密码，建议设置为另一串随机字符。
+宝塔里给域名申请 SSL 后，把站点反向代理到 `http://127.0.0.1:8080`。`ADMIN_WEB_TOKEN` 是 `/admin` 后台登录密码，建议设置为一串随机强密码。
 
 后台入口：
 
@@ -122,20 +120,7 @@ https://bot.your-domain.example/day_xxb.php?chat_id=-100xxx&created_at=2026-07-0
 
 即可查看指定日期历史账单；页面顶部会显示最近历史日期和「下载账单」按钮。下载按钮会生成 `.xlsx` 文件，文件名格式为 `账单_日期_群名_时间戳.xlsx`。也可以直接追加 `download=excel` 下载当前日期或当前时间窗口的账单。
 
-如果你已经有自己的 PHP 账单系统，也可以继续用 `.php` 地址：
-
-```env
-PUBLIC_BILL_BASE_URL=https://your-domain.example/day_xxb.php
-PUBLIC_BILL_BOT_NAME=YOUR_BOT_CODE
-```
-
-如果你的网页参数和示例机器人完全一致，也可以直接配置完整模板：
-
-```env
-PUBLIC_BILL_URL_TEMPLATE=https://your-domain.example/day_xxb.php?firstname=&chat_id={chat_id}&up_page=1&down_page=1&created_at=&begintime={begin_time}&endtime={end_time}&all={all}&phpname={bot_name}&type=bjr
-```
-
-按钮逻辑：配置了 `PUBLIC_BILL_URL_TEMPLATE` 或 `PUBLIC_BILL_BASE_URL` 时，底部「🌐 完整账单」会打开网页；不配置时，按钮会在 Telegram 内显示完整账单。
+按钮逻辑：配置了 `PUBLIC_BILL_BASE_URL` 时，底部「🌐 完整账单」会打开网页；不配置时只发送 Telegram 内账单摘要。
 
 ### TRC20 链上监听
 

@@ -28,7 +28,6 @@ type Config struct {
 	QueryWorkers        int
 	NotifyWorkers       int
 	QueueSize           int
-	HostCheckTTL        time.Duration
 	GroupCacheTTL       time.Duration
 	UserTouchCacheTTL   time.Duration
 	OperatorCacheTTL    time.Duration
@@ -75,7 +74,6 @@ func Load() (Config, error) {
 		QueryWorkers:        intEnv("BOT_QUERY_THREADS", 4),
 		NotifyWorkers:       intEnv("BOT_NOTIFICATION_THREADS", 6),
 		QueueSize:           intEnv("BOT_QUEUE_SIZE", 4096),
-		HostCheckTTL:        secondsEnv("BOT_HOST_CHECK_TTL_SECONDS", 600),
 		GroupCacheTTL:       secondsEnv("BOT_GROUP_CACHE_TTL_SECONDS", 60),
 		UserTouchCacheTTL:   secondsEnv("BOT_USER_TOUCH_CACHE_TTL_SECONDS", 180),
 		OperatorCacheTTL:    secondsEnv("BOT_OPERATOR_CACHE_TTL_SECONDS", 10),

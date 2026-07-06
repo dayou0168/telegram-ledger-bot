@@ -1,15 +1,36 @@
-# 宝塔 Docker Compose 精简版
-# 填写顺序：
-# 1. 先填“必填配置”，机器人才能启动。
-# 2. 再按需要填“选填配置”，用于网页账单、后台、TRC20 监听等功能。
-# 3. “高级配置”一般不用改，需要自定义时再取消注释。
+# Telegram 记账机器人 Go v2.1 + PostgreSQL
+#
+# 宝塔 Docker Compose 使用方法：
+# 1. 新建 Compose 项目，把本文件完整粘贴进去。
+# 2. 先填写 TELEGRAM_BOT_TOKEN、TELEGRAM_BOT_USERNAME、BOT_HOST_USER_ID。
+# 3. 把 POSTGRES_PASSWORD 改成强密码，并同步修改 DATABASE_URL 里的密码。
+# 4. 如果要使用完整账单/后台，把 PUBLIC_BILL_BASE_URL 改成你的 HTTPS 域名，并填写 ADMIN_WEB_TOKEN。
 
 services:
-  ledger-bot:
-    image: ghcr.io/dayou0168/telegram-ledger-bot:latest
-    container_name: ledger-bot
+  postgres:
+    image: postgres:16-alpine
+    container_name: ledger-postgres
     restart: unless-stopped
+    environment:
+      POSTGRES_DB: "ledger_bot"
+      POSTGRES_USER: "ledger"
+      POSTGRES_PASSWORD: "change_this_strong_password"
+      TZ: "Asia/Shanghai"
+    volumes:
+      - ledger_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ledger -d ledger_bot"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
+  ledger-bot:
+    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.1
+    container_name: ledger-bot-go
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
       # ==================== 必填配置 ====================
 
@@ -23,91 +44,70 @@ services:
       # 私聊机器人发送“我的ID”获取。
       BOT_HOST_USER_ID: "123456789"
 
+      # 必填：PostgreSQL 连接地址。密码要和上面的 POSTGRES_PASSWORD 保持一致。
+      DATABASE_URL: "postgres://ledger:change_this_strong_password@postgres:5432/ledger_bot?sslmode=disable"
+
       # ==================== 选填配置 ====================
 
-      # 选填：程序默认操作人 Telegram 数字 ID，多个用英文逗号分隔。
-      # 默认操作人可以邀请机器人、记账、广播；没有就留空。
+      # 选填：服务器默认操作人，多个用英文逗号分隔。
       DEFAULT_OPERATOR_USER_IDS: ""
 
       # 选填但建议填写：你的网页账单/后台域名，必须带 https://。
-      # 不要带空格，不要写 /day_xxb.php。
-      # 例如：https://bot.tianze8.cc
+      # 示例：https://bot.tianze8.cc
       PUBLIC_BILL_BASE_URL: ""
 
-      # 选填：账单访问 token。
-      # 留空表示完整账单链接公开可访问；填写后账单链接会自动带 token。
-      BILL_WEB_TOKEN: ""
-
       # 选填但建议填写：后台管理登录密码。
-      # 填写后可通过私聊菜单“⚙后台管理”打开后台，网页会要求输入这个密码。
-      ADMIN_WEB_TOKEN: "换成一串随机字符"
+      ADMIN_WEB_TOKEN: "change_this_admin_password"
 
-      # 选填但推荐：Tronscan API Key。
-      # 不监听 USDT 地址可以留空；监听地址较多建议填写。
+      # 选填但推荐：Tronscan API Key。不监听 USDT 地址可以留空。
       TRONGRID_API_KEY: ""
 
       # ==================== 高级配置 ====================
-      # 下面这些都有程序默认值，一般不用改。
-      # 如果需要自定义，把前面的 # 去掉再修改值。
 
-      # Telegram API 地址。没有自建 Bot API Server 就不用改。
-      # TELEGRAM_API_BASE: "https://api.telegram.org"
+      # 所有业务时间使用北京时间。
+      BOT_TIMEZONE: "Asia/Shanghai"
 
-      # 数据库位置。默认会持久化到下面的 Docker 卷。
-      # BOT_DB_PATH: "data/ledger_bot.db"
-
-      # 时区。账单、日切、网页时间默认都是北京时间。
-      # BOT_TIMEZONE: "Asia/Shanghai"
-
-      # 4核8G推荐并发池。日本服务器可直接使用这组配置。
-      # 群内记账、私聊控制台、链上监听、汇率、广播、查询、通知互相隔离。
+      # 日本 4 核 8G 推荐并发池。这里是最大并发上限，不是长期占满。
       BOT_WORKER_THREADS: "16"
       BOT_CONTROL_THREADS: "6"
       BOT_CHAIN_THREADS: "12"
-      BOT_RATE_THREADS: "1"
+      BOT_RATE_THREADS: "2"
       BOT_BROADCAST_THREADS: "4"
       BOT_QUERY_THREADS: "4"
       BOT_NOTIFICATION_THREADS: "6"
-      BOT_HOST_CHECK_TTL_SECONDS: "600"
+      BOT_QUEUE_SIZE: "4096"
 
-      # 网页账单服务。默认已开启，容器内监听 8080。
-      # BILL_WEB_ENABLED: "1"
-      # BILL_WEB_HOST: "0.0.0.0"
-      # BILL_WEB_PORT: "8080"
+      # Telegram 官方 Bot API。后续如果自建 Bot API Server，再改这里。
+      TELEGRAM_API_BASE: "https://api.telegram.org"
+      BOT_POLL_TIMEOUT: "50"
+      BOT_REQUEST_TIMEOUT: "30"
 
-      # 自定义完整账单 URL 模板。使用内置网页账单时不要填。
-      # PUBLIC_BILL_URL_TEMPLATE: ""
-      # PUBLIC_BILL_BOT_NAME: "LEDGER_BOT"
+      # Tronscan / TRC20 监听配置。
+      TRONSCAN_API_BASE: "https://apilist.tronscanapi.com/api"
+      TRON_USDT_CONTRACT: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+      TRON_POLL_INTERVAL_SECONDS: "1"
+      TRONSCAN_GLOBAL_SCAN_PAGES: "1"
+      TRON_ADDRESS_BACKFILL_SECONDS: "60"
+      TRON_INITIAL_LOOKBACK_MINUTES: "15"
 
-      # TRC20 监听参数。
-      # 默认每秒做一次全局 USDT 最新流水扫描，所有监听地址共用这一次请求。
-      # TRONSCAN_API_BASE: "https://apilist.tronscanapi.com/api"
-      # TRON_USDT_CONTRACT: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
-      # TRON_POLL_INTERVAL_SECONDS: "1"
-      # TRON_INITIAL_LOOKBACK_MINUTES: "15"
-      # 每轮全局扫描页数。每页 50 条，默认 1 页，调用量最低。
-      # 如果全网 USDT 很拥堵且担心漏单，可调成 2 或 3，但调用量会同步增加。
-      # TRONSCAN_GLOBAL_SCAN_PAGES: "1"
-      # 按地址低频回补间隔，单位秒。用于补漏，不影响秒级主扫描；设为 0 可关闭。
-      # TRON_ADDRESS_BACKFILL_SECONDS: "60"
+      # Z0 / 实时汇率配置，默认 OKX OTC、CNY、USDT、支付宝档位。
+      P2P_RATE_API_BASE: "https://p2p.army/api/fapi"
+      P2P_RATE_FRONT_API: "NextVOF2Ozuh36mW0TCv"
+      P2P_RATE_MARKET: "okx"
+      P2P_RATE_FIAT_UNIT: "CNY"
+      P2P_RATE_ASSET: "USDT"
+      P2P_RATE_TRADE_METHODS: "aliPay"
+      P2P_RATE_REFRESH_SECONDS: "60"
+      P2P_RATE_CACHE_TTL_SECONDS: "180"
 
-      # Z0/实时汇率。默认 OKX，USDT 卖 CNY，支付宝档位。
-      # P2P_RATE_API_BASE: "https://p2p.army/api/fapi"
-      # P2P_RATE_FRONT_API: "NextVOF2Ozuh36mW0TCv"
-      # P2P_RATE_MARKET: "okx"
-      # P2P_RATE_FIAT_UNIT: "CNY"
-      # P2P_RATE_ASSET: "USDT"
-      # P2P_RATE_TRADE_METHODS: "aliPay"
-      # P2P_RATE_REFRESH_SECONDS: "60"
-      # P2P_RATE_CACHE_TTL_SECONDS: "180"
+      # 后台管理和短账单网页。
+      ADMIN_WEB_ENABLED: "1"
+      ADMIN_WEB_HOST: "0.0.0.0"
+      ADMIN_WEB_PORT: "8080"
 
     ports:
-      # 宝塔/Nginx 反向代理目标填：http://127.0.0.1:8080
+      # 宝塔/Nginx 反向代理目标：http://127.0.0.1:8080
       - "8080:8080"
 
-    volumes:
-      # 持久化数据库，重建容器不会丢账本。
-      - ledger_bot_data:/app/data
-
 volumes:
-  ledger_bot_data:
+  ledger_pg_data:

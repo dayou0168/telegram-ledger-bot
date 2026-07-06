@@ -21,6 +21,32 @@ func TestParseLedgerDepositWithRate(t *testing.T) {
 	}
 }
 
+func TestParseLedgerDepositWithMultiplierAndRate(t *testing.T) {
+	cmd, ok := parseLedger("+10000*5/7.1")
+	if !ok {
+		t.Fatal("expected deposit command")
+	}
+	if formatRat(cmd.Multiplier, 2) != "5" {
+		t.Fatalf("multiplier = %s", formatRat(cmd.Multiplier, 2))
+	}
+	if formatRat(cmd.Rate, 2) != "7.1" {
+		t.Fatalf("rate = %s", formatRat(cmd.Rate, 2))
+	}
+}
+
+func TestParseLedgerDepositWithInlineFee(t *testing.T) {
+	cmd, ok := parseLedger("+1000*12%")
+	if !ok {
+		t.Fatal("expected deposit command")
+	}
+	if formatRat(cmd.FeeRate, 2) != "12" {
+		t.Fatalf("fee = %s", formatRat(cmd.FeeRate, 2))
+	}
+	if formatRat(cmd.Multiplier, 2) != "1" {
+		t.Fatalf("multiplier = %s", formatRat(cmd.Multiplier, 2))
+	}
+}
+
 func TestParseLedgerPayoutRequiresUSDT(t *testing.T) {
 	if _, ok := parseLedger("下发100"); ok {
 		t.Fatal("plain CNY payout should be disabled")
@@ -34,14 +60,30 @@ func TestParseLedgerPayoutRequiresUSDT(t *testing.T) {
 	}
 }
 
+func TestParseLedgerPayoutWithMultiplierAndRate(t *testing.T) {
+	cmd, ok := parseLedger("下发5000*5/7.1")
+	if !ok {
+		t.Fatal("expected payout command")
+	}
+	if cmd.Kind != "payout" || cmd.IsUSDT {
+		t.Fatalf("unexpected payout command: %+v", cmd)
+	}
+	if formatRat(cmd.Multiplier, 2) != "5" {
+		t.Fatalf("multiplier = %s", formatRat(cmd.Multiplier, 2))
+	}
+	if formatRat(cmd.Rate, 2) != "7.1" {
+		t.Fatalf("rate = %s", formatRat(cmd.Rate, 2))
+	}
+}
+
 func TestFormatAmountRoundsHalfUpToTwoDecimals(t *testing.T) {
 	cases := map[string]string{
-		"100":     "100.00",
+		"100":     "100",
 		"100.554": "100.55",
 		"100.555": "100.56",
 		"100.556": "100.56",
 		"100/6":   "16.67",
-		"0.004":   "0.00",
+		"0.004":   "0",
 		"0.005":   "0.01",
 	}
 	for raw, want := range cases {

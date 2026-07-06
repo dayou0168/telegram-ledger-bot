@@ -75,7 +75,7 @@ func (c *Client) FetchOrderBookTop(ctx context.Context, market, fiatUnit, asset 
 	}
 	entries := make([]OrderBookEntry, 0, limit)
 	for _, item := range payload.Data {
-		price := strings.TrimSpace(item.Buy.Price)
+		price := strings.TrimSpace(item.Buy.Price.String())
 		if price == "" || parsePrice(price) == nil {
 			continue
 		}
@@ -152,12 +152,39 @@ type orderBookItem struct {
 }
 
 type orderBookAd struct {
-	Price string            `json:"price"`
+	Price jsonStringNumber  `json:"price"`
 	User  orderBookMerchant `json:"user"`
 }
 
 type orderBookMerchant struct {
 	Nickname string `json:"nickname"`
+}
+
+type jsonStringNumber string
+
+func (v *jsonStringNumber) UnmarshalJSON(raw []byte) error {
+	raw = bytes.TrimSpace(raw)
+	if bytes.Equal(raw, []byte("null")) || len(raw) == 0 {
+		*v = ""
+		return nil
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		*v = jsonStringNumber(strings.TrimSpace(text))
+		return nil
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var number json.Number
+	if err := decoder.Decode(&number); err == nil {
+		*v = jsonStringNumber(number.String())
+		return nil
+	}
+	return fmt.Errorf("unsupported json string/number: %s", string(raw))
+}
+
+func (v jsonStringNumber) String() string {
+	return string(v)
 }
 
 func parsePrice(raw string) *big.Rat {

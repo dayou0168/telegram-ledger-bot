@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"fmt"
+	"html"
 	"log"
 	"math/big"
 	"strconv"
@@ -34,19 +35,15 @@ func (b *Bot) canUseAddressWatch(ctx context.Context, userID int64) bool {
 }
 
 func (b *Bot) sendAddressWatchMenu(ctx context.Context, chatID, ownerID, replyTo int64) error {
-	settings, err := b.store.GetWatchSettings(ctx, ownerID)
-	if err != nil {
-		return err
-	}
 	targets, err := b.store.ListWatchTargetsForOwner(ctx, ownerID)
 	if err != nil {
 		return err
 	}
-	text := formatAddressWatchMenuText(settings, targets)
-	keyboard := telegram.InlineKeyboardMarkup{InlineKeyboard: addressWatchKeyboard(settings, targets)}
+	text := formatAddressWatchMenuText(targets)
+	keyboard := telegram.InlineKeyboardMarkup{InlineKeyboard: addressWatchKeyboard(targets)}
 	_, err = b.tg.SendMessage(ctx, chatID, text, map[string]any{
-		"reply_to_message_id": replyTo,
-		"reply_markup":        keyboard,
+		"parse_mode":   "HTML",
+		"reply_markup": keyboard,
 	})
 	return err
 }
@@ -56,37 +53,45 @@ func (b *Bot) handleAddressWatchCallback(ctx context.Context, cb telegram.Callba
 		return b.tg.AnswerCallback(ctx, cb.ID, "")
 	}
 	chatID := cb.Message.Chat.ID
-	replyTo := cb.Message.MessageID
+	messageID := cb.Message.MessageID
 	now := time.Now().In(b.loc)
 	switch {
 	case cb.Data == "watch:menu":
 		if err := b.tg.AnswerCallback(ctx, cb.ID, "已刷新"); err != nil {
 			return err
 		}
-		return b.sendAddressWatchMenu(ctx, chatID, cb.From.ID, replyTo)
+		return b.editAddressWatchMenu(ctx, chatID, messageID, cb.From.ID)
 	case cb.Data == "watch:add":
 		b.privateStates.Set(formatID(cb.From.ID), privateState{Mode: "watch_add", CreatedAt: now})
 		if err := b.tg.AnswerCallback(ctx, cb.ID, "请输入监听地址"); err != nil {
 			return err
 		}
-		_, err := b.tg.SendMessage(ctx, chatID, "请发送要监听的 TRC20 地址，可在地址后面加备注。\n例如：TGhAAy... 监控地址", map[string]any{"reply_to_message_id": replyTo})
+		_, err := b.tg.SendMessage(ctx, chatID, "请发送要监听的 TRC20 地址，可在地址后面加备注。\n例如：TGhAAy... 监控地址", nil)
 		return err
 	case cb.Data == "watch:remove":
 		b.privateStates.Set(formatID(cb.From.ID), privateState{Mode: "watch_remove", CreatedAt: now})
 		if err := b.tg.AnswerCallback(ctx, cb.ID, "请输入要删除的地址"); err != nil {
 			return err
 		}
-		_, err := b.tg.SendMessage(ctx, chatID, "请发送要删除的 TRC20 监听地址。", map[string]any{"reply_to_message_id": replyTo})
+		_, err := b.tg.SendMessage(ctx, chatID, "请发送要删除的 TRC20 监听地址。", nil)
 		return err
 	case cb.Data == "watch:min":
 		b.privateStates.Set(formatID(cb.From.ID), privateState{Mode: "watch_min", CreatedAt: now})
 		if err := b.tg.AnswerCallback(ctx, cb.ID, "请输入最小金额"); err != nil {
 			return err
 		}
-		_, err := b.tg.SendMessage(ctx, chatID, "请发送最小提醒金额，低于这个 USDT 金额不提醒。\n例如：10；发送 0 表示全部提醒。", map[string]any{"reply_to_message_id": replyTo})
+		_, err := b.tg.SendMessage(ctx, chatID, "请发送最小提醒金额，低于这个 USDT 金额不提醒。\n例如：10；发送 0 表示全部提醒。", nil)
 		return err
 	case cb.Data == "watch:income", cb.Data == "watch:expense", cb.Data == "watch:trx":
 		return b.toggleAddressWatchSetting(ctx, cb, now)
+	case strings.HasPrefix(cb.Data, "watch:open:"):
+		address := strings.TrimPrefix(cb.Data, "watch:open:")
+		if err := b.tg.AnswerCallback(ctx, cb.ID, "已打开"); err != nil {
+			return err
+		}
+		return b.editAddressWatchDetail(ctx, chatID, messageID, cb.From.ID, address)
+	case strings.HasPrefix(cb.Data, "watch:t:"):
+		return b.handleAddressWatchTargetCallback(ctx, cb, now)
 	case strings.HasPrefix(cb.Data, "watch:del:"):
 		address := strings.TrimPrefix(cb.Data, "watch:del:")
 		removed, err := b.store.RemoveWatch(ctx, cb.From.ID, address, now)
@@ -101,7 +106,7 @@ func (b *Bot) handleAddressWatchCallback(ctx context.Context, cb telegram.Callba
 		} else if err := b.tg.AnswerCallback(ctx, cb.ID, "没有找到这个地址"); err != nil {
 			return err
 		}
-		return b.sendAddressWatchMenu(ctx, chatID, cb.From.ID, replyTo)
+		return b.editAddressWatchMenu(ctx, chatID, messageID, cb.From.ID)
 	default:
 		return b.tg.AnswerCallback(ctx, cb.ID, "")
 	}
@@ -147,9 +152,130 @@ func (b *Bot) handleAddressWatchState(ctx context.Context, msg telegram.Message,
 		b.watchTargetCache.Clear()
 		_, _ = b.tg.SendMessage(ctx, msg.Chat.ID, "最小提醒金额已设置为 "+minAmount+" USDT。", map[string]any{"reply_to_message_id": msg.MessageID})
 		return b.sendAddressWatchMenu(ctx, msg.Chat.ID, user.ID, msg.MessageID)
+	case "watch_target_min":
+		minAmount := formatRat(parseRat(text), 2)
+		if parseRat(text) == nil || parseRat(text).Sign() < 0 {
+			_, err := b.tg.SendMessage(ctx, msg.Chat.ID, "最小提醒金额格式不正确，请发送大于等于 0 的数字。", nil)
+			return err
+		}
+		target, ok, err := b.store.GetWatchTarget(ctx, user.ID, state.WatchAddress)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			_, err := b.tg.SendMessage(ctx, msg.Chat.ID, "没有找到这个监听地址。", nil)
+			return err
+		}
+		target.MinNotifyAmount = minAmount
+		if _, err := b.store.UpdateWatchTarget(ctx, target, now); err != nil {
+			return err
+		}
+		b.watchTargetCache.Clear()
+		_, _ = b.tg.SendMessage(ctx, msg.Chat.ID, "最小提醒金额已设置为 "+minAmount+" USDT。", nil)
+		return b.sendAddressWatchDetail(ctx, msg.Chat.ID, user.ID, target.Address)
+	case "watch_target_label":
+		target, ok, err := b.store.GetWatchTarget(ctx, user.ID, state.WatchAddress)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			_, err := b.tg.SendMessage(ctx, msg.Chat.ID, "没有找到这个监听地址。", nil)
+			return err
+		}
+		target.Label = normalizeWatchLabel(text)
+		if _, err := b.store.UpdateWatchTarget(ctx, target, now); err != nil {
+			return err
+		}
+		b.watchTargetCache.Clear()
+		_, _ = b.tg.SendMessage(ctx, msg.Chat.ID, "备注已保存。", nil)
+		return b.sendAddressWatchDetail(ctx, msg.Chat.ID, user.ID, target.Address)
 	default:
 		return nil
 	}
+}
+
+func (b *Bot) handleAddressWatchTargetCallback(ctx context.Context, cb telegram.CallbackQuery, now time.Time) error {
+	if cb.Message == nil {
+		return b.tg.AnswerCallback(ctx, cb.ID, "")
+	}
+	parts := strings.SplitN(strings.TrimPrefix(cb.Data, "watch:t:"), ":", 2)
+	if len(parts) != 2 {
+		return b.tg.AnswerCallback(ctx, cb.ID, "")
+	}
+	action, address := parts[0], parts[1]
+	chatID := cb.Message.Chat.ID
+	messageID := cb.Message.MessageID
+	if action == "back" {
+		if err := b.tg.AnswerCallback(ctx, cb.ID, "返回列表"); err != nil {
+			return err
+		}
+		return b.editAddressWatchMenu(ctx, chatID, messageID, cb.From.ID)
+	}
+	target, ok, err := b.store.GetWatchTarget(ctx, cb.From.ID, address)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		if err := b.tg.AnswerCallback(ctx, cb.ID, "没有找到这个地址"); err != nil {
+			return err
+		}
+		return b.editAddressWatchMenu(ctx, chatID, messageID, cb.From.ID)
+	}
+	switch action {
+	case "enabled":
+		enabled := targetWatchEnabled(target)
+		target.WatchIncome = !enabled
+		target.WatchExpense = !enabled
+		if !enabled {
+			target.NotifyTRX = true
+		} else {
+			target.NotifyTRX = false
+		}
+	case "income":
+		target.WatchIncome = !target.WatchIncome
+	case "expense":
+		target.WatchExpense = !target.WatchExpense
+	case "trx":
+		target.NotifyTRX = !target.NotifyTRX
+	case "min":
+		b.privateStates.Set(formatID(cb.From.ID), privateState{Mode: "watch_target_min", WatchAddress: address, CreatedAt: now})
+		if err := b.tg.AnswerCallback(ctx, cb.ID, "请输入最小金额"); err != nil {
+			return err
+		}
+		_, err := b.tg.SendMessage(ctx, chatID, "请发送这个地址的最小提醒金额，低于这个 USDT 金额不提醒。\n例如：10；发送 0 表示全部提醒。", nil)
+		return err
+	case "label":
+		b.privateStates.Set(formatID(cb.From.ID), privateState{Mode: "watch_target_label", WatchAddress: address, CreatedAt: now})
+		if err := b.tg.AnswerCallback(ctx, cb.ID, "请输入备注"); err != nil {
+			return err
+		}
+		_, err := b.tg.SendMessage(ctx, chatID, "请发送这个地址的备注。发送“清空”可删除备注。", nil)
+		return err
+	case "del":
+		removed, err := b.store.RemoveWatch(ctx, cb.From.ID, address, now)
+		if err != nil {
+			return err
+		}
+		b.watchTargetCache.Clear()
+		if removed {
+			if err := b.tg.AnswerCallback(ctx, cb.ID, "已删除"); err != nil {
+				return err
+			}
+		} else if err := b.tg.AnswerCallback(ctx, cb.ID, "没有找到这个地址"); err != nil {
+			return err
+		}
+		return b.editAddressWatchMenu(ctx, chatID, messageID, cb.From.ID)
+	default:
+		return b.tg.AnswerCallback(ctx, cb.ID, "")
+	}
+	if _, err := b.store.UpdateWatchTarget(ctx, target, now); err != nil {
+		return err
+	}
+	b.watchTargetCache.Clear()
+	if err := b.tg.AnswerCallback(ctx, cb.ID, "已更新"); err != nil {
+		return err
+	}
+	return b.editAddressWatchDetail(ctx, chatID, messageID, cb.From.ID, address)
 }
 
 func (b *Bot) toggleAddressWatchSetting(ctx context.Context, cb telegram.CallbackQuery, now time.Time) error {
@@ -196,18 +322,64 @@ func (b *Bot) addWatchFromPrivate(ctx context.Context, msg telegram.Message, use
 	return err
 }
 
-func formatAddressWatchMenuText(settings storage.WatchSettings, targets []storage.WatchTarget) string {
+func (b *Bot) editAddressWatchMenu(ctx context.Context, chatID, messageID, ownerID int64) error {
+	targets, err := b.store.ListWatchTargetsForOwner(ctx, ownerID)
+	if err != nil {
+		return err
+	}
+	_, err = b.tg.EditMessageText(ctx, chatID, messageID, formatAddressWatchMenuText(targets), map[string]any{
+		"parse_mode": "HTML",
+		"reply_markup": telegram.InlineKeyboardMarkup{
+			InlineKeyboard: addressWatchKeyboard(targets),
+		},
+	})
+	return err
+}
+
+func (b *Bot) sendAddressWatchDetail(ctx context.Context, chatID, ownerID int64, address string) error {
+	target, ok, err := b.store.GetWatchTarget(ctx, ownerID, address)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		_, err := b.tg.SendMessage(ctx, chatID, "没有找到这个监听地址。", nil)
+		return err
+	}
+	_, err = b.tg.SendMessage(ctx, chatID, formatAddressWatchDetailText(target), map[string]any{
+		"parse_mode": "HTML",
+		"reply_markup": telegram.InlineKeyboardMarkup{
+			InlineKeyboard: addressWatchDetailKeyboard(target),
+		},
+	})
+	return err
+}
+
+func (b *Bot) editAddressWatchDetail(ctx context.Context, chatID, messageID, ownerID int64, address string) error {
+	target, ok, err := b.store.GetWatchTarget(ctx, ownerID, address)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		_, err := b.tg.EditMessageText(ctx, chatID, messageID, "没有找到这个监听地址。", map[string]any{
+			"reply_markup": telegram.InlineKeyboardMarkup{InlineKeyboard: [][]telegram.InlineKeyboardButton{
+				{{Text: "返回列表", CallbackData: "watch:menu"}},
+			}},
+		})
+		return err
+	}
+	_, err = b.tg.EditMessageText(ctx, chatID, messageID, formatAddressWatchDetailText(target), map[string]any{
+		"parse_mode": "HTML",
+		"reply_markup": telegram.InlineKeyboardMarkup{
+			InlineKeyboard: addressWatchDetailKeyboard(target),
+		},
+	})
+	return err
+}
+
+func formatAddressWatchMenuText(targets []storage.WatchTarget) string {
 	var out strings.Builder
-	out.WriteString("USDT 地址监听\n\n")
-	out.WriteString("收入：")
-	out.WriteString(onOff(settings.WatchIncome))
-	out.WriteString("  支出：")
-	out.WriteString(onOff(settings.WatchExpense))
-	out.WriteString("\nTRX通知：")
-	out.WriteString(onOff(settings.NotifyTRX))
-	out.WriteString("  最小提醒：")
-	out.WriteString(settings.MinNotifyAmount)
-	out.WriteString(" USDT\n\n当前监听地址：")
+	out.WriteString("<b>USDT 地址监听</b>\n\n")
+	out.WriteString("当前监听地址：")
 	if len(targets) == 0 {
 		out.WriteString("\n暂无")
 		return out.String()
@@ -216,32 +388,66 @@ func formatAddressWatchMenuText(settings storage.WatchSettings, targets []storag
 		out.WriteByte('\n')
 		out.WriteString(strconv.Itoa(i + 1))
 		out.WriteString(". ")
-		out.WriteString(target.Address)
-		if target.Label != "" {
-			out.WriteString("  ")
-			out.WriteString(target.Label)
-		}
+		out.WriteString(html.EscapeString(target.Address))
+		out.WriteString("  ")
+		out.WriteString(onOff(targetWatchEnabled(target)))
 	}
 	return out.String()
 }
 
-func addressWatchKeyboard(settings storage.WatchSettings, targets []storage.WatchTarget) [][]telegram.InlineKeyboardButton {
+func formatAddressWatchDetailText(target storage.WatchTarget) string {
+	var out strings.Builder
+	out.WriteString("<b>监听地址设置</b>\n\n")
+	out.WriteString("<code>")
+	out.WriteString(html.EscapeString(target.Address))
+	out.WriteString("</code>\n")
+	out.WriteString("状态：")
+	out.WriteString(onOff(targetWatchEnabled(target)))
+	out.WriteString("\n备注：")
+	if target.Label == "" {
+		out.WriteString("无")
+	} else {
+		out.WriteString(html.EscapeString(target.Label))
+	}
+	out.WriteString("\n\n收入：")
+	out.WriteString(onOff(target.WatchIncome))
+	out.WriteString("  支出：")
+	out.WriteString(onOff(target.WatchExpense))
+	out.WriteString("\nTRX通知：")
+	out.WriteString(onOff(target.NotifyTRX))
+	out.WriteString("  最小提醒：")
+	out.WriteString(target.MinNotifyAmount)
+	out.WriteString(" USDT")
+	return out.String()
+}
+
+func addressWatchKeyboard(targets []storage.WatchTarget) [][]telegram.InlineKeyboardButton {
 	rows := [][]telegram.InlineKeyboardButton{
-		{{Text: "添加地址", CallbackData: "watch:add"}, {Text: "删除地址", CallbackData: "watch:remove"}},
-		{{Text: "收入 " + onOff(settings.WatchIncome), CallbackData: "watch:income"}, {Text: "支出 " + onOff(settings.WatchExpense), CallbackData: "watch:expense"}},
-		{{Text: "TRX通知 " + onOff(settings.NotifyTRX), CallbackData: "watch:trx"}, {Text: "最小金额 " + settings.MinNotifyAmount, CallbackData: "watch:min"}},
+		{{Text: "添加地址", CallbackData: "watch:add"}},
 	}
 	for _, target := range targets {
 		rows = append(rows, []telegram.InlineKeyboardButton{{
-			Text:         "删除 " + shortAddress(target.Address),
-			CallbackData: "watch:del:" + target.Address,
+			Text:         target.Address + "  " + onOff(targetWatchEnabled(target)),
+			CallbackData: "watch:open:" + target.Address,
 		}})
-		if len(rows) >= 12 {
-			break
-		}
 	}
 	rows = append(rows, []telegram.InlineKeyboardButton{{Text: "刷新", CallbackData: "watch:menu"}})
 	return rows
+}
+
+func addressWatchDetailKeyboard(target storage.WatchTarget) [][]telegram.InlineKeyboardButton {
+	enabledAction := "关闭监听"
+	if !targetWatchEnabled(target) {
+		enabledAction = "开启监听"
+	}
+	address := target.Address
+	return [][]telegram.InlineKeyboardButton{
+		{{Text: enabledAction, CallbackData: "watch:t:enabled:" + address}},
+		{{Text: "收入 " + onOff(target.WatchIncome), CallbackData: "watch:t:income:" + address}, {Text: "支出 " + onOff(target.WatchExpense), CallbackData: "watch:t:expense:" + address}},
+		{{Text: "TRX通知 " + onOff(target.NotifyTRX), CallbackData: "watch:t:trx:" + address}, {Text: "最小金额 " + target.MinNotifyAmount, CallbackData: "watch:t:min:" + address}},
+		{{Text: "设置备注", CallbackData: "watch:t:label:" + address}, {Text: "删除地址", CallbackData: "watch:t:del:" + address}},
+		{{Text: "返回列表", CallbackData: "watch:t:back:" + address}},
+	}
 }
 
 func parseWatchAddressAndLabel(text string) (string, string) {
@@ -259,6 +465,20 @@ func onOff(value bool) string {
 		return "开启"
 	}
 	return "关闭"
+}
+
+func targetWatchEnabled(target storage.WatchTarget) bool {
+	return target.WatchIncome || target.WatchExpense || target.NotifyTRX
+}
+
+func normalizeWatchLabel(text string) string {
+	text = strings.TrimSpace(text)
+	switch text {
+	case "清空", "删除", "无", "-":
+		return ""
+	default:
+		return text
+	}
 }
 
 func (b *Bot) removeWatchFromPrivate(ctx context.Context, msg telegram.Message, user storage.User, address string, now time.Time) error {
@@ -412,14 +632,14 @@ func formatTransferNotice(t tron.Transfer, w storage.WatchTarget, direction stri
 	if t.To == w.Address && w.Label != "" {
 		to += " ← " + w.Label
 	}
-	return fmt.Sprintf("交易类型： %s\n交易金额： %s USDT\n出账地址： <code>%s</code>\n入账地址： <code>%s</code>\n交易时间： %s\n交易哈希： <a href=\"https://tronscan.org/#/transaction/%s\">%s</a>",
+	return fmt.Sprintf("交易类型： %s\n交易金额： %s USDT\n出账地址： %s\n入账地址： %s\n交易时间： %s\n交易哈希： <a href=\"https://tronscan.org/#/transaction/%s\">%s</a>",
 		label,
 		signedAmount,
-		from,
-		to,
+		formatCode(from),
+		formatCode(to),
 		time.UnixMilli(t.BlockTimestamp).Format("2006-01-02 15:04:05"),
-		t.Hash,
-		shortHash(t.Hash),
+		html.EscapeString(t.Hash),
+		html.EscapeString(shortHash(t.Hash)),
 	)
 }
 

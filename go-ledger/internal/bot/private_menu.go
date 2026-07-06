@@ -16,13 +16,37 @@ func (b *Bot) handlePrivateShortcut(ctx context.Context, msg telegram.Message, u
 	case "📃详细说明", "详细说明":
 		return true, b.sendPrivateText(ctx, msg.Chat.ID, msg.MessageID, privateDetailedHelp())
 	case "🔎查询UID", "查询UID":
-		return true, b.sendPrivateText(ctx, msg.Chat.ID, msg.MessageID,
-			fmt.Sprintf("你的 Telegram UID：%d\n\n需要添加别人为操作人时，让对方私聊机器人发送“我的ID”，然后把 UID 填到后台或在群内用操作员命令添加。", user.ID))
+		return true, b.sendUIDLookup(ctx, msg.Chat.ID, msg.MessageID, user.ID)
 	case "⚙后台管理", "后台管理", "👥广播权限", "广播权限", "🔁广播替换", "广播替换":
 		return true, b.sendAdminEntry(ctx, msg.Chat.ID, msg.MessageID)
 	default:
 		return false, nil
 	}
+}
+
+func (b *Bot) sendUIDLookup(ctx context.Context, chatID, replyTo, userID int64) error {
+	userIsBot := false
+	keyboard := telegram.ReplyKeyboardMarkup{
+		Keyboard: [][]telegram.KeyboardButton{
+			{{
+				Text: "选择用户获取UID",
+				RequestUsers: &telegram.KeyboardButtonRequestUsers{
+					RequestID:   1001,
+					UserIsBot:   &userIsBot,
+					MaxQuantity: 5,
+				},
+			}},
+			{{Text: "菜单"}},
+		},
+		ResizeKeyboard:  true,
+		OneTimeKeyboard: true,
+	}
+	text := fmt.Sprintf("你的 Telegram UID：%d\n\n可以点击下方按钮选择用户获取 UID，也可以让对方私聊机器人发送“我的ID”。", userID)
+	_, err := b.tg.SendMessage(ctx, chatID, text, map[string]any{
+		"reply_to_message_id": replyTo,
+		"reply_markup":        keyboard,
+	})
+	return err
 }
 
 func (b *Bot) sendPrivateText(ctx context.Context, chatID, replyTo int64, text string) error {

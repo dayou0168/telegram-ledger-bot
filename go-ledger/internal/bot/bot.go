@@ -232,6 +232,14 @@ func (b *Bot) handleMessage(ctx context.Context, msg telegram.Message) error {
 	}
 	cmd, ok := parseLedger(text)
 	if !ok {
+		if isArithmeticExpression(text) {
+			result, err := calculateExpression(text)
+			if err != nil {
+				return nil
+			}
+			_, err = b.tg.SendMessage(ctx, msg.Chat.ID, strings.TrimSpace(text)+"="+formatCalculationResult(result), nil)
+			return err
+		}
 		return nil
 	}
 	return b.handleLedger(ctx, msg, user, cmd, now)
@@ -240,6 +248,9 @@ func (b *Bot) handleMessage(ctx context.Context, msg telegram.Message) error {
 func (b *Bot) handlePrivateMessage(ctx context.Context, msg telegram.Message, user storage.User, text string, now time.Time) error {
 	if err := b.store.TouchUser(ctx, msg.Chat.ID, user, now); err != nil {
 		return err
+	}
+	if msg.UsersShared != nil {
+		return b.handleUsersShared(ctx, msg)
 	}
 	if text == "/start" || text == "菜单" || text == "" {
 		return b.sendPrivateMenu(ctx, msg.Chat.ID, msg.MessageID)
@@ -272,7 +283,7 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg telegram.Message, us
 		switch state.Mode {
 		case "quick_reply":
 			return b.handleQuickReplyMaterial(ctx, msg, user, state)
-		case "watch_add", "watch_remove", "watch_min":
+		case "watch_add", "watch_remove", "watch_min", "watch_target_min", "watch_target_label":
 			return b.handleAddressWatchState(ctx, msg, user, state, text, now)
 		default:
 			return b.handleBroadcastMaterial(ctx, msg, user, state, now)
@@ -285,6 +296,29 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg telegram.Message, us
 		return b.removeWatchFromPrivate(ctx, msg, user, match[1], now)
 	}
 	return b.sendPrivateMenu(ctx, msg.Chat.ID, msg.MessageID)
+}
+
+func (b *Bot) handleUsersShared(ctx context.Context, msg telegram.Message) error {
+	if msg.UsersShared == nil || len(msg.UsersShared.Users) == 0 {
+		_, err := b.tg.SendMessage(ctx, msg.Chat.ID, "没有获取到用户 UID。", map[string]any{"reply_to_message_id": msg.MessageID})
+		return err
+	}
+	var out strings.Builder
+	out.WriteString("已获取用户 UID：")
+	for _, shared := range msg.UsersShared.Users {
+		out.WriteByte('\n')
+		name := strings.TrimSpace(strings.TrimSpace(shared.FirstName + " " + shared.LastName))
+		if name == "" && shared.Username != "" {
+			name = "@" + shared.Username
+		}
+		if name != "" {
+			out.WriteString(name)
+			out.WriteString("：")
+		}
+		out.WriteString(formatID(shared.UserID))
+	}
+	_, err := b.tg.SendMessage(ctx, msg.Chat.ID, out.String(), map[string]any{"reply_to_message_id": msg.MessageID})
+	return err
 }
 
 func (b *Bot) handleCallback(ctx context.Context, cb telegram.CallbackQuery) error {
@@ -317,7 +351,10 @@ func (b *Bot) handleMyChatMember(ctx context.Context, upd telegram.ChatMemberUpd
 			_, _ = b.tg.SendMessage(ctx, upd.Chat.ID, "邀请人没有授权，机器人将自动退出。", nil)
 			return b.tg.LeaveChat(ctx, upd.Chat.ID)
 		}
-		return b.store.EnsureGroup(ctx, upd.Chat.ID, upd.Chat.Title, now)
+		if err := b.store.EnsureGroup(ctx, upd.Chat.ID, upd.Chat.Title, now); err != nil {
+			return err
+		}
+		return nil
 	}
 	return nil
 }

@@ -18,11 +18,13 @@ const (
 )
 
 type ledgerCommand struct {
-	Kind   string
-	Amount *big.Rat
-	Rate   *big.Rat
-	IsUSDT bool
-	Remark string
+	Kind       string
+	Amount     *big.Rat
+	Multiplier *big.Rat
+	Rate       *big.Rat
+	FeeRate    *big.Rat
+	IsUSDT     bool
+	Remark     string
 }
 
 type settingCommand struct {
@@ -37,8 +39,8 @@ type zRateCommand struct {
 }
 
 var (
-	depositPattern  = regexp.MustCompile(`^\+([0-9]+(?:\.[0-9]+)?)(?:/([0-9]+(?:\.[0-9]+)?))?([uU])?(?:\s+(.+))?$`)
-	payoutPattern   = regexp.MustCompile(`^下发\s*([0-9]+(?:\.[0-9]+)?)([uU])(?:\s+(.+))?$`)
+	depositPattern  = regexp.MustCompile(`^([+-])\s*([0-9]+(?:\.[0-9]+)?)([uU])?(?:\s*\*\s*([0-9]+(?:\.[0-9]+)?)(%)?)?(?:\s*/\s*([0-9]+(?:\.[0-9]+)?))?(?:\s+(.+))?$`)
+	payoutPattern   = regexp.MustCompile(`^下发\s*([+-]?[0-9]+(?:\.[0-9]+)?)([uU])?(?:\s*\*\s*([0-9]+(?:\.[0-9]+)?))?(?:\s*/\s*([0-9]+(?:\.[0-9]+)?))?(?:\s+(.+))?$`)
 	feePattern      = regexp.MustCompile(`^设置(?:入款|下发)?费率\s*([+-]?[0-9]+(?:\.[0-9]+)?)%?$`)
 	ratePattern     = regexp.MustCompile(`^设置(?:入款|下发)?汇率\s*([+-]?[0-9]+(?:\.[0-9]+)?)$`)
 	cutoffPattern   = regexp.MustCompile(`^设置日切\s*(-?[0-9]{1,2})$`)
@@ -52,26 +54,94 @@ var (
 func parseLedger(text string) (ledgerCommand, bool) {
 	text = strings.TrimSpace(text)
 	if match := depositPattern.FindStringSubmatch(text); match != nil {
-		amount := parseRat(match[1])
-		rate := parseRat(match[2])
+		amount := parseRat(match[2])
+		if amount == nil {
+			return ledgerCommand{}, false
+		}
+		if match[1] == "-" {
+			amount.Neg(amount)
+		}
+		multiplier := parseRat(match[4])
+		if multiplier == nil {
+			multiplier = big.NewRat(1, 1)
+		}
+		inlineFee := (*big.Rat)(nil)
+		if match[5] != "" {
+			inlineFee = parseRat(match[4])
+			multiplier = big.NewRat(1, 1)
+		}
+		rate := parseRat(match[6])
+		feeRate, remark := parseLedgerTail(match[7])
+		if feeRate == nil {
+			feeRate = inlineFee
+		}
 		return ledgerCommand{
-			Kind:   "deposit",
-			Amount: amount,
-			Rate:   rate,
-			IsUSDT: strings.EqualFold(match[3], "u"),
-			Remark: strings.TrimSpace(match[4]),
-		}, amount != nil
+			Kind:       "deposit",
+			Amount:     amount,
+			Multiplier: multiplier,
+			Rate:       rate,
+			FeeRate:    feeRate,
+			IsUSDT:     strings.EqualFold(match[3], "u"),
+			Remark:     remark,
+		}, true
 	}
 	if match := payoutPattern.FindStringSubmatch(text); match != nil {
 		amount := parseRat(match[1])
+		if amount == nil {
+			return ledgerCommand{}, false
+		}
+		multiplier := parseRat(match[3])
+		if multiplier == nil {
+			multiplier = big.NewRat(1, 1)
+		}
+		rate := parseRat(match[4])
+		isUSDT := strings.EqualFold(match[2], "u")
+		if !isUSDT && multiplier.Cmp(big.NewRat(1, 1)) == 0 && rate == nil {
+			return ledgerCommand{}, false
+		}
+		_, remark := parseLedgerTail(match[5])
 		return ledgerCommand{
-			Kind:   "payout",
-			Amount: amount,
-			IsUSDT: true,
-			Remark: strings.TrimSpace(match[3]),
-		}, amount != nil
+			Kind:       "payout",
+			Amount:     amount,
+			Multiplier: multiplier,
+			Rate:       rate,
+			IsUSDT:     isUSDT,
+			Remark:     remark,
+		}, true
 	}
 	return ledgerCommand{}, false
+}
+
+func parseLedgerTail(tail string) (*big.Rat, string) {
+	tokens := strings.Fields(strings.TrimSpace(tail))
+	if len(tokens) == 0 {
+		return nil, ""
+	}
+	var kept []string
+	var feeRate *big.Rat
+	for _, token := range tokens {
+		if fee := parseFeeToken(token); fee != nil {
+			feeRate = fee
+			continue
+		}
+		kept = append(kept, token)
+	}
+	return feeRate, strings.Join(kept, " ")
+}
+
+func parseFeeToken(token string) *big.Rat {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return nil
+	}
+	if strings.HasPrefix(token, "费率") {
+		raw := strings.TrimSuffix(strings.TrimPrefix(token, "费率"), "%")
+		return parseRat(raw)
+	}
+	if strings.HasSuffix(token, "%") {
+		return parseRat(strings.TrimSuffix(token, "%"))
+	}
+	return nil
 }
 
 func parseSetting(text string) (settingCommand, bool) {
@@ -219,11 +289,12 @@ func formatRat(value *big.Rat, precision int) string {
 
 func formatAmount(value *big.Rat) string {
 	if value == nil {
-		return "0.00"
+		return "0"
 	}
 	text := value.FloatString(2)
-	if text == "-0.00" {
-		return "0.00"
+	text = strings.TrimRight(strings.TrimRight(text, "0"), ".")
+	if text == "" || text == "-0" {
+		return "0"
 	}
 	return text
 }

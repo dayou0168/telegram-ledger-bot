@@ -7,6 +7,7 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"math/big"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -41,6 +42,7 @@ type billData struct {
 	Group        storage.Group
 	DayKey       string
 	Records      []storage.Record
+	Summary      billSummary
 	BillDays     []string
 	PrevDay      string
 	NextDay      string
@@ -50,6 +52,19 @@ type billData struct {
 	DownloadPath string
 	Query        string
 	Field        string
+}
+
+type billSummary struct {
+	Deposits         []storage.Record
+	Payouts          []storage.Record
+	DepositCount     int
+	PayoutCount      int
+	TotalDepositCNY  string
+	TotalDepositUSDT string
+	TotalPayoutUSDT  string
+	BalanceUSDT      string
+	ExchangeRate     string
+	FeeRate          string
 }
 
 func New(cfg config.Config, store *storage.Store) *Server {
@@ -127,6 +142,7 @@ func (s *Server) bill(w http.ResponseWriter, r *http.Request) {
 		Group:        group,
 		DayKey:       dayKey,
 		Records:      records,
+		Summary:      summarizeBill(group, records),
 		BillDays:     days,
 		PrevDay:      addDay(dayKey, -1),
 		NextDay:      addDay(dayKey, 1),
@@ -536,7 +552,7 @@ func buildBillXLSX(group storage.Group, dayKey string, records []storage.Record)
 			billKind(record.Kind),
 			record.CreatedAt.Format("2006-01-02 15:04:05"),
 			billAmount(record),
-			record.Rate,
+			billNumber(record.Rate, 8),
 			record.ActorName,
 			record.Remark,
 		}
@@ -576,13 +592,19 @@ func safeFileName(value, fallback string) string {
 }
 
 func billAmount(record storage.Record) string {
+	amount := billNumber(record.Amount, 2)
 	if strings.EqualFold(record.Currency, "USDT") {
-		return record.Amount + "U"
+		return amount + "U"
 	}
-	if record.Rate == "" || record.Rate == "1" {
-		return record.Amount
+	rate := billNumber(record.Rate, 8)
+	if rate == "" || rate == "1" {
+		return amount
 	}
-	return record.Amount + "/" + record.Rate + "=" + record.ResultUSDT + "U"
+	result := billNumber(record.ResultUSDT, 2)
+	if result == "" {
+		return amount + "/" + rate
+	}
+	return amount + "/" + rate + "=" + result + "U"
 }
 
 func billKind(kind string) string {
@@ -590,6 +612,107 @@ func billKind(kind string) string {
 		return "下发"
 	}
 	return "入款"
+}
+
+func summarizeBill(group storage.Group, records []storage.Record) billSummary {
+	summary := billSummary{
+		ExchangeRate: billExchangeRateDisplay(group),
+		FeeRate:      group.FeeRate,
+	}
+	totalDepositCNY := big.NewRat(0, 1)
+	totalDepositUSDT := big.NewRat(0, 1)
+	totalPayoutUSDT := big.NewRat(0, 1)
+	for _, record := range records {
+		result := parseBillRat(record.ResultUSDT)
+		if result == nil {
+			result = big.NewRat(0, 1)
+		}
+		switch record.Kind {
+		case "deposit":
+			summary.Deposits = append(summary.Deposits, record)
+			totalDepositUSDT.Add(totalDepositUSDT, result)
+			if strings.EqualFold(record.Currency, "CNY") {
+				if amount := parseBillRat(record.Amount); amount != nil {
+					totalDepositCNY.Add(totalDepositCNY, amount)
+				}
+			}
+		case "payout":
+			summary.Payouts = append(summary.Payouts, record)
+			totalPayoutUSDT.Add(totalPayoutUSDT, result)
+		}
+	}
+	balance := new(big.Rat).Sub(totalDepositUSDT, totalPayoutUSDT)
+	summary.DepositCount = len(summary.Deposits)
+	summary.PayoutCount = len(summary.Payouts)
+	summary.TotalDepositCNY = formatBillRat(totalDepositCNY, 2)
+	summary.TotalDepositUSDT = formatBillRat(totalDepositUSDT, 2)
+	summary.TotalPayoutUSDT = formatBillRat(totalPayoutUSDT, 2)
+	summary.BalanceUSDT = formatBillRat(balance, 2)
+	if summary.FeeRate == "" {
+		summary.FeeRate = "0"
+	}
+	summary.FeeRate = billNumber(summary.FeeRate, 2)
+	return summary
+}
+
+func billExchangeRateDisplay(group storage.Group) string {
+	if group.ExchangeRateSource != "" && group.ExchangeRateRank > 0 {
+		source := strings.TrimSpace(group.ExchangeRateSource)
+		if source == "" {
+			source = "支付宝"
+		}
+		label := source + strconv.Itoa(group.ExchangeRateRank) + "档"
+		offset := parseBillRat(group.ExchangeRateOffset)
+		if offset == nil || offset.Sign() == 0 {
+			return label
+		}
+		if offset.Sign() > 0 {
+			return label + " 上浮" + formatBillRat(offset, 8)
+		}
+		abs := new(big.Rat).Neg(offset)
+		return label + " 下浮" + formatBillRat(abs, 8)
+	}
+	rate := billNumber(group.DepositExchangeRate, 8)
+	if rate == "" {
+		return "1"
+	}
+	return rate
+}
+
+func parseBillRat(raw string) *big.Rat {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	value, ok := new(big.Rat).SetString(raw)
+	if !ok {
+		return nil
+	}
+	return value
+}
+
+func formatBillRat(value *big.Rat, precision int) string {
+	if value == nil {
+		return "0"
+	}
+	text := value.FloatString(precision)
+	text = strings.TrimRight(strings.TrimRight(text, "0"), ".")
+	if text == "" || text == "-0" {
+		return "0"
+	}
+	return text
+}
+
+func billNumber(raw string, precision int) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	value := parseBillRat(raw)
+	if value == nil {
+		return raw
+	}
+	return formatBillRat(value, precision)
 }
 
 func normalizedBillField(field string) string {
@@ -826,16 +949,18 @@ const billHTML = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>完整账单</title>
 <style>
-:root{--bg:#eaf1f7;--panel:#fff;--line:#d8e2ee;--ink:#0e1b2f;--muted:#5b6f88;--gold:#d8b45d;--blue:#244f9f}
+:root{--bg:#eaf1f7;--panel:#fff;--line:#d8e2ee;--ink:#0e1b2f;--muted:#5b6f88;--gold:#d8b45d;--blue:#244f9f;--deep:#14223a}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Arial,"Microsoft YaHei",sans-serif}
-.wrap{max-width:1100px;margin:0 auto;padding:26px}.head{display:flex;justify-content:space-between;gap:16px;align-items:flex-end;margin-bottom:18px}
+.wrap{max-width:1120px;margin:0 auto;padding:26px}.head{display:flex;justify-content:space-between;gap:16px;align-items:flex-end;margin-bottom:18px}
 .brand{color:#b97914;font-weight:800}.title{font-size:30px;font-weight:900;margin-top:8px}.sub{color:var(--muted);margin-top:6px}
-.tools{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.btn{height:38px;border:1px solid #c8d6e6;border-radius:6px;background:#fff;color:var(--ink);font-weight:800;padding:0 14px;text-decoration:none;display:inline-flex;align-items:center;cursor:pointer}.btn.primary{background:#14223a;color:#fff;border-color:#14223a}.history{height:38px;border:1px solid #c8d6e6;border-radius:6px;background:#fff;padding:0 10px;font-weight:700}
-.filter{margin:0 0 18px;display:grid;grid-template-columns:minmax(240px,1fr) 140px auto;gap:10px}.filter input,.filter select{height:38px;border:1px solid #c8d6e6;border-radius:6px;background:#fff;color:var(--ink);padding:0 12px;font-size:14px}.filter button{border:0}
-.card{background:var(--panel);border:1px solid #c8d6e6;border-top:5px solid var(--gold);border-radius:8px;padding:20px}
-table{width:100%;border-collapse:collapse}th,td{border:1px solid var(--line);padding:12px;text-align:center;vertical-align:middle}th{background:#f5f8fb;font-size:15px}
-.amount{color:var(--blue);font-weight:700}.empty{padding:40px;text-align:center;color:var(--muted)}
-@media(max-width:720px){.wrap{padding:14px}.head{display:block}.tools{margin-top:14px}.btn,.history{width:100%;justify-content:center}.filter{grid-template-columns:1fr}.filter button{width:100%;justify-content:center}table{font-size:13px}th,td{padding:9px}}
+.tools{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.btn{height:38px;border:1px solid #c8d6e6;border-radius:6px;background:#fff;color:var(--ink);font-weight:800;padding:0 14px;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;cursor:pointer}.btn.primary{background:var(--deep);color:#fff;border-color:var(--deep)}.history{height:38px;border:1px solid #c8d6e6;border-radius:6px;background:#fff;padding:0 10px;font-weight:800;color:var(--ink)}
+.stats{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin:0 0 16px}.stat{background:var(--panel);border:1px solid #c8d6e6;border-radius:8px;padding:14px 16px;min-height:76px}.stat span{display:block;color:var(--muted);font-size:13px}.stat strong{display:block;margin-top:8px;font-size:19px;line-height:1.25}
+.filter-panel{background:var(--panel);border:1px solid #c8d6e6;border-radius:8px;padding:12px;margin-bottom:20px}.filter{display:grid;grid-template-columns:minmax(240px,1fr) 140px auto;gap:10px;margin:0}.filter input,.filter select{height:38px;border:1px solid #c8d6e6;border-radius:6px;background:#fff;color:var(--ink);padding:0 12px;font-size:14px}.filter button{border:0}
+.bill-card{background:var(--panel);border:1px solid #c8d6e6;border-top:5px solid var(--gold);border-radius:8px;padding:18px 18px 14px;margin-top:16px}.bill-card h2{font-size:22px;margin:4px 0 16px}.bill-card h2 small{font-size:14px;color:var(--muted);font-weight:700}.table-scroll{overflow-x:auto}
+table{width:100%;border-collapse:collapse;table-layout:fixed}th,td{border:1px solid var(--line);padding:11px 12px;text-align:center;vertical-align:middle;word-break:break-word}th{background:#f5f8fb;font-size:15px}.time{width:150px}.amount-col{width:260px}.actor{width:260px}.remark{width:auto}
+.amount{color:var(--blue);font-weight:700}.empty{padding:36px;text-align:center;color:var(--muted)}.totals{display:flex;gap:18px;flex-wrap:wrap;margin-top:14px;color:var(--muted);font-size:14px}.totals strong{color:var(--ink)}
+@media(max-width:900px){.stats{grid-template-columns:repeat(2,minmax(0,1fr))}.wrap{padding:18px}.head{display:block}.tools{margin-top:14px}}
+@media(max-width:720px){.wrap{padding:14px}.btn,.history{width:100%}.filter{grid-template-columns:1fr}.filter button{width:100%}table{font-size:13px;min-width:760px}th,td{padding:9px}.stats{grid-template-columns:1fr}.title{font-size:26px}}
 </style>
 </head>
 <body><main class="wrap">
@@ -851,7 +976,15 @@ table{width:100%;border-collapse:collapse}th,td{border:1px solid var(--line);pad
 <a class="btn primary" href="{{.DownloadPath}}">下载账单</a>
 </div>
 </section>
-<section class="card">
+<section class="stats">
+<div class="stat"><span>总入款</span><strong>{{.Summary.TotalDepositCNY}} / {{.Summary.TotalDepositUSDT}}U</strong></div>
+<div class="stat"><span>汇率</span><strong>{{.Summary.ExchangeRate}}</strong></div>
+<div class="stat"><span>交易费率</span><strong>{{.Summary.FeeRate}}%</strong></div>
+<div class="stat"><span>应下发</span><strong>{{.Summary.TotalDepositUSDT}}U</strong></div>
+<div class="stat"><span>已下发</span><strong>{{.Summary.TotalPayoutUSDT}}U</strong></div>
+<div class="stat"><span>余额</span><strong>{{.Summary.BalanceUSDT}}U</strong></div>
+</section>
+<section class="filter-panel">
 <form class="filter" method="get" action="/b/{{.Group.ChatID}}/{{.DayKey}}">
 <input name="q" value="{{.Query}}" placeholder="输入名字、备注、金额或时间关键词">
 <select name="field">
@@ -862,8 +995,19 @@ table{width:100%;border-collapse:collapse}th,td{border:1px solid var(--line);pad
 </select>
 <button class="btn primary" type="submit">搜索</button>
 </form>
-<table><thead><tr><th>类型</th><th>时间</th><th>金额</th><th>操作人</th><th>备注</th></tr></thead><tbody>
-{{range .Records}}<tr><td>{{billKind .Kind}}</td><td>{{.CreatedAt.Format "01-02 15:04:05"}}</td><td class="amount">{{billAmount .}}</td><td>{{.ActorName}}</td><td>{{.Remark}}</td></tr>{{else}}<tr><td class="empty" colspan="5">暂无账单记录</td></tr>{{end}}
-</tbody></table>
+</section>
+<section class="bill-card">
+<h2>入款 <small>({{.Summary.DepositCount}}笔)</small></h2>
+<div class="table-scroll"><table><thead><tr><th class="time">时间</th><th class="amount-col">金额</th><th class="actor">操作人</th><th class="remark">备注</th></tr></thead><tbody>
+{{range .Summary.Deposits}}<tr><td>{{.CreatedAt.Format "01-02 15:04:05"}}</td><td class="amount">{{billAmount .}}</td><td>{{.ActorName}}</td><td>{{.Remark}}</td></tr>{{else}}<tr><td class="empty" colspan="4">暂无入款记录</td></tr>{{end}}
+</tbody></table></div>
+<div class="totals"><span>总入款：<strong>{{.Summary.TotalDepositCNY}} / {{.Summary.TotalDepositUSDT}}U</strong></span><span>汇率：<strong>{{.Summary.ExchangeRate}}</strong></span><span>交易费率：<strong>{{.Summary.FeeRate}}%</strong></span></div>
+</section>
+<section class="bill-card">
+<h2>下发 <small>({{.Summary.PayoutCount}}笔)</small></h2>
+<div class="table-scroll"><table><thead><tr><th class="time">时间</th><th class="amount-col">金额</th><th class="actor">操作人</th><th class="remark">备注</th></tr></thead><tbody>
+{{range .Summary.Payouts}}<tr><td>{{.CreatedAt.Format "01-02 15:04:05"}}</td><td class="amount">{{billAmount .}}</td><td>{{.ActorName}}</td><td>{{.Remark}}</td></tr>{{else}}<tr><td class="empty" colspan="4">暂无下发记录</td></tr>{{end}}
+</tbody></table></div>
+<div class="totals"><span>应下发：<strong>{{.Summary.TotalDepositUSDT}}U</strong></span><span>已下发：<strong>{{.Summary.TotalPayoutUSDT}}U</strong></span><span>余额：<strong>{{.Summary.BalanceUSDT}}U</strong></span></div>
 </section>
 </main></body></html>`

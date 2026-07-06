@@ -39,18 +39,32 @@ func TestBuildBillText(t *testing.T) {
 	}, loc, "")
 
 	wants := []string{
-		"今日入款（1笔）",
-		"01:02:03 100.00/10*0.97=9.70U 阿泽 测试",
-		"今日下发（1笔）",
-		"01:02:04 2.00U 阿泽",
-		"总入款：100.00（9.70U）",
+		"<b>今日入款（1笔）</b>",
+		"01:02:03 100/10*0.97=9.7U 阿泽 测试",
+		"<b>今日下发（1笔）</b>",
+		"01:02:04 2U 阿泽",
+		"总入款：100（9.7U）",
 		"交易费率：3%",
-		"已下发：2.00U",
-		"余额：7.70U",
+		"已下发：2U",
+		"余额：7.7U",
 	}
 	for _, want := range wants {
 		if !strings.Contains(text, want) {
 			t.Fatalf("bill text missing %q:\n%s", want, text)
 		}
+	}
+}
+
+func TestBuildBillTextRealtimeRateLabel(t *testing.T) {
+	loc := time.FixedZone("Asia/Shanghai", 8*3600)
+	text := buildBillText(storage.Group{
+		DepositExchangeRate: "6.63",
+		ExchangeRateSource:  "支付宝",
+		ExchangeRateRank:    1,
+		ExchangeRateOffset:  "-0.1",
+		FeeRate:             "0",
+	}, nil, loc, "")
+	if !strings.Contains(text, "实时汇率：\n支付宝1档 下浮0.1") {
+		t.Fatalf("bill text missing realtime rate label:\n%s", text)
 	}
 }

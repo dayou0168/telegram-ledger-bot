@@ -8,14 +8,15 @@ type Update struct {
 }
 
 type Message struct {
-	MessageID int64     `json:"message_id"`
-	From      *User     `json:"from,omitempty"`
-	Chat      Chat      `json:"chat"`
-	Text      string    `json:"text,omitempty"`
-	Caption   string    `json:"caption,omitempty"`
-	ReplyTo   *Message  `json:"reply_to_message,omitempty"`
-	Photo     []Photo   `json:"photo,omitempty"`
-	Document  *Document `json:"document,omitempty"`
+	MessageID   int64        `json:"message_id"`
+	From        *User        `json:"from,omitempty"`
+	Chat        Chat         `json:"chat"`
+	Text        string       `json:"text,omitempty"`
+	Caption     string       `json:"caption,omitempty"`
+	ReplyTo     *Message     `json:"reply_to_message,omitempty"`
+	Photo       []Photo      `json:"photo,omitempty"`
+	Document    *Document    `json:"document,omitempty"`
+	UsersShared *UsersShared `json:"users_shared,omitempty"`
 }
 
 func (m Message) TextOrCaption() string {
@@ -83,6 +84,18 @@ type Document struct {
 	MimeType string `json:"mime_type,omitempty"`
 }
 
+type UsersShared struct {
+	RequestID int          `json:"request_id"`
+	Users     []SharedUser `json:"users"`
+}
+
+type SharedUser struct {
+	UserID    int64  `json:"user_id"`
+	FirstName string `json:"first_name,omitempty"`
+	LastName  string `json:"last_name,omitempty"`
+	Username  string `json:"username,omitempty"`
+}
+
 type InlineKeyboardMarkup struct {
 	InlineKeyboard [][]InlineKeyboardButton `json:"inline_keyboard"`
 }
@@ -100,7 +113,14 @@ type ReplyKeyboardMarkup struct {
 }
 
 type KeyboardButton struct {
-	Text string `json:"text"`
+	Text         string                      `json:"text"`
+	RequestUsers *KeyboardButtonRequestUsers `json:"request_users,omitempty"`
+}
+
+type KeyboardButtonRequestUsers struct {
+	RequestID   int   `json:"request_id"`
+	UserIsBot   *bool `json:"user_is_bot,omitempty"`
+	MaxQuantity int   `json:"max_quantity,omitempty"`
 }
 
 type ChatPermissions struct {

@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"fmt"
+	"html"
 	"log"
 	"strconv"
 	"strings"
@@ -33,10 +34,13 @@ func (b *Bot) notifyBroadcastReplyAsync(ctx context.Context, msg telegram.Messag
 			{{Text: "快速回复", CallbackData: "br:q:" + formatID(delivery.ID)}},
 			replyLinkButtons(msg, delivery),
 		}}
-		if _, err := b.tg.SendMessage(jobCtx, delivery.OperatorUserID, text, map[string]any{
-			"reply_markup": keyboard,
-		}); err != nil {
-			log.Printf("send broadcast reply notice: %v", err)
+		for recipient := range b.broadcastReplyRecipients(delivery.OperatorUserID) {
+			if _, err := b.tg.SendMessage(jobCtx, recipient, text, map[string]any{
+				"parse_mode":   "HTML",
+				"reply_markup": keyboard,
+			}); err != nil {
+				log.Printf("send broadcast reply notice: %v", err)
+			}
 		}
 	})
 }
@@ -93,7 +97,6 @@ func (b *Bot) handleQuickReplyMaterial(ctx context.Context, msg telegram.Message
 			_, _ = b.tg.SendMessage(sendCtx, msg.Chat.ID, "快速回复发送失败："+err.Error(), map[string]any{"reply_to_message_id": msg.MessageID})
 			return
 		}
-		_, _ = b.tg.SendMessage(sendCtx, msg.Chat.ID, "快速回复已发送。可继续发送下一条，或发“返回”结束。", map[string]any{"reply_to_message_id": msg.MessageID})
 	})
 	return nil
 }
@@ -120,7 +123,32 @@ func formatBroadcastReplyNotice(msg telegram.Message, user storage.User, deliver
 			content = "[消息]"
 		}
 	}
-	return fmt.Sprintf("广播消息收到群内回复\n群组：%s\n回复人：%s\n内容：\n%s", group, user.DisplayName, content)
+	groupLabel := html.EscapeString(group)
+	if url := telegramMessageURL(msg.Chat, msg.MessageID); url != "" {
+		groupLabel = `<a href="` + html.EscapeString(url) + `">` + groupLabel + `</a>`
+	}
+	sender := html.EscapeString(user.DisplayName)
+	if sender == "" {
+		sender = formatID(user.ID)
+	}
+	sender = `<a href="tg://user?id=` + formatID(user.ID) + `">` + sender + `</a>`
+	return fmt.Sprintf("群：%s\n人：%s\n\n内容：\n\n%s", groupLabel, sender, html.EscapeString(trimRunes(content, 1200)))
+}
+
+func (b *Bot) broadcastReplyRecipients(operatorID int64) map[int64]struct{} {
+	recipients := map[int64]struct{}{}
+	if operatorID != 0 {
+		recipients[operatorID] = struct{}{}
+	}
+	if b.cfg.HostUserID != 0 {
+		recipients[b.cfg.HostUserID] = struct{}{}
+	}
+	for id := range b.cfg.DefaultOperatorIDs {
+		if id != 0 {
+			recipients[id] = struct{}{}
+		}
+	}
+	return recipients
 }
 
 func replyLinkButtons(msg telegram.Message, delivery storage.BroadcastDelivery) []telegram.InlineKeyboardButton {

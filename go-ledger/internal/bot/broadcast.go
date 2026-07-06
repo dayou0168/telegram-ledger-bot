@@ -18,6 +18,7 @@ type privateState struct {
 	TargetName           string
 	ChatIDs              []int64
 	NotifyAll            bool
+	WatchAddress         string
 	QuickReplyTargetChat int64
 	QuickReplyMessageID  int64
 	CreatedAt            time.Time
@@ -213,9 +214,8 @@ func (b *Bot) toggleBroadcastNotifyAll(ctx context.Context, cb telegram.Callback
 	if cb.Message == nil {
 		return nil
 	}
-	_, err := b.tg.SendMessage(ctx, cb.Message.Chat.ID, formatBroadcastReadyText(state.TargetName, len(state.ChatIDs), state.NotifyAll), map[string]any{
-		"reply_to_message_id": cb.Message.MessageID,
-		"reply_markup":        broadcastReadyKeyboard(state.NotifyAll),
+	_, err := b.tg.EditMessageText(ctx, cb.Message.Chat.ID, cb.Message.MessageID, formatBroadcastReadyText(state.TargetName, len(state.ChatIDs), state.NotifyAll), map[string]any{
+		"reply_markup": broadcastReadyKeyboard(state.NotifyAll),
 	})
 	return err
 }
@@ -237,18 +237,24 @@ func (b *Bot) handleBroadcastMaterial(ctx context.Context, msg telegram.Message,
 	mode := state.Mode
 	notifyAll := state.NotifyAll
 	operatorID := user.ID
+	status, err := b.tg.SendMessage(ctx, msg.Chat.ID, fmt.Sprintf("广播发送中：目标 %d 个。", len(targets)), nil)
+	if err != nil {
+		return err
+	}
 	b.broadcastPool.Submit(func(jobCtx context.Context) {
 		success, failed := b.copyBroadcast(jobCtx, operatorID, sourceChatID, sourceMessageID, targets, mode, targetName, notifyAll)
-		text := fmt.Sprintf("广播完成：成功 %d 个，失败 %d 个。\n目标：%s", success, failed, targetName)
+		text := fmt.Sprintf("广播完成：成功 %d 个，失败 %d 个。", success, failed)
 		if notifyAll {
 			text += "\n通知所有人：开启"
 		}
-		if _, err := b.tg.SendMessage(jobCtx, sourceChatID, text, map[string]any{"reply_to_message_id": sourceMessageID}); err != nil {
-			log.Printf("send broadcast result: %v", err)
+		if _, err := b.tg.EditMessageText(jobCtx, sourceChatID, status.MessageID, text, nil); err != nil {
+			log.Printf("edit broadcast result: %v", err)
+			if _, err := b.tg.SendMessage(jobCtx, sourceChatID, text, nil); err != nil {
+				log.Printf("send broadcast result fallback: %v", err)
+			}
 		}
 	})
-	_, err := b.tg.SendMessage(ctx, msg.Chat.ID, fmt.Sprintf("广播已提交：%s，目标 %d 个。可继续发送下一条。", targetName, len(targets)), map[string]any{"reply_to_message_id": msg.MessageID})
-	return err
+	return nil
 }
 
 func (b *Bot) copyBroadcast(ctx context.Context, operatorID, fromChatID, messageID int64, targetChatIDs []int64, mode, targetName string, notifyAll bool) (int, int) {

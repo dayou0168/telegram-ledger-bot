@@ -67,6 +67,10 @@ func (b *Bot) handleLedger(ctx context.Context, msg telegram.Message, user stora
 		return err
 	}
 
+	effectiveAmount := new(big.Rat).Set(cmd.Amount)
+	if cmd.Multiplier != nil {
+		effectiveAmount.Mul(effectiveAmount, cmd.Multiplier)
+	}
 	rate := cmd.Rate
 	if cmd.IsUSDT {
 		rate = big.NewRat(1, 1)
@@ -78,11 +82,14 @@ func (b *Bot) handleLedger(ctx context.Context, msg telegram.Message, user stora
 	if rate == nil || rate.Sign() == 0 {
 		rate = big.NewRat(1, 1)
 	}
-	resultUSDT := new(big.Rat).Set(cmd.Amount)
+	resultUSDT := new(big.Rat).Set(effectiveAmount)
 	if !cmd.IsUSDT {
 		resultUSDT.Quo(resultUSDT, rate)
 	}
-	feeRate := parseRat(group.FeeRate)
+	feeRate := cmd.FeeRate
+	if feeRate == nil {
+		feeRate = parseRat(group.FeeRate)
+	}
 	if cmd.Kind == "deposit" && feeRate != nil && feeRate.Sign() != 0 {
 		resultUSDT.Mul(resultUSDT, feeFactor(feeRate))
 	}
@@ -96,9 +103,9 @@ func (b *Bot) handleLedger(ctx context.Context, msg telegram.Message, user stora
 		DayKey:          dayKey,
 		Kind:            cmd.Kind,
 		Currency:        currency,
-		Amount:          formatAmount(cmd.Amount),
+		Amount:          formatAmount(effectiveAmount),
 		Rate:            formatRat(rate, 8),
-		FeeRate:         group.FeeRate,
+		FeeRate:         formatRat(feeRate, 4),
 		ResultUSDT:      formatAmount(resultUSDT),
 		ActorUserID:     user.ID,
 		ActorName:       user.DisplayName,
@@ -338,13 +345,12 @@ func (b *Bot) sendBillMessage(ctx context.Context, chatID, replyTo int64, now ti
 		return telegram.Message{}, err
 	}
 	text := buildBillText(group, records, b.loc, prefix)
-	opts := map[string]any{}
-	if replyTo > 0 {
-		opts["reply_to_message_id"] = replyTo
+	opts := map[string]any{
+		"parse_mode": "HTML",
 	}
 	if url := b.publicBillURL(chatID, dayKey); url != "" {
 		opts["reply_markup"] = telegram.InlineKeyboardMarkup{InlineKeyboard: [][]telegram.InlineKeyboardButton{
-			{{Text: "完整账单", URL: url}},
+			{{Text: "🌍 完整账单", URL: url}},
 		}}
 	}
 	return b.tg.SendMessage(ctx, chatID, text, opts)

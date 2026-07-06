@@ -66,6 +66,9 @@ func (s *Store) migrate(ctx context.Context) error {
 			payout_rate TEXT NOT NULL DEFAULT '0',
 			deposit_exchange_rate TEXT NOT NULL DEFAULT '1',
 			payout_exchange_rate TEXT NOT NULL DEFAULT '1',
+			exchange_rate_source TEXT NOT NULL DEFAULT '',
+			exchange_rate_rank INTEGER NOT NULL DEFAULT 0,
+			exchange_rate_offset TEXT NOT NULL DEFAULT '',
 			fee_rate TEXT NOT NULL DEFAULT '0',
 			cutoff_hour INTEGER NOT NULL DEFAULT 0,
 			all_members_can_record BOOLEAN NOT NULL DEFAULT FALSE,
@@ -75,6 +78,12 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_groups_updated_negative
 			ON groups(updated_at DESC, chat_id)
 			WHERE chat_id < 0`,
+		`CREATE INDEX IF NOT EXISTS idx_groups_title_negative
+			ON groups(title ASC, chat_id ASC)
+			WHERE chat_id < 0`,
+		`ALTER TABLE groups ADD COLUMN IF NOT EXISTS exchange_rate_source TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE groups ADD COLUMN IF NOT EXISTS exchange_rate_rank INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE groups ADD COLUMN IF NOT EXISTS exchange_rate_offset TEXT NOT NULL DEFAULT ''`,
 		`CREATE TABLE IF NOT EXISTS users (
 			chat_id BIGINT NOT NULL,
 			user_id BIGINT NOT NULL,
@@ -98,6 +107,8 @@ func (s *Store) migrate(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_operators_chat_role
 			ON operators(chat_id, role, user_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_operators_chat_order
+			ON operators(chat_id, role, created_at, user_id)`,
 		`CREATE TABLE IF NOT EXISTS broadcast_operators (
 			user_id BIGINT PRIMARY KEY,
 			status TEXT NOT NULL DEFAULT 'active',
@@ -108,6 +119,8 @@ func (s *Store) migrate(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_broadcast_operators_status
 			ON broadcast_operators(status, user_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_broadcast_operators_list
+			ON broadcast_operators(status, updated_at DESC, user_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_broadcast_operators_created_by
 			ON broadcast_operators(created_by, status, created_at, user_id)`,
 		`CREATE TABLE IF NOT EXISTS broadcast_groups (
@@ -137,6 +150,12 @@ func (s *Store) migrate(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_broadcast_permissions_user
 			ON broadcast_operator_permissions(user_id, target, group_name, chat_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_broadcast_permissions_chat
+			ON broadcast_operator_permissions(user_id, target, chat_id)
+			WHERE target = 'chat'`,
+		`CREATE INDEX IF NOT EXISTS idx_broadcast_permissions_group
+			ON broadcast_operator_permissions(user_id, target, group_name)
+			WHERE target = 'group'`,
 		`CREATE TABLE IF NOT EXISTS broadcast_deliveries (
 			id BIGSERIAL PRIMARY KEY,
 			operator_user_id BIGINT NOT NULL,
@@ -197,13 +216,24 @@ func (s *Store) migrate(ctx context.Context) error {
 			owner_user_id BIGINT NOT NULL,
 			address TEXT NOT NULL,
 			label TEXT NOT NULL DEFAULT '',
+			watch_income BOOLEAN NOT NULL DEFAULT TRUE,
+			watch_expense BOOLEAN NOT NULL DEFAULT TRUE,
+			notify_trx BOOLEAN NOT NULL DEFAULT TRUE,
+			min_notify_amount TEXT NOT NULL DEFAULT '0',
 			active BOOLEAN NOT NULL DEFAULT TRUE,
 			created_at TIMESTAMPTZ NOT NULL,
 			updated_at TIMESTAMPTZ NOT NULL,
 			PRIMARY KEY(owner_user_id, address)
 		)`,
+		`ALTER TABLE address_watches ADD COLUMN IF NOT EXISTS watch_income BOOLEAN NOT NULL DEFAULT TRUE`,
+		`ALTER TABLE address_watches ADD COLUMN IF NOT EXISTS watch_expense BOOLEAN NOT NULL DEFAULT TRUE`,
+		`ALTER TABLE address_watches ADD COLUMN IF NOT EXISTS notify_trx BOOLEAN NOT NULL DEFAULT TRUE`,
+		`ALTER TABLE address_watches ADD COLUMN IF NOT EXISTS min_notify_amount TEXT NOT NULL DEFAULT '0'`,
 		`CREATE INDEX IF NOT EXISTS idx_address_watches_active
 			ON address_watches(active, owner_user_id, address)`,
+		`CREATE INDEX IF NOT EXISTS idx_address_watches_owner_active
+			ON address_watches(owner_user_id, updated_at DESC, address)
+			WHERE active = TRUE`,
 		`CREATE TABLE IF NOT EXISTS address_watch_settings (
 			owner_user_id BIGINT PRIMARY KEY,
 			watch_income BOOLEAN NOT NULL DEFAULT TRUE,
@@ -300,7 +330,8 @@ func (s *Store) FindUserByUsername(ctx context.Context, chatID int64, username s
 
 func (s *Store) GetGroup(ctx context.Context, chatID int64) (Group, error) {
 	row := s.pool.QueryRow(ctx, `SELECT chat_id, title, active, business_open, owner_user_id,
-		deposit_rate, payout_rate, deposit_exchange_rate, payout_exchange_rate, fee_rate,
+		deposit_rate, payout_rate, deposit_exchange_rate, payout_exchange_rate,
+		exchange_rate_source, exchange_rate_rank, exchange_rate_offset, fee_rate,
 		cutoff_hour, all_members_can_record, created_at, updated_at
 		FROM groups WHERE chat_id = $1`, chatID)
 	return scanGroup(row)
@@ -308,7 +339,8 @@ func (s *Store) GetGroup(ctx context.Context, chatID int64) (Group, error) {
 
 func (s *Store) ListGroups(ctx context.Context) ([]Group, error) {
 	rows, err := s.pool.Query(ctx, `SELECT chat_id, title, active, business_open, owner_user_id,
-		deposit_rate, payout_rate, deposit_exchange_rate, payout_exchange_rate, fee_rate,
+		deposit_rate, payout_rate, deposit_exchange_rate, payout_exchange_rate,
+		exchange_rate_source, exchange_rate_rank, exchange_rate_offset, fee_rate,
 		cutoff_hour, all_members_can_record, created_at, updated_at
 		FROM groups
 		WHERE chat_id < 0
@@ -331,7 +363,8 @@ func (s *Store) ListGroups(ctx context.Context) ([]Group, error) {
 func scanGroup(scanner recordScanner) (Group, error) {
 	var g Group
 	err := scanner.Scan(&g.ChatID, &g.Title, &g.Active, &g.BusinessOpen, &g.OwnerUserID,
-		&g.DepositRate, &g.PayoutRate, &g.DepositExchangeRate, &g.PayoutExchangeRate, &g.FeeRate,
+		&g.DepositRate, &g.PayoutRate, &g.DepositExchangeRate, &g.PayoutExchangeRate,
+		&g.ExchangeRateSource, &g.ExchangeRateRank, &g.ExchangeRateOffset, &g.FeeRate,
 		&g.CutoffHour, &g.AllMembersCanRecord, &g.CreatedAt, &g.UpdatedAt)
 	return g, err
 }
@@ -355,8 +388,28 @@ func (s *Store) SetGroupFeeRate(ctx context.Context, chatID int64, feeRate strin
 }
 
 func (s *Store) SetGroupExchangeRate(ctx context.Context, chatID int64, rate string, now time.Time) error {
-	_, err := s.pool.Exec(ctx, `UPDATE groups SET deposit_exchange_rate=$1, payout_exchange_rate=$1, updated_at=$2 WHERE chat_id=$3`,
+	_, err := s.pool.Exec(ctx, `UPDATE groups SET
+			deposit_exchange_rate=$1,
+			payout_exchange_rate=$1,
+			exchange_rate_source='',
+			exchange_rate_rank=0,
+			exchange_rate_offset='',
+			updated_at=$2
+		WHERE chat_id=$3`,
 		rate, now, chatID)
+	return err
+}
+
+func (s *Store) SetGroupRealtimeExchangeRate(ctx context.Context, chatID int64, rate, source string, rank int, offset string, now time.Time) error {
+	_, err := s.pool.Exec(ctx, `UPDATE groups SET
+			deposit_exchange_rate=$1,
+			payout_exchange_rate=$1,
+			exchange_rate_source=$2,
+			exchange_rate_rank=$3,
+			exchange_rate_offset=$4,
+			updated_at=$5
+		WHERE chat_id=$6`,
+		rate, source, rank, offset, now, chatID)
 	return err
 }
 
@@ -612,7 +665,8 @@ func (s *Store) ListBroadcastGroups(ctx context.Context) ([]BroadcastGroup, erro
 
 func (s *Store) ListBroadcastGroupChats(ctx context.Context, name string) ([]Group, error) {
 	rows, err := s.pool.Query(ctx, `SELECT g.chat_id, g.title, g.active, g.business_open, g.owner_user_id,
-		g.deposit_rate, g.payout_rate, g.deposit_exchange_rate, g.payout_exchange_rate, g.fee_rate,
+		g.deposit_rate, g.payout_rate, g.deposit_exchange_rate, g.payout_exchange_rate,
+		g.exchange_rate_source, g.exchange_rate_rank, g.exchange_rate_offset, g.fee_rate,
 		g.cutoff_hour, g.all_members_can_record, g.created_at, g.updated_at
 		FROM broadcast_group_chats bgc
 		JOIN groups g ON g.chat_id=bgc.chat_id
@@ -687,7 +741,8 @@ func (s *Store) ListAllowedBroadcastChats(ctx context.Context, userID int64, all
 		return s.ListGroups(ctx)
 	}
 	rows, err := s.pool.Query(ctx, `SELECT DISTINCT g.chat_id, g.title, g.active, g.business_open, g.owner_user_id,
-		g.deposit_rate, g.payout_rate, g.deposit_exchange_rate, g.payout_exchange_rate, g.fee_rate,
+		g.deposit_rate, g.payout_rate, g.deposit_exchange_rate, g.payout_exchange_rate,
+		g.exchange_rate_source, g.exchange_rate_rank, g.exchange_rate_offset, g.fee_rate,
 		g.cutoff_hour, g.all_members_can_record, g.created_at, g.updated_at
 		FROM groups g
 		WHERE g.chat_id < 0
@@ -912,13 +967,12 @@ func (s *Store) SoftDeleteAllRecords(ctx context.Context, chatID int64, now time
 
 func (s *Store) ListWatchTargets(ctx context.Context) ([]WatchTarget, error) {
 	rows, err := s.pool.Query(ctx, `SELECT w.owner_user_id, w.address, w.label,
-		COALESCE(s.watch_income, TRUE), COALESCE(s.watch_expense, TRUE), COALESCE(s.notify_trx, TRUE),
-		COALESCE(s.min_notify_amount, '0'), COALESCE(MAX(n.block_timestamp), 0)
+		w.watch_income, w.watch_expense, w.notify_trx, w.min_notify_amount,
+		COALESCE(MAX(n.block_timestamp), 0)
 		FROM address_watches w
-		LEFT JOIN address_watch_settings s ON s.owner_user_id = w.owner_user_id
 		LEFT JOIN chain_notifications n ON n.owner_user_id = w.owner_user_id AND n.address = w.address
 		WHERE w.active = TRUE
-		GROUP BY w.owner_user_id, w.address, w.label, s.watch_income, s.watch_expense, s.notify_trx, s.min_notify_amount
+		GROUP BY w.owner_user_id, w.address, w.label, w.watch_income, w.watch_expense, w.notify_trx, w.min_notify_amount
 		ORDER BY w.owner_user_id ASC, w.address ASC`)
 	if err != nil {
 		return nil, err
@@ -937,13 +991,12 @@ func (s *Store) ListWatchTargets(ctx context.Context) ([]WatchTarget, error) {
 
 func (s *Store) ListWatchTargetsForOwner(ctx context.Context, owner int64) ([]WatchTarget, error) {
 	rows, err := s.pool.Query(ctx, `SELECT w.owner_user_id, w.address, w.label,
-		COALESCE(s.watch_income, TRUE), COALESCE(s.watch_expense, TRUE), COALESCE(s.notify_trx, TRUE),
-		COALESCE(s.min_notify_amount, '0'), COALESCE(MAX(n.block_timestamp), 0)
+		w.watch_income, w.watch_expense, w.notify_trx, w.min_notify_amount,
+		COALESCE(MAX(n.block_timestamp), 0)
 		FROM address_watches w
-		LEFT JOIN address_watch_settings s ON s.owner_user_id = w.owner_user_id
 		LEFT JOIN chain_notifications n ON n.owner_user_id = w.owner_user_id AND n.address = w.address
 		WHERE w.active = TRUE AND w.owner_user_id=$1
-		GROUP BY w.owner_user_id, w.address, w.label, s.watch_income, s.watch_expense, s.notify_trx, s.min_notify_amount
+		GROUP BY w.owner_user_id, w.address, w.label, w.watch_income, w.watch_expense, w.notify_trx, w.min_notify_amount
 		ORDER BY w.updated_at DESC, w.address ASC`, owner)
 	if err != nil {
 		return nil, err
@@ -991,11 +1044,58 @@ func (s *Store) SaveWatchSettings(ctx context.Context, settings WatchSettings, n
 }
 
 func (s *Store) AddWatch(ctx context.Context, owner int64, address, label string, now time.Time) error {
-	_, err := s.pool.Exec(ctx, `INSERT INTO address_watches(owner_user_id, address, label, active, created_at, updated_at)
-		VALUES($1, $2, $3, TRUE, $4, $5)
+	_, err := s.pool.Exec(ctx, `INSERT INTO address_watches(
+			owner_user_id, address, label, watch_income, watch_expense, notify_trx, min_notify_amount, active, created_at, updated_at
+		)
+		SELECT $1, $2, $3,
+			COALESCE(s.watch_income, TRUE),
+			COALESCE(s.watch_expense, TRUE),
+			COALESCE(s.notify_trx, TRUE),
+			COALESCE(s.min_notify_amount, '0'),
+			TRUE, $4, $5
+		FROM (SELECT 1) seed
+		LEFT JOIN address_watch_settings s ON s.owner_user_id=$1
 		ON CONFLICT(owner_user_id, address) DO UPDATE SET label=excluded.label, active=TRUE, updated_at=excluded.updated_at`,
 		owner, address, label, now, now)
 	return err
+}
+
+func (s *Store) GetWatchTarget(ctx context.Context, owner int64, address string) (WatchTarget, bool, error) {
+	row := s.pool.QueryRow(ctx, `SELECT w.owner_user_id, w.address, w.label,
+		w.watch_income, w.watch_expense, w.notify_trx, w.min_notify_amount,
+		COALESCE(MAX(n.block_timestamp), 0)
+		FROM address_watches w
+		LEFT JOIN chain_notifications n ON n.owner_user_id = w.owner_user_id AND n.address = w.address
+		WHERE w.active = TRUE AND w.owner_user_id=$1 AND w.address=$2
+		GROUP BY w.owner_user_id, w.address, w.label, w.watch_income, w.watch_expense, w.notify_trx, w.min_notify_amount`,
+		owner, address)
+	var target WatchTarget
+	err := row.Scan(&target.OwnerUserID, &target.Address, &target.Label, &target.WatchIncome, &target.WatchExpense, &target.NotifyTRX, &target.MinNotifyAmount, &target.LatestTimestamp)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return WatchTarget{}, false, nil
+	}
+	return target, err == nil, err
+}
+
+func (s *Store) UpdateWatchTarget(ctx context.Context, target WatchTarget, now time.Time) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `UPDATE address_watches SET
+			label=$3,
+			watch_income=$4,
+			watch_expense=$5,
+			notify_trx=$6,
+			min_notify_amount=$7,
+			updated_at=$8
+		WHERE owner_user_id=$1 AND address=$2 AND active=TRUE`,
+		target.OwnerUserID,
+		target.Address,
+		strings.TrimSpace(target.Label),
+		target.WatchIncome,
+		target.WatchExpense,
+		target.NotifyTRX,
+		target.MinNotifyAmount,
+		now,
+	)
+	return tag.RowsAffected() > 0, err
 }
 
 func (s *Store) RemoveWatch(ctx context.Context, owner int64, address string, now time.Time) (bool, error) {

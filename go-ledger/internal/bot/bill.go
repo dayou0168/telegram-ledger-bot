@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"html"
 	"math/big"
 	"strings"
 	"time"
@@ -38,19 +39,19 @@ func buildBillText(group storage.Group, records []storage.Record, loc *time.Loca
 
 	var out strings.Builder
 	if prefix != "" {
-		out.WriteString(prefix)
+		out.WriteString(html.EscapeString(prefix))
 		out.WriteString("\n\n")
 	}
-	out.WriteString("今日入款（")
+	out.WriteString("<b>今日入款（")
 	out.WriteString(formatInt(len(deposits)))
-	out.WriteString("笔）\n")
+	out.WriteString("笔）</b>\n")
 	for _, record := range deposits {
 		out.WriteString(recordLine(record, loc))
 		out.WriteByte('\n')
 	}
-	out.WriteString("\n今日下发（")
+	out.WriteString("\n<b>今日下发（")
 	out.WriteString(formatInt(len(payouts)))
-	out.WriteString("笔）\n")
+	out.WriteString("笔）</b>\n")
 	for _, record := range payouts {
 		out.WriteString(recordLine(record, loc))
 		out.WriteByte('\n')
@@ -59,10 +60,16 @@ func buildBillText(group storage.Group, records []storage.Record, loc *time.Loca
 	out.WriteString(formatAmount(totalDepositCNY))
 	out.WriteString("（")
 	out.WriteString(formatAmount(totalDepositUSDT))
-	out.WriteString("U）\n汇率：")
-	out.WriteString(group.DepositExchangeRate)
+	out.WriteString("U）\n")
+	if label := exchangeRateDisplay(group); label != "" {
+		out.WriteString("实时汇率：\n")
+		out.WriteString(html.EscapeString(label))
+	} else {
+		out.WriteString("汇率：")
+		out.WriteString(html.EscapeString(formatRecordRate(group.DepositExchangeRate)))
+	}
 	out.WriteString("\n交易费率：")
-	out.WriteString(group.FeeRate)
+	out.WriteString(html.EscapeString(formatRecordAmount(group.FeeRate)))
 	out.WriteString("%\n\n应下发：")
 	out.WriteString(formatAmount(totalDepositUSDT))
 	out.WriteString("U\n已下发：")
@@ -84,30 +91,47 @@ func recordLine(record storage.Record, loc *time.Location) string {
 	out.WriteString(recordAmountExpr(record))
 	if record.ActorName != "" {
 		out.WriteByte(' ')
-		out.WriteString(record.ActorName)
+		out.WriteString(html.EscapeString(record.ActorName))
 	}
 	if record.Remark != "" {
 		out.WriteByte(' ')
-		out.WriteString(record.Remark)
+		out.WriteString(html.EscapeString(record.Remark))
 	}
 	return out.String()
 }
 
 func recordAmountExpr(record storage.Record) string {
 	if strings.EqualFold(record.Currency, "USDT") {
-		return record.Amount + "U"
+		return formatRecordAmount(record.Amount) + "U"
 	}
-	expr := record.Amount
-	if record.Rate != "" && record.Rate != "1" {
-		expr += "/" + record.Rate
+	expr := formatRecordAmount(record.Amount)
+	rate := formatRecordRate(record.Rate)
+	if rate != "" && rate != "1" {
+		expr += "/" + rate
 		if record.Kind == "deposit" {
 			if factor := feeFactorText(record.FeeRate); factor != "" {
 				expr += "*" + factor
 			}
 		}
-		expr += "=" + record.ResultUSDT + "U"
+		expr += "=" + formatRecordAmount(record.ResultUSDT) + "U"
 	}
 	return expr
+}
+
+func formatRecordAmount(raw string) string {
+	value := parseRat(raw)
+	if value == nil {
+		return strings.TrimSpace(raw)
+	}
+	return formatAmount(value)
+}
+
+func formatRecordRate(raw string) string {
+	value := parseRat(raw)
+	if value == nil {
+		return strings.TrimSpace(raw)
+	}
+	return formatRat(value, 8)
 }
 
 func feeFactorText(raw string) string {
@@ -120,4 +144,24 @@ func feeFactorText(raw string) string {
 
 func formatInt(value int) string {
 	return new(big.Int).SetInt64(int64(value)).String()
+}
+
+func exchangeRateDisplay(group storage.Group) string {
+	if group.ExchangeRateSource == "" || group.ExchangeRateRank <= 0 {
+		return ""
+	}
+	source := strings.TrimSpace(group.ExchangeRateSource)
+	if source == "" {
+		source = "支付宝"
+	}
+	label := source + formatInt(group.ExchangeRateRank) + "档"
+	offset := parseRat(group.ExchangeRateOffset)
+	if offset == nil || offset.Sign() == 0 {
+		return label
+	}
+	if offset.Sign() > 0 {
+		return label + " 上浮" + formatRat(offset, 8)
+	}
+	abs := new(big.Rat).Neg(offset)
+	return label + " 下浮" + formatRat(abs, 8)
 }
