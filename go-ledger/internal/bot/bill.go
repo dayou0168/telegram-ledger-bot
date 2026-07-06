@@ -10,6 +10,8 @@ import (
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
 )
 
+const groupBillDefaultRecordLimit = 5
+
 func buildBillText(group storage.Group, records []storage.Record, loc *time.Location, prefix string) string {
 	var deposits []storage.Record
 	var payouts []storage.Record
@@ -46,14 +48,14 @@ func buildBillText(group storage.Group, records []storage.Record, loc *time.Loca
 	out.WriteString("<b>今日入款（")
 	out.WriteString(formatInt(len(deposits)))
 	out.WriteString("笔）</b>\n")
-	for _, record := range deposits {
+	for _, record := range latestRecords(deposits, groupBillDefaultRecordLimit) {
 		out.WriteString(recordLine(record, loc))
 		out.WriteByte('\n')
 	}
 	out.WriteString("\n<b>今日下发（")
 	out.WriteString(formatInt(len(payouts)))
 	out.WriteString("笔）</b>\n")
-	for _, record := range payouts {
+	for _, record := range latestRecords(payouts, groupBillDefaultRecordLimit) {
 		out.WriteString(recordLine(record, loc))
 		out.WriteByte('\n')
 	}
@@ -81,6 +83,13 @@ func buildBillText(group storage.Group, records []storage.Record, loc *time.Loca
 	return out.String()
 }
 
+func latestRecords(records []storage.Record, limit int) []storage.Record {
+	if limit <= 0 || len(records) <= limit {
+		return records
+	}
+	return records[len(records)-limit:]
+}
+
 func recordLine(record storage.Record, loc *time.Location) string {
 	createdAt := record.CreatedAt
 	if loc != nil {
@@ -90,7 +99,7 @@ func recordLine(record storage.Record, loc *time.Location) string {
 	out.WriteString(createdAt.Format("15:04:05"))
 	out.WriteByte(' ')
 	link := recordMessageURL(record.ChatID, record.SourceMessageID)
-	out.WriteString(linkedRecordText(recordAmountExpr(record), link))
+	out.WriteString(recordAmountExprHTML(record, link))
 	if name := recordSubjectName(record); name != "" {
 		out.WriteByte(' ')
 		out.WriteString(linkedRecordText(name, link))
@@ -134,16 +143,42 @@ func recordAmountExpr(record storage.Record) string {
 	}
 	expr := formatRecordAmount(record.Amount)
 	rate := formatRecordRate(record.Rate)
-	if rate != "" && rate != "1" {
-		expr += "/" + rate
-		if record.Kind == "deposit" {
-			if factor := feeFactorText(record.FeeRate); factor != "" {
-				expr += "*" + factor
-			}
-		}
-		expr += "=" + formatRecordAmount(record.ResultUSDT) + "U"
+	if rate == "" {
+		rate = "1"
 	}
+	expr += " / " + rate
+	if record.Kind == "deposit" {
+		if factor := feeFactorText(record.FeeRate); factor != "" {
+			expr += "*" + factor
+		}
+	}
+	expr += "=" + formatRecordAmount(record.ResultUSDT) + "U"
 	return expr
+}
+
+func recordAmountExprHTML(record storage.Record, link string) string {
+	amount := formatRecordAmount(record.Amount)
+	if strings.EqualFold(record.Currency, "USDT") {
+		return linkedRecordText(amount, link) + "U"
+	}
+	rate := formatRecordRate(record.Rate)
+	if rate == "" {
+		rate = "1"
+	}
+	var out strings.Builder
+	out.WriteString(linkedRecordText(amount, link))
+	out.WriteString(" / ")
+	out.WriteString(html.EscapeString(rate))
+	if record.Kind == "deposit" {
+		if factor := feeFactorText(record.FeeRate); factor != "" {
+			out.WriteByte('*')
+			out.WriteString(html.EscapeString(factor))
+		}
+	}
+	out.WriteByte('=')
+	out.WriteString(html.EscapeString(formatRecordAmount(record.ResultUSDT)))
+	out.WriteByte('U')
+	return out.String()
 }
 
 func formatRecordAmount(raw string) string {

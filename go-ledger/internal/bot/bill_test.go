@@ -41,7 +41,7 @@ func TestBuildBillText(t *testing.T) {
 
 	wants := []string{
 		"<b>今日入款（1笔）</b>",
-		"01:02:03 100/10*0.97=9.7U 阿泽 测试",
+		"01:02:03 100 / 10*0.97=9.7U 阿泽 测试",
 		"<b>今日下发（1笔）</b>",
 		"01:02:04 2U 阿泽",
 		"总入款：100（9.7U）",
@@ -74,8 +74,28 @@ func TestRecordLineUsesSubjectNameAndMessageLink(t *testing.T) {
 	if !strings.Contains(line, `href="https://t.me/c/3720457420/1234"`) {
 		t.Fatalf("record line missing message link: %s", line)
 	}
+	if !strings.Contains(line, `>666</a> / 10=66.6U`) {
+		t.Fatalf("record line should only link the original amount in formula: %s", line)
+	}
 	if strings.Contains(line, "阿泽") || !strings.Contains(line, ">新一</a>") {
 		t.Fatalf("record line should display subject name only: %s", line)
+	}
+}
+
+func TestRecordLineShowsDefaultRateFormula(t *testing.T) {
+	loc := time.FixedZone("Asia/Shanghai", 8*3600)
+	record := storage.Record{
+		Kind:        "deposit",
+		Currency:    "CNY",
+		Amount:      "888.00",
+		Rate:        "1",
+		ResultUSDT:  "888.00",
+		SubjectName: "阿泽",
+		CreatedAt:   time.Date(2026, 7, 6, 19, 45, 52, 0, loc),
+	}
+	line := recordLine(record, loc)
+	if !strings.Contains(line, "19:45:52 888 / 1=888U 阿泽") {
+		t.Fatalf("record line should show default rate formula: %s", line)
 	}
 }
 
@@ -103,5 +123,38 @@ func TestBuildBillTextRealtimeRateLabel(t *testing.T) {
 	}, nil, loc, "")
 	if !strings.Contains(text, "实时汇率：\n支付宝1档 下浮0.1") {
 		t.Fatalf("bill text missing realtime rate label:\n%s", text)
+	}
+}
+
+func TestBuildBillTextShowsLatestFiveRecords(t *testing.T) {
+	loc := time.FixedZone("Asia/Shanghai", 8*3600)
+	createdAt := time.Date(2026, 7, 6, 1, 0, 0, 0, loc)
+	records := make([]storage.Record, 0, 7)
+	for i := 1; i <= 7; i++ {
+		records = append(records, storage.Record{
+			Kind:        "deposit",
+			Currency:    "CNY",
+			Amount:      formatInt(i),
+			Rate:        "1",
+			ResultUSDT:  formatInt(i),
+			SubjectName: "阿泽",
+			CreatedAt:   createdAt.Add(time.Duration(i) * time.Minute),
+		})
+	}
+	text := buildBillText(storage.Group{DepositExchangeRate: "1"}, records, loc, "")
+	if !strings.Contains(text, "<b>今日入款（7笔）</b>") {
+		t.Fatalf("bill text should keep total count:\n%s", text)
+	}
+	if strings.Contains(text, "01:01:00 1 / 1=1U") || strings.Contains(text, "01:02:00 2 / 1=2U") {
+		t.Fatalf("bill text should hide older records:\n%s", text)
+	}
+	for _, want := range []string{
+		"01:03:00 3 / 1=3U",
+		"01:07:00 7 / 1=7U",
+		"总入款：28（28U）",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("bill text missing %q:\n%s", want, text)
+		}
 	}
 }
