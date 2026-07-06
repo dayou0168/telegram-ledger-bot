@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import threading
 from tempfile import TemporaryDirectory
 import time
 
@@ -63,6 +64,18 @@ class InlineExecutor:
         return fn(*args, **kwargs)
 
 
+class CountingRuntimeStorage:
+    def __init__(self) -> None:
+        self.group_calls = 0
+        self.user_calls = 0
+
+    def ensure_group(self, chat_id, title, now):  # type: ignore[no-untyped-def]
+        self.group_calls += 1
+
+    def touch_user(self, chat_id, user, now):  # type: ignore[no-untyped-def]
+        self.user_calls += 1
+
+
 def make_config(
     db_path: Path,
     *,
@@ -101,6 +114,7 @@ def make_config(
         p2p_rate_refresh_seconds=60,
         p2p_rate_cache_ttl_seconds=180,
         worker_threads=1,
+        control_threads=1,
         chain_threads=1,
         rate_threads=1,
         broadcast_threads=1,
@@ -148,6 +162,55 @@ def test_private_menu_only_shows_available_features() -> None:
     assert "💵自助续费" not in labels
     assert "🛠功能设置" not in labels
     assert "📒账单统计" not in labels
+
+
+def test_private_updates_use_control_executor() -> None:
+    bot = object.__new__(LedgerBot)
+    bot.control_executor = object()
+    bot.update_executor = object()
+
+    assert (
+        bot.update_executor_for_update({"message": {"chat": {"id": 1001, "type": "private"}}})
+        is bot.control_executor
+    )
+    assert (
+        bot.update_executor_for_update({"message": {"chat": {"id": -1001, "type": "supergroup"}}})
+        is bot.update_executor
+    )
+    assert (
+        bot.update_executor_for_update(
+            {"callback_query": {"message": {"chat": {"id": 1001, "type": "private"}}}}
+        )
+        is bot.control_executor
+    )
+
+
+def test_group_and_user_touch_cache_skips_repeated_writes() -> None:
+    bot = object.__new__(LedgerBot)
+    storage = CountingRuntimeStorage()
+    bot.storage = storage
+    bot.hot_cache_lock = threading.Lock()
+    bot.group_touch_ttl_seconds = 60.0
+    bot.user_touch_ttl_seconds = 60.0
+    bot.group_touch_cache = {}
+    bot.user_touch_cache = {}
+    bot.operator_cache = {}
+    user = TelegramUser(1001, "aze", "阿泽")
+    now = datetime(2026, 7, 6, tzinfo=BEIJING_TZ)
+
+    bot.ensure_group_cached(-1001, "测试群", now)
+    bot.ensure_group_cached(-1001, "测试群", now)
+    bot.touch_user_cached(-1001, user, now)
+    bot.touch_user_cached(-1001, user, now)
+
+    assert storage.group_calls == 1
+    assert storage.user_calls == 1
+
+    bot.ensure_group_cached(-1001, "新群名", now)
+    bot.touch_user_cached(-1001, TelegramUser(1001, "aze", "阿泽2"), now)
+
+    assert storage.group_calls == 2
+    assert storage.user_calls == 2
 
 
 def test_private_admin_button_sends_admin_link_to_root() -> None:
@@ -288,6 +351,10 @@ def test_broadcast_permissions_support_group_and_single_chat_acl() -> None:
             assert bot.can_create_broadcast_child_operator(level1)
             assert not bot.can_create_broadcast_child_operator(child)
             assert bot.can_manage_broadcast_operator(level1, 30)
+            assert bot.can_use_address_watch(root)
+            assert bot.can_use_address_watch(TelegramUser(11, "default", "Default"))
+            assert bot.can_use_address_watch(level1)
+            assert bot.can_use_address_watch(child)
             assert bot.can_use_broadcast_group(level1, "finance")
             assert bot.can_use_broadcast_target(level1, -1001)
             assert bot.can_use_broadcast_target(level1, -1002)
@@ -312,6 +379,63 @@ def test_broadcast_permissions_support_group_and_single_chat_acl() -> None:
             assert bot.can_use_direct_broadcast_target(level1, -1002)
             assert bot.storage.list_broadcast_operator_ids_with_feature("sent_notifications") == {20}
             assert bot.storage.list_broadcast_operator_ids_with_feature("reply_notifications") == {20}
+
+            bot.storage.disable_broadcast_operator(user_id=30, now=current)
+
+            assert not bot.can_use_address_watch(child)
+        finally:
+            bot.storage.current().conn.close()
+
+
+def test_address_watch_private_commands_require_operator_identity() -> None:
+    with TemporaryDirectory() as tmp:
+        bot = LedgerBot(make_config(Path(tmp) / "bot.db"))
+        fake = FakeClient()
+        bot.client = fake
+        try:
+            current = datetime(2026, 7, 4, 12, tzinfo=BEIJING_TZ)
+            regular = TelegramUser(99, "regular", "Regular")
+            default_operator = TelegramUser(11, "default", "Default")
+
+            assert bot.handle_address_watch_command(
+                1001,
+                regular,
+                "添加监听地址 TGhAAySHUUcEGua33pZZ88wP3bA6X5eQuZ 测试",
+                current,
+                77,
+            )
+            assert fake.messages[-1]["text"] == bot.address_watch_denied_text()
+
+            assert bot.handle_address_watch_command(
+                1001,
+                default_operator,
+                "添加监听地址 TGhAAySHUUcEGua33pZZ88wP3bA6X5eQuZ 测试",
+                current,
+                78,
+            )
+            assert bot.storage.list_address_watches(default_operator.user_id)[0]["address"] == (
+                "TGhAAySHUUcEGua33pZZ88wP3bA6X5eQuZ"
+            )
+        finally:
+            bot.storage.current().conn.close()
+
+
+def test_address_watch_callback_requires_operator_identity() -> None:
+    with TemporaryDirectory() as tmp:
+        bot = LedgerBot(make_config(Path(tmp) / "bot.db"))
+        fake = FakeClient()
+        bot.client = fake
+        try:
+            bot.handle_callback(
+                {
+                    "id": "callback-id",
+                    "from": {"id": 99, "username": "regular", "first_name": "Regular"},
+                    "message": {"message_id": 10, "chat": {"id": 1001, "type": "private"}},
+                    "data": "watch:prompt:add",
+                }
+            )
+
+            assert fake.answers[-1]["text"] == bot.address_watch_denied_text()
         finally:
             bot.storage.current().conn.close()
 

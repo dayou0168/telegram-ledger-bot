@@ -267,6 +267,66 @@ def test_activate_group_does_not_promote_first_starter() -> None:
             storage.conn.close()
 
 
+def test_day_cutoff_resume_preserves_active_settings() -> None:
+    with TemporaryDirectory() as tmp:
+        storage = Storage(Path(tmp) / "bot.db")
+        try:
+            activated_at = datetime(2026, 7, 4, 9, tzinfo=BEIJING_TZ)
+            now = datetime(2026, 7, 5, 0, 1, tzinfo=BEIJING_TZ)
+            storage.ensure_group(-100123, "测试群", activated_at)
+            storage.update_group(
+                -100123,
+                activated_at,
+                active=0,
+                activated_at=activated_at.isoformat(),
+                stopped_at=None,
+                deposit_fee_rate="3",
+                payout_fee_rate="1.5",
+                deposit_exchange_rate="7.31",
+                payout_exchange_rate="7.20",
+                realtime_rate=1,
+                realtime_rate_rank=1,
+                realtime_rate_offset="-0.10",
+            )
+
+            group = storage.resume_group_if_not_manually_stopped(-100123, now)
+
+            assert group["active"] == 1
+            assert group["deposit_fee_rate"] == "3"
+            assert group["payout_fee_rate"] == "1.5"
+            assert group["deposit_exchange_rate"] == "7.31"
+            assert group["payout_exchange_rate"] == "7.20"
+            assert group["realtime_rate"] == 1
+            assert group["realtime_rate_rank"] == 1
+            assert group["realtime_rate_offset"] == "-0.10"
+        finally:
+            storage.conn.close()
+
+
+def test_manually_stopped_group_does_not_resume_after_day_cutoff() -> None:
+    with TemporaryDirectory() as tmp:
+        storage = Storage(Path(tmp) / "bot.db")
+        try:
+            activated_at = datetime(2026, 7, 4, 9, tzinfo=BEIJING_TZ)
+            stopped_at = datetime(2026, 7, 4, 18, tzinfo=BEIJING_TZ)
+            now = datetime(2026, 7, 5, 0, 1, tzinfo=BEIJING_TZ)
+            storage.ensure_group(-100123, "测试群", activated_at)
+            storage.update_group(
+                -100123,
+                stopped_at,
+                active=0,
+                activated_at=activated_at.isoformat(),
+                stopped_at=stopped_at.isoformat(),
+            )
+
+            group = storage.resume_group_if_not_manually_stopped(-100123, now)
+
+            assert group["active"] == 0
+            assert group["stopped_at"] == stopped_at.isoformat()
+        finally:
+            storage.conn.close()
+
+
 def test_named_broadcast_group_bulk_add_remove_and_title_refresh() -> None:
     with TemporaryDirectory() as tmp:
         storage = Storage(Path(tmp) / "bot.db")

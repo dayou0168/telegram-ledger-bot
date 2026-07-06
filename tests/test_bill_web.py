@@ -251,7 +251,7 @@ def test_admin_page_renders_management_sections() -> None:
 
         assert response.status == 200
         assert "后台管理" in body
-        assert "地址白名单" in body
+        assert "地址白名单" not in body
         assert "广播权限" in body
         assert "广播替换" in body
         assert "已保存群组" in body
@@ -278,7 +278,7 @@ def test_admin_page_renders_management_sections() -> None:
         assert "开启，回复后替换原投递消息" in body
 
 
-def test_admin_post_updates_whitelist_broadcast_permissions_and_replacement() -> None:
+def test_admin_post_updates_broadcast_permissions_and_replacement() -> None:
     with TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "bot.db"
         storage = Storage(db_path)
@@ -308,11 +308,6 @@ def test_admin_post_updates_whitelist_broadcast_permissions_and_replacement() ->
             "action=add_broadcast_members&group_name=finance&chat_ids=%E6%B5%8B%E8%AF%95%E7%BE%A4%EF%BC%88-100111%EF%BC%89",
             "action=grant_broadcast_permission&user_id=2001&group_name=finance",
             "action=grant_broadcast_chat_permission&user_id=2001&chat_id=%E6%B5%8B%E8%AF%95%E7%BE%A4%EF%BC%88-100111%EF%BC%89",
-            (
-                "action=add_whitelist&chat_id=%E6%B5%8B%E8%AF%95%E7%BE%A4%EF%BC%88-100111%EF%BC%89"
-                "&address=TGhAAySHUUcEGua33pZZ88wP3bA6X5eQuZ"
-                "&label=monitor"
-            ),
             "action=set_broadcast_replacement&enabled=1&text=hello&photo=file123",
         ]
         cookie = f"ledger_admin_session={make_admin_session_value('admin-secret')}"
@@ -326,10 +321,6 @@ def test_admin_post_updates_whitelist_broadcast_permissions_and_replacement() ->
             assert storage.user_can_access_broadcast_group(2001, "finance")
             assert storage.user_can_access_broadcast_chat(2001, -100111)
             assert storage.target_chat_ids_for_broadcast_group("finance") == [-100111]
-            whitelist = storage.get_address_whitelist(-100111, "TGhAAySHUUcEGua33pZZ88wP3bA6X5eQuZ")
-            assert whitelist is not None
-            assert whitelist["label"] == "monitor"
-            assert whitelist["image_url"].startswith("https://bot.example.com/uploads/address_check_")
             replacement = storage.get_broadcast_replacement_settings()
             assert replacement["enabled"] == 1
             assert replacement["text"] == "hello"

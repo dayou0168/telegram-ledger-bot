@@ -178,7 +178,7 @@ def test_otc_top_entries_use_cache_within_ttl() -> None:
     assert bot.get_otc_top_entries(10) == entries
 
 
-def test_telegram_poll_timeout_includes_p2p_refresh_interval() -> None:
+def test_telegram_poll_timeout_is_not_limited_by_background_intervals() -> None:
     bot = object.__new__(LedgerBot)
     bot.config = SimpleNamespace(
         tron_poll_interval_seconds=0,
@@ -186,7 +186,7 @@ def test_telegram_poll_timeout_includes_p2p_refresh_interval() -> None:
         poll_timeout=50,
     )
 
-    assert bot.telegram_poll_timeout() == 12
+    assert bot.telegram_poll_timeout() == 50
 
 
 def _order_book_entry(rank: int, price: str) -> P2POrderBookEntry:

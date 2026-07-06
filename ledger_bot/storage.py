@@ -60,6 +60,7 @@ class Storage:
                 realtime_rate_rank INTEGER,
                 realtime_rate_offset TEXT NOT NULL DEFAULT '0',
                 activated_at TEXT,
+                stopped_at TEXT,
                 trial_started_at TEXT,
                 trial_until TEXT,
                 created_at TEXT NOT NULL,
@@ -312,6 +313,7 @@ class Storage:
                 "realtime_rate": "INTEGER NOT NULL DEFAULT 0",
                 "realtime_rate_rank": "INTEGER",
                 "realtime_rate_offset": "TEXT NOT NULL DEFAULT '0'",
+                "stopped_at": "TEXT",
             },
         )
         self._add_missing_columns(
@@ -1250,11 +1252,17 @@ class Storage:
 
     def activate_group(self, chat_id: int, now: datetime) -> sqlite3.Row:
         group = self.get_group(chat_id)
-        updates: dict[str, Any] = {"active": 1, "activated_at": now.isoformat()}
+        updates: dict[str, Any] = {"active": 1, "activated_at": now.isoformat(), "stopped_at": None}
         if not group["trial_started_at"]:
             updates["trial_started_at"] = now.isoformat()
             updates["trial_until"] = (now + timedelta(hours=12)).isoformat()
         return self.update_group(chat_id, now, **updates)
+
+    def resume_group_if_not_manually_stopped(self, chat_id: int, now: datetime) -> sqlite3.Row:
+        group = self.get_group(chat_id)
+        if group["active"] or not group["activated_at"] or group_value(group, "stopped_at"):
+            return group
+        return self.update_group(chat_id, now, active=1)
 
     def touch_user(self, chat_id: int, user: TelegramUser, now: datetime) -> None:
         self.conn.execute(

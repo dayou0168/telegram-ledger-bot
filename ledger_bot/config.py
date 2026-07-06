@@ -54,6 +54,7 @@ class Config:
     p2p_rate_refresh_seconds: int
     p2p_rate_cache_ttl_seconds: int
     worker_threads: int
+    control_threads: int
     chain_threads: int
     rate_threads: int
     broadcast_threads: int
@@ -123,13 +124,14 @@ def load_config() -> Config:
         ),
         p2p_rate_refresh_seconds=int(os.environ.get("P2P_RATE_REFRESH_SECONDS", "60")),
         p2p_rate_cache_ttl_seconds=int(os.environ.get("P2P_RATE_CACHE_TTL_SECONDS", "180")),
-        worker_threads=max(1, int(os.environ.get("BOT_WORKER_THREADS", "8"))),
-        chain_threads=max(1, int(os.environ.get("BOT_CHAIN_THREADS", os.environ.get("BOT_MONITOR_THREADS", "8")))),
+        worker_threads=max(1, int(os.environ.get("BOT_WORKER_THREADS", "16"))),
+        control_threads=max(1, int(os.environ.get("BOT_CONTROL_THREADS", "6"))),
+        chain_threads=max(1, int(os.environ.get("BOT_CHAIN_THREADS", os.environ.get("BOT_MONITOR_THREADS", "12")))),
         rate_threads=max(1, int(os.environ.get("BOT_RATE_THREADS", "1"))),
         broadcast_threads=max(1, int(os.environ.get("BOT_BROADCAST_THREADS", "4"))),
-        query_threads=max(1, int(os.environ.get("BOT_QUERY_THREADS", "2"))),
-        notification_threads=max(1, int(os.environ.get("BOT_NOTIFICATION_THREADS", "4"))),
-        host_check_ttl_seconds=max(0, int(os.environ.get("BOT_HOST_CHECK_TTL_SECONDS", "300"))),
+        query_threads=max(1, int(os.environ.get("BOT_QUERY_THREADS", "4"))),
+        notification_threads=max(1, int(os.environ.get("BOT_NOTIFICATION_THREADS", "6"))),
+        host_check_ttl_seconds=max(0, int(os.environ.get("BOT_HOST_CHECK_TTL_SECONDS", "600"))),
         poll_timeout=int(os.environ.get("BOT_POLL_TIMEOUT", "50")),
         request_timeout=int(os.environ.get("BOT_REQUEST_TIMEOUT", "70")),
     )

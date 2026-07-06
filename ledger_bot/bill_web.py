@@ -23,9 +23,7 @@ from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 import uuid
 from zipfile import ZIP_DEFLATED, ZipFile
 
-from .address_image import save_address_verification_image
 from .bot import (
-    detect_usdt_network,
     format_fee_multiplier,
     format_money,
     format_number,
@@ -413,36 +411,6 @@ def apply_admin_action(
 ) -> str:
     action = form_value(form, "action")
     now = datetime.now(timezone)
-    if action == "add_whitelist":
-        chat_id = parse_single_admin_chat_id(form, "chat_id")
-        address = form_value(form, "address")
-        network = detect_usdt_network(address)
-        if network != "TRC20":
-            raise ValueError("白名单地址格式不正确，只支持 TRC20 的 T 地址。")
-        storage.get_group(chat_id)
-        label = form_value(form, "label") or None
-        image_url = None
-        if config is not None:
-            image_url = save_address_verification_image(
-                db_path=Path(config.db_path),
-                public_base_url=getattr(config, "public_bill_base_url", None),
-                address=address,
-            )
-        storage.add_address_whitelist(
-            chat_id=chat_id,
-            network=network,
-            address=address,
-            label=label,
-            image_url=image_url,
-            created_by=0,
-            now=now,
-        )
-        return "白名单地址已保存。"
-    if action == "remove_whitelist":
-        chat_id = parse_single_admin_chat_id(form, "chat_id")
-        address = form_value(form, "address")
-        removed = storage.remove_address_whitelist(chat_id, address, now=now)
-        return "白名单地址已删除。" if removed else "没有找到这个白名单地址。"
     if action == "create_broadcast_group":
         name = form_value(form, "group_name")
         storage.create_named_broadcast_group(name, created_by=0, now=now)
@@ -676,7 +644,6 @@ def render_admin_login_page(message: str = "") -> str:
 
 def render_admin_page(storage: Storage, config: Config, *, message: str = "") -> str:
     groups = storage.list_broadcast_groups()
-    whitelist_rows = storage.list_address_whitelist()
     named_groups = storage.list_named_broadcast_groups()
     permissions = storage.list_broadcast_group_permissions()
     chat_permissions = storage.list_broadcast_chat_permissions()
@@ -691,7 +658,7 @@ def render_admin_page(storage: Storage, config: Config, *, message: str = "") ->
           <div class="admin-title">
             <div class="brand">Telegram 记账机器人</div>
             <h1>后台管理</h1>
-            <p>集中管理地址白名单、广播分组、操作人权限、替换策略和已保存群组。</p>
+            <p>集中管理广播分组、操作人权限、替换策略和已保存群组。</p>
           </div>
           <div class="admin-header-actions">
             <a class="btn" href="/admin">刷新</a>
@@ -710,13 +677,8 @@ def render_admin_page(storage: Storage, config: Config, *, message: str = "") ->
             <span>启用操作人</span>
             <strong>{active_operator_count}</strong>
           </div>
-          <div class="admin-summary-item">
-            <span>白名单地址</span>
-            <strong>{len(whitelist_rows)}</strong>
-          </div>
         </section>
         <nav class="admin-nav" aria-label="后台管理导航">
-          <a href="#admin-whitelist">地址白名单</a>
           <a href="#admin-groups">广播分组</a>
           <a href="#admin-permissions">广播权限</a>
           <a href="#admin-replacement">广播替换</a>
@@ -724,27 +686,6 @@ def render_admin_page(storage: Storage, config: Config, *, message: str = "") ->
         </nav>
         {notice}
         <section class="admin-grid">
-          <div class="admin-card admin-card-whitelist" id="admin-whitelist">
-            <h2>地址白名单</h2>
-            <form method="POST" action="/admin" class="admin-form">
-              {hidden_input("action", "add_whitelist")}
-              {render_group_select("chat_id", groups, "选择群组", required=True)}
-              <input name="address" placeholder="TRC20 地址" required>
-              <input name="label" placeholder="备注，可选">
-              <input name="image_note" placeholder="地址核对图自动生成" disabled>
-              <button type="submit">保存白名单</button>
-            </form>
-            <form method="POST" action="/admin" class="admin-form inline-form">
-              {hidden_input("action", "remove_whitelist")}
-              {render_group_select("chat_id", groups, "选择群组", required=True)}
-              <input name="address" placeholder="TRC20 地址" required>
-              <button type="submit">删除白名单</button>
-            </form>
-            <div class="admin-scroll-panel">
-              {render_whitelist_table(whitelist_rows)}
-            </div>
-          </div>
-
           <div class="admin-card admin-card-groups" id="admin-groups">
             <h2>广播分组</h2>
             <div class="admin-action-panel">
@@ -883,40 +824,6 @@ def render_group_multi_select(rows: list[Any]) -> str:
     <select name="chat_ids" class="admin-multi-select admin-form-wide" multiple size="8">
       {''.join(options)}
     </select>
-    """
-
-
-def render_whitelist_table(rows: list[Any]) -> str:
-    if not rows:
-        return '<p class="empty admin-empty">暂无白名单地址</p>'
-    body = []
-    for row in rows:
-        status = "启用" if row["enabled"] else "停用"
-        title = row["chat_title"] or row["chat_id"]
-        image = f'<a href="{escape(row["image_url"], quote=True)}" target="_blank">核对图</a>' if row["image_url"] else "自动生成"
-        body.append(
-            "<tr>"
-            f"<td>{escape(str(title))}<br><small>{row['chat_id']}</small></td>"
-            f"<td><code>{escape(row['address'])}</code></td>"
-            f"<td>{escape(row['label'] or '')}</td>"
-            f"<td>{image}</td>"
-            f"<td>{status}</td>"
-            "</tr>"
-        )
-    return f"""
-    <div class="table-wrap admin-table-wrap">
-      <table class="records admin-table whitelist-table">
-        <colgroup>
-          <col class="whitelist-col-group">
-          <col class="whitelist-col-address">
-          <col class="whitelist-col-label">
-          <col class="whitelist-col-image">
-          <col class="whitelist-col-status">
-        </colgroup>
-        <thead><tr><td>群组</td><td>地址</td><td>备注</td><td>核对图</td><td>状态</td></tr></thead>
-        <tbody>{''.join(body)}</tbody>
-      </table>
-    </div>
     """
 
 
@@ -2542,7 +2449,6 @@ def page_shell(title: str, body: str) -> str:
       display: grid;
       grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
       grid-template-areas:
-        "whitelist whitelist"
         "replacement replacement"
         "groups groups"
         "permissions permissions"
@@ -2561,9 +2467,6 @@ def page_shell(title: str, body: str) -> str:
       border-top: 4px solid #e4c078;
       border-radius: 8px;
       box-shadow: var(--shadow);
-    }}
-    .admin-card-whitelist {{
-      grid-area: whitelist;
     }}
     .admin-card-groups {{
       grid-area: groups;
@@ -2768,29 +2671,6 @@ def page_shell(title: str, body: str) -> str:
       font-size: 13px;
       text-align: center;
     }}
-    .whitelist-table {{
-      table-layout: fixed;
-      width: 100%;
-    }}
-    .whitelist-col-group {{
-      width: 18%;
-    }}
-    .whitelist-col-address {{
-      width: 44%;
-    }}
-    .whitelist-col-label {{
-      width: 18%;
-    }}
-    .whitelist-col-image {{
-      width: 10%;
-    }}
-    .whitelist-col-status {{
-      width: 10%;
-    }}
-    .whitelist-table code {{
-      white-space: nowrap;
-      word-break: normal;
-    }}
     .admin-empty {{
       border: 1px dashed var(--line);
       border-radius: 6px;
@@ -2803,7 +2683,6 @@ def page_shell(title: str, body: str) -> str:
       .admin-grid {{
         grid-template-columns: 1fr;
         grid-template-areas:
-          "whitelist"
           "replacement"
           "groups"
           "permissions"

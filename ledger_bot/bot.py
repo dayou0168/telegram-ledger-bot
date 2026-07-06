@@ -137,6 +137,10 @@ class LedgerBot:
             max_workers=config.worker_threads,
             thread_name_prefix="ledger-worker",
         )
+        self.control_executor = ThreadPoolExecutor(
+            max_workers=config.control_threads,
+            thread_name_prefix="ledger-control",
+        )
         self.chain_executor = ThreadPoolExecutor(
             max_workers=config.chain_threads,
             thread_name_prefix="ledger-chain",
@@ -169,7 +173,18 @@ class LedgerBot:
         self.tron_poll_running = False
         self.host_presence_cache: dict[int, tuple[float, TelegramUser | None]] = {}
         self.host_presence_lock = threading.Lock()
+        self.host_presence_refreshing: set[int] = set()
         self.trongrid_error_log_after: dict[str, float] = {}
+        self.group_touch_ttl_seconds = 60.0
+        self.user_touch_ttl_seconds = 180.0
+        self.operator_cache_ttl_seconds = 10.0
+        self.address_watch_cache_ttl_seconds = 3.0
+        self.hot_cache_lock = threading.Lock()
+        self.group_touch_cache: dict[int, tuple[float, str | None]] = {}
+        self.user_touch_cache: dict[tuple[int, int], tuple[float, str | None, str]] = {}
+        self.operator_cache: dict[tuple[int, int, str | None], tuple[float, bool]] = {}
+        self.address_watch_targets_cache: tuple[float, list[dict[str, Any]]] | None = None
+        self.address_watch_settings_cache: dict[int, tuple[float, dict[str, Any]]] = {}
         self.address_watch_pending: dict[int, str] = {}
         self.broadcast_pending: dict[int, dict[str, Any]] = {}
         self.broadcast_reply_pending: dict[int, dict[str, Any]] = {}
@@ -193,10 +208,23 @@ class LedgerBot:
             if self.background_loops_started:
                 return
             self.background_loops_started = True
+        thread = threading.Thread(
+            target=self.prewarm_runtime_caches,
+            name="ledger-cache-prewarm",
+            daemon=True,
+        )
+        thread.start()
         if self.config.tron_poll_interval_seconds > 0:
             thread = threading.Thread(
                 target=self.address_watch_scheduler_loop,
                 name="ledger-address-watch-scheduler",
+                daemon=True,
+            )
+            thread.start()
+        if self.config.p2p_rate_refresh_seconds > 0:
+            thread = threading.Thread(
+                target=self.realtime_rate_scheduler_loop,
+                name="ledger-rate-scheduler",
                 daemon=True,
             )
             thread.start()
@@ -210,6 +238,15 @@ class LedgerBot:
             interval = max(0.2, min(1.0, self.config.tron_poll_interval_seconds / 2))
             time.sleep(interval)
 
+    def realtime_rate_scheduler_loop(self) -> None:
+        while True:
+            try:
+                self.refresh_realtime_rates_if_due()
+            except Exception as exc:
+                print(f"Realtime rate scheduler error: {exc}", flush=True)
+            interval = max(1.0, min(10.0, self.config.p2p_rate_refresh_seconds / 2))
+            time.sleep(interval)
+
     def _poll_once(self) -> None:
         updates = self.client.get_updates(self.offset, self.telegram_poll_timeout())
         for update in updates:
@@ -218,8 +255,61 @@ class LedgerBot:
             if not self.storage.claim_update(update_id, datetime.now(self.config.timezone)):
                 continue
             self.submit_update(update)
-        self.refresh_realtime_rates_if_due()
-        self.poll_address_watches_if_due()
+
+    def prewarm_runtime_caches(self) -> None:
+        try:
+            self.active_address_watch_targets(force_refresh=True)
+            self.storage.list_broadcast_groups()
+            self.storage.list_named_broadcast_groups()
+            self.storage.list_broadcast_operators(active_only=False)
+        except Exception as exc:
+            print(f"Cache prewarm error: {exc}", flush=True)
+
+    def active_address_watch_targets(self, *, force_refresh: bool = False) -> list[dict[str, Any]]:
+        now = time.monotonic()
+        with self.hot_cache_lock:
+            cached = self.address_watch_targets_cache
+            if (
+                not force_refresh
+                and cached is not None
+                and now - cached[0] <= self.address_watch_cache_ttl_seconds
+            ):
+                return [dict(row) for row in cached[1]]
+
+        rows = [dict(row) for row in self.storage.list_active_address_watch_targets()]
+        with self.hot_cache_lock:
+            self.address_watch_targets_cache = (now, [dict(row) for row in rows])
+        return rows
+
+    def address_watch_settings(
+        self,
+        owner_user_id: int,
+        now: datetime,
+        *,
+        force_refresh: bool = False,
+    ) -> dict[str, Any]:
+        cache_now = time.monotonic()
+        with self.hot_cache_lock:
+            cached = self.address_watch_settings_cache.get(owner_user_id)
+            if (
+                not force_refresh
+                and cached is not None
+                and cache_now - cached[0] <= self.address_watch_cache_ttl_seconds
+            ):
+                return dict(cached[1])
+
+        settings = dict(self.storage.get_address_watch_settings(owner_user_id, now))
+        with self.hot_cache_lock:
+            self.address_watch_settings_cache[owner_user_id] = (cache_now, dict(settings))
+        return settings
+
+    def invalidate_address_watch_cache(self, owner_user_id: int | None = None) -> None:
+        with self.hot_cache_lock:
+            self.address_watch_targets_cache = None
+            if owner_user_id is None:
+                self.address_watch_settings_cache.clear()
+            else:
+                self.address_watch_settings_cache.pop(owner_user_id, None)
 
     def submit_update(self, update: dict[str, Any]) -> None:
         key = self.update_lock_key(update)
@@ -232,10 +322,22 @@ class LedgerBot:
                 should_start = True
         if not should_start:
             return
-        future = self.update_executor.submit(self.process_update_queue, key)
+        future = self.update_executor_for_update(update).submit(self.process_update_queue, key)
         with self.update_futures_guard:
             self.update_futures.add(future)
         future.add_done_callback(self.update_future_done)
+
+    def update_executor_for_update(self, update: dict[str, Any]) -> ThreadPoolExecutor:
+        if message := update.get("message"):
+            chat = message.get("chat") or {}
+            if chat.get("type") == "private":
+                return self.control_executor
+        if callback := update.get("callback_query"):
+            message = callback.get("message") or {}
+            chat = message.get("chat") or {}
+            if chat.get("type") == "private":
+                return self.control_executor
+        return self.update_executor
 
     def update_future_done(self, future: Future[None]) -> None:
         with self.update_futures_guard:
@@ -257,12 +359,20 @@ class LedgerBot:
             self.process_claimed_update(update)
 
     def process_claimed_update(self, update: dict[str, Any]) -> None:
+        started_at = time.monotonic()
         try:
             self.handle_update(update)
         except TelegramAPIError as exc:
             print(f"Telegram API error: {exc}", flush=True)
         except Exception as exc:
             print(f"Unhandled update error: {exc}", flush=True)
+        finally:
+            elapsed = time.monotonic() - started_at
+            if elapsed >= 2:
+                print(
+                    f"Slow update {update.get('update_id', 'unknown')} handled in {elapsed:.2f}s",
+                    flush=True,
+                )
 
     @staticmethod
     def update_lock_key(update: dict[str, Any]) -> str:
@@ -282,14 +392,7 @@ class LedgerBot:
         return f"update:{update.get('update_id', 'unknown')}"
 
     def telegram_poll_timeout(self) -> int:
-        intervals = [
-            value
-            for value in (self.config.tron_poll_interval_seconds, self.config.p2p_rate_refresh_seconds)
-            if value > 0
-        ]
-        if not intervals:
-            return self.config.poll_timeout
-        return min(self.config.poll_timeout, max(1, min(intervals)))
+        return self.config.poll_timeout
 
     def handle_update(self, update: dict[str, Any]) -> None:
         if "message" in update:
@@ -317,6 +420,7 @@ class LedgerBot:
                     pass
                 self.client.leave_chat(chat_id)
                 self.storage.forget_group(chat_id)
+                self.invalidate_group_runtime_cache(chat_id)
                 return
             self.storage.ensure_group(chat_id, chat.get("title"), now)
             return
@@ -353,18 +457,15 @@ class LedgerBot:
             text=text,
             now=now,
         )
-        self.storage.ensure_group(ctx.chat_id, ctx.chat_title, now)
+        self.ensure_group_cached(ctx.chat_id, ctx.chat_title, now)
         self.storage.apply_due_day_cutoff(ctx.chat_id, now, self.config.timezone)
-        self.storage.touch_user(ctx.chat_id, user, now)
+        self.touch_user_cached(ctx.chat_id, user, now)
         if ctx.reply_user:
-            self.storage.touch_user(ctx.chat_id, ctx.reply_user, now)
+            self.touch_user_cached(ctx.chat_id, ctx.reply_user, now)
 
         self.handle_broadcast_reply_notification(ctx)
 
         if not text:
-            return
-
-        if self.handle_address_whitelist_command(ctx):
             return
 
         if self.handle_group_address_verification(ctx):
@@ -388,6 +489,45 @@ class LedgerBot:
         else:
             self.handle_ledger_entry(ctx, parsed)
 
+    def ensure_group_cached(self, chat_id: int, title: str | None, now: datetime) -> None:
+        now_mono = time.monotonic()
+        with self.hot_cache_lock:
+            cached = self.group_touch_cache.get(chat_id)
+            if cached is not None:
+                expires_at, cached_title = cached
+                if expires_at >= now_mono and cached_title == title:
+                    return
+        self.storage.ensure_group(chat_id, title, now)
+        with self.hot_cache_lock:
+            self.group_touch_cache[chat_id] = (now_mono + self.group_touch_ttl_seconds, title)
+
+    def touch_user_cached(self, chat_id: int, user: TelegramUser, now: datetime) -> None:
+        now_mono = time.monotonic()
+        key = (chat_id, user.user_id)
+        with self.hot_cache_lock:
+            cached = self.user_touch_cache.get(key)
+            if cached is not None:
+                expires_at, username, display_name = cached
+                if expires_at >= now_mono and username == user.username and display_name == user.display_name:
+                    return
+        self.storage.touch_user(chat_id, user, now)
+        with self.hot_cache_lock:
+            self.user_touch_cache[key] = (
+                now_mono + self.user_touch_ttl_seconds,
+                user.username,
+                user.display_name,
+            )
+
+    def invalidate_group_runtime_cache(self, chat_id: int) -> None:
+        with self.hot_cache_lock:
+            self.group_touch_cache.pop(chat_id, None)
+            for key in list(self.user_touch_cache):
+                if key[0] == chat_id:
+                    self.user_touch_cache.pop(key, None)
+            for key in list(self.operator_cache):
+                if key[0] == chat_id:
+                    self.operator_cache.pop(key, None)
+
     def handle_command(self, ctx: MessageContext, command: ParsedCommand) -> None:
         group = self.storage.get_group(ctx.chat_id)
         if command.name in MANAGEMENT_COMMANDS:
@@ -405,7 +545,7 @@ class LedgerBot:
                     reply_markup={"inline_keyboard": [[{"text": "🚩 使用说明", "callback_data": "help"}]]},
                 )
             case "stop":
-                self.storage.update_group(ctx.chat_id, ctx.now, active=0)
+                self.storage.update_group(ctx.chat_id, ctx.now, active=0, stopped_at=ctx.now.isoformat())
                 self.reply(ctx, "已停止记账。发送“开始”可重新开启。")
             case "open_business":
                 self.storage.update_group(ctx.chat_id, ctx.now, business_open=1)
@@ -414,7 +554,7 @@ class LedgerBot:
                 self.storage.update_group(ctx.chat_id, ctx.now, business_open=0)
                 self._set_permissions(ctx, False)
             case "stop_and_close_business":
-                self.storage.update_group(ctx.chat_id, ctx.now, active=0, business_open=0)
+                self.storage.update_group(ctx.chat_id, ctx.now, active=0, business_open=0, stopped_at=ctx.now.isoformat())
                 self._set_permissions(ctx, False, prefix="已拉停：记账暂停，群员发言已关闭。")
             case "show_bill":
                 self.send_bill(ctx)
@@ -536,6 +676,7 @@ class LedgerBot:
             case "leave_group":
                 self.reply(ctx, "机器人即将退群，并清除本群权限和账单。")
                 self.storage.delete_group_data(ctx.chat_id)
+                self.invalidate_group_runtime_cache(ctx.chat_id)
                 self.client.leave_chat(ctx.chat_id)
             case "set_rate_from_otc_rank":
                 self.set_rate_from_otc_rank(ctx, int(command.args["rank"]), command.args["offset"])
@@ -791,7 +932,7 @@ class LedgerBot:
         if normalized in {"⚙后台管理", "后台管理", "打开后台"}:
             self.send_admin_web_link(chat_id, user, message_id)
             return
-        if self.handle_address_watch_pending_input(chat_id, user.user_id, normalized, now, message_id):
+        if self.handle_address_watch_pending_input(chat_id, user, normalized, now, message_id):
             return
         if self.handle_default_operator_command(chat_id, user, normalized, message_id):
             return
@@ -818,9 +959,12 @@ class LedgerBot:
             self.client.send_message(chat_id, self.private_help_text(), reply_to_message_id=message_id)
             return
         if normalized in {"🔔地址监听", "地址监听", "监听地址"}:
+            if not self.can_use_address_watch(user):
+                self.client.send_message(chat_id, self.address_watch_denied_text(), reply_to_message_id=message_id)
+                return
             self.send_address_watch_menu(chat_id, user.user_id, message_id)
             return
-        if self.handle_address_watch_command(chat_id, user.user_id, normalized, now, message_id):
+        if self.handle_address_watch_command(chat_id, user, normalized, now, message_id):
             return
         if address := extract_tron_address(normalized):
             self.submit_query(self.send_tron_address_query, chat_id, address, reply_to_message_id=message_id)
@@ -1214,8 +1358,8 @@ class LedgerBot:
                 "回复自己发送的原始加账消息，发送 撤销 / 撤销入款 / 撤销下发。",
                 "",
                 "群内地址验证：",
-                "直接发送 TRC20 地址，机器人会回复验证次数、上次发送人和本次发送人。",
-                "地址白名单在后台管理里维护，保存后自动生成 USDT 防篡改核对图；白名单地址会回复核对图、余额和状态。",
+                "直接发送 TRC20 地址，首次出现会回复 USDT 防篡改核对图。",
+                "同一群后续再次发送相同地址，会回复验证次数、上次发送人和本次发送人。",
                 "",
                 "私聊地址监听：",
                 "点击 🔔地址监听 打开按钮面板，可添加/删除监听地址、设置备注和最小提醒金额。",
@@ -1227,7 +1371,7 @@ class LedgerBot:
                 "通知所有人是按钮开关，不需要写在广播内容里。",
                 "",
                 "广播管理：",
-                "点击 ⚙后台管理 进入网页登录页，管理群组、分组、广播权限、地址白名单和替换内容。",
+                "点击 ⚙后台管理 进入网页登录页，管理群组、分组、广播权限和替换内容。",
                 "后台里按群名搜索或多选群组，不需要逐个查群 ID。",
                 "点击 🔎查询UID 可用 Telegram 原生选择用户功能获取 UID；也可以转发消息给机器人自动识别。",
                 "",
@@ -2598,7 +2742,7 @@ class LedgerBot:
         reply_to_message_id: int | None = None,
     ) -> None:
         rows = self.storage.list_address_watches(owner_user_id)
-        settings = self.storage.get_address_watch_settings(owner_user_id, datetime.now(self.config.timezone))
+        settings = self.address_watch_settings(owner_user_id, datetime.now(self.config.timezone))
         min_amount = min_notify_amount(settings)
         min_text = "不限" if min_amount == 0 else f"{format_number(min_amount)} USDT"
         lines = [
@@ -2660,20 +2804,28 @@ class LedgerBot:
     def handle_address_watch_command(
         self,
         chat_id: int,
-        owner_user_id: int,
+        user: TelegramUser,
         text: str,
         now: datetime,
         reply_to_message_id: int | None,
     ) -> bool:
         add_match = re.fullmatch(r"(?:添加监听地址|设置监听地址|添加地址|设置地址|监听)\s+(.+)", text)
         if add_match:
-            self.add_address_watch_from_text(chat_id, owner_user_id, add_match.group(1), now, reply_to_message_id)
+            if not self.can_use_address_watch(user):
+                self.client.send_message(chat_id, self.address_watch_denied_text(), reply_to_message_id=reply_to_message_id)
+                return True
+            self.add_address_watch_from_text(chat_id, user.user_id, add_match.group(1), now, reply_to_message_id)
             return True
 
         remove_match = re.fullmatch(r"(?:删除监听地址|删除地址|取消监听)\s+(\S+)", text)
         if remove_match:
+            if not self.can_use_address_watch(user):
+                self.client.send_message(chat_id, self.address_watch_denied_text(), reply_to_message_id=reply_to_message_id)
+                return True
             address = remove_match.group(1).strip()
-            removed = self.storage.remove_address_watch(owner_user_id, address)
+            removed = self.storage.remove_address_watch(user.user_id, address)
+            if removed:
+                self.invalidate_address_watch_cache(user.user_id)
             self.client.send_message(
                 chat_id,
                 "监听地址已删除。" if removed else "没有找到这个监听地址。",
@@ -2683,26 +2835,37 @@ class LedgerBot:
 
         label_match = re.fullmatch(r"(?:设置地址备注|设置备注|修改备注)\s+(.+)", text)
         if label_match:
-            self.update_address_watch_label_from_text(chat_id, owner_user_id, label_match.group(1), now, reply_to_message_id)
+            if not self.can_use_address_watch(user):
+                self.client.send_message(chat_id, self.address_watch_denied_text(), reply_to_message_id=reply_to_message_id)
+                return True
+            self.update_address_watch_label_from_text(chat_id, user.user_id, label_match.group(1), now, reply_to_message_id)
             return True
 
         amount_match = re.fullmatch(r"(?:设置监听金额|设置最小金额|最小提醒金额|最小金额)\s*(\d+(?:\.\d+)?)", text)
         if amount_match:
-            self.update_address_watch_min_amount(chat_id, owner_user_id, amount_match.group(1), now, reply_to_message_id)
+            if not self.can_use_address_watch(user):
+                self.client.send_message(chat_id, self.address_watch_denied_text(), reply_to_message_id=reply_to_message_id)
+                return True
+            self.update_address_watch_min_amount(chat_id, user.user_id, amount_match.group(1), now, reply_to_message_id)
             return True
         return False
 
     def handle_address_watch_pending_input(
         self,
         chat_id: int,
-        owner_user_id: int,
+        user: TelegramUser,
         text: str,
         now: datetime,
         reply_to_message_id: int | None,
     ) -> bool:
+        owner_user_id = user.user_id
         action = self.address_watch_pending.get(owner_user_id)
         if not action:
             return False
+        if not self.can_use_address_watch(user):
+            self.address_watch_pending.pop(owner_user_id, None)
+            self.client.send_message(chat_id, self.address_watch_denied_text(), reply_to_message_id=reply_to_message_id)
+            return True
         if text in {"取消", "退出", "返回"}:
             self.address_watch_pending.pop(owner_user_id, None)
             self.client.send_message(chat_id, "已取消。", reply_to_message_id=reply_to_message_id)
@@ -2712,6 +2875,8 @@ class LedgerBot:
             ok = self.add_address_watch_from_text(chat_id, owner_user_id, text, now, reply_to_message_id)
         elif action == "remove":
             removed = self.storage.remove_address_watch(owner_user_id, text.strip())
+            if removed:
+                self.invalidate_address_watch_cache(owner_user_id)
             self.client.send_message(
                 chat_id,
                 "监听地址已删除。" if removed else "没有找到这个监听地址。",
@@ -2750,6 +2915,7 @@ class LedgerBot:
             )
             return False
         self.storage.add_address_watch(owner_user_id, network, address, label, now)
+        self.invalidate_address_watch_cache(owner_user_id)
         self.client.send_message(chat_id, "监听地址已保存。", reply_to_message_id=reply_to_message_id)
         return True
 
@@ -2766,6 +2932,8 @@ class LedgerBot:
             self.client.send_message(chat_id, "请发送地址和备注，格式：T地址 备注", reply_to_message_id=reply_to_message_id)
             return False
         changed = self.storage.update_address_watch_label(owner_user_id, address, label, now)
+        if changed:
+            self.invalidate_address_watch_cache(owner_user_id)
         self.client.send_message(
             chat_id,
             "地址备注已更新。" if changed else "没有找到这个监听地址。",
@@ -2786,6 +2954,7 @@ class LedgerBot:
             self.client.send_message(chat_id, "请输入大于或等于 0 的 USDT 金额，例如：10", reply_to_message_id=reply_to_message_id)
             return False
         self.storage.update_address_watch_settings(owner_user_id, now, min_notify_amount=str(amount))
+        self.invalidate_address_watch_cache(owner_user_id)
         label = "不限" if amount == 0 else f"{format_number(amount)} USDT"
         self.client.send_message(chat_id, f"最小提醒金额已设置为：{label}", reply_to_message_id=reply_to_message_id)
         return True
@@ -2797,98 +2966,6 @@ class LedgerBot:
             return "", None
         return parts[0].strip(), (parts[1].strip() if len(parts) > 1 and parts[1].strip() else None)
 
-    def handle_address_whitelist_command(self, ctx: MessageContext) -> bool:
-        text = ctx.text.strip()
-        if text in {"显示白名单", "白名单列表", "地址白名单"}:
-            if not self.require_operator(ctx):
-                return True
-            rows = self.storage.list_address_whitelist(ctx.chat_id, enabled_only=True)
-            if not rows:
-                self.reply(ctx, "当前群没有白名单地址。")
-                return True
-            lines = [f"地址白名单（{len(rows)}个）："]
-            for row in rows[:30]:
-                label = f" {row['label']}" if row["label"] else ""
-                lines.append(f"{row['address']}{label}")
-            if len(rows) > 30:
-                lines.append(f"... 还有 {len(rows) - 30} 个，请到后台查看。")
-            self.reply(ctx, "\n".join(lines))
-            return True
-
-        add_match = re.fullmatch(r"(?:添加白名单地址|设置白名单地址|白名单添加)\s+(.+)", text, flags=re.S)
-        if add_match:
-            if not self.require_operator(ctx):
-                return True
-            address, tail = self.parse_address_and_tail(add_match.group(1))
-            network = detect_usdt_network(address)
-            if network != "TRC20":
-                self.reply(ctx, "地址格式不支持。白名单当前只支持 TRC20 的 T 开头地址。")
-                return True
-            label, _image_url = self.parse_whitelist_tail(tail)
-            image_url = self.generated_address_image_url(address)
-            self.storage.add_address_whitelist(
-                chat_id=ctx.chat_id,
-                network=network,
-                address=address,
-                label=label,
-                image_url=image_url,
-                created_by=ctx.user.user_id,
-                now=ctx.now,
-            )
-            self.reply(ctx, "白名单地址已保存。")
-            return True
-
-        image_match = re.fullmatch(r"(?:设置白名单图片|白名单图片)\s+(.+)", text, flags=re.S)
-        if image_match:
-            if not self.require_operator(ctx):
-                return True
-            address, _tail = self.parse_address_and_tail(image_match.group(1))
-            if detect_usdt_network(address) != "TRC20":
-                self.reply(ctx, "格式：设置白名单图片 T地址")
-                return True
-            existing = self.storage.get_address_whitelist(ctx.chat_id, address, enabled_only=False)
-            if existing is None:
-                self.reply(ctx, "没有找到这个白名单地址，请先添加白名单地址。")
-                return True
-            image_url = self.generated_address_image_url(address)
-            self.storage.add_address_whitelist(
-                chat_id=ctx.chat_id,
-                network=existing["network"],
-                address=address,
-                label=existing["label"],
-                image_url=image_url,
-                created_by=ctx.user.user_id,
-                now=ctx.now,
-            )
-            self.reply(ctx, "白名单地址核对图已重新生成。")
-            return True
-
-        remove_match = re.fullmatch(r"(?:删除白名单地址|移除白名单地址|白名单删除)\s+(\S+)", text)
-        if remove_match:
-            if not self.require_operator(ctx):
-                return True
-            address = remove_match.group(1).strip()
-            removed = self.storage.remove_address_whitelist(ctx.chat_id, address, now=ctx.now)
-            self.reply(ctx, "白名单地址已删除。" if removed else "没有找到这个白名单地址。")
-            return True
-
-        return False
-
-    @staticmethod
-    def parse_whitelist_tail(tail: str | None) -> tuple[str | None, str | None]:
-        if not tail:
-            return None, None
-        label_parts: list[str] = []
-        image_url: str | None = None
-        for part in tail.split():
-            lowered = part.lower()
-            if lowered.startswith(("图片=", "图片:", "image=", "url=")):
-                image_url = re.split(r"[:=]", part, maxsplit=1)[1].strip()
-            else:
-                label_parts.append(part)
-        label = " ".join(label_parts).strip() or None
-        return label, image_url
-
     def handle_group_address_verification(self, ctx: MessageContext) -> bool:
         address = ctx.text.strip()
         if detect_usdt_network(address) != "TRC20":
@@ -2899,12 +2976,11 @@ class LedgerBot:
             sender=ctx.user,
             now=ctx.now,
         )
-        whitelist = self.storage.get_address_whitelist(ctx.chat_id, address)
-        if whitelist is not None:
-            address_info = self.fetch_whitelist_address_info(address)
-            lines = self.address_whitelist_reply(address, whitelist, verification, address_info)
+        if int(verification["count"]) == 1:
+            address_info = self.fetch_group_address_info(address)
+            lines = self.first_address_verification_reply(address, verification, address_info)
             text = "\n".join(lines)
-            image_url = whitelist["image_url"]
+            image_url = self.generated_address_image_url(address)
             if image_url and str(image_url).startswith(("http://", "https://")):
                 self.client.send_photo(
                     ctx.chat_id,
@@ -2921,13 +2997,7 @@ class LedgerBot:
                     parse_mode="HTML",
                 )
             return True
-        lines = [
-            f"验证地址： <code>{escape(address)}</code>",
-            f"验证次数： {verification['count']}",
-        ]
-        if verification["previous_sender_name"]:
-            lines.append(f"上次发送人： {escape(verification['previous_sender_name'])}")
-        lines.append(f"本次发送人： {escape(verification['current_sender_name'])}")
+        lines = self.repeat_address_verification_reply(address, verification)
         self.client.send_message(
             ctx.chat_id,
             "\n".join(lines),
@@ -2936,10 +3006,9 @@ class LedgerBot:
         )
         return True
 
-    def address_whitelist_reply(
+    def first_address_verification_reply(
         self,
         address: str,
-        whitelist: Any,
         verification: dict[str, Any],
         address_info: Any | None,
     ) -> list[str]:
@@ -2957,16 +3026,25 @@ class LedgerBot:
             lines.append("🌐 创建： 暂无")
             lines.append("├ ▣ USDT： 暂无")
             lines.append("├ ▣ TRX： 暂无")
-        lines.append("└✅ 状态： 白名单")
+        lines.append("└✅ 状态： 首次验证")
         lines.append(f"验证次数： {verification['count']}")
         if verification["previous_sender_name"]:
             lines.append(f"上次发送人： {escape(verification['previous_sender_name'])}")
         lines.append(f"本次发送人： {escape(verification['current_sender_name'])}")
-        if whitelist["label"]:
-            lines.append(f"备注： {escape(whitelist['label'])}")
         return lines
 
-    def fetch_whitelist_address_info(self, address: str) -> Any | None:
+    @staticmethod
+    def repeat_address_verification_reply(address: str, verification: dict[str, Any]) -> list[str]:
+        lines = [
+            f"验证地址： <code>{escape(address)}</code>",
+            f"验证次数： {verification['count']}",
+        ]
+        if verification["previous_sender_name"]:
+            lines.append(f"上次发送人： {escape(verification['previous_sender_name'])}")
+        lines.append(f"本次发送人： {escape(verification['current_sender_name'])}")
+        return lines
+
+    def fetch_group_address_info(self, address: str) -> Any | None:
         try:
             row = self.tron_client.fetch_account(address)
             return parse_tron_address_info(
@@ -2976,7 +3054,7 @@ class LedgerBot:
                 usdt_contract=self.config.tron_usdt_contract,
             )
         except TronGridError as exc:
-            print(f"Whitelist address info failed for {address}: {exc}", flush=True)
+            print(f"Group address info failed for {address}: {exc}", flush=True)
             return None
 
     def generated_address_image_url(self, address: str) -> str | None:
@@ -2993,6 +3071,7 @@ class LedgerBot:
     def handle_ledger_entry(self, ctx: MessageContext, entry: ParsedLedgerEntry) -> None:
         if not self.ensure_host_present_for_accounting(ctx):
             return
+        self.storage.resume_group_if_not_manually_stopped(ctx.chat_id, ctx.now)
         group = self.storage.get_group(ctx.chat_id)
         if not group["active"]:
             if entry.kind == "deposit" and entry.amount == 0:
@@ -3353,6 +3432,7 @@ class LedgerBot:
                 changed += self.storage.remove_operator(ctx.chat_id, username_norm=username)
         action = "添加" if add else "删除"
         if changed:
+            self.invalidate_operator_cache(ctx.chat_id)
             self.reply(ctx, f"操作员已{action}成功。")
         else:
             self.reply(ctx, f"没有找到要{action}的操作员。可 @用户名，或回复对方消息后发送指令。")
@@ -3576,6 +3656,7 @@ class LedgerBot:
         if group["owner_user_id"] == user.user_id:
             return
         self.storage.set_group_owner(chat_id, user, now=now)
+        self.invalidate_operator_cache(chat_id)
 
     def ensure_host_present_for_accounting(self, ctx: MessageContext) -> bool:
         return self.ensure_host_present_or_leave(ctx.chat_id, ctx.chat_title, ctx.user, ctx.now)
@@ -3601,6 +3682,7 @@ class LedgerBot:
             self.client.leave_chat(chat_id)
         finally:
             self.storage.forget_group(chat_id)
+            self.invalidate_group_runtime_cache(chat_id)
         print(f"Left group {chat_id} ({chat_title or 'untitled'}): host is not present", flush=True)
         return False
 
@@ -3614,13 +3696,39 @@ class LedgerBot:
         cached = self.cached_host_presence(chat_id)
         if cached is not None:
             return cached
+        if self.cached_host_absence(chat_id):
+            return None
+        stale = self.cached_host_presence(chat_id, allow_expired=True)
+        if stale is not None:
+            self.schedule_host_presence_refresh(chat_id)
+            return stale
+        group = self.storage.get_group(chat_id)
+        if group["owner_user_id"] == host_user_id:
+            known_host = TelegramUser(host_user_id, None, str(host_user_id))
+            self.cache_host_presence(chat_id, known_host)
+            self.schedule_host_presence_refresh(chat_id)
+            return known_host
+        return self.fetch_host_in_group(chat_id, now, allow_stale_on_error=True)
+
+    def fetch_host_in_group(
+        self,
+        chat_id: int,
+        now: datetime,
+        *,
+        allow_stale_on_error: bool = False,
+    ) -> TelegramUser | None:
+        host_user_id = self.config.bot_host_user_id
+        if host_user_id is None:
+            return None
         try:
             member = self.client.get_chat_member(chat_id, host_user_id)
         except TelegramRetryableError:
             raise
         except TelegramAPIError as exc:
             print(f"Could not verify host {host_user_id} in {chat_id}: {exc}", flush=True)
-            return self.cached_host_presence(chat_id, allow_expired=True)
+            if allow_stale_on_error:
+                return self.cached_host_presence(chat_id, allow_expired=True)
+            return None
         status = member.get("status")
         if status in {"left", "kicked"}:
             self.cache_host_presence(chat_id, None)
@@ -3633,7 +3741,47 @@ class LedgerBot:
         self.storage.touch_user(chat_id, host_user, now)
         self.cache_host_presence(chat_id, host_user)
         return host_user
-        return None
+
+    def schedule_host_presence_refresh(self, chat_id: int) -> None:
+        with self.host_presence_lock:
+            if chat_id in self.host_presence_refreshing:
+                return
+            self.host_presence_refreshing.add(chat_id)
+        future = self.query_executor.submit(self.refresh_host_presence, chat_id)
+        future.add_done_callback(lambda _: self.mark_host_presence_refresh_done(chat_id))
+
+    def mark_host_presence_refresh_done(self, chat_id: int) -> None:
+        with self.host_presence_lock:
+            self.host_presence_refreshing.discard(chat_id)
+
+    def refresh_host_presence(self, chat_id: int) -> None:
+        now = datetime.now(self.config.timezone)
+        try:
+            host_user = self.fetch_host_in_group(chat_id, now, allow_stale_on_error=False)
+        except TelegramRetryableError as exc:
+            print(f"Host presence refresh retryable error for {chat_id}: {exc}", flush=True)
+            return
+        if host_user is not None:
+            try:
+                self.set_group_owner_if_missing(chat_id, host_user, now)
+            except KeyError:
+                return
+            return
+        try:
+            group = self.storage.get_group(chat_id)
+        except KeyError:
+            return
+        reason = "未配置宿主，机器人将自动退出。" if self.config.bot_host_user_id is None else "宿主不在群内，机器人将自动退出。"
+        try:
+            self.client.send_message(chat_id, reason)
+        except TelegramAPIError:
+            pass
+        try:
+            self.client.leave_chat(chat_id)
+        finally:
+            self.storage.forget_group(chat_id)
+            self.invalidate_group_runtime_cache(chat_id)
+        print(f"Left group {chat_id} ({group['chat_title'] or 'untitled'}): host is not present", flush=True)
 
     def cached_host_presence(self, chat_id: int, *, allow_expired: bool = False) -> TelegramUser | None:
         ttl = self.config.host_check_ttl_seconds
@@ -3647,6 +3795,17 @@ class LedgerBot:
         if allow_expired or expires_at >= time.monotonic():
             return user
         return None
+
+    def cached_host_absence(self, chat_id: int) -> bool:
+        ttl = self.config.host_check_ttl_seconds
+        if ttl <= 0:
+            return False
+        with self.host_presence_lock:
+            cached = self.host_presence_cache.get(chat_id)
+        if cached is None:
+            return False
+        expires_at, user = cached
+        return user is None and expires_at >= time.monotonic()
 
     def cache_host_presence(self, chat_id: int, user: TelegramUser | None) -> None:
         ttl = self.config.host_check_ttl_seconds
@@ -3677,6 +3836,10 @@ class LedgerBot:
         fake_ctx = MessageContext(message=message, chat_id=chat_id, chat_title=chat.get("title"), user=user, text="", now=now)
 
         if data.startswith("watch:"):
+            if not self.can_use_address_watch(user):
+                self.address_watch_pending.pop(user.user_id, None)
+                self.client.answer_callback_query(callback["id"], self.address_watch_denied_text())
+                return
             self.handle_address_watch_callback(chat_id, user.user_id, callback["id"], data, now)
             return
 
@@ -4085,7 +4248,7 @@ class LedgerBot:
         fallback_min_timestamp_ms = int(
             (now - timedelta(minutes=self.config.tron_initial_lookback_minutes)).timestamp() * 1000
         )
-        watches = [dict(row) for row in self.storage.list_active_address_watch_targets()]
+        watches = self.active_address_watch_targets()
         if not watches:
             return
         if self.tron_client.uses_tronscan_api():
@@ -4168,7 +4331,7 @@ class LedgerBot:
                 self.process_address_watch_transfer_row(watch, row, now)
 
     def poll_one_address_watch(self, watch: dict[str, Any], now: datetime, fallback_min_timestamp_ms: int) -> None:
-        settings = self.storage.get_address_watch_settings(watch["owner_user_id"], now)
+        settings = self.address_watch_settings(watch["owner_user_id"], now)
         min_timestamp_ms = self.address_watch_min_timestamp_ms(watch, fallback_min_timestamp_ms)
         try:
             rows = self.tron_client.fetch_trc20_transfers(
@@ -4191,7 +4354,7 @@ class LedgerBot:
         *,
         settings: Any | None = None,
     ) -> None:
-        settings = settings or self.storage.get_address_watch_settings(watch["owner_user_id"], now)
+        settings = settings or self.address_watch_settings(watch["owner_user_id"], now)
         transfer = parse_usdt_transfer(
             row,
             watched_address=watch["address"],
@@ -4252,7 +4415,7 @@ class LedgerBot:
         data: str,
         now: datetime,
     ) -> None:
-        settings = self.storage.get_address_watch_settings(owner_user_id, now)
+        settings = self.address_watch_settings(owner_user_id, now)
         if data == "watch:prompt:add":
             self.address_watch_pending[owner_user_id] = "add"
             self.client.answer_callback_query(callback_id, "请发送地址和备注。")
@@ -4275,21 +4438,26 @@ class LedgerBot:
             return
         if data == "watch:mode:compact":
             self.storage.update_address_watch_settings(owner_user_id, now, display_mode="compact")
+            self.invalidate_address_watch_cache(owner_user_id)
             text = "已切换精简模式。"
         elif data == "watch:mode:full":
             self.storage.update_address_watch_settings(owner_user_id, now, display_mode="full")
+            self.invalidate_address_watch_cache(owner_user_id)
             text = "已切换完整模式。"
         elif data == "watch:toggle:income":
             value = 0 if settings["watch_income"] else 1
             self.storage.update_address_watch_settings(owner_user_id, now, watch_income=value)
+            self.invalidate_address_watch_cache(owner_user_id)
             text = "收入监听已开启。" if value else "收入监听已关闭。"
         elif data == "watch:toggle:expense":
             value = 0 if settings["watch_expense"] else 1
             self.storage.update_address_watch_settings(owner_user_id, now, watch_expense=value)
+            self.invalidate_address_watch_cache(owner_user_id)
             text = "支出监听已开启。" if value else "支出监听已关闭。"
         elif data == "watch:toggle:trx":
             value = 0 if settings["notify_trx"] else 1
             self.storage.update_address_watch_settings(owner_user_id, now, notify_trx=value)
+            self.invalidate_address_watch_cache(owner_user_id)
             text = "TRX通知已开启。" if value else "TRX通知已关闭。"
         else:
             text = "未知设置。"
@@ -4310,7 +4478,10 @@ class LedgerBot:
         return self.require_operator(ctx)
 
     def require_operator(self, ctx: MessageContext, callback_id: str | None = None) -> bool:
-        ok = self.is_host(ctx.user.user_id) or self.is_default_operator(ctx.user) or self.storage.is_operator(ctx.chat_id, ctx.user)
+        ok = self.is_host(ctx.user.user_id) or self.is_default_operator(ctx.user) or self.is_group_operator_cached(
+            ctx.chat_id,
+            ctx.user,
+        )
         if ok:
             return True
         text = "没有操作权限。请管理员添加操作员。"
@@ -4325,6 +4496,29 @@ class LedgerBot:
             return True
         self.reply(ctx, "只有宿主或本群最高权限可以设置单群操作员。")
         return False
+
+    def is_group_operator_cached(self, chat_id: int, user: TelegramUser) -> bool:
+        username_norm = user.username_norm
+        key = (chat_id, user.user_id, username_norm)
+        now = time.monotonic()
+        with self.hot_cache_lock:
+            cached = self.operator_cache.get(key)
+            if cached is not None and now - cached[0] <= self.operator_cache_ttl_seconds:
+                return cached[1]
+
+        ok = self.storage.is_operator(chat_id, user)
+        with self.hot_cache_lock:
+            self.operator_cache[key] = (now, ok)
+        return ok
+
+    def invalidate_operator_cache(self, chat_id: int | None = None) -> None:
+        with self.hot_cache_lock:
+            if chat_id is None:
+                self.operator_cache.clear()
+                return
+            for key in list(self.operator_cache):
+                if key[0] == chat_id:
+                    self.operator_cache.pop(key, None)
 
     def is_host(self, user_id: int) -> bool:
         return user_id == self.config.bot_host_user_id
@@ -4347,6 +4541,13 @@ class LedgerBot:
             or self.is_active_broadcast_operator(user.user_id)
             or self.storage.user_has_any_broadcast_permissions(user.user_id)
         )
+
+    def can_use_address_watch(self, user: TelegramUser) -> bool:
+        return self.is_broadcast_root(user) or self.is_active_broadcast_operator(user.user_id)
+
+    @staticmethod
+    def address_watch_denied_text() -> str:
+        return "没有地址监听权限。只有宿主、一级操作人和下级操作人可以使用。"
 
     def group_for_time(self, chat_id: int, now: datetime) -> Any:
         return self.storage.apply_due_day_cutoff(chat_id, now, self.config.timezone)
