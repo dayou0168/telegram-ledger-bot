@@ -105,10 +105,10 @@ func mentionChunks(users []storage.User, maxLen int) []string {
 }
 
 func mentionUser(user storage.User) string {
-	name := strings.TrimSpace(user.DisplayName)
-	if name == "" && user.Username != "" {
-		name = "@" + user.Username
+	if user.Username != "" {
+		return "@" + html.EscapeString(user.Username)
 	}
+	name := strings.TrimSpace(user.DisplayName)
 	if name == "" {
 		name = formatID(user.ID)
 	}

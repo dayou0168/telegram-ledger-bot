@@ -3,6 +3,7 @@ package bot
 import (
 	"html"
 	"math/big"
+	"strconv"
 	"strings"
 	"time"
 
@@ -88,16 +89,43 @@ func recordLine(record storage.Record, loc *time.Location) string {
 	var out strings.Builder
 	out.WriteString(createdAt.Format("15:04:05"))
 	out.WriteByte(' ')
-	out.WriteString(recordAmountExpr(record))
-	if record.ActorName != "" {
+	link := recordMessageURL(record.ChatID, record.SourceMessageID)
+	out.WriteString(linkedRecordText(recordAmountExpr(record), link))
+	if name := recordSubjectName(record); name != "" {
 		out.WriteByte(' ')
-		out.WriteString(html.EscapeString(record.ActorName))
+		out.WriteString(linkedRecordText(name, link))
 	}
 	if record.Remark != "" {
 		out.WriteByte(' ')
 		out.WriteString(html.EscapeString(record.Remark))
 	}
 	return out.String()
+}
+
+func recordSubjectName(record storage.Record) string {
+	if strings.TrimSpace(record.SubjectName) != "" {
+		return strings.TrimSpace(record.SubjectName)
+	}
+	return strings.TrimSpace(record.ActorName)
+}
+
+func linkedRecordText(text, link string) string {
+	escaped := html.EscapeString(text)
+	if link == "" {
+		return escaped
+	}
+	return `<a href="` + html.EscapeString(link) + `">` + escaped + `</a>`
+}
+
+func recordMessageURL(chatID, messageID int64) string {
+	if messageID <= 0 {
+		return ""
+	}
+	raw := strconv.FormatInt(chatID, 10)
+	if strings.HasPrefix(raw, "-100") && len(raw) > 4 {
+		return "https://t.me/c/" + strings.TrimPrefix(raw, "-100") + "/" + strconv.FormatInt(messageID, 10)
+	}
+	return ""
 }
 
 func recordAmountExpr(record storage.Record) string {

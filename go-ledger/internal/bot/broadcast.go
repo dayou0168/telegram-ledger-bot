@@ -237,16 +237,13 @@ func (b *Bot) handleBroadcastMaterial(ctx context.Context, msg telegram.Message,
 	mode := state.Mode
 	notifyAll := state.NotifyAll
 	operatorID := user.ID
-	status, err := b.tg.SendMessage(ctx, msg.Chat.ID, fmt.Sprintf("广播发送中：目标 %d 个。", len(targets)), nil)
+	status, err := b.tg.SendMessage(ctx, msg.Chat.ID, formatBroadcastProgressText(mode, len(targets)), nil)
 	if err != nil {
 		return err
 	}
 	b.broadcastPool.Submit(func(jobCtx context.Context) {
 		success, failed := b.copyBroadcast(jobCtx, operatorID, sourceChatID, sourceMessageID, targets, mode, targetName, notifyAll)
-		text := fmt.Sprintf("广播完成：成功 %d 个，失败 %d 个。", success, failed)
-		if notifyAll {
-			text += "\n通知所有人：开启"
-		}
+		text := formatBroadcastResultText(mode, targetName, success, failed, notifyAll)
 		if _, err := b.tg.EditMessageText(jobCtx, sourceChatID, status.MessageID, text, nil); err != nil {
 			log.Printf("edit broadcast result: %v", err)
 			if _, err := b.tg.SendMessage(jobCtx, sourceChatID, text, nil); err != nil {
@@ -296,6 +293,34 @@ func (b *Bot) copyBroadcast(ctx context.Context, operatorID, fromChatID, message
 		}
 	}
 	return success, failed
+}
+
+func formatBroadcastProgressText(mode string, count int) string {
+	if mode == "chat" && count == 1 {
+		return "发送中..."
+	}
+	return fmt.Sprintf("广播发送中：目标 %d 个。", count)
+}
+
+func formatBroadcastResultText(mode, targetName string, success, failed int, notifyAll bool) string {
+	var text string
+	if mode == "chat" && success+failed == 1 {
+		targetName = strings.TrimSpace(targetName)
+		if success == 1 {
+			text = "发送完成。"
+		} else {
+			text = "发送失败。"
+		}
+		if targetName != "" {
+			text = targetName + "：" + text
+		}
+	} else {
+		text = fmt.Sprintf("广播完成：成功 %d 个，失败 %d 个。", success, failed)
+	}
+	if notifyAll {
+		text += "\n通知所有人：开启"
+	}
+	return text
 }
 
 func formatBroadcastReadyText(name string, count int, notifyAll bool) string {

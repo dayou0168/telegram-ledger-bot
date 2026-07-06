@@ -10,6 +10,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -41,11 +42,10 @@ type pageData struct {
 type billData struct {
 	Group        storage.Group
 	DayKey       string
-	Records      []storage.Record
+	TitleDay     string
 	Summary      billSummary
-	BillDays     []string
-	PrevDay      string
-	NextDay      string
+	HistoryLinks []billHistoryLink
+	TodayPath    string
 	PrevPath     string
 	NextPath     string
 	FilterSuffix string
@@ -55,16 +55,49 @@ type billData struct {
 }
 
 type billSummary struct {
-	Deposits         []storage.Record
-	Payouts          []storage.Record
-	DepositCount     int
-	PayoutCount      int
-	TotalDepositCNY  string
-	TotalDepositUSDT string
-	TotalPayoutUSDT  string
-	BalanceUSDT      string
-	ExchangeRate     string
-	FeeRate          string
+	Deposits              []storage.Record
+	Payouts               []storage.Record
+	DepositCount          int
+	PayoutCount           int
+	TotalDepositCNY       string
+	TotalDepositGrossUSDT string
+	TotalDepositNetCNY    string
+	TotalDepositNetUSDT   string
+	TotalPayoutCNY        string
+	TotalPayoutUSDT       string
+	BalanceCNY            string
+	BalanceUSDT           string
+	CommissionCNY         string
+	ExchangeRate          string
+	FeeRate               string
+	SubjectStats          []billPeopleStat
+	ActorStats            []billPeopleStat
+	RemarkStats           []billPeopleStat
+	RateStats             []billRateStat
+}
+
+type billHistoryLink struct {
+	DayKey string
+	Label  string
+	URL    string
+	Active bool
+}
+
+type billPeopleStat struct {
+	Name        string
+	Count       int
+	InCNY       string
+	InUSDT      string
+	OutCNY      string
+	OutUSDT     string
+	BalanceCNY  string
+	BalanceUSDT string
+}
+
+type billRateStat struct {
+	Rate       string
+	AmountCNY  string
+	AmountUSDT string
 }
 
 func New(cfg config.Config, store *storage.Store) *Server {
@@ -75,6 +108,7 @@ func (s *Server) Run(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.health)
 	mux.HandleFunc("/b/", s.bill)
+	mux.HandleFunc("/day_xxb.php", s.legacyBill)
 	mux.HandleFunc("/admin/login", s.login)
 	mux.HandleFunc("/admin/logout", s.logout)
 	mux.HandleFunc("/admin", s.withAuth(s.index))
@@ -125,8 +159,8 @@ func (s *Server) bill(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	query := strings.TrimSpace(r.URL.Query().Get("q"))
-	field := normalizedBillField(r.URL.Query().Get("field"))
+	query := billQueryText(r)
+	field := billQueryField(r)
 	records = filterBillRecords(records, query, field)
 	if action == "download" {
 		s.downloadBill(w, group, dayKey, records)
@@ -137,15 +171,15 @@ func (s *Server) bill(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	summary := summarizeBill(group, records)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := billTemplate.Execute(w, billData{
 		Group:        group,
 		DayKey:       dayKey,
-		Records:      records,
-		Summary:      summarizeBill(group, records),
-		BillDays:     days,
-		PrevDay:      addDay(dayKey, -1),
-		NextDay:      addDay(dayKey, 1),
+		TitleDay:     dayKey,
+		Summary:      summary,
+		HistoryLinks: buildBillHistoryLinks(chatID, days, dayKey, field, query, 30),
+		TodayPath:    billPath(chatID, s.currentBillDay(group)) + billFilterSuffix(field, query),
 		PrevPath:     billPath(chatID, addDay(dayKey, -1)) + billFilterSuffix(field, query),
 		NextPath:     billPath(chatID, addDay(dayKey, 1)) + billFilterSuffix(field, query),
 		FilterSuffix: billFilterSuffix(field, query),
@@ -155,6 +189,50 @@ func (s *Server) bill(w http.ResponseWriter, r *http.Request) {
 	}); err != nil {
 		log.Printf("render bill: %v", err)
 	}
+}
+
+func (s *Server) legacyBill(w http.ResponseWriter, r *http.Request) {
+	values := r.URL.Query()
+	chatID, err := strconv.ParseInt(strings.TrimSpace(values.Get("chat_id")), 10, 64)
+	if err != nil || chatID == 0 {
+		http.Error(w, "缺少 chat_id", http.StatusBadRequest)
+		return
+	}
+	group, err := s.store.GetGroup(r.Context(), chatID)
+	if err != nil {
+		http.Error(w, "账单不存在", http.StatusNotFound)
+		return
+	}
+	dayKey := normalizeBillDay(values.Get("created_at"))
+	if dayKey == "" {
+		dayKey = normalizeBillDay(datePart(values.Get("begintime")))
+	}
+	if dayKey == "" {
+		dayKey = s.currentBillDay(group)
+	}
+	path := billPath(chatID, dayKey)
+	if strings.TrimSpace(values.Get("download")) != "" {
+		path += "/download"
+	}
+	query := strings.TrimSpace(values.Get("firstname"))
+	field := legacyBillType(values.Get("type"))
+	if suffix := billFilterSuffix(field, query); suffix != "" {
+		path += suffix
+	}
+	http.Redirect(w, r, path, http.StatusFound)
+}
+
+func (s *Server) currentBillDay(group storage.Group) string {
+	loc, err := time.LoadLocation(s.cfg.Timezone)
+	if err != nil {
+		loc = time.FixedZone("Asia/Shanghai", 8*3600)
+	}
+	now := time.Now().In(loc)
+	cutoff := group.CutoffHour
+	if cutoff < 0 || cutoff > 23 {
+		cutoff = 0
+	}
+	return now.Add(-time.Duration(cutoff) * time.Hour).Format("2006-01-02")
 }
 
 func (s *Server) downloadBill(w http.ResponseWriter, group storage.Group, dayKey string, records []storage.Record) {
@@ -490,10 +568,8 @@ func parseBillPath(path string) (int64, string, string, bool) {
 		return 0, "", "", false
 	}
 	day := strings.TrimSpace(parts[2])
-	if len(day) == 8 {
-		day = day[:4] + "-" + day[4:6] + "-" + day[6:]
-	}
-	if len(day) != 10 {
+	day = normalizeBillDay(day)
+	if day == "" {
 		return 0, "", "", false
 	}
 	action := ""
@@ -533,53 +609,202 @@ func addDay(dayKey string, delta int) string {
 	if err != nil {
 		return dayKey
 	}
-	return day.AddDate(0, 0, delta).Format("20060102")
+	return day.AddDate(0, 0, delta).Format("2006-01-02")
+}
+
+func normalizeBillDay(day string) string {
+	day = strings.TrimSpace(day)
+	if len(day) >= 10 && day[4:5] == "-" && day[7:8] == "-" {
+		return day[:10]
+	}
+	if len(day) == 8 {
+		return day[:4] + "-" + day[4:6] + "-" + day[6:]
+	}
+	return ""
+}
+
+func datePart(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) >= 10 {
+		return value[:10]
+	}
+	return ""
+}
+
+func shortDayLabel(dayKey string) string {
+	day, err := time.Parse("2006-01-02", dayKey)
+	if err != nil {
+		return dayKey
+	}
+	return day.Format("01-02")
+}
+
+func buildBillHistoryLinks(chatID int64, days []string, currentDay, field, query string, limit int) []billHistoryLink {
+	if limit <= 0 || limit > len(days) {
+		limit = len(days)
+	}
+	links := make([]billHistoryLink, 0, limit)
+	suffix := billFilterSuffix(field, query)
+	for _, day := range days[:limit] {
+		links = append(links, billHistoryLink{
+			DayKey: day,
+			Label:  shortDayLabel(day),
+			URL:    billPath(chatID, day) + suffix,
+			Active: day == currentDay,
+		})
+	}
+	return links
 }
 
 func buildBillXLSX(group storage.Group, dayKey string, records []storage.Record) ([]byte, error) {
+	summary := summarizeBill(group, records)
+	depositSummary := summarizeBill(group, summary.Deposits)
+	payoutSummary := summarizeBill(group, summary.Payouts)
 	file := excelize.NewFile()
 	defer func() { _ = file.Close() }()
 	sheet := "账单"
 	file.SetSheetName("Sheet1", sheet)
-	headers := []string{"类型", "时间", "金额", "汇率", "操作人", "备注"}
-	for i, header := range headers {
-		cell, _ := excelize.CoordinatesToCellName(i+1, 1)
-		_ = file.SetCellValue(sheet, cell, header)
-	}
-	for i, record := range records {
-		row := i + 2
-		values := []any{
-			billKind(record.Kind),
-			record.CreatedAt.Format("2006-01-02 15:04:05"),
-			billAmount(record),
-			billNumber(record.Rate, 8),
-			record.ActorName,
-			record.Remark,
-		}
-		for col, value := range values {
-			cell, _ := excelize.CoordinatesToCellName(col+1, row)
-			_ = file.SetCellValue(sheet, cell, value)
-		}
-	}
-	title := fmt.Sprintf("%s %s", group.Title, dayKey)
-	_ = file.SetCellValue(sheet, "H1", title)
-	_ = file.SetColWidth(sheet, "A", "A", 12)
-	_ = file.SetColWidth(sheet, "B", "B", 22)
-	_ = file.SetColWidth(sheet, "C", "C", 26)
-	_ = file.SetColWidth(sheet, "D", "D", 12)
-	_ = file.SetColWidth(sheet, "E", "E", 24)
-	_ = file.SetColWidth(sheet, "F", "F", 36)
-	style, _ := file.NewStyle(&excelize.Style{
+	titleStyle, _ := file.NewStyle(&excelize.Style{
+		Font:      &excelize.Font{Bold: true, Color: "0E1B2F"},
+		Fill:      excelize.Fill{Type: "pattern", Color: []string{"EFDCA9"}, Pattern: 1},
+		Alignment: &excelize.Alignment{Horizontal: "center", Vertical: "center"},
+	})
+	headerStyle, _ := file.NewStyle(&excelize.Style{
 		Font:      &excelize.Font{Bold: true, Color: "0E1B2F"},
 		Fill:      excelize.Fill{Type: "pattern", Color: []string{"F4F7FB"}, Pattern: 1},
 		Alignment: &excelize.Alignment{Horizontal: "center", Vertical: "center"},
+		Border: []excelize.Border{
+			{Type: "left", Color: "DCE5EF", Style: 1},
+			{Type: "right", Color: "DCE5EF", Style: 1},
+			{Type: "top", Color: "DCE5EF", Style: 1},
+			{Type: "bottom", Color: "DCE5EF", Style: 1},
+		},
 	})
-	_ = file.SetCellStyle(sheet, "A1", "F1", style)
+	cellStyle, _ := file.NewStyle(&excelize.Style{
+		Alignment: &excelize.Alignment{Horizontal: "center", Vertical: "center", WrapText: true},
+		Border: []excelize.Border{
+			{Type: "left", Color: "E5EDF5", Style: 1},
+			{Type: "right", Color: "E5EDF5", Style: 1},
+			{Type: "top", Color: "E5EDF5", Style: 1},
+			{Type: "bottom", Color: "E5EDF5", Style: 1},
+		},
+	})
+	row := 1
+	addTitle := func(text string) {
+		start, _ := excelize.CoordinatesToCellName(1, row)
+		end, _ := excelize.CoordinatesToCellName(8, row)
+		_ = file.MergeCell(sheet, start, end)
+		_ = file.SetCellValue(sheet, start, text)
+		_ = file.SetCellStyle(sheet, start, end, titleStyle)
+		row++
+	}
+	addRow := func(values ...any) {
+		for col, value := range values {
+			cell, _ := excelize.CoordinatesToCellName(col+1, row)
+			_ = file.SetCellValue(sheet, cell, value)
+			_ = file.SetCellStyle(sheet, cell, cell, cellStyle)
+		}
+		row++
+	}
+	addHeader := func(values ...any) {
+		addRow(values...)
+		start, _ := excelize.CoordinatesToCellName(1, row-1)
+		end, _ := excelize.CoordinatesToCellName(len(values), row-1)
+		_ = file.SetCellStyle(sheet, start, end, headerStyle)
+	}
+	addEmpty := func() {
+		row++
+	}
+
+	addTitle(fmt.Sprintf("%s  %s  【%s】", dayKey, weekdayLabel(dayKey), group.Title))
+	addEmpty()
+	addTitle(fmt.Sprintf("入款：%d笔", len(summary.Deposits)))
+	addHeader("序号", "时间", "金额", "应下发", "应下发(U)", "转账人", "回复人", "操作人")
+	for i, record := range summary.Deposits {
+		addRow(i+1, billExcelTime(record.CreatedAt), billNumber(record.Amount, 2), billAmount(record), billNumber(record.ResultUSDT, 2), record.Remark, recordSubjectName(record), recordActorName(record))
+	}
+	addEmpty()
+	addPeopleXLSXSection(addTitle, addHeader, addRow, "入款回复人小计", depositSummary.SubjectStats, true)
+	addEmpty()
+	addPeopleXLSXSection(addTitle, addHeader, addRow, "入款操作人小计", depositSummary.ActorStats, true)
+	addEmpty()
+	addTitle("入款按汇率小计")
+	addHeader("汇率", "入款", "换算U")
+	for _, item := range summary.RateStats {
+		addRow(item.Rate, item.AmountCNY, item.AmountUSDT+" U")
+	}
+	addEmpty()
+	addTitle(fmt.Sprintf("下发：%d笔", len(summary.Payouts)))
+	addHeader("序号", "时间", "金额", "回复人", "操作人")
+	for i, record := range summary.Payouts {
+		addRow(i+1, billExcelTime(record.CreatedAt), billAmount(record), recordSubjectName(record), recordActorName(record))
+	}
+	addEmpty()
+	addPeopleXLSXSection(addTitle, addHeader, addRow, "下发回复人小计", payoutSummary.SubjectStats, false)
+	addEmpty()
+	addTitle("总计")
+	addRow("费率：", summary.FeeRate+"%")
+	addRow("汇率：", summary.ExchangeRate)
+	addRow("入款总数：", summary.TotalDepositCNY+"  |  "+summary.TotalDepositGrossUSDT+" U")
+	addRow("应下发：", summary.TotalDepositNetCNY+"  |  "+summary.TotalDepositNetUSDT+" U")
+	addRow("已下发：", summary.TotalPayoutCNY+"  |  "+summary.TotalPayoutUSDT+" U")
+	addRow("未下发：", summary.BalanceCNY+"  |  "+summary.BalanceUSDT+" U")
+	_ = file.SetColWidth(sheet, "A", "A", 10)
+	_ = file.SetColWidth(sheet, "B", "B", 16)
+	_ = file.SetColWidth(sheet, "C", "C", 18)
+	_ = file.SetColWidth(sheet, "D", "D", 28)
+	_ = file.SetColWidth(sheet, "E", "E", 16)
+	_ = file.SetColWidth(sheet, "F", "F", 24)
+	_ = file.SetColWidth(sheet, "G", "H", 28)
 	var buf bytes.Buffer
 	if err := file.Write(&buf); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+func addPeopleXLSXSection(
+	addTitle func(string),
+	addHeader func(...any),
+	addRow func(...any),
+	title string,
+	stats []billPeopleStat,
+	inOnly bool,
+) {
+	addTitle(title)
+	addHeader("用户名", "笔数", "入款", "已下发", "未下发")
+	for _, item := range stats {
+		amount := item.OutCNY + "  |  " + item.OutUSDT + " U"
+		if inOnly {
+			amount = item.InCNY + "  |  " + item.InUSDT + " U"
+		}
+		addRow(item.Name, fmt.Sprintf("%d 笔", item.Count), amount, item.OutCNY+"  |  "+item.OutUSDT+" U", item.BalanceCNY+"  |  "+item.BalanceUSDT+" U")
+	}
+}
+
+func weekdayLabel(dayKey string) string {
+	day, err := time.Parse("2006-01-02", dayKey)
+	if err != nil {
+		return ""
+	}
+	labels := []string{"星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"}
+	return labels[int(day.Weekday())]
+}
+
+func billExcelTime(value time.Time) string {
+	return value.In(beijingLocation()).Format("15:04:05")
+}
+
+func billDisplayTime(value time.Time) string {
+	return value.In(beijingLocation()).Format("01-02 15:04:05")
+}
+
+func beijingLocation() *time.Location {
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		return time.FixedZone("Asia/Shanghai", 8*3600)
+	}
+	return loc
 }
 
 func safeFileName(value, fallback string) string {
@@ -604,6 +829,12 @@ func billAmount(record storage.Record) string {
 	if result == "" {
 		return amount + "/" + rate
 	}
+	if record.Kind == "payout" {
+		return result + "U/" + amount
+	}
+	if factor := billFeeFactorText(record.FeeRate); factor != "" {
+		return amount + "/" + rate + "*" + factor + "=" + result + "U"
+	}
 	return amount + "/" + rate + "=" + result + "U"
 }
 
@@ -619,40 +850,248 @@ func summarizeBill(group storage.Group, records []storage.Record) billSummary {
 		ExchangeRate: billExchangeRateDisplay(group),
 		FeeRate:      group.FeeRate,
 	}
-	totalDepositCNY := big.NewRat(0, 1)
-	totalDepositUSDT := big.NewRat(0, 1)
-	totalPayoutUSDT := big.NewRat(0, 1)
+	totalDepositCNY := newBillRat()
+	totalDepositGrossUSDT := newBillRat()
+	totalDepositNetCNY := newBillRat()
+	totalDepositNetUSDT := newBillRat()
+	totalPayoutCNY := newBillRat()
+	totalPayoutUSDT := newBillRat()
+	commissionCNY := newBillRat()
+	subjectStats := map[string]*billPeopleStatAccumulator{}
+	actorStats := map[string]*billPeopleStatAccumulator{}
+	remarkStats := map[string]*billPeopleStatAccumulator{}
+	rateStats := map[string]*billRateAccumulator{}
 	for _, record := range records {
-		result := parseBillRat(record.ResultUSDT)
-		if result == nil {
-			result = big.NewRat(0, 1)
-		}
 		switch record.Kind {
 		case "deposit":
 			summary.Deposits = append(summary.Deposits, record)
-			totalDepositUSDT.Add(totalDepositUSDT, result)
-			if strings.EqualFold(record.Currency, "CNY") {
-				if amount := parseBillRat(record.Amount); amount != nil {
-					totalDepositCNY.Add(totalDepositCNY, amount)
-				}
+			amountCNY := recordCNYAmount(record)
+			grossUSDT := recordGrossUSDT(record)
+			netUSDT := recordResultUSDT(record)
+			rate := recordRateRat(record)
+			netCNY := mulBillRat(netUSDT, rate)
+			totalDepositCNY.Add(totalDepositCNY, amountCNY)
+			totalDepositGrossUSDT.Add(totalDepositGrossUSDT, grossUSDT)
+			totalDepositNetCNY.Add(totalDepositNetCNY, netCNY)
+			totalDepositNetUSDT.Add(totalDepositNetUSDT, netUSDT)
+			commission := new(big.Rat).Sub(grossUSDT, netUSDT)
+			commissionCNY.Add(commissionCNY, mulBillRat(commission, rate))
+			addPeopleDeposit(subjectStats, recordSubjectName(record), amountCNY, grossUSDT, netCNY, netUSDT)
+			addPeopleDeposit(actorStats, recordActorName(record), amountCNY, grossUSDT, netCNY, netUSDT)
+			addPeopleDeposit(remarkStats, record.Remark, amountCNY, grossUSDT, netCNY, netUSDT)
+			rateKey := formatBillRat(rate, 4)
+			item := rateStats[rateKey]
+			if item == nil {
+				item = &billRateAccumulator{rate: rateKey, amountCNY: newBillRat(), amountUSDT: newBillRat()}
+				rateStats[rateKey] = item
 			}
+			item.amountCNY.Add(item.amountCNY, amountCNY)
+			item.amountUSDT.Add(item.amountUSDT, grossUSDT)
 		case "payout":
 			summary.Payouts = append(summary.Payouts, record)
-			totalPayoutUSDT.Add(totalPayoutUSDT, result)
+			amountCNY := recordCNYAmount(record)
+			amountUSDT := recordResultUSDT(record)
+			totalPayoutCNY.Add(totalPayoutCNY, amountCNY)
+			totalPayoutUSDT.Add(totalPayoutUSDT, amountUSDT)
+			addPeoplePayout(subjectStats, recordSubjectName(record), amountCNY, amountUSDT)
+			addPeoplePayout(actorStats, recordActorName(record), amountCNY, amountUSDT)
+			addPeoplePayout(remarkStats, record.Remark, amountCNY, amountUSDT)
 		}
 	}
-	balance := new(big.Rat).Sub(totalDepositUSDT, totalPayoutUSDT)
+	balanceCNY := new(big.Rat).Sub(totalDepositNetCNY, totalPayoutCNY)
+	balanceUSDT := new(big.Rat).Sub(totalDepositNetUSDT, totalPayoutUSDT)
 	summary.DepositCount = len(summary.Deposits)
 	summary.PayoutCount = len(summary.Payouts)
 	summary.TotalDepositCNY = formatBillRat(totalDepositCNY, 2)
-	summary.TotalDepositUSDT = formatBillRat(totalDepositUSDT, 2)
+	summary.TotalDepositGrossUSDT = formatBillRat(totalDepositGrossUSDT, 2)
+	summary.TotalDepositNetCNY = formatBillRat(totalDepositNetCNY, 2)
+	summary.TotalDepositNetUSDT = formatBillRat(totalDepositNetUSDT, 2)
+	summary.TotalPayoutCNY = formatBillRat(totalPayoutCNY, 2)
 	summary.TotalPayoutUSDT = formatBillRat(totalPayoutUSDT, 2)
-	summary.BalanceUSDT = formatBillRat(balance, 2)
+	summary.BalanceCNY = formatBillRat(balanceCNY, 2)
+	summary.BalanceUSDT = formatBillRat(balanceUSDT, 2)
+	summary.CommissionCNY = formatBillRat(commissionCNY, 2)
+	summary.SubjectStats = buildPeopleStats(subjectStats)
+	summary.ActorStats = buildPeopleStats(actorStats)
+	summary.RemarkStats = buildPeopleStats(remarkStats)
+	summary.RateStats = buildRateStats(rateStats)
 	if summary.FeeRate == "" {
 		summary.FeeRate = "0"
 	}
 	summary.FeeRate = billNumber(summary.FeeRate, 2)
 	return summary
+}
+
+type billPeopleStatAccumulator struct {
+	name    string
+	count   int
+	inCNY   *big.Rat
+	inUSDT  *big.Rat
+	netCNY  *big.Rat
+	netUSDT *big.Rat
+	outCNY  *big.Rat
+	outUSDT *big.Rat
+}
+
+type billRateAccumulator struct {
+	rate       string
+	amountCNY  *big.Rat
+	amountUSDT *big.Rat
+}
+
+func newBillRat() *big.Rat {
+	return big.NewRat(0, 1)
+}
+
+func mulBillRat(a, b *big.Rat) *big.Rat {
+	if a == nil || b == nil {
+		return newBillRat()
+	}
+	return new(big.Rat).Mul(a, b)
+}
+
+func recordRat(raw string) *big.Rat {
+	value := parseBillRat(raw)
+	if value == nil {
+		return newBillRat()
+	}
+	return value
+}
+
+func recordRateRat(record storage.Record) *big.Rat {
+	rate := parseBillRat(record.Rate)
+	if rate == nil || rate.Sign() == 0 {
+		return big.NewRat(1, 1)
+	}
+	return rate
+}
+
+func recordGrossUSDT(record storage.Record) *big.Rat {
+	amount := recordRat(record.Amount)
+	if strings.EqualFold(record.Currency, "USDT") {
+		return amount
+	}
+	return new(big.Rat).Quo(amount, recordRateRat(record))
+}
+
+func recordResultUSDT(record storage.Record) *big.Rat {
+	result := parseBillRat(record.ResultUSDT)
+	if result != nil {
+		return result
+	}
+	return recordGrossUSDT(record)
+}
+
+func recordCNYAmount(record storage.Record) *big.Rat {
+	amount := recordRat(record.Amount)
+	if strings.EqualFold(record.Currency, "CNY") {
+		return amount
+	}
+	return mulBillRat(amount, recordRateRat(record))
+}
+
+func recordSubjectName(record storage.Record) string {
+	if strings.TrimSpace(record.SubjectName) != "" {
+		return strings.TrimSpace(record.SubjectName)
+	}
+	return recordActorName(record)
+}
+
+func recordActorName(record storage.Record) string {
+	if strings.TrimSpace(record.ActorName) != "" {
+		return strings.TrimSpace(record.ActorName)
+	}
+	return "未命名"
+}
+
+func peopleAccumulator(items map[string]*billPeopleStatAccumulator, name string) *billPeopleStatAccumulator {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = ""
+	}
+	item := items[name]
+	if item == nil {
+		item = &billPeopleStatAccumulator{
+			name:    name,
+			inCNY:   newBillRat(),
+			inUSDT:  newBillRat(),
+			netCNY:  newBillRat(),
+			netUSDT: newBillRat(),
+			outCNY:  newBillRat(),
+			outUSDT: newBillRat(),
+		}
+		items[name] = item
+	}
+	return item
+}
+
+func addPeopleDeposit(items map[string]*billPeopleStatAccumulator, name string, inCNY, inUSDT, netCNY, netUSDT *big.Rat) {
+	item := peopleAccumulator(items, name)
+	item.count++
+	item.inCNY.Add(item.inCNY, inCNY)
+	item.inUSDT.Add(item.inUSDT, inUSDT)
+	item.netCNY.Add(item.netCNY, netCNY)
+	item.netUSDT.Add(item.netUSDT, netUSDT)
+}
+
+func addPeoplePayout(items map[string]*billPeopleStatAccumulator, name string, outCNY, outUSDT *big.Rat) {
+	item := peopleAccumulator(items, name)
+	item.count++
+	item.outCNY.Add(item.outCNY, outCNY)
+	item.outUSDT.Add(item.outUSDT, outUSDT)
+}
+
+func buildPeopleStats(items map[string]*billPeopleStatAccumulator) []billPeopleStat {
+	stats := make([]billPeopleStat, 0, len(items))
+	for _, item := range items {
+		balanceCNY := new(big.Rat).Sub(item.netCNY, item.outCNY)
+		balanceUSDT := new(big.Rat).Sub(item.netUSDT, item.outUSDT)
+		stats = append(stats, billPeopleStat{
+			Name:        item.name,
+			Count:       item.count,
+			InCNY:       formatBillRat(item.inCNY, 2),
+			InUSDT:      formatBillRat(item.inUSDT, 2),
+			OutCNY:      formatBillRat(item.outCNY, 2),
+			OutUSDT:     formatBillRat(item.outUSDT, 2),
+			BalanceCNY:  formatBillRat(balanceCNY, 2),
+			BalanceUSDT: formatBillRat(balanceUSDT, 2),
+		})
+	}
+	sort.Slice(stats, func(i, j int) bool {
+		return stats[i].Name < stats[j].Name
+	})
+	return stats
+}
+
+func buildRateStats(items map[string]*billRateAccumulator) []billRateStat {
+	stats := make([]billRateStat, 0, len(items))
+	for _, item := range items {
+		stats = append(stats, billRateStat{
+			Rate:       item.rate,
+			AmountCNY:  formatBillRat(item.amountCNY, 2),
+			AmountUSDT: formatBillRat(item.amountUSDT, 2),
+		})
+	}
+	sort.Slice(stats, func(i, j int) bool {
+		left := parseBillRat(stats[i].Rate)
+		right := parseBillRat(stats[j].Rate)
+		if left != nil && right != nil {
+			return left.Cmp(right) < 0
+		}
+		return stats[i].Rate < stats[j].Rate
+	})
+	return stats
+}
+
+func billFeeFactorText(raw string) string {
+	fee := parseBillRat(raw)
+	if fee == nil || fee.Sign() == 0 {
+		return ""
+	}
+	factor := big.NewRat(100, 1)
+	factor.Sub(factor, fee)
+	factor.Quo(factor, big.NewRat(100, 1))
+	return formatBillRat(factor, 4)
 }
 
 func billExchangeRateDisplay(group storage.Group) string {
@@ -715,10 +1154,41 @@ func billNumber(raw string, precision int) string {
 	return formatBillRat(value, precision)
 }
 
+func billQueryText(r *http.Request) string {
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	if query != "" {
+		return query
+	}
+	return strings.TrimSpace(r.URL.Query().Get("firstname"))
+}
+
+func billQueryField(r *http.Request) string {
+	field := strings.TrimSpace(r.URL.Query().Get("field"))
+	if field != "" {
+		return normalizedBillField(field)
+	}
+	return legacyBillType(r.URL.Query().Get("type"))
+}
+
+func legacyBillType(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "bjr", "subject":
+		return "subject"
+	case "czr", "actor":
+		return "actor"
+	case "bz", "remark":
+		return "remark"
+	case "amount":
+		return "amount"
+	default:
+		return "all"
+	}
+}
+
 func normalizedBillField(field string) string {
 	switch strings.ToLower(strings.TrimSpace(field)) {
-	case "actor", "remark", "amount":
-		return strings.ToLower(strings.TrimSpace(field))
+	case "subject", "actor", "remark", "amount", "bjr", "czr", "bz":
+		return legacyBillType(field)
 	default:
 		return "all"
 	}
@@ -741,6 +1211,8 @@ func filterBillRecords(records []storage.Record, query, field string) []storage.
 
 func billRecordMatches(record storage.Record, field, query string) bool {
 	switch field {
+	case "subject":
+		return containsFold(recordSubjectName(record), query)
 	case "actor":
 		return containsFold(record.ActorName, query)
 	case "remark":
@@ -784,8 +1256,11 @@ var adminTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
 var loginTemplate = template.Must(template.New("login").Parse(loginHTML))
 
 var billTemplate = template.Must(template.New("bill").Funcs(template.FuncMap{
-	"billAmount": billAmount,
-	"billKind":   billKind,
+	"billAmount":    billAmount,
+	"billKind":      billKind,
+	"billTime":      billDisplayTime,
+	"recordSubject": recordSubjectName,
+	"recordActor":   recordActorName,
 }).Parse(billHTML))
 
 const loginHTML = `<!doctype html>
@@ -831,18 +1306,18 @@ const adminHTML = `<!doctype html>
 .btn.secondary{background:#fff;color:var(--navy);border:1px solid var(--line)}
 .msg{margin-top:14px;background:#eef8ff;border:1px solid #b8d8ff;color:#16437b;border-radius:6px;padding:10px 12px}
 .warn{margin-top:14px;background:#fff7dd;border:1px solid #e1bd5f;border-radius:6px;padding:10px 12px}
-.grid{margin-top:16px;display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:start}
+.grid{margin-top:16px;display:grid;grid-template-columns:minmax(0,1fr);gap:16px;align-items:start}
 .card{background:var(--panel);border:1px solid var(--line);border-top:4px solid var(--gold);border-radius:8px;padding:18px;min-width:0}
-.card.wide{grid-column:1 / -1}
+.card.wide{grid-column:auto}
 h2{font-size:21px;margin:0 0 12px}.hint{color:var(--muted);margin:0 0 12px;line-height:1.55}
 .row{display:grid;grid-template-columns:1fr 1fr auto;gap:8px;margin-bottom:8px}.row.two{grid-template-columns:1fr auto}.row.one{grid-template-columns:1fr}
 input,select,textarea{border:1px solid #b8c8dc;border-radius:6px;background:#fff;color:var(--ink);min-height:38px;padding:8px 10px;font-size:14px;min-width:0}
 select[multiple]{min-height:150px}.full{width:100%}
 table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid #dce5ef;padding:10px;text-align:center;vertical-align:middle}th{background:#f4f7fb;font-weight:800}
-.scroll{max-height:260px;overflow:auto;border:1px solid #dce5ef;border-radius:6px}.scroll table{margin:0;border:0}.scroll th:first-child,.scroll td:first-child{border-left:0}.scroll th:last-child,.scroll td:last-child{border-right:0}
+.scroll{max-height:280px;overflow:auto;border:1px solid #dce5ef;border-radius:6px}.scroll table{margin:0;border:0}.scroll th:first-child,.scroll td:first-child{border-left:0}.scroll th:last-child,.scroll td:last-child{border-right:0}.scroll th{position:sticky;top:0;z-index:1}
 .pill{display:inline-block;border:1px solid #d5e1ec;background:#f7fafc;border-radius:999px;padding:3px 9px;color:#40566f}
 .actions{display:flex;gap:8px;flex-wrap:wrap}.mini{height:32px;padding:0 10px}
-@media(max-width:900px){.grid{grid-template-columns:1fr}.top{align-items:flex-start;flex-direction:column}.row,.row.two{grid-template-columns:1fr}.btn{width:100%}}
+@media(max-width:900px){.top{align-items:flex-start;flex-direction:column}.row,.row.two{grid-template-columns:1fr}.btn{width:100%}}
 </style>
 </head>
 <body><main class="wrap">
@@ -949,65 +1424,59 @@ const billHTML = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>完整账单</title>
 <style>
-:root{--bg:#eaf1f7;--panel:#fff;--line:#d8e2ee;--ink:#0e1b2f;--muted:#5b6f88;--gold:#d8b45d;--blue:#244f9f;--deep:#14223a}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Arial,"Microsoft YaHei",sans-serif}
-.wrap{max-width:1120px;margin:0 auto;padding:26px}.head{display:flex;justify-content:space-between;gap:16px;align-items:flex-end;margin-bottom:18px}
-.brand{color:#b97914;font-weight:800}.title{font-size:30px;font-weight:900;margin-top:8px}.sub{color:var(--muted);margin-top:6px}
-.tools{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.btn{height:38px;border:1px solid #c8d6e6;border-radius:6px;background:#fff;color:var(--ink);font-weight:800;padding:0 14px;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;cursor:pointer}.btn.primary{background:var(--deep);color:#fff;border-color:var(--deep)}.history{height:38px;border:1px solid #c8d6e6;border-radius:6px;background:#fff;padding:0 10px;font-weight:800;color:var(--ink)}
-.stats{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin:0 0 16px}.stat{background:var(--panel);border:1px solid #c8d6e6;border-radius:8px;padding:14px 16px;min-height:76px}.stat span{display:block;color:var(--muted);font-size:13px}.stat strong{display:block;margin-top:8px;font-size:19px;line-height:1.25}
-.filter-panel{background:var(--panel);border:1px solid #c8d6e6;border-radius:8px;padding:12px;margin-bottom:20px}.filter{display:grid;grid-template-columns:minmax(240px,1fr) 140px auto;gap:10px;margin:0}.filter input,.filter select{height:38px;border:1px solid #c8d6e6;border-radius:6px;background:#fff;color:var(--ink);padding:0 12px;font-size:14px}.filter button{border:0}
-.bill-card{background:var(--panel);border:1px solid #c8d6e6;border-top:5px solid var(--gold);border-radius:8px;padding:18px 18px 14px;margin-top:16px}.bill-card h2{font-size:22px;margin:4px 0 16px}.bill-card h2 small{font-size:14px;color:var(--muted);font-weight:700}.table-scroll{overflow-x:auto}
-table{width:100%;border-collapse:collapse;table-layout:fixed}th,td{border:1px solid var(--line);padding:11px 12px;text-align:center;vertical-align:middle;word-break:break-word}th{background:#f5f8fb;font-size:15px}.time{width:150px}.amount-col{width:260px}.actor{width:260px}.remark{width:auto}
-.amount{color:var(--blue);font-weight:700}.empty{padding:36px;text-align:center;color:var(--muted)}.totals{display:flex;gap:18px;flex-wrap:wrap;margin-top:14px;color:var(--muted);font-size:14px}.totals strong{color:var(--ink)}
-@media(max-width:900px){.stats{grid-template-columns:repeat(2,minmax(0,1fr))}.wrap{padding:18px}.head{display:block}.tools{margin-top:14px}}
-@media(max-width:720px){.wrap{padding:14px}.btn,.history{width:100%}.filter{grid-template-columns:1fr}.filter button{width:100%}table{font-size:13px;min-width:760px}th,td{padding:9px}.stats{grid-template-columns:1fr}.title{font-size:26px}}
+:root{--bg:#eaf1f7;--panel:#fff;--panel-soft:#f5f8fb;--line:#c8d6e6;--line-soft:#dfe8f2;--text:#0e1b2f;--muted:#5b6f88;--gold:#b87916;--gold-soft:#fbf2dc;--blue:#1f5fae;--blue-dark:#143f82;--blue-soft:#edf5ff;--shadow:0 8px 24px rgba(36,77,114,.07)}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:Arial,"Microsoft YaHei","PingFang SC",sans-serif;font-size:14px;line-height:1.5}a{color:var(--blue);text-decoration:none}a:hover{color:var(--gold);text-decoration:underline}
+.content-wrapper{min-height:100vh;width:100%;max-width:1280px;margin:0 auto;padding:28px 32px 36px}.container{width:100%;margin:0 auto}.content{min-height:250px;display:grid;grid-template-columns:minmax(0,1fr);gap:16px}
+.bill-toolbar,.bill-search,.box{background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:var(--shadow)}.bill-toolbar{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;padding:4px 0 16px;margin-bottom:8px;background:transparent;border:0;border-radius:0;box-shadow:none}
+.bill-heading{display:flex;flex-direction:column;gap:3px;min-width:0}.bill-heading .brand{color:var(--gold);font-weight:800}.bill-heading h1{margin:0;font-size:28px;font-weight:800;line-height:1.25;overflow-wrap:anywhere}.bill-heading p{margin:0;color:#536782}
+.toolbar-actions{display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end;align-items:center}.btn{display:inline-flex;align-items:center;justify-content:center;min-height:34px;padding:7px 12px;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--text);font-weight:600;white-space:nowrap}.btn:hover{background:var(--blue-soft);text-decoration:none}.btn.primary{border-color:var(--blue);background:var(--blue);color:#fff}.btn.primary:hover{background:var(--blue-dark);color:#fff}
+.history-menu{position:relative;display:inline-flex;align-items:center;min-height:34px;z-index:5}.history-trigger{font:inherit;cursor:pointer}.history-dropdown{display:none;position:absolute;top:40px;left:0;min-width:92px;max-height:520px;overflow-y:auto;padding:6px 0;background:#fff;border:1px solid var(--line);border-radius:4px;box-shadow:0 12px 28px rgba(20,42,75,.16)}.history-menu:hover .history-dropdown,.history-menu:focus-within .history-dropdown{display:block}.history-dropdown a,.history-empty{display:block;padding:3px 14px;line-height:22px;color:var(--muted);white-space:nowrap}.history-dropdown a:hover{background:var(--blue-soft);color:var(--blue);text-decoration:none}.history-dropdown a.active{color:var(--gold);font-weight:700;background:var(--gold-soft)}
+.summary-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin-bottom:18px}.summary-card{min-height:78px;padding:15px 16px;background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:var(--shadow)}.summary-card span{display:block;margin-bottom:8px;color:var(--muted);font-size:13px}.summary-card strong{display:block;color:var(--text);font-size:19px;line-height:1.25;overflow-wrap:anywhere}
+.bill-search{display:flex;justify-content:center;gap:8px;width:100%;padding:12px 14px;margin:0 0 26px}.bill-search input[type=text]{flex:1 1 360px;min-width:0;height:34px;border-radius:6px;border:1px solid var(--line);padding:0 10px;background:#fff}.bill-search select{flex:0 0 130px;height:34px;border-radius:6px;border:1px solid var(--line);background:#fff}.bill-search button{flex:0 0 86px;height:34px;border-radius:6px;background:var(--blue);color:#fff;border:0;cursor:pointer;font-weight:700}.bill-search button:hover{background:var(--blue-dark)}
+.panel{width:100%;margin:0;padding:0;background:transparent;border:0;box-shadow:none}.box{margin:0;padding:20px;width:100%;border-top:5px solid #efdca9}.box-primary{border-left:1px solid var(--line)}.box-header{display:block;padding-bottom:12px;border-bottom:1px solid var(--line-soft);margin-bottom:8px}.box-title{display:inline-block;margin:0;font-size:22px;font-weight:bold;line-height:1.2}.box-body{padding:0}.table-wrap{overflow-x:auto}
+table{width:100%;max-width:100%;border-collapse:collapse;table-layout:fixed}td{padding:10px 8px!important;overflow-wrap:anywhere;white-space:normal;text-align:center;vertical-align:middle;border:1px solid var(--line-soft)}.records thead td,.records .table-head td{font-weight:800;color:#172336;background:var(--panel-soft)}.records td:first-child{white-space:nowrap}.records tbody tr:hover td{background:#fbfdff}.col-time{width:14%}.col-amount{width:24%}.col-rate{width:22%}.col-actor{width:24%}.col-note{width:16%}.copyable{cursor:pointer;border-bottom:1px dotted #94a3b8}.empty{color:var(--muted);text-align:center;padding:18px 0!important}
+.footer-note{display:flex;gap:18px;flex-wrap:wrap;margin-top:14px;color:var(--muted);font-size:14px}.footer-note strong{color:var(--text)}
+@media(max-width:920px){.content-wrapper{padding:20px 16px 28px}.bill-toolbar{align-items:stretch;flex-direction:column}.toolbar-actions{justify-content:flex-start}.summary-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:640px){body{font-size:13px}.bill-heading h1{font-size:24px}.summary-grid{grid-template-columns:1fr}.summary-card{min-height:68px}.box{padding:14px 10px;margin-bottom:12px}.box-title{font-size:18px}.bill-search{flex-direction:column;margin-bottom:16px}.bill-search input[type=text],.bill-search select,.bill-search button{width:100%;flex:auto}.toolbar-actions .btn,.history-menu,.history-trigger{width:100%}.history-dropdown{left:0;right:0}.records{min-width:760px}}
 </style>
 </head>
-<body><main class="wrap">
-<section class="head">
-<div><div class="brand">Telegram 记账机器人</div><div class="title">{{.Group.Title}}</div><div class="sub">群 ID：{{.Group.ChatID}} · {{.DayKey}} · 北京时间</div></div>
-<div class="tools">
+<body><main class="content-wrapper"><div class="container">
+<section class="bill-toolbar">
+<div class="bill-heading"><div class="brand">Telegram 记账机器人</div><h1>{{.Group.Title}}</h1><p>群 ID：{{.Group.ChatID}} · {{.TitleDay}} · 北京时间</p></div>
+<nav class="toolbar-actions">
+<a class="btn" href="{{.TodayPath}}">今日</a>
 <a class="btn" href="{{.PrevPath}}">上一天</a>
-<select class="history" onchange="if(this.value){location.href=this.value}">
-<option value="">历史账单</option>
-{{range .BillDays}}<option value="/b/{{$.Group.ChatID}}/{{.}}{{$.FilterSuffix}}" {{if eq . $.DayKey}}selected{{end}}>{{.}}</option>{{end}}
-</select>
 <a class="btn" href="{{.NextPath}}">下一天</a>
-<a class="btn primary" href="{{.DownloadPath}}">下载账单</a>
-</div>
+<span class="history-menu"><button type="button" class="btn history-trigger">历史账单⌄</button><span class="history-dropdown">{{range .HistoryLinks}}<a class="{{if .Active}}active{{end}}" href="{{.URL}}">{{.Label}}</a>{{else}}<span class="history-empty">无历史账单</span>{{end}}</span></span>
+<a class="btn" href="{{.DownloadPath}}">下载账单</a>
+</nav>
 </section>
-<section class="stats">
-<div class="stat"><span>总入款</span><strong>{{.Summary.TotalDepositCNY}} / {{.Summary.TotalDepositUSDT}}U</strong></div>
-<div class="stat"><span>汇率</span><strong>{{.Summary.ExchangeRate}}</strong></div>
-<div class="stat"><span>交易费率</span><strong>{{.Summary.FeeRate}}%</strong></div>
-<div class="stat"><span>应下发</span><strong>{{.Summary.TotalDepositUSDT}}U</strong></div>
-<div class="stat"><span>已下发</span><strong>{{.Summary.TotalPayoutUSDT}}U</strong></div>
-<div class="stat"><span>余额</span><strong>{{.Summary.BalanceUSDT}}U</strong></div>
+<section class="summary-grid">
+<div class="summary-card"><span>总入款</span><strong>{{.Summary.TotalDepositCNY}} / {{.Summary.TotalDepositGrossUSDT}}U</strong></div>
+<div class="summary-card"><span>汇率</span><strong>{{.Summary.ExchangeRate}}</strong></div>
+<div class="summary-card"><span>交易费率</span><strong>{{.Summary.FeeRate}}%</strong></div>
+<div class="summary-card"><span>应下发</span><strong>{{.Summary.TotalDepositNetUSDT}}U</strong></div>
+<div class="summary-card"><span>已下发</span><strong>{{.Summary.TotalPayoutUSDT}}U</strong></div>
+<div class="summary-card"><span>余额</span><strong>{{.Summary.BalanceUSDT}}U</strong></div>
 </section>
-<section class="filter-panel">
-<form class="filter" method="get" action="/b/{{.Group.ChatID}}/{{.DayKey}}">
-<input name="q" value="{{.Query}}" placeholder="输入名字、备注、金额或时间关键词">
+<form class="bill-search" method="get" action="/b/{{.Group.ChatID}}/{{.DayKey}}">
+<input type="text" name="q" value="{{.Query}}" placeholder="输入您要查询的名字或者备注关键词">
 <select name="field">
 <option value="all" {{if eq .Field "all"}}selected{{end}}>全部字段</option>
+<option value="subject" {{if eq .Field "subject"}}selected{{end}}>按标记人</option>
 <option value="actor" {{if eq .Field "actor"}}selected{{end}}>按操作人</option>
 <option value="remark" {{if eq .Field "remark"}}selected{{end}}>按备注</option>
 <option value="amount" {{if eq .Field "amount"}}selected{{end}}>按金额</option>
 </select>
-<button class="btn primary" type="submit">搜索</button>
+<button type="submit">搜索</button>
 </form>
+<section class="content">
+<section class="panel"><div class="box box-primary"><div class="box-header"><h3 class="box-title">入款 (<span>{{.Summary.DepositCount}}</span>笔)</h3></div><div class="box-body"><div class="table-wrap"><table class="records"><colgroup><col class="col-time"><col class="col-amount"><col class="col-rate"><col class="col-actor"><col class="col-note"></colgroup><thead><tr><td>时间</td><td>金额</td><td>标记人</td><td>操作人</td><td>备注</td></tr></thead><tbody>{{range .Summary.Deposits}}<tr><td>{{billTime .CreatedAt}}</td><td><span class="copyable">{{billAmount .}}</span></td><td>{{recordSubject .}}</td><td>{{recordActor .}}</td><td>{{.Remark}}</td></tr>{{else}}<tr><td colspan="5" class="empty">暂无记录</td></tr>{{end}}</tbody></table></div></div></div></section>
+<section class="panel"><div class="box box-primary"><div class="box-header"><h3 class="box-title">下发 (<span>{{.Summary.PayoutCount}}</span>笔)</h3></div><div class="box-body"><div class="table-wrap"><table class="records"><colgroup><col class="col-time"><col class="col-amount"><col class="col-rate"><col class="col-actor"><col class="col-note"></colgroup><thead><tr><td>时间</td><td>金额</td><td>标记人</td><td>操作人</td><td>备注</td></tr></thead><tbody>{{range .Summary.Payouts}}<tr><td>{{billTime .CreatedAt}}</td><td><span class="copyable">{{billAmount .}}</span></td><td>{{recordSubject .}}</td><td>{{recordActor .}}</td><td>{{.Remark}}</td></tr>{{else}}<tr><td colspan="5" class="empty">暂无记录</td></tr>{{end}}</tbody></table></div></div></div></section>
+<section class="panel"><div class="box box-primary"><div class="box-header"><h3 class="box-title">统计（按标记人） ({{len .Summary.SubjectStats}} 人)</h3></div><div class="box-body"><div class="table-wrap"><table class="records"><tbody><tr class="table-head"><td>用户名</td><td>入款</td><td>已下发</td><td>未下发</td></tr>{{range .Summary.SubjectStats}}<tr><td>{{.Name}} ({{.Count}} 笔)</td><td><span class="copyable">{{.InCNY}}</span>/<span class="copyable">{{.InUSDT}}</span>U</td><td><span class="copyable">{{.OutCNY}}</span>/<span class="copyable">{{.OutUSDT}}</span>U</td><td><span class="copyable">{{.BalanceCNY}}</span>/<span class="copyable">{{.BalanceUSDT}}</span>U</td></tr>{{else}}<tr><td colspan="4" class="empty">暂无统计</td></tr>{{end}}</tbody></table></div></div></div></section>
+<section class="panel"><div class="box box-primary"><div class="box-header"><h3 class="box-title">统计（按操作人） ({{len .Summary.ActorStats}} 人)</h3></div><div class="box-body"><div class="table-wrap"><table class="records"><tbody><tr class="table-head"><td>用户名</td><td>入款</td><td>已下发</td><td>未下发</td></tr>{{range .Summary.ActorStats}}<tr><td>{{.Name}} ({{.Count}} 笔)</td><td><span class="copyable">{{.InCNY}}</span>/<span class="copyable">{{.InUSDT}}</span>U</td><td><span class="copyable">{{.OutCNY}}</span>/<span class="copyable">{{.OutUSDT}}</span>U</td><td><span class="copyable">{{.BalanceCNY}}</span>/<span class="copyable">{{.BalanceUSDT}}</span>U</td></tr>{{else}}<tr><td colspan="4" class="empty">暂无统计</td></tr>{{end}}</tbody></table></div></div></div></section>
+<section class="panel"><div class="box box-primary"><div class="box-header"><h3 class="box-title">统计（按备注） ({{len .Summary.RemarkStats}} 人)</h3></div><div class="box-body"><div class="table-wrap"><table class="records"><tbody><tr class="table-head"><td>用户名</td><td>入款</td><td>已下发</td><td>未下发</td></tr>{{range .Summary.RemarkStats}}<tr><td>{{.Name}} ({{.Count}} 笔)</td><td><span class="copyable">{{.InCNY}}</span>/<span class="copyable">{{.InUSDT}}</span>U</td><td><span class="copyable">{{.OutCNY}}</span>/<span class="copyable">{{.OutUSDT}}</span>U</td><td><span class="copyable">{{.BalanceCNY}}</span>/<span class="copyable">{{.BalanceUSDT}}</span>U</td></tr>{{else}}<tr><td colspan="4" class="empty">暂无统计</td></tr>{{end}}</tbody></table></div></div></div></section>
+<section class="panel"><div class="box box-primary"><div class="box-header"><h3 class="box-title">统计（按汇率分类）</h3></div><div class="box-body"><div class="table-wrap"><table class="records"><tbody><tr class="table-head"><td>汇率</td><td>入款</td><td>换算U</td></tr>{{range .Summary.RateStats}}<tr><td>{{.Rate}}</td><td>{{.AmountCNY}}</td><td>{{.AmountUSDT}} U</td></tr>{{else}}<tr><td colspan="3" class="empty">暂无统计</td></tr>{{end}}</tbody></table></div></div></div></section>
+<div class="footer-note"><span>总入款：<strong>{{.Summary.TotalDepositCNY}} / {{.Summary.TotalDepositGrossUSDT}}U</strong></span><span>汇率：<strong>{{.Summary.ExchangeRate}}</strong></span><span>交易费率：<strong>{{.Summary.FeeRate}}%</strong></span></div>
 </section>
-<section class="bill-card">
-<h2>入款 <small>({{.Summary.DepositCount}}笔)</small></h2>
-<div class="table-scroll"><table><thead><tr><th class="time">时间</th><th class="amount-col">金额</th><th class="actor">操作人</th><th class="remark">备注</th></tr></thead><tbody>
-{{range .Summary.Deposits}}<tr><td>{{.CreatedAt.Format "01-02 15:04:05"}}</td><td class="amount">{{billAmount .}}</td><td>{{.ActorName}}</td><td>{{.Remark}}</td></tr>{{else}}<tr><td class="empty" colspan="4">暂无入款记录</td></tr>{{end}}
-</tbody></table></div>
-<div class="totals"><span>总入款：<strong>{{.Summary.TotalDepositCNY}} / {{.Summary.TotalDepositUSDT}}U</strong></span><span>汇率：<strong>{{.Summary.ExchangeRate}}</strong></span><span>交易费率：<strong>{{.Summary.FeeRate}}%</strong></span></div>
-</section>
-<section class="bill-card">
-<h2>下发 <small>({{.Summary.PayoutCount}}笔)</small></h2>
-<div class="table-scroll"><table><thead><tr><th class="time">时间</th><th class="amount-col">金额</th><th class="actor">操作人</th><th class="remark">备注</th></tr></thead><tbody>
-{{range .Summary.Payouts}}<tr><td>{{.CreatedAt.Format "01-02 15:04:05"}}</td><td class="amount">{{billAmount .}}</td><td>{{.ActorName}}</td><td>{{.Remark}}</td></tr>{{else}}<tr><td class="empty" colspan="4">暂无下发记录</td></tr>{{end}}
-</tbody></table></div>
-<div class="totals"><span>应下发：<strong>{{.Summary.TotalDepositUSDT}}U</strong></span><span>已下发：<strong>{{.Summary.TotalPayoutUSDT}}U</strong></span><span>余额：<strong>{{.Summary.BalanceUSDT}}U</strong></span></div>
-</section>
-</main></body></html>`
+</div></main></body></html>`

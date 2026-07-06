@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
+	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/telegram"
 )
 
 func TestBuildBillText(t *testing.T) {
@@ -52,6 +53,42 @@ func TestBuildBillText(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Fatalf("bill text missing %q:\n%s", want, text)
 		}
+	}
+}
+
+func TestRecordLineUsesSubjectNameAndMessageLink(t *testing.T) {
+	loc := time.FixedZone("Asia/Shanghai", 8*3600)
+	record := storage.Record{
+		ChatID:          -1003720457420,
+		SourceMessageID: 1234,
+		Kind:            "deposit",
+		Currency:        "CNY",
+		Amount:          "666",
+		Rate:            "10",
+		ResultUSDT:      "66.6",
+		SubjectName:     "新一",
+		ActorName:       "阿泽",
+		CreatedAt:       time.Date(2026, 7, 6, 21, 33, 2, 0, loc),
+	}
+	line := recordLine(record, loc)
+	if !strings.Contains(line, `href="https://t.me/c/3720457420/1234"`) {
+		t.Fatalf("record line missing message link: %s", line)
+	}
+	if strings.Contains(line, "阿泽") || !strings.Contains(line, ">新一</a>") {
+		t.Fatalf("record line should display subject name only: %s", line)
+	}
+}
+
+func TestLedgerSubjectFromReplyMessage(t *testing.T) {
+	msg := telegram.Message{
+		From: &telegram.User{ID: 1, FirstName: "阿泽", Username: "aze89"},
+		ReplyTo: &telegram.Message{
+			From: &telegram.User{ID: 2, FirstName: "新一", Username: "newone"},
+		},
+	}
+	subject := ledgerSubjectFromMessage(msg, userFromTelegram(*msg.From))
+	if subject.ID != 2 || subject.DisplayName != "新一" {
+		t.Fatalf("subject = %+v, want replied user 新一", subject)
 	}
 }
 

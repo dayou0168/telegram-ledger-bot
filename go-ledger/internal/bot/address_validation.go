@@ -3,6 +3,7 @@ package bot
 import (
 	"bytes"
 	"context"
+	_ "embed"
 	"html"
 	"image"
 	"image/color"
@@ -33,11 +34,15 @@ var (
 	addressVerifyTemplateErr  error
 )
 
+//go:embed assets/address_verify_template.png
+var addressVerifyTemplatePNG []byte
+
 func (b *Bot) handleAddressValidation(ctx context.Context, msg telegram.Message, user storage.User, address string, now time.Time) error {
 	validation, err := b.store.RecordAddressValidation(ctx, msg.Chat.ID, address, user, now)
 	if err != nil {
 		return err
 	}
+	b.hydrateAddressValidationNames(ctx, msg.Chat.ID, &validation)
 	if validation.VerifyCount == 1 {
 		var account *tron.Account
 		if info, err := b.tron.FetchAccount(ctx, address, b.cfg.USDTContract); err == nil {
@@ -64,6 +69,28 @@ func (b *Bot) handleAddressValidation(ctx context.Context, msg telegram.Message,
 		"parse_mode":          "HTML",
 	})
 	return err
+}
+
+func (b *Bot) hydrateAddressValidationNames(ctx context.Context, chatID int64, v *storage.AddressValidation) {
+	v.FirstUserName = b.addressValidationUserLabel(ctx, chatID, v.FirstUserID, v.FirstUserName)
+	v.PreviousUserName = b.addressValidationUserLabel(ctx, chatID, v.PreviousUserID, v.PreviousUserName)
+	v.LastUserName = b.addressValidationUserLabel(ctx, chatID, v.LastUserID, v.LastUserName)
+}
+
+func (b *Bot) addressValidationUserLabel(ctx context.Context, chatID, userID int64, fallback string) string {
+	if userID == 0 {
+		return fallback
+	}
+	user, ok, err := b.store.GetUser(ctx, chatID, userID)
+	if err == nil && ok {
+		if user.Username != "" {
+			return "@" + user.Username
+		}
+		if user.DisplayName != "" {
+			return user.DisplayName
+		}
+	}
+	return fallback
 }
 
 func formatFirstAddressValidationCaption(v storage.AddressValidation, account *tron.Account, loc *time.Location) string {
@@ -140,6 +167,14 @@ func addressVerifyTemplate() (*image.RGBA, error) {
 }
 
 func buildAddressVerifyTemplate() (*image.RGBA, error) {
+	if len(addressVerifyTemplatePNG) > 0 {
+		decoded, err := png.Decode(bytes.NewReader(addressVerifyTemplatePNG))
+		if err == nil {
+			rgba := image.NewRGBA(decoded.Bounds())
+			draw.Draw(rgba, rgba.Bounds(), decoded, image.Point{}, draw.Src)
+			return rgba, nil
+		}
+	}
 	img := image.NewRGBA(image.Rect(0, 0, addressVerifyWidth, addressVerifyHeight))
 	draw.Draw(img, img.Bounds(), image.NewUniform(hexColor(0x03, 0xa7, 0x7b)), image.Point{}, draw.Src)
 

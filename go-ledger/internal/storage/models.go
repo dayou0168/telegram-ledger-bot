@@ -87,6 +87,8 @@ type Record struct {
 	Rate            string
 	FeeRate         string
 	ResultUSDT      string
+	SubjectUserID   int64
+	SubjectName     string
 	ActorUserID     int64
 	ActorName       string
 	SourceMessageID int64

@@ -98,6 +98,7 @@ func (b *Bot) handleLedger(ctx context.Context, msg telegram.Message, user stora
 		currency = "USDT"
 	}
 	dayKey := businessDayKey(now, group.CutoffHour)
+	subject := ledgerSubjectFromMessage(msg, user)
 	recordID, err := b.store.InsertRecord(ctx, storage.Record{
 		ChatID:          msg.Chat.ID,
 		DayKey:          dayKey,
@@ -107,6 +108,8 @@ func (b *Bot) handleLedger(ctx context.Context, msg telegram.Message, user stora
 		Rate:            formatRat(rate, 8),
 		FeeRate:         formatRat(feeRate, 4),
 		ResultUSDT:      formatAmount(resultUSDT),
+		SubjectUserID:   subject.ID,
+		SubjectName:     subject.DisplayName,
 		ActorUserID:     user.ID,
 		ActorName:       user.DisplayName,
 		SourceMessageID: msg.MessageID,
@@ -118,6 +121,13 @@ func (b *Bot) handleLedger(ctx context.Context, msg telegram.Message, user stora
 	}
 	b.sendBillForRecordAsync(ctx, msg.Chat.ID, msg.MessageID, recordID, now)
 	return nil
+}
+
+func ledgerSubjectFromMessage(msg telegram.Message, actor storage.User) storage.User {
+	if msg.ReplyTo != nil && msg.ReplyTo.From != nil && msg.ReplyTo.From.ID != 0 {
+		return userFromTelegram(*msg.ReplyTo.From)
+	}
+	return actor
 }
 
 func (b *Bot) handleSetting(ctx context.Context, msg telegram.Message, user storage.User, cmd settingCommand, now time.Time) error {
@@ -346,7 +356,8 @@ func (b *Bot) sendBillMessage(ctx context.Context, chatID, replyTo int64, now ti
 	}
 	text := buildBillText(group, records, b.loc, prefix)
 	opts := map[string]any{
-		"parse_mode": "HTML",
+		"parse_mode":               "HTML",
+		"disable_web_page_preview": true,
 	}
 	if url := b.publicBillURL(chatID, dayKey); url != "" {
 		opts["reply_markup"] = telegram.InlineKeyboardMarkup{InlineKeyboard: [][]telegram.InlineKeyboardButton{

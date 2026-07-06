@@ -192,6 +192,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			rate TEXT NOT NULL,
 			fee_rate TEXT NOT NULL,
 			result_usdt TEXT NOT NULL,
+			subject_user_id BIGINT NOT NULL DEFAULT 0,
+			subject_name TEXT NOT NULL DEFAULT '',
 			actor_user_id BIGINT NOT NULL,
 			actor_name TEXT NOT NULL DEFAULT '',
 			source_message_id BIGINT NOT NULL DEFAULT 0,
@@ -203,9 +205,14 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_records_chat_day_active
 			ON records(chat_id, day_key, id)
 			WHERE deleted_at IS NULL`,
+		`ALTER TABLE records ADD COLUMN IF NOT EXISTS subject_user_id BIGINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE records ADD COLUMN IF NOT EXISTS subject_name TEXT NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_records_chat_kind_active
 			ON records(chat_id, kind, id DESC)
 			WHERE deleted_at IS NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_records_chat_subject_day_active
+			ON records(chat_id, subject_user_id, day_key, id)
+			WHERE deleted_at IS NULL AND subject_user_id <> 0`,
 		`CREATE INDEX IF NOT EXISTS idx_records_chat_source_message
 			ON records(chat_id, source_message_id, id DESC)
 			WHERE deleted_at IS NULL AND source_message_id <> 0`,
@@ -320,6 +327,19 @@ func (s *Store) FindUserByUsername(ctx context.Context, chatID int64, username s
 		FROM users
 		WHERE chat_id=$1 AND lower(username)=$2
 		LIMIT 1`, chatID, username)
+	var user User
+	err := row.Scan(&user.ID, &user.Username, &user.DisplayName)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return User{}, false, nil
+	}
+	return user, err == nil, err
+}
+
+func (s *Store) GetUser(ctx context.Context, chatID, userID int64) (User, bool, error) {
+	row := s.pool.QueryRow(ctx, `SELECT user_id, username, display_name
+		FROM users
+		WHERE chat_id=$1 AND user_id=$2
+		LIMIT 1`, chatID, userID)
 	var user User
 	err := row.Scan(&user.ID, &user.Username, &user.DisplayName)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -866,12 +886,12 @@ func (s *Store) SaveBroadcastReplaceSetting(ctx context.Context, setting Broadca
 func (s *Store) InsertRecord(ctx context.Context, r Record) (int64, error) {
 	var id int64
 	err := s.pool.QueryRow(ctx, `INSERT INTO records(
-		chat_id, day_key, kind, currency, amount, rate, fee_rate, result_usdt, actor_user_id, actor_name,
+		chat_id, day_key, kind, currency, amount, rate, fee_rate, result_usdt, subject_user_id, subject_name, actor_user_id, actor_name,
 		source_message_id, bot_message_id, remark, created_at
-	) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+	) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 	RETURNING id`,
-		r.ChatID, r.DayKey, r.Kind, r.Currency, r.Amount, r.Rate, r.FeeRate, r.ResultUSDT, r.ActorUserID,
-		r.ActorName, r.SourceMessageID, r.BotMessageID, r.Remark, r.CreatedAt).Scan(&id)
+		r.ChatID, r.DayKey, r.Kind, r.Currency, r.Amount, r.Rate, r.FeeRate, r.ResultUSDT, r.SubjectUserID,
+		r.SubjectName, r.ActorUserID, r.ActorName, r.SourceMessageID, r.BotMessageID, r.Remark, r.CreatedAt).Scan(&id)
 	return id, err
 }
 
@@ -882,7 +902,7 @@ func (s *Store) SetRecordBotMessage(ctx context.Context, recordID, botMessageID 
 
 func (s *Store) ListRecordsForDay(ctx context.Context, chatID int64, dayKey string) ([]Record, error) {
 	rows, err := s.pool.Query(ctx, `SELECT id, chat_id, day_key, kind, currency, amount, rate, fee_rate, result_usdt,
-		actor_user_id, actor_name, source_message_id, bot_message_id, remark, created_at, deleted_at
+		subject_user_id, subject_name, actor_user_id, actor_name, source_message_id, bot_message_id, remark, created_at, deleted_at
 		FROM records
 		WHERE chat_id=$1 AND day_key=$2 AND deleted_at IS NULL
 		ORDER BY id ASC`, chatID, dayKey)
@@ -924,7 +944,7 @@ func (s *Store) ListBillDays(ctx context.Context, chatID int64) ([]string, error
 
 func (s *Store) FindRecordByMessage(ctx context.Context, chatID, messageID int64) (Record, bool, error) {
 	rows, err := s.pool.Query(ctx, `SELECT id, chat_id, day_key, kind, currency, amount, rate, fee_rate, result_usdt,
-		actor_user_id, actor_name, source_message_id, bot_message_id, remark, created_at, deleted_at
+		subject_user_id, subject_name, actor_user_id, actor_name, source_message_id, bot_message_id, remark, created_at, deleted_at
 		FROM records
 		WHERE chat_id=$1
 		  AND deleted_at IS NULL
@@ -1214,6 +1234,8 @@ func scanRecord(scanner recordScanner) (Record, error) {
 		&record.Rate,
 		&record.FeeRate,
 		&record.ResultUSDT,
+		&record.SubjectUserID,
+		&record.SubjectName,
 		&record.ActorUserID,
 		&record.ActorName,
 		&record.SourceMessageID,
