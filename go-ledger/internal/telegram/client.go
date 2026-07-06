@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -18,6 +19,31 @@ type Client struct {
 	baseURL string
 	token   string
 	http    *http.Client
+}
+
+type Error struct {
+	Endpoint    string
+	ErrorCode   int
+	Description string
+	RetryAfter  int
+}
+
+func (e *Error) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.RetryAfter > 0 {
+		return fmt.Sprintf("telegram %s: %d %s retry_after=%d", e.Endpoint, e.ErrorCode, e.Description, e.RetryAfter)
+	}
+	return fmt.Sprintf("telegram %s: %d %s", e.Endpoint, e.ErrorCode, e.Description)
+}
+
+func RetryAfter(err error) (time.Duration, bool) {
+	var tgErr *Error
+	if errors.As(err, &tgErr) && tgErr.RetryAfter > 0 {
+		return time.Duration(tgErr.RetryAfter) * time.Second, true
+	}
+	return 0, false
 }
 
 func NewClient(baseURL, token string, timeout time.Duration) *Client {
@@ -239,12 +265,20 @@ func (c *Client) callMultipart(ctx context.Context, endpoint string, fields map[
 		Result      json.RawMessage `json:"result"`
 		Description string          `json:"description"`
 		ErrorCode   int             `json:"error_code"`
+		Parameters  struct {
+			RetryAfter int `json:"retry_after"`
+		} `json:"parameters"`
 	}
 	if err := json.Unmarshal(raw, &wrapper); err != nil {
 		return fmt.Errorf("telegram non-json response %s: %w", resp.Status, err)
 	}
 	if !wrapper.OK {
-		return fmt.Errorf("telegram %s: %d %s", endpoint, wrapper.ErrorCode, wrapper.Description)
+		return &Error{
+			Endpoint:    endpoint,
+			ErrorCode:   wrapper.ErrorCode,
+			Description: wrapper.Description,
+			RetryAfter:  wrapper.Parameters.RetryAfter,
+		}
 	}
 	if out != nil {
 		if err := json.Unmarshal(wrapper.Result, out); err != nil {
@@ -288,12 +322,20 @@ func (c *Client) call(ctx context.Context, method, endpoint string, query url.Va
 		Result      json.RawMessage `json:"result"`
 		Description string          `json:"description"`
 		ErrorCode   int             `json:"error_code"`
+		Parameters  struct {
+			RetryAfter int `json:"retry_after"`
+		} `json:"parameters"`
 	}
 	if err := json.Unmarshal(raw, &wrapper); err != nil {
 		return fmt.Errorf("telegram non-json response %s: %w", resp.Status, err)
 	}
 	if !wrapper.OK {
-		return fmt.Errorf("telegram %s: %d %s", endpoint, wrapper.ErrorCode, wrapper.Description)
+		return &Error{
+			Endpoint:    endpoint,
+			ErrorCode:   wrapper.ErrorCode,
+			Description: wrapper.Description,
+			RetryAfter:  wrapper.Parameters.RetryAfter,
+		}
 	}
 	if out != nil {
 		if err := json.Unmarshal(wrapper.Result, out); err != nil {

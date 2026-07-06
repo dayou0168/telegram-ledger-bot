@@ -274,6 +274,27 @@ func (s *Store) migrate(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_chain_notifications_latest
 			ON chain_notifications(owner_user_id, address, block_timestamp DESC)`,
+		`CREATE TABLE IF NOT EXISTS notification_outbox (
+			id BIGSERIAL PRIMARY KEY,
+			kind TEXT NOT NULL,
+			dedupe_key TEXT NOT NULL UNIQUE,
+			chat_id BIGINT NOT NULL,
+			text TEXT NOT NULL,
+			parse_mode TEXT NOT NULL DEFAULT '',
+			disable_preview BOOLEAN NOT NULL DEFAULT FALSE,
+			status TEXT NOT NULL DEFAULT 'pending',
+			attempts INTEGER NOT NULL DEFAULT 0,
+			next_attempt_at TIMESTAMPTZ NOT NULL,
+			last_error TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL,
+			updated_at TIMESTAMPTZ NOT NULL,
+			sent_at TIMESTAMPTZ
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_notification_outbox_due
+			ON notification_outbox(status, next_attempt_at, id)
+			WHERE status IN ('pending', 'failed', 'sending')`,
+		`CREATE INDEX IF NOT EXISTS idx_notification_outbox_chat
+			ON notification_outbox(chat_id, created_at DESC)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.pool.Exec(ctx, statement); err != nil {
@@ -1212,6 +1233,104 @@ func (s *Store) RecordChainNotification(ctx context.Context, owner int64, addres
 		VALUES($1, $2, $3, $4, $5, $6)
 		ON CONFLICT DO NOTHING`, owner, address, txHash, direction, blockTimestamp, now)
 	return tag.RowsAffected() == 1, err
+}
+
+func (s *Store) RecordChainNotificationOutbox(ctx context.Context, owner int64, address, txHash, direction string, blockTimestamp int64, chatID int64, text, parseMode string, disablePreview bool, now time.Time) (bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer rollback(ctx, tx)
+	tag, err := tx.Exec(ctx, `INSERT INTO chain_notifications(owner_user_id, address, tx_hash, direction, block_timestamp, created_at)
+		VALUES($1, $2, $3, $4, $5, $6)
+		ON CONFLICT DO NOTHING`, owner, address, txHash, direction, blockTimestamp, now)
+	if err != nil {
+		return false, err
+	}
+	if tag.RowsAffected() == 0 {
+		return false, tx.Commit(ctx)
+	}
+	dedupeKey := fmt.Sprintf("chain:%d:%s:%s:%s", owner, address, txHash, direction)
+	if _, err := tx.Exec(ctx, `INSERT INTO notification_outbox(
+			kind, dedupe_key, chat_id, text, parse_mode, disable_preview, status,
+			attempts, next_attempt_at, created_at, updated_at
+		) VALUES('chain', $1, $2, $3, $4, $5, 'pending', 0, $6, $6, $6)
+		ON CONFLICT(dedupe_key) DO NOTHING`,
+		dedupeKey, chatID, text, parseMode, disablePreview, now); err != nil {
+		return false, err
+	}
+	return true, tx.Commit(ctx)
+}
+
+func (s *Store) ClaimDueNotifications(ctx context.Context, limit int, now time.Time) ([]NotificationOutbox, error) {
+	if limit < 1 {
+		limit = 1
+	}
+	staleBefore := now.Add(-2 * time.Minute)
+	rows, err := s.pool.Query(ctx, `WITH next AS (
+			SELECT id
+			FROM notification_outbox
+			WHERE (status IN ('pending', 'failed') AND next_attempt_at <= $1)
+				OR (status = 'sending' AND updated_at <= $3)
+			ORDER BY next_attempt_at ASC, id ASC
+			LIMIT $2
+			FOR UPDATE SKIP LOCKED
+		)
+		UPDATE notification_outbox n
+		SET status='sending',
+			attempts=n.attempts + 1,
+			updated_at=$1
+		FROM next
+		WHERE n.id = next.id
+		RETURNING n.id, n.kind, n.dedupe_key, n.chat_id, n.text, n.parse_mode,
+			n.disable_preview, n.status, n.attempts, n.next_attempt_at, n.last_error,
+			n.created_at, n.updated_at, n.sent_at`, now, limit, staleBefore)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []NotificationOutbox
+	for rows.Next() {
+		var item NotificationOutbox
+		if err := rows.Scan(
+			&item.ID,
+			&item.Kind,
+			&item.DedupeKey,
+			&item.ChatID,
+			&item.Text,
+			&item.ParseMode,
+			&item.DisablePreview,
+			&item.Status,
+			&item.Attempts,
+			&item.NextAttemptAt,
+			&item.LastError,
+			&item.CreatedAt,
+			&item.UpdatedAt,
+			&item.SentAt,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) MarkNotificationSent(ctx context.Context, id int64, now time.Time) error {
+	_, err := s.pool.Exec(ctx, `UPDATE notification_outbox
+		SET status='sent', sent_at=$2, updated_at=$2, last_error=''
+		WHERE id=$1`, id, now)
+	return err
+}
+
+func (s *Store) MarkNotificationFailed(ctx context.Context, id int64, message string, nextAttemptAt time.Time, now time.Time) error {
+	message = strings.TrimSpace(message)
+	if len(message) > 1000 {
+		message = message[:1000]
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE notification_outbox
+		SET status='failed', last_error=$2, next_attempt_at=$3, updated_at=$4
+		WHERE id=$1`, id, message, nextAttemptAt, now)
+	return err
 }
 
 func rollback(ctx context.Context, tx pgx.Tx) {

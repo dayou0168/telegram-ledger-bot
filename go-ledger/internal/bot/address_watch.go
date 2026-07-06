@@ -512,11 +512,18 @@ func (b *Bot) addressWatchScheduler(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			b.chainPool.Submit(func(jobCtx context.Context) {
+			if !b.watchRunning.CompareAndSwap(false, true) {
+				continue
+			}
+			if !b.chainPool.Submit(func(jobCtx context.Context) {
+				defer b.watchRunning.Store(false)
 				if err := b.pollAddressWatches(jobCtx); err != nil {
 					log.Printf("poll address watches: %v", err)
 				}
-			})
+			}) {
+				b.watchRunning.Store(false)
+				log.Printf("poll address watches: chain queue is full")
+			}
 		}
 	}
 }
@@ -536,7 +543,7 @@ func (b *Bot) pollAddressWatches(ctx context.Context) error {
 	now := time.Now().In(b.loc)
 	minByAddress := watchAddressMinTimestamps(targets, now, b.cfg.TronLookbackMinutes)
 	for address, minTimestamp := range minByAddress {
-		transfers, err := b.tron.FetchAddressUSDTTransfersSince(ctx, address, b.cfg.USDTContract, 20, minTimestamp)
+		transfers, err := b.tron.FetchAddressUSDTTransfersSincePages(ctx, address, b.cfg.USDTContract, 50, b.cfg.TronAddressPages, minTimestamp)
 		if err != nil {
 			log.Printf("fetch watch transfers %s: %v", address, err)
 			continue
@@ -585,7 +592,8 @@ func (b *Bot) processWatchTransfers(ctx context.Context, transfers []tron.Transf
 			if !amountAtLeast(transfer.Value, transfer.TokenDecimals, target.MinNotifyAmount) {
 				continue
 			}
-			inserted, err := b.store.RecordChainNotification(ctx, target.OwnerUserID, target.Address, transfer.Hash, direction, transfer.BlockTimestamp, now)
+			text := b.formatTransferNotice(transfer, target, direction)
+			inserted, err := b.store.RecordChainNotificationOutbox(ctx, target.OwnerUserID, target.Address, transfer.Hash, direction, transfer.BlockTimestamp, target.OwnerUserID, text, "HTML", true, now)
 			if err != nil {
 				log.Printf("record chain notification: %v", err)
 				continue
@@ -593,19 +601,7 @@ func (b *Bot) processWatchTransfers(ctx context.Context, transfers []tron.Transf
 			if !inserted {
 				continue
 			}
-			t := transfer
-			w := target
-			d := direction
-			b.notifyPool.Submit(func(sendCtx context.Context) {
-				_, err := b.tg.SendMessage(sendCtx, w.OwnerUserID, b.formatTransferNotice(t, w, d), map[string]any{
-					"parse_mode":               "HTML",
-					"disable_web_page_preview": true,
-					"link_preview_options":     map[string]any{"is_disabled": true},
-				})
-				if err != nil {
-					log.Printf("send chain notification: %v", err)
-				}
-			})
+			b.kickNotificationOutbox()
 		}
 	}
 }

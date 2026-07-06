@@ -86,14 +86,36 @@ func (c *Client) FetchAddressUSDTTransfers(ctx context.Context, address, contrac
 }
 
 func (c *Client) FetchAddressUSDTTransfersSince(ctx context.Context, address, contract string, limit int, minTimestamp int64) ([]Transfer, error) {
+	return c.FetchAddressUSDTTransfersSincePages(ctx, address, contract, limit, 1, minTimestamp)
+}
+
+func (c *Client) FetchAddressUSDTTransfersSincePages(ctx context.Context, address, contract string, limit int, pages int, minTimestamp int64) ([]Transfer, error) {
 	if limit < 1 {
 		limit = 20
 	}
+	if pages < 1 {
+		pages = 1
+	}
+	var all []Transfer
+	for page := 0; page < pages; page++ {
+		transfers, err := c.fetchAddressUSDTTransfersPage(ctx, address, contract, limit, page*limit, minTimestamp)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, transfers...)
+		if len(transfers) < limit || reachedTransferWindow(transfers, minTimestamp) {
+			break
+		}
+	}
+	return all, nil
+}
+
+func (c *Client) fetchAddressUSDTTransfersPage(ctx context.Context, address, contract string, limit int, start int, minTimestamp int64) ([]Transfer, error) {
 	values := url.Values{}
 	values.Set("address", address)
 	values.Set("trc20Id", contract)
 	values.Set("limit", strconv.Itoa(limit))
-	values.Set("start", "0")
+	values.Set("start", strconv.Itoa(start))
 	values.Set("direction", "0")
 	values.Set("reverse", "true")
 	if minTimestamp > 0 {
@@ -105,9 +127,21 @@ func (c *Client) FetchAddressUSDTTransfersSince(ctx context.Context, address, co
 	}
 	transfers := make([]Transfer, 0, len(result.TokenTransfers))
 	for _, row := range result.TokenTransfers {
-		transfers = append(transfers, row.toTransfer())
+		transfer := row.toTransfer()
+		if minTimestamp > 0 && transfer.BlockTimestamp < minTimestamp {
+			continue
+		}
+		transfers = append(transfers, transfer)
 	}
 	return transfers, nil
+}
+
+func reachedTransferWindow(transfers []Transfer, minTimestamp int64) bool {
+	if minTimestamp <= 0 || len(transfers) == 0 {
+		return false
+	}
+	oldest := transfers[len(transfers)-1].BlockTimestamp
+	return oldest <= minTimestamp
 }
 
 func (c *Client) FetchAccount(ctx context.Context, address, usdtContract string) (Account, error) {

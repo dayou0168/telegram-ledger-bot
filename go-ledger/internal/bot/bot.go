@@ -6,6 +6,7 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/config"
@@ -39,6 +40,9 @@ type Bot struct {
 	watchTargetCache *ttlCache[[]storage.WatchTarget]
 	rateBookCache    *ttlCache[[]p2p.OrderBookEntry]
 	privateStates    *ttlCache[privateState]
+	notificationWake chan struct{}
+	telegramLimiter  *telegramRateLimiter
+	watchRunning     atomic.Bool
 }
 
 func New(cfg config.Config, store *storage.Store, tg *telegram.Client, tronClient *tron.Client, p2pClient *p2p.Client) *Bot {
@@ -67,6 +71,8 @@ func New(cfg config.Config, store *storage.Store, tg *telegram.Client, tronClien
 		watchTargetCache: newTTLCache[[]storage.WatchTarget](cfg.WatchCacheTTL),
 		rateBookCache:    newTTLCache[[]p2p.OrderBookEntry](cfg.P2PCacheTTL),
 		privateStates:    newTTLCache[privateState](30 * time.Minute),
+		notificationWake: make(chan struct{}, 1),
+		telegramLimiter:  newTelegramRateLimiter(),
 	}
 }
 
@@ -80,6 +86,7 @@ func (b *Bot) Run(ctx context.Context) error {
 	b.notifyPool.StartN(ctx, b.cfg.NotifyWorkers)
 
 	go b.addressWatchScheduler(ctx)
+	go b.notificationOutboxScheduler(ctx)
 	go b.rateScheduler(ctx)
 
 	var offset int64

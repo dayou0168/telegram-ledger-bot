@@ -42,6 +42,7 @@ type Config struct {
 	TronAPIKey        string
 	USDTContract      string
 	TronGlobalPages   int
+	TronAddressPages  int
 	P2PRefreshEvery   time.Duration
 	P2PCacheTTL       time.Duration
 	P2PAPIBase        string
@@ -87,6 +88,7 @@ func Load() (Config, error) {
 		TronAPIKey:          strings.TrimSpace(os.Getenv("TRONGRID_API_KEY")),
 		USDTContract:        env("TRON_USDT_CONTRACT", "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"),
 		TronGlobalPages:     intEnv("TRONSCAN_GLOBAL_SCAN_PAGES", 1),
+		TronAddressPages:    intEnv("TRON_ADDRESS_SCAN_PAGES", 3),
 		P2PRefreshEvery:     secondsEnv("P2P_RATE_REFRESH_SECONDS", 60),
 		P2PCacheTTL:         secondsEnv("P2P_RATE_CACHE_TTL_SECONDS", 180),
 		P2PAPIBase:          strings.TrimRight(env("P2P_RATE_API_BASE", "https://p2p.army/api/fapi"), "/"),
@@ -115,6 +117,9 @@ func Load() (Config, error) {
 	}
 	if cfg.QueueSize < 128 {
 		cfg.QueueSize = 128
+	}
+	if cfg.TronAddressPages < 1 {
+		cfg.TronAddressPages = 1
 	}
 	return cfg, nil
 }
