@@ -6,4 +6,5 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 data/
-
+go-ledger/ledger-bot
+go-ledger/ledger-bot.exe

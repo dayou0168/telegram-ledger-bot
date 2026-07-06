@@ -1,0 +1,95 @@
+# Telegram Ledger Bot Go Runtime v2.1
+
+这是机器人 Go 版 v2.1 主线，目标是把同步、异步、队列、并发、缓存和数据库从架构层面重新设计。
+
+Python 版 1.3 已作为旧稳定版封存；Go 版从 2.1 开始按 PostgreSQL-first 继续开发。当前已具备：
+
+- Telegram long polling。
+- 按 `chat_id` / `user_id` 串行分发。
+- 独立弹性功能池：记账、私聊控制、链上监听、汇率、广播、TRX 查询、通知。
+- PostgreSQL 主存储，启动时自动迁移 schema 和索引。
+- 金额保存统一四舍五入到小数点后 2 位；汇率保留必要精度。
+- 基础群保存、用户 touch、操作员权限表、账本记录表。
+- `开始` / `停止`，日切后不重置群配置，费率和汇率继续沿用。
+- `上课` / `下课` 调用 Telegram 群权限开启或关闭全员发言，机器人需要群管理权限。
+- `设置费率3`、`设置汇率7.1`、`设置日切04`。
+- `+100`、`+100/7`、`+100U`、`下发100U`；`下发100` 已禁用，避免误把人民币当 U。
+- `+0`、`显示账单`、`账单` 生成当前业务日账单摘要。
+- `通知所有人` 会在群内 @ 已发言成员，并按 Telegram 消息长度自动分段。
+- `清除今日账单` / `清除全部账单` 带二次确认，只清当前群账单，不重置群配置、汇率或费率。
+- 回复原始加账消息或机器人账单回执发送 `撤销` / `撤销入款` / `撤销下发`。
+- 回复用户或输入 `@用户名` 添加/删除本群操作员。
+- 加账写库和 Telegram 账单回执发送拆开：同群写库串行，回执异步有序发送，并保存机器人回执消息 ID 供撤销定位。
+- 完整账单按钮使用短链接：`/b/{chat_id}/{yyyymmdd}`，不再拼接冗长的 `begintime/endtime` 参数。
+- 内置后台管理和短账单网页，后台通过 `ADMIN_WEB_TOKEN` 登录；账单页支持历史日期、上一天/下一天、高级筛选和下载 `.xlsx`。
+- 私聊按钮式广播入口：群发、分组广播、单群发送；选定目标后可连续发送文字、图片、图片+文字或文件，不再逐条确认。
+- 广播目标选择后可切换“通知所有人”，开启后广播投递到目标群会自动追加 @ 已发言成员。
+- 私聊菜单已接入详细说明、UID 查询和后台管理入口；后台入口会使用 `PUBLIC_BILL_BASE_URL/admin`。
+- 广播回复通知：群成员回复投递消息时，原操作人会收到私聊通知，可快速回复并定位消息。
+- 广播替换：后台可开关，仅对单群发送生效；群成员回复投递消息时，可把原投递消息替换成固定图片/文字。
+- `Z0` 查询 OKX OTC 商家所有实时汇率 TOP10，`Z1 -0.1` / `设置汇率 Z1 -0.1` 可按档位偏移设置群汇率。
+- 实时汇率全局定时刷新，默认 60 秒刷新一次，所有群共用缓存。
+- 群内发送 TRC20 地址会自动记录验证次数；首次出现回复防篡改核对图，重复出现显示上次发送人和本次发送人。
+- `查询T...` / `查询TRX地址 T...` 查询 TRON 地址余额、创建/活跃时间和最近 USDT 流水，走独立查询池。
+- 地址监听权限：宿主、默认操作人、一级/下级操作人；私聊按钮面板支持添加/删除地址、收入/支出/TRX 通知开关、最小提醒金额。
+- Tronscan 全局 USDT 主扫描，本地匹配监听地址，通知异步发送。
+
+## 构建
+
+推荐直接使用 GitHub Actions 构建发布的镜像：
+
+```bash
+docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.1
+```
+
+本目录也保留独立 Dockerfile，方便本地构建：
+
+```bash
+docker build -t telegram-ledger-bot-go:dev .
+```
+
+推荐直接用本目录的 `docker-compose.yml` 启动，里面已经包含 PostgreSQL，默认拉取 `ghcr.io/dayou0168/telegram-ledger-bot-go:2.1`：
+
+```bash
+docker compose up -d --build
+```
+
+核心环境变量：
+
+```env
+TELEGRAM_BOT_TOKEN=123456:replace-me
+TELEGRAM_BOT_USERNAME=your_bot_username
+BOT_HOST_USER_ID=123456789
+DATABASE_URL=postgres://ledger:change_this_strong_password@postgres:5432/ledger_bot?sslmode=disable
+PUBLIC_BILL_BASE_URL=https://bot.example.com
+ADMIN_WEB_TOKEN=change_this_admin_password
+```
+
+## 推荐默认并发
+
+4 核 8G：
+
+```env
+BOT_WORKER_THREADS=16
+BOT_CONTROL_THREADS=6
+BOT_CHAIN_THREADS=12
+BOT_RATE_THREADS=2
+BOT_BROADCAST_THREADS=4
+BOT_QUERY_THREADS=4
+BOT_NOTIFICATION_THREADS=6
+BOT_QUEUE_SIZE=4096
+```
+
+这些值是最大并发上限，不是长期占用。Go 版功能池会按队列压力自动扩容，空闲 30 秒自动缩回；少量群活跃时，空闲资源会用于异步回执、缓存预热、链上索引和账单摘要预计算，而不是让账本队列等待慢 HTTP。
+
+## 数据库原则
+
+- 生产主库使用 PostgreSQL。
+- Telegram 更新去重、账本、权限、广播任务、链上通知都落 PostgreSQL。
+- 表设计从第一版就使用 `BIGINT` Telegram ID、`TIMESTAMPTZ` 时间、`BOOLEAN` 开关和高频组合索引。
+- 金额类字段在写库前统一格式化为两位小数，减少长尾小数导致的账单阅读问题。
+- SQLite 不再作为 v2.1 主线目标，避免后续再次迁移。
+
+## 迁移原则
+
+Go 版直接按测试阶段空库启动，不导入 Python 1.3 的 SQLite 数据。等账单、广播、监听三块经过真实群测试后，再切换生产 Bot Token。

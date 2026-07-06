@@ -1,0 +1,77 @@
+name: Go Ledger Runtime
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - "go-ledger/**"
+      - ".github/workflows/go-ledger.yml"
+  pull_request:
+    paths:
+      - "go-ledger/**"
+      - ".github/workflows/go-ledger.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: ledger_bot_test
+          POSTGRES_USER: ledger
+          POSTGRES_PASSWORD: ledger
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ledger -d ledger_bot_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Download dependencies
+        working-directory: go-ledger
+        run: go mod download
+
+      - name: Test
+        working-directory: go-ledger
+        env:
+          TEST_DATABASE_URL: postgres://ledger:ledger@localhost:5432/ledger_bot_test?sslmode=disable
+        run: go test ./...
+
+      - name: Build
+        working-directory: go-ledger
+        run: go build ./cmd/ledger-bot
+
+      - name: Build Docker image
+        working-directory: go-ledger
+        run: docker build -t telegram-ledger-bot-go:2.1 .
+
+      - name: Login to GHCR
+        if: github.event_name == 'push'
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Publish Docker image
+        if: github.event_name == 'push'
+        working-directory: go-ledger
+        run: |
+          IMAGE="ghcr.io/${{ github.repository_owner }}/telegram-ledger-bot-go"
+          docker tag telegram-ledger-bot-go:2.1 "$IMAGE:2.1"
+          docker tag telegram-ledger-bot-go:2.1 "$IMAGE:latest"
+          docker push "$IMAGE:2.1"
+          docker push "$IMAGE:latest"

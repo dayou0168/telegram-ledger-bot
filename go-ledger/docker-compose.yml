@@ -1,0 +1,102 @@
+# Telegram 记账机器人 Go v2.1 + PostgreSQL
+#
+# 使用方法：
+# 1. 先把 TELEGRAM_BOT_TOKEN、TELEGRAM_BOT_USERNAME、BOT_HOST_USER_ID 改成你的真实值。
+# 2. POSTGRES_PASSWORD 建议改成强密码，并同步到 DATABASE_URL 里。
+# 3. 宝塔 Docker Compose 里直接粘贴本文件即可，默认使用 GitHub 自动构建好的镜像。
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ledger-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: "ledger_bot"
+      POSTGRES_USER: "ledger"
+      POSTGRES_PASSWORD: "change_this_strong_password"
+      TZ: "Asia/Shanghai"
+    volumes:
+      - ledger_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ledger -d ledger_bot"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  ledger-bot:
+    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.1
+    container_name: ledger-bot-go
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # 必填：BotFather 给你的机器人 Token。
+      TELEGRAM_BOT_TOKEN: "123456:replace-me"
+
+      # 必填：机器人用户名，不要带 @。
+      TELEGRAM_BOT_USERNAME: "your_bot_username"
+
+      # 必填：唯一宿主 Telegram 数字 ID。
+      BOT_HOST_USER_ID: "123456789"
+
+      # PostgreSQL 连接地址。密码要和上面的 POSTGRES_PASSWORD 保持一致。
+      DATABASE_URL: "postgres://ledger:change_this_strong_password@postgres:5432/ledger_bot?sslmode=disable"
+
+      # 所有业务时间使用北京时间。
+      BOT_TIMEZONE: "Asia/Shanghai"
+
+      # 可选：服务器默认操作人，多个用英文逗号分隔。
+      DEFAULT_OPERATOR_USER_IDS: ""
+
+      # 日本 4 核 8G 推荐默认值。这里是最大并发上限，不是长期占满。
+      BOT_WORKER_THREADS: "16"
+      BOT_CONTROL_THREADS: "6"
+      BOT_CHAIN_THREADS: "12"
+      BOT_RATE_THREADS: "2"
+      BOT_BROADCAST_THREADS: "4"
+      BOT_QUERY_THREADS: "4"
+      BOT_NOTIFICATION_THREADS: "6"
+      BOT_QUEUE_SIZE: "4096"
+
+      # Telegram 官方 Bot API。后续如果自建 Bot API Server，再改这里。
+      TELEGRAM_API_BASE: "https://api.telegram.org"
+      BOT_POLL_TIMEOUT: "50"
+      BOT_REQUEST_TIMEOUT: "30"
+
+      # Tronscan / TRC20 监听配置。
+      TRONSCAN_API_BASE: "https://apilist.tronscanapi.com/api"
+      TRONGRID_API_KEY: ""
+      TRON_USDT_CONTRACT: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+      TRON_POLL_INTERVAL_SECONDS: "1"
+      TRONSCAN_GLOBAL_SCAN_PAGES: "1"
+      TRON_ADDRESS_BACKFILL_SECONDS: "60"
+      TRON_INITIAL_LOOKBACK_MINUTES: "15"
+
+      # Z0 / 实时汇率配置，默认 OKX OTC、CNY、USDT、支付宝档位。
+      P2P_RATE_API_BASE: "https://p2p.army/api/fapi"
+      P2P_RATE_FRONT_API: "NextVOF2Ozuh36mW0TCv"
+      P2P_RATE_MARKET: "okx"
+      P2P_RATE_FIAT_UNIT: "CNY"
+      P2P_RATE_ASSET: "USDT"
+      P2P_RATE_TRADE_METHODS: "aliPay"
+      P2P_RATE_REFRESH_SECONDS: "60"
+      P2P_RATE_CACHE_TTL_SECONDS: "180"
+
+      # 账单网页/后台后续接入时使用。
+      # 配好 HTTPS 域名后，完整账单按钮会使用短链接：
+      # https://你的域名/b/群ID/日期
+      PUBLIC_BILL_BASE_URL: ""
+
+      # 后台管理和短账单网页。公网部署必须填写 ADMIN_WEB_TOKEN。
+      ADMIN_WEB_ENABLED: "1"
+      ADMIN_WEB_HOST: "0.0.0.0"
+      ADMIN_WEB_PORT: "8080"
+      ADMIN_WEB_TOKEN: "change_this_admin_password"
+
+    ports:
+      # 宝塔/Nginx 反向代理目标：http://127.0.0.1:8080
+      - "8080:8080"
+
+volumes:
+  ledger_pg_data:
