@@ -108,6 +108,7 @@ type InlineKeyboardButton struct {
 
 type ReplyKeyboardMarkup struct {
 	Keyboard        [][]KeyboardButton `json:"keyboard"`
+	IsPersistent    bool               `json:"is_persistent,omitempty"`
 	ResizeKeyboard  bool               `json:"resize_keyboard"`
 	OneTimeKeyboard bool               `json:"one_time_keyboard"`
 }

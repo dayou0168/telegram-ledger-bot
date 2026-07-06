@@ -18,6 +18,7 @@ type privateState struct {
 	TargetName           string
 	ChatIDs              []int64
 	NotifyAll            bool
+	ControlMessageID     int64
 	WatchAddress         string
 	QuickReplyTargetChat int64
 	QuickReplyMessageID  int64
@@ -185,19 +186,23 @@ func (b *Bot) setBroadcastTargets(ctx context.Context, cb telegram.CallbackQuery
 	if len(chatIDs) == 0 {
 		return b.tg.AnswerCallback(ctx, cb.ID, "没有可发送的目标群")
 	}
-	b.privateStates.Set(formatID(cb.From.ID), privateState{
+	state := privateState{
 		Mode:       mode,
 		TargetName: name,
 		ChatIDs:    chatIDs,
 		CreatedAt:  time.Now().In(b.loc),
-	})
+	}
 	if err := b.tg.AnswerCallback(ctx, cb.ID, "已选择"); err != nil {
 		return err
 	}
-	_, err := b.tg.SendMessage(ctx, cb.Message.Chat.ID, formatBroadcastReadyText(name, len(chatIDs), false), map[string]any{
+	ready, err := b.tg.SendMessage(ctx, cb.Message.Chat.ID, formatBroadcastReadyText(name, len(chatIDs), false), map[string]any{
 		"reply_to_message_id": cb.Message.MessageID,
 		"reply_markup":        broadcastSessionKeyboard(name, false),
 	})
+	if err == nil {
+		state.ControlMessageID = ready.MessageID
+		b.privateStates.Set(formatID(cb.From.ID), state)
+	}
 	return err
 }
 
@@ -256,7 +261,10 @@ func (b *Bot) handleBroadcastMaterial(ctx context.Context, msg telegram.Message,
 	mode := state.Mode
 	notifyAll := state.NotifyAll
 	operatorID := user.ID
-	status, err := b.tg.SendMessage(ctx, msg.Chat.ID, formatBroadcastProgressText(mode, len(targets)), nil)
+	sessionKeyboard := broadcastSessionKeyboard(targetName, notifyAll)
+	status, err := b.tg.SendMessage(ctx, msg.Chat.ID, formatBroadcastProgressText(mode, len(targets)), map[string]any{
+		"reply_markup": sessionKeyboard,
+	})
 	if err != nil {
 		return err
 	}
@@ -265,7 +273,7 @@ func (b *Bot) handleBroadcastMaterial(ctx context.Context, msg telegram.Message,
 		text := formatBroadcastResultText(mode, success, failed, notifyAll)
 		if _, err := b.tg.EditMessageText(jobCtx, sourceChatID, status.MessageID, text, nil); err != nil {
 			log.Printf("edit broadcast result: %v", err)
-			if _, err := b.tg.SendMessage(jobCtx, sourceChatID, text, nil); err != nil {
+			if _, err := b.tg.SendMessage(jobCtx, sourceChatID, text, map[string]any{"reply_markup": sessionKeyboard}); err != nil {
 				log.Printf("send broadcast result fallback: %v", err)
 			}
 		}
@@ -360,6 +368,7 @@ func broadcastSessionKeyboard(targetName string, notifyAll bool) telegram.ReplyK
 			{{Text: targetLabel}},
 			{{Text: statusLabel}, {Text: "切换群"}, {Text: "结束广播"}},
 		},
+		IsPersistent:   true,
 		ResizeKeyboard: true,
 	}
 }
@@ -409,14 +418,19 @@ func isBroadcastTargetLabelText(text string) bool {
 }
 
 func (b *Bot) refreshBroadcastSessionKeyboard(ctx context.Context, msg telegram.Message, state privateState) error {
-	refresh, err := b.tg.SendMessage(ctx, msg.Chat.ID, "状态已更新", map[string]any{
+	oldControlMessageID := state.ControlMessageID
+	refresh, err := b.tg.SendMessage(ctx, msg.Chat.ID, formatBroadcastReadyText(state.TargetName, len(state.ChatIDs), state.NotifyAll), map[string]any{
 		"reply_markup": broadcastSessionKeyboard(state.TargetName, state.NotifyAll),
 	})
 	if err != nil {
 		return err
 	}
+	state.ControlMessageID = refresh.MessageID
+	if msg.From != nil {
+		b.privateStates.Set(formatID(msg.From.ID), state)
+	}
 	b.deleteMessageBestEffort(ctx, msg.Chat.ID, msg.MessageID)
-	b.deleteMessageBestEffort(ctx, msg.Chat.ID, refresh.MessageID)
+	b.deleteMessageBestEffort(ctx, msg.Chat.ID, oldControlMessageID)
 	return nil
 }
 

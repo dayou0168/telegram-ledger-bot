@@ -44,6 +44,9 @@ func TestBroadcastSessionControls(t *testing.T) {
 	if len(keyboard.Keyboard) != 2 || len(keyboard.Keyboard[0]) != 1 || len(keyboard.Keyboard[1]) != 3 {
 		t.Fatalf("unexpected keyboard shape: %#v", keyboard.Keyboard)
 	}
+	if !keyboard.IsPersistent {
+		t.Fatal("broadcast session keyboard should be persistent")
+	}
 	if keyboard.Keyboard[0][0].Text != "当前目标：11" {
 		t.Fatalf("unexpected target label: %#v", keyboard.Keyboard[0])
 	}
