@@ -82,14 +82,25 @@ func (c *Client) FetchAddressUSDTTransfers(ctx context.Context, address, contrac
 	if limit < 1 {
 		limit = 5
 	}
+	return c.FetchAddressUSDTTransfersSince(ctx, address, contract, limit, 0)
+}
+
+func (c *Client) FetchAddressUSDTTransfersSince(ctx context.Context, address, contract string, limit int, minTimestamp int64) ([]Transfer, error) {
+	if limit < 1 {
+		limit = 20
+	}
 	values := url.Values{}
-	values.Set("contract_address", contract)
-	values.Set("relatedAddress", address)
+	values.Set("address", address)
+	values.Set("trc20Id", contract)
 	values.Set("limit", strconv.Itoa(limit))
 	values.Set("start", "0")
-	values.Set("sort", "-timestamp")
+	values.Set("direction", "0")
+	values.Set("reverse", "true")
+	if minTimestamp > 0 {
+		values.Set("start_timestamp", strconv.FormatInt(minTimestamp, 10))
+	}
 	var result tronscanTransferResponse
-	if err := c.get(ctx, "/token_trc20/transfers", values, &result); err != nil {
+	if err := c.get(ctx, "/transfer/trc20", values, &result); err != nil {
 		return nil, err
 	}
 	transfers := make([]Transfer, 0, len(result.TokenTransfers))
@@ -159,6 +170,7 @@ func (c *Client) get(ctx context.Context, path string, values url.Values, out an
 type tronscanTransferResponse struct {
 	TokenTransfers []tronscanTransfer `json:"token_transfers"`
 	Data           []tronscanTransfer `json:"data"`
+	TokenInfo      tronscanToken      `json:"tokenInfo"`
 }
 
 type tronscanAccountResponse struct {
@@ -188,6 +200,11 @@ func (r *tronscanTransferResponse) UnmarshalJSON(raw []byte) error {
 	if len(a.TokenTransfers) == 0 && len(a.Data) > 0 {
 		a.TokenTransfers = a.Data
 	}
+	for i := range a.TokenTransfers {
+		if a.TokenTransfers[i].TokenInfo.empty() && a.TokenTransfers[i].TokenInfoAlt.empty() {
+			a.TokenTransfers[i].TokenInfo = a.TokenInfo
+		}
+	}
 	*r = tronscanTransferResponse(a)
 	return nil
 }
@@ -201,11 +218,14 @@ type tronscanTransfer struct {
 	ToAlt          string        `json:"to"`
 	Quant          string        `json:"quant"`
 	Value          string        `json:"value"`
+	Amount         string        `json:"amount"`
 	BlockTimestamp int64         `json:"block_ts"`
 	Timestamp      int64         `json:"block_timestamp"`
-	Confirmed      bool          `json:"confirmed"`
+	Confirmed      boolish       `json:"confirmed"`
 	TokenInfo      tronscanToken `json:"tokenInfo"`
 	TokenInfoAlt   tronscanToken `json:"token_info"`
+	ID             string        `json:"id"`
+	Decimals       int           `json:"decimals"`
 }
 
 type tronscanToken struct {
@@ -217,13 +237,37 @@ type tronscanToken struct {
 	Decimals2 int    `json:"decimals"`
 }
 
+func (t tronscanToken) empty() bool {
+	return t.Symbol == "" && t.Symbol2 == "" && t.Address == "" && t.Address2 == "" && t.Decimals == 0 && t.Decimals2 == 0
+}
+
+type boolish bool
+
+func (b *boolish) UnmarshalJSON(raw []byte) error {
+	rawText := strings.Trim(strings.TrimSpace(string(raw)), `"`)
+	switch strings.ToLower(rawText) {
+	case "", "null", "false", "0":
+		*b = false
+	case "true", "1":
+		*b = true
+	default:
+		var n int
+		if _, err := fmt.Sscanf(rawText, "%d", &n); err == nil {
+			*b = n != 0
+			return nil
+		}
+		*b = false
+	}
+	return nil
+}
+
 func (t tronscanTransfer) toTransfer() Transfer {
 	token := t.TokenInfo
 	if token.Symbol == "" && token.Symbol2 == "" {
 		token = t.TokenInfoAlt
 	}
 	hash := first(t.Hash, t.TransactionID)
-	value := first(t.Quant, t.Value)
+	value := first(t.Quant, t.Value, t.Amount)
 	ts := t.BlockTimestamp
 	if ts == 0 {
 		ts = t.Timestamp
@@ -234,10 +278,10 @@ func (t tronscanTransfer) toTransfer() Transfer {
 		To:             first(t.To, t.ToAlt),
 		Value:          value,
 		TokenSymbol:    first(token.Symbol, token.Symbol2),
-		TokenAddress:   first(token.Address, token.Address2),
-		TokenDecimals:  firstInt(token.Decimals, token.Decimals2, 6),
+		TokenAddress:   first(token.Address, token.Address2, t.ID),
+		TokenDecimals:  firstInt(token.Decimals, token.Decimals2, t.Decimals, 6),
 		BlockTimestamp: ts,
-		Confirmed:      t.Confirmed,
+		Confirmed:      bool(t.Confirmed),
 	}
 }
 

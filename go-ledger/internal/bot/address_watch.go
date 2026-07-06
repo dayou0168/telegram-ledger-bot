@@ -529,21 +529,45 @@ func (b *Bot) pollAddressWatches(ctx context.Context) error {
 	if len(targets) == 0 {
 		return nil
 	}
-	minTimestamp := time.Now().Add(-time.Duration(b.cfg.TronLookbackMinutes) * time.Minute).UnixMilli()
-	for _, target := range targets {
-		if target.LatestTimestamp > 0 && target.LatestTimestamp-30000 > minTimestamp {
-			minTimestamp = target.LatestTimestamp - 30000
-		}
-	}
-	transfers, err := b.tron.FetchGlobalUSDTTransfers(ctx, b.cfg.USDTContract, minTimestamp, b.cfg.TronGlobalPages)
-	if err != nil {
-		return err
-	}
 	byAddress := make(map[string][]storage.WatchTarget)
 	for _, target := range targets {
 		byAddress[target.Address] = append(byAddress[target.Address], target)
 	}
 	now := time.Now().In(b.loc)
+	minByAddress := watchAddressMinTimestamps(targets, now, b.cfg.TronLookbackMinutes)
+	for address, minTimestamp := range minByAddress {
+		transfers, err := b.tron.FetchAddressUSDTTransfersSince(ctx, address, b.cfg.USDTContract, 20, minTimestamp)
+		if err != nil {
+			log.Printf("fetch watch transfers %s: %v", address, err)
+			continue
+		}
+		b.processWatchTransfers(ctx, transfers, byAddress, now)
+	}
+	return nil
+}
+
+func watchAddressMinTimestamps(targets []storage.WatchTarget, now time.Time, lookbackMinutes int) map[string]int64 {
+	if lookbackMinutes < 1 {
+		lookbackMinutes = 15
+	}
+	defaultMin := now.Add(-time.Duration(lookbackMinutes) * time.Minute).UnixMilli()
+	minByAddress := make(map[string]int64)
+	for _, target := range targets {
+		minTimestamp := defaultMin
+		if target.LatestTimestamp > 0 {
+			minTimestamp = target.LatestTimestamp - 30000
+			if minTimestamp < defaultMin {
+				minTimestamp = defaultMin
+			}
+		}
+		if current, ok := minByAddress[target.Address]; !ok || minTimestamp < current {
+			minByAddress[target.Address] = minTimestamp
+		}
+	}
+	return minByAddress
+}
+
+func (b *Bot) processWatchTransfers(ctx context.Context, transfers []tron.Transfer, byAddress map[string][]storage.WatchTarget, now time.Time) {
 	for _, transfer := range transfers {
 		matches := append([]storage.WatchTarget{}, byAddress[transfer.From]...)
 		matches = append(matches, byAddress[transfer.To]...)
@@ -573,14 +597,17 @@ func (b *Bot) pollAddressWatches(ctx context.Context) error {
 			w := target
 			d := direction
 			b.notifyPool.Submit(func(sendCtx context.Context) {
-				_, err := b.tg.SendMessage(sendCtx, w.OwnerUserID, formatTransferNotice(t, w, d), map[string]any{"parse_mode": "HTML"})
+				_, err := b.tg.SendMessage(sendCtx, w.OwnerUserID, b.formatTransferNotice(t, w, d), map[string]any{
+					"parse_mode":               "HTML",
+					"disable_web_page_preview": true,
+					"link_preview_options":     map[string]any{"is_disabled": true},
+				})
 				if err != nil {
 					log.Printf("send chain notification: %v", err)
 				}
 			})
 		}
 	}
-	return nil
 }
 
 func (b *Bot) watchTargets(ctx context.Context) ([]storage.WatchTarget, error) {
@@ -616,7 +643,7 @@ func tokenAmount(raw string, decimals int) *big.Rat {
 	return value.Quo(value, new(big.Rat).SetInt(scale))
 }
 
-func formatTransferNotice(t tron.Transfer, w storage.WatchTarget, direction string) string {
+func (b *Bot) formatTransferNotice(t tron.Transfer, w storage.WatchTarget, direction string) string {
 	amount := formatAmount(tokenAmount(t.Value, t.TokenDecimals))
 	label := "⬇️收入"
 	signedAmount := amount
@@ -637,7 +664,7 @@ func formatTransferNotice(t tron.Transfer, w storage.WatchTarget, direction stri
 		signedAmount,
 		formatCode(from),
 		formatCode(to),
-		time.UnixMilli(t.BlockTimestamp).Format("2006-01-02 15:04:05"),
+		formatMilliTime(t.BlockTimestamp, b.loc),
 		html.EscapeString(t.Hash),
 		html.EscapeString(shortHash(t.Hash)),
 	)
