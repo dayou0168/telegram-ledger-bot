@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
@@ -542,14 +543,34 @@ func (b *Bot) pollAddressWatches(ctx context.Context) error {
 	}
 	now := time.Now().In(b.loc)
 	minByAddress := watchAddressMinTimestamps(targets, now, b.cfg.TronLookbackMinutes)
-	for address, minTimestamp := range minByAddress {
-		transfers, err := b.tron.FetchAddressUSDTTransfersSincePages(ctx, address, b.cfg.USDTContract, 50, b.cfg.TronAddressPages, minTimestamp)
-		if err != nil {
-			log.Printf("fetch watch transfers %s: %v", address, err)
-			continue
-		}
-		b.processWatchTransfers(ctx, transfers, byAddress, now)
+	concurrency := b.cfg.TronAddressScanConcurrency
+	if concurrency < 1 {
+		concurrency = 1
 	}
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	for address, minTimestamp := range minByAddress {
+		address := address
+		minTimestamp := minTimestamp
+		select {
+		case <-ctx.Done():
+			wg.Wait()
+			return ctx.Err()
+		case sem <- struct{}{}:
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			transfers, err := b.tron.FetchAddressUSDTTransfersSincePages(ctx, address, b.cfg.USDTContract, 50, b.cfg.TronAddressPages, minTimestamp)
+			if err != nil {
+				log.Printf("fetch watch transfers %s: %v", address, err)
+				return
+			}
+			b.processWatchTransfers(ctx, transfers, byAddress, now)
+		}()
+	}
+	wg.Wait()
 	return nil
 }
 
