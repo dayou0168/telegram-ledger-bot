@@ -26,7 +26,7 @@ type privateState struct {
 
 func isBroadcastMenuText(text string) bool {
 	switch strings.TrimSpace(text) {
-	case "📡群发广播", "群发广播", "📣分组广播", "分组广播", "🗂群列表", "群列表", "单群发送":
+	case "📡群发广播", "群发广播", "📣分组广播", "分组广播", "🗂群列表", "群列表", "单群发送", "切换群", "切换目标":
 		return true
 	default:
 		return false
@@ -196,7 +196,7 @@ func (b *Bot) setBroadcastTargets(ctx context.Context, cb telegram.CallbackQuery
 	}
 	_, err := b.tg.SendMessage(ctx, cb.Message.Chat.ID, formatBroadcastReadyText(name, len(chatIDs), false), map[string]any{
 		"reply_to_message_id": cb.Message.MessageID,
-		"reply_markup":        broadcastReadyKeyboard(false),
+		"reply_markup":        broadcastSessionKeyboard(name, false),
 	})
 	return err
 }
@@ -230,6 +230,30 @@ func (b *Bot) handleBroadcastMaterial(ctx context.Context, msg telegram.Message,
 		b.privateStates.Delete(formatID(user.ID))
 		return b.sendPrivateMenu(ctx, msg.Chat.ID, msg.MessageID)
 	}
+	if isBroadcastEndText(msg.Text) {
+		b.privateStates.Delete(formatID(user.ID))
+		return b.sendPrivateMenu(ctx, msg.Chat.ID, msg.MessageID)
+	}
+	if isBroadcastSwitchTargetText(msg.Text) {
+		b.privateStates.Delete(formatID(user.ID))
+		return b.sendBroadcastMenu(ctx, msg, user, "群发广播")
+	}
+	if isBroadcastTargetLabelText(msg.Text) {
+		return nil
+	}
+	if isBroadcastNotifyToggleText(msg.Text) {
+		state.NotifyAll = !state.NotifyAll
+		b.privateStates.Set(formatID(user.ID), state)
+		status := "关闭"
+		if state.NotifyAll {
+			status = "开启"
+		}
+		_, err := b.tg.SendMessage(ctx, msg.Chat.ID, "通知所有人："+status, map[string]any{
+			"reply_to_message_id": msg.MessageID,
+			"reply_markup":        broadcastSessionKeyboard(state.TargetName, state.NotifyAll),
+		})
+		return err
+	}
 	targets := append([]int64(nil), state.ChatIDs...)
 	sourceChatID := msg.Chat.ID
 	sourceMessageID := msg.MessageID
@@ -243,7 +267,7 @@ func (b *Bot) handleBroadcastMaterial(ctx context.Context, msg telegram.Message,
 	}
 	b.broadcastPool.Submit(func(jobCtx context.Context) {
 		success, failed := b.copyBroadcast(jobCtx, operatorID, sourceChatID, sourceMessageID, targets, mode, targetName, notifyAll)
-		text := formatBroadcastResultText(mode, targetName, success, failed, notifyAll)
+		text := formatBroadcastResultText(mode, success, failed, notifyAll)
 		if _, err := b.tg.EditMessageText(jobCtx, sourceChatID, status.MessageID, text, nil); err != nil {
 			log.Printf("edit broadcast result: %v", err)
 			if _, err := b.tg.SendMessage(jobCtx, sourceChatID, text, nil); err != nil {
@@ -302,17 +326,13 @@ func formatBroadcastProgressText(mode string, count int) string {
 	return fmt.Sprintf("广播发送中：目标 %d 个。", count)
 }
 
-func formatBroadcastResultText(mode, targetName string, success, failed int, notifyAll bool) string {
+func formatBroadcastResultText(mode string, success, failed int, notifyAll bool) string {
 	var text string
 	if mode == "chat" && success+failed == 1 {
-		targetName = strings.TrimSpace(targetName)
 		if success == 1 {
 			text = "发送完成。"
 		} else {
 			text = "发送失败。"
-		}
-		if targetName != "" {
-			text = targetName + "：" + text
 		}
 	} else {
 		text = fmt.Sprintf("广播完成：成功 %d 个，失败 %d 个。", success, failed)
@@ -328,7 +348,25 @@ func formatBroadcastReadyText(name string, count int, notifyAll bool) string {
 	if notifyAll {
 		status = "开启"
 	}
-	return fmt.Sprintf("已选择：%s\n目标群：%d个\n通知所有人：%s\n\n请直接发送广播内容；文字、图片、图片+文字、文件都会原样复制。可连续发送，发“返回”结束。", name, count, status)
+	return fmt.Sprintf("已选择：%s\n目标群：%d个\n通知所有人：%s\n\n请直接发送广播内容；文字、图片、图片+文字、文件都会原样复制。底部按钮可切换通知、切换群或结束广播。", name, count, status)
+}
+
+func broadcastSessionKeyboard(targetName string, notifyAll bool) telegram.ReplyKeyboardMarkup {
+	label := "通知所有人：关闭"
+	if notifyAll {
+		label = "通知所有人：开启"
+	}
+	targetLabel := "当前目标：" + strings.TrimSpace(targetName)
+	if strings.TrimSpace(targetName) == "" {
+		targetLabel = "当前目标：未命名群"
+	}
+	return telegram.ReplyKeyboardMarkup{
+		Keyboard: [][]telegram.KeyboardButton{
+			{{Text: targetLabel}},
+			{{Text: label}, {Text: "切换群"}, {Text: "结束广播"}},
+		},
+		ResizeKeyboard: true,
+	}
 }
 
 func broadcastReadyKeyboard(notifyAll bool) telegram.InlineKeyboardMarkup {
@@ -340,6 +378,37 @@ func broadcastReadyKeyboard(notifyAll bool) telegram.InlineKeyboardMarkup {
 		{{Text: label, CallbackData: "bc:notify"}},
 		{{Text: "取消广播", CallbackData: "bc:cancel"}},
 	}}
+}
+
+func isBroadcastNotifyToggleText(text string) bool {
+	switch strings.TrimSpace(text) {
+	case "通知所有人", "通知所有人：关闭", "通知所有人：开启", "通知所有人:关闭", "通知所有人:开启":
+		return true
+	default:
+		return false
+	}
+}
+
+func isBroadcastEndText(text string) bool {
+	switch strings.TrimSpace(text) {
+	case "结束广播", "取消广播", "返回", "取消":
+		return true
+	default:
+		return false
+	}
+}
+
+func isBroadcastSwitchTargetText(text string) bool {
+	switch strings.TrimSpace(text) {
+	case "切换群", "切换目标":
+		return true
+	default:
+		return false
+	}
+}
+
+func isBroadcastTargetLabelText(text string) bool {
+	return strings.HasPrefix(strings.TrimSpace(text), "当前目标：")
 }
 
 func (b *Bot) canUseBroadcast(ctx context.Context, userID int64) bool {
