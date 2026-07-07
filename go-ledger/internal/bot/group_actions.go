@@ -71,11 +71,11 @@ func (b *Bot) notifyAllInChatAsync(ctx context.Context, chatID, replyTo int64) {
 			return
 		}
 		if len(users) == 0 {
-			_, _ = b.tg.SendMessage(jobCtx, chatID, "暂无可通知成员。", map[string]any{"reply_to_message_id": replyTo})
+			_, _ = b.sendText(jobCtx, sendPriorityLow, chatID, "暂无可通知成员。", map[string]any{"reply_to_message_id": replyTo})
 			return
 		}
 		for _, chunk := range mentionChunks(users, 3400) {
-			if _, err := b.tg.SendMessage(jobCtx, chatID, chunk, map[string]any{
+			if _, err := b.sendText(jobCtx, sendPriorityLow, chatID, chunk, map[string]any{
 				"reply_to_message_id": replyTo,
 				"parse_mode":          "HTML",
 			}); err != nil {

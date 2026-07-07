@@ -63,11 +63,6 @@ func (b *Bot) drainNotificationOutbox(ctx context.Context) {
 }
 
 func (b *Bot) sendOutboxNotification(ctx context.Context, item storage.NotificationOutbox) {
-	if b.telegramLimiter != nil {
-		if err := b.telegramLimiter.Wait(ctx, item.ChatID); err != nil {
-			return
-		}
-	}
 	opts := map[string]any{}
 	if item.ParseMode != "" {
 		opts["parse_mode"] = item.ParseMode
@@ -76,7 +71,7 @@ func (b *Bot) sendOutboxNotification(ctx context.Context, item storage.Notificat
 		opts["disable_web_page_preview"] = true
 		opts["link_preview_options"] = map[string]any{"is_disabled": true}
 	}
-	_, err := b.tg.SendMessage(ctx, item.ChatID, item.Text, opts)
+	_, err := b.sendText(ctx, sendPriorityHigh, item.ChatID, item.Text, opts)
 	now := time.Now().In(b.loc)
 	if err == nil {
 		if err := b.store.MarkNotificationSent(ctx, item.ID, now); err != nil {

@@ -18,7 +18,7 @@ func (b *Bot) handleTRXAddressQuery(ctx context.Context, msg telegram.Message, a
 	replyTo := msg.MessageID
 	b.queryPool.Submit(func(jobCtx context.Context) {
 		text := b.queryTRXAddressText(jobCtx, address)
-		if _, err := b.tg.SendMessage(jobCtx, chatID, text, map[string]any{
+		if _, err := b.sendText(jobCtx, sendPriorityNormal, chatID, text, map[string]any{
 			"reply_to_message_id": replyTo,
 			"parse_mode":          "HTML",
 		}); err != nil {

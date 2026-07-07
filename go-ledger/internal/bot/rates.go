@@ -50,7 +50,7 @@ func (b *Bot) handleZ0(ctx context.Context, msg telegram.Message) error {
 		} else {
 			text = formatZ0(entries)
 		}
-		if _, err := b.tg.SendMessage(jobCtx, chatID, text, map[string]any{"parse_mode": "HTML"}); err != nil {
+		if _, err := b.sendText(jobCtx, sendPriorityNormal, chatID, text, map[string]any{"parse_mode": "HTML"}); err != nil {
 			log.Printf("send z0 result: %v", err)
 		}
 	})
@@ -68,21 +68,21 @@ func (b *Bot) handleZRateSetting(ctx context.Context, msg telegram.Message, user
 	b.ratePool.Submit(func(jobCtx context.Context) {
 		entries, err := b.rateBook(jobCtx)
 		if err != nil {
-			_, _ = b.tg.SendMessage(jobCtx, chatID, "设置失败：实时汇率暂不可用："+err.Error(), nil)
+			_, _ = b.sendText(jobCtx, sendPriorityNormal, chatID, "设置失败：实时汇率暂不可用："+err.Error(), nil)
 			return
 		}
 		if cmd.Rank < 1 || cmd.Rank > len(entries) {
-			_, _ = b.tg.SendMessage(jobCtx, chatID, "设置失败：没有这个 Z 档位。", nil)
+			_, _ = b.sendText(jobCtx, sendPriorityNormal, chatID, "设置失败：没有这个 Z 档位。", nil)
 			return
 		}
 		base := parseRat(entries[cmd.Rank-1].Price)
 		if base == nil {
-			_, _ = b.tg.SendMessage(jobCtx, chatID, "设置失败：档位价格格式异常。", nil)
+			_, _ = b.sendText(jobCtx, sendPriorityNormal, chatID, "设置失败：档位价格格式异常。", nil)
 			return
 		}
 		rate := new(big.Rat).Add(base, cmd.Offset)
 		if rate.Sign() <= 0 {
-			_, _ = b.tg.SendMessage(jobCtx, chatID, "设置失败：偏移后的汇率必须大于0。", nil)
+			_, _ = b.sendText(jobCtx, sendPriorityNormal, chatID, "设置失败：偏移后的汇率必须大于0。", nil)
 			return
 		}
 		rateText := formatRat(rate, 8)
@@ -90,7 +90,7 @@ func (b *Bot) handleZRateSetting(ctx context.Context, msg telegram.Message, user
 		offset := formatSigned(cmd.Offset)
 		if err := b.store.SetGroupRealtimeExchangeRate(jobCtx, chatID, rateText, source, cmd.Rank, offset, now); err != nil {
 			log.Printf("set z rate: %v", err)
-			_, _ = b.tg.SendMessage(jobCtx, chatID, "设置失败：数据库写入失败。", nil)
+			_, _ = b.sendText(jobCtx, sendPriorityNormal, chatID, "设置失败：数据库写入失败。", nil)
 			return
 		}
 		text := fmt.Sprintf("操作成功：Z%d 基准%s，偏移%s，当前汇率%s",
@@ -99,7 +99,7 @@ func (b *Bot) handleZRateSetting(ctx context.Context, msg telegram.Message, user
 			formatSigned(cmd.Offset),
 			rateText,
 		)
-		if _, err := b.tg.SendMessage(jobCtx, chatID, text, nil); err != nil {
+		if _, err := b.sendText(jobCtx, sendPriorityNormal, chatID, text, nil); err != nil {
 			log.Printf("send z rate result: %v", err)
 		}
 	})

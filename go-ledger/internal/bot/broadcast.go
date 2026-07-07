@@ -273,7 +273,8 @@ func (b *Bot) handleBroadcastMaterial(ctx context.Context, msg telegram.Message,
 		text := formatBroadcastResultText(mode, success, failed, notifyAll)
 		if _, err := b.tg.EditMessageText(jobCtx, sourceChatID, status.MessageID, text, nil); err != nil {
 			log.Printf("edit broadcast result: %v", err)
-			if _, err := b.tg.SendMessage(jobCtx, sourceChatID, text, map[string]any{"reply_markup": sessionKeyboard}); err != nil {
+			b.deleteMessageBestEffort(jobCtx, sourceChatID, status.MessageID)
+			if _, err := b.sendText(jobCtx, sendPriorityLow, sourceChatID, text, map[string]any{"reply_markup": sessionKeyboard}); err != nil {
 				log.Printf("send broadcast result fallback: %v", err)
 			}
 		}

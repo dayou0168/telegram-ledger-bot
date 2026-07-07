@@ -42,6 +42,7 @@ type Bot struct {
 	privateStates    *ttlCache[privateState]
 	notificationWake chan struct{}
 	telegramLimiter  *telegramRateLimiter
+	textGateway      *telegramTextGateway
 	watchRunning     atomic.Bool
 }
 
@@ -50,7 +51,7 @@ func New(cfg config.Config, store *storage.Store, tg *telegram.Client, tronClien
 	if err != nil {
 		loc = time.FixedZone("Asia/Shanghai", 8*3600)
 	}
-	return &Bot{
+	bot := &Bot{
 		cfg:              cfg,
 		store:            store,
 		tg:               tg,
@@ -74,6 +75,8 @@ func New(cfg config.Config, store *storage.Store, tg *telegram.Client, tronClien
 		notificationWake: make(chan struct{}, 1),
 		telegramLimiter:  newTelegramRateLimiter(),
 	}
+	bot.textGateway = newTelegramTextGateway(tg, bot.telegramLimiter, cfg.NotifyWorkers, cfg.QueueSize)
+	return bot
 }
 
 func (b *Bot) Run(ctx context.Context) error {
@@ -84,6 +87,7 @@ func (b *Bot) Run(ctx context.Context) error {
 	b.broadcastPool.StartN(ctx, b.cfg.BroadcastWorkers)
 	b.queryPool.StartN(ctx, b.cfg.QueryWorkers)
 	b.notifyPool.StartN(ctx, b.cfg.NotifyWorkers)
+	b.textGateway.Start(ctx)
 
 	go b.addressWatchScheduler(ctx)
 	go b.notificationOutboxScheduler(ctx)
