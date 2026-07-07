@@ -19,7 +19,7 @@ import (
 const addressWatchDeniedText = "没有地址监听权限。只有宿主、一级操作人和下级操作人可以使用。"
 
 func (b *Bot) canUseAddressWatch(ctx context.Context, userID int64) bool {
-	if b.isRoot(userID) {
+	if b.perms.HasGlobalAddressWatchAccess(userID) {
 		return true
 	}
 	key := "broadcast:" + formatID(userID)
@@ -313,7 +313,7 @@ func (b *Bot) editAddressWatchMenu(ctx context.Context, chatID, messageID, owner
 	if err != nil {
 		return err
 	}
-	_, err = b.tg.EditMessageText(ctx, chatID, messageID, formatAddressWatchMenuText(targets), map[string]any{
+	_, err = b.editText(ctx, chatID, messageID, formatAddressWatchMenuText(targets), map[string]any{
 		"parse_mode": "HTML",
 		"reply_markup": telegram.InlineKeyboardMarkup{
 			InlineKeyboard: addressWatchKeyboard(targets),
@@ -344,14 +344,14 @@ func (b *Bot) editAddressWatchDetail(ctx context.Context, chatID, messageID, own
 		return err
 	}
 	if !ok {
-		_, err := b.tg.EditMessageText(ctx, chatID, messageID, "没有找到这个监听地址。", map[string]any{
+		_, err := b.editText(ctx, chatID, messageID, "没有找到这个监听地址。", map[string]any{
 			"reply_markup": telegram.InlineKeyboardMarkup{InlineKeyboard: [][]telegram.InlineKeyboardButton{
 				{{Text: "返回列表", CallbackData: "watch:menu"}},
 			}},
 		})
 		return err
 	}
-	_, err = b.tg.EditMessageText(ctx, chatID, messageID, formatAddressWatchDetailText(target), map[string]any{
+	_, err = b.editText(ctx, chatID, messageID, formatAddressWatchDetailText(target), map[string]any{
 		"parse_mode": "HTML",
 		"reply_markup": telegram.InlineKeyboardMarkup{
 			InlineKeyboard: addressWatchDetailKeyboard(target),

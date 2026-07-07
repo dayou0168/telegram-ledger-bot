@@ -88,7 +88,7 @@ func (b *Bot) handleQuickReplyMaterial(ctx context.Context, msg telegram.Message
 		return b.enqueueReplyText(ctx, sendPriorityNormal, "quick_reply_lost", msg.Chat.ID, msg.MessageID, "快速回复目标已失效，请重新点回复通知。", nil, time.Now().In(b.loc))
 	}
 	b.notifyPool.Submit(func(sendCtx context.Context) {
-		if _, err := b.tg.CopyMessage(sendCtx, targetChatID, msg.Chat.ID, msg.MessageID, map[string]any{"reply_to_message_id": replyTo}); err != nil {
+		if _, err := b.copyMessage(sendCtx, targetChatID, msg.Chat.ID, msg.MessageID, map[string]any{"reply_to_message_id": replyTo}); err != nil {
 			log.Printf("send quick reply: %v", err)
 			_ = b.enqueueReplyText(sendCtx, sendPriorityNormal, "quick_reply_failed", msg.Chat.ID, msg.MessageID, "快速回复发送失败："+err.Error(), nil, time.Now().In(b.loc))
 			return
@@ -136,13 +136,8 @@ func (b *Bot) broadcastReplyRecipients(operatorID int64) map[int64]struct{} {
 	if operatorID != 0 {
 		recipients[operatorID] = struct{}{}
 	}
-	if b.cfg.HostUserID != 0 {
-		recipients[b.cfg.HostUserID] = struct{}{}
-	}
-	for id := range b.cfg.DefaultOperatorIDs {
-		if id != 0 {
-			recipients[id] = struct{}{}
-		}
+	for _, id := range b.perms.PrivilegedUserIDs() {
+		recipients[id] = struct{}{}
 	}
 	return recipients
 }

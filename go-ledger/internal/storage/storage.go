@@ -205,6 +205,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_records_chat_day_active
 			ON records(chat_id, day_key, id)
 			WHERE deleted_at IS NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_records_chat_active_id
+			ON records(chat_id, id DESC)
+			WHERE deleted_at IS NULL`,
 		`ALTER TABLE records ADD COLUMN IF NOT EXISTS subject_user_id BIGINT NOT NULL DEFAULT 0`,
 		`ALTER TABLE records ADD COLUMN IF NOT EXISTS subject_name TEXT NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_records_chat_kind_active
@@ -302,6 +305,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		`ALTER TABLE notification_outbox ADD COLUMN IF NOT EXISTS priority INTEGER NOT NULL DEFAULT 1`,
 		`CREATE INDEX IF NOT EXISTS idx_notification_outbox_due
 			ON notification_outbox(status, next_attempt_at, id)
+			WHERE status IN ('pending', 'failed', 'sending')`,
+		`CREATE INDEX IF NOT EXISTS idx_notification_outbox_due_priority
+			ON notification_outbox(priority, next_attempt_at, id)
 			WHERE status IN ('pending', 'failed', 'sending')`,
 		`CREATE INDEX IF NOT EXISTS idx_notification_outbox_chat
 			ON notification_outbox(chat_id, created_at DESC)`,
@@ -1334,7 +1340,7 @@ func (s *Store) ClaimDueNotifications(ctx context.Context, limit int, now time.T
 			FROM notification_outbox
 			WHERE (status IN ('pending', 'failed') AND next_attempt_at <= $1)
 				OR (status = 'sending' AND updated_at <= $3)
-			ORDER BY next_attempt_at ASC, id ASC
+			ORDER BY priority ASC, next_attempt_at ASC, id ASC
 			LIMIT $2
 			FOR UPDATE SKIP LOCKED
 		)

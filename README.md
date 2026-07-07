@@ -1,6 +1,6 @@
 # Telegram 群组记账机器人
 
-这是一个按群组使用的 Telegram 记账机器人原型，参考了你提供的两套记账助手教程和截图里的账单样式。
+这是 Telegram 记账机器人 Go v2.1 主线，按群组使用，生产部署使用 PostgreSQL 和 GHCR 镜像。Python 版 1.3 已作为旧稳定版封存，不再作为当前发布入口。
 
 ## 当前已支持功能
 
@@ -18,8 +18,8 @@
 - 私聊菜单：开始记账、详细说明、群发广播、分组广播、地址监听、群列表、广播权限、广播替换、后台管理。
 - 机器人只有一个宿主，宿主由服务器配置 `BOT_HOST_USER_ID` 指定；宿主是最高权限。
 - 默认操作人只由维护人员修改服务器配置 `DEFAULT_OPERATOR_USER_IDS` 添加/删除。默认操作人可以邀请机器人进群、在任意群记账、使用群发广播和分组广播，但不会因为发送 `开始` 或拥有默认权限而变成本群最高权限。
-- 宿主可以在群内发送 `添加操作员 @user` / `删除操作员 @user` 设置单群操作人。
-- 机器人被邀请进群或群里有人发言时会按 `chat_id` 保存群组，群名变更后会自动更新；不会因为宿主不在群内而自动退群。
+- 宿主或默认操作人可以在群内发送 `添加操作员 @user` / `删除操作员 @user` 设置单群操作人。
+- 机器人被邀请进群或群里有人发言时会按 `chat_id` 保存群组，群名变更后会自动更新；邀请人必须是宿主或默认操作人，否则机器人会自动退出。
 - 只用于广播、不需要记账的群可以不发送 `开始`；如果已经开启过记账，发送 `停止` 或 `关闭` 即可暂停记账，群仍会保留在群发/分组广播列表中。
 - 私聊点击 `📡群发广播` 或 `📣分组广播` 后，可用按钮选择全部群、分组或单群；选择目标后进入连续发送模式，文字、图片、文件或图文都会直接投递，不再二次确认。
 - 广播分组、分组成员、单群授权、广播操作人和广播替换都放到后台管理页操作，后台可按群名搜索或多选群组，避免手动查群 ID。
@@ -42,7 +42,17 @@
 - `开启记账置顶` / `关闭记账置顶`。
 - 每个群的 `🌐 完整账单` 按钮会按 `chat_id` 生成独立链接。
 
-## 运行
+## 运行 Go v2.1
+
+推荐优先使用 Go v2.1 镜像和 PostgreSQL：
+
+```powershell
+docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.1
+```
+
+宝塔 Docker Compose 可以直接使用仓库里的 [docker-compose.ghcr.yml](docker-compose.ghcr.yml)。这个文件默认拉取 `ghcr.io/dayou0168/telegram-ledger-bot-go:2.1`，包含 PostgreSQL、后台网页端口和常用环境变量。
+
+本地源码构建和更完整的 Go 运行说明见 [go-ledger/README.md](go-ledger/README.md)。
 
 1. 复制配置：
 
@@ -72,7 +82,7 @@ BOT_QUEUE_SIZE=4096
 
 先私聊机器人发送 `我的ID` 获取你的 Telegram ID，再填入 `BOT_HOST_USER_ID`。机器人只允许配置一个宿主。默认操作人可在 `.env` 的 `DEFAULT_OPERATOR_USER_IDS` 里用英文逗号分隔，只有维护程序的人员能通过改服务器配置添加或删除。
 
-并发池说明：默认按日本 4 核 8G 服务器优化。`BOT_WORKER_THREADS` 处理群内记账、撤销、群内设置等实时消息，同一群会按 FIFO 队列串行、不同群可并发；`BOT_CONTROL_THREADS` 处理私聊菜单、后台入口、广播控制台等私聊交互；`BOT_CHAIN_THREADS` 处理 USDT/TRX 链上监听并并行扫描监听地址；`BOT_RATE_THREADS` 处理 Z0 和实时汇率刷新；`BOT_BROADCAST_THREADS` 处理群发/分组广播，默认最多同时跑 4 个广播任务，单个广播任务内部仍按目标群逐个发送，避免触发 Telegram 限流；`BOT_QUERY_THREADS` 处理 TRX 地址查询等外部查询；`BOT_NOTIFICATION_THREADS` 处理广播发送通知、回复通知和通知素材复制。群内记账、私聊控制、广播、链上监听、汇率刷新、查询、通知互相隔离，避免某一类慢任务拖住其他版块。
+并发池说明：默认按 4 核 8G 服务器优化。`BOT_WORKER_THREADS` 处理群内记账、撤销、群内设置等实时消息，同一群会按 FIFO 队列串行、不同群可并发；`BOT_CONTROL_THREADS` 处理私聊菜单、后台入口、广播控制台等私聊交互；`BOT_CHAIN_THREADS` 处理 USDT/TRX 链上监听并并行扫描监听地址；`BOT_RATE_THREADS` 处理 Z0 和实时汇率刷新；`BOT_BROADCAST_THREADS` 处理群发/分组广播，默认最多同时跑 4 个广播任务，单个广播任务内部仍按目标群逐个发送，避免触发 Telegram 限流；`BOT_QUERY_THREADS` 处理 TRX 地址查询等外部查询；`BOT_NOTIFICATION_THREADS` 处理广播发送通知、回复通知和通知素材复制。群内记账、私聊控制、广播、链上监听、汇率刷新、查询、通知互相隔离，避免某一类慢任务拖住其他版块。
 
 如果你用自建 Telegram Bot API Server，`TELEGRAM_API_BASE` 填服务根地址即可，例如：
 
@@ -162,16 +172,7 @@ P2P_RATE_CACHE_TTL_SECONDS=180
 3. 启动：
 
 ```powershell
-python -m ledger_bot
+docker compose -f docker-compose.ghcr.yml up -d
 ```
 
-服务器部署见 [docs/deployment.md](docs/deployment.md)，推荐优先用 Docker Compose。
-
-如果使用预构建镜像，宝塔 Docker Compose 可以直接使用仓库里的 [docker-compose.ghcr.yml](docker-compose.ghcr.yml)。这个文件是精简版，只保留必填和常用配置；高级参数程序会使用默认值，需要时再按注释取消对应配置。
-
-## 还没接入的外部查询
-
-这些功能已经预留指令入口，但需要第三方 API 再接：
-
-- 火币/越南盾/马币/金价查询。
-- 手机号、银行卡、身份证查询。
+服务器部署见 [docs/deployment.md](docs/deployment.md)，当前发布优先用 Go v2.1 镜像和 Docker Compose。

@@ -23,7 +23,7 @@ func (b *Bot) tryReplaceBroadcastDelivery(ctx context.Context, delivery storage.
 	}
 	text := strings.TrimSpace(setting.Text)
 	if len(setting.ImageData) > 0 {
-		if _, err := b.tg.EditMessagePhotoBytes(ctx, delivery.TargetChatID, delivery.TargetMessageID, setting.ImageName, setting.ImageData, text, nil); err != nil {
+		if _, err := b.editPhotoBytes(ctx, delivery.TargetChatID, delivery.TargetMessageID, setting.ImageName, setting.ImageData, text, nil); err != nil {
 			log.Printf("replace broadcast media: %v", err)
 			return
 		}
@@ -33,11 +33,11 @@ func (b *Bot) tryReplaceBroadcastDelivery(ctx context.Context, delivery storage.
 	if text == "" {
 		return
 	}
-	if _, err := b.tg.EditMessageText(ctx, delivery.TargetChatID, delivery.TargetMessageID, text, nil); err == nil {
+	if _, err := b.editText(ctx, delivery.TargetChatID, delivery.TargetMessageID, text, nil); err == nil {
 		b.markBroadcastReplaced(ctx, delivery.ID)
 		return
 	}
-	if _, err := b.tg.EditMessageCaption(ctx, delivery.TargetChatID, delivery.TargetMessageID, text, nil); err == nil {
+	if _, err := b.editCaption(ctx, delivery.TargetChatID, delivery.TargetMessageID, text, nil); err == nil {
 		b.markBroadcastReplaced(ctx, delivery.ID)
 		return
 	}

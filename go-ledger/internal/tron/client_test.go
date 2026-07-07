@@ -40,3 +40,24 @@ func TestTronscanAddressTransferResponse(t *testing.T) {
 		t.Fatalf("unexpected addresses: %+v", transfer)
 	}
 }
+
+func TestNormalizeTimestampMillis(t *testing.T) {
+	tests := []struct {
+		name string
+		in   int64
+		want int64
+	}{
+		{name: "zero", in: 0, want: 0},
+		{name: "seconds", in: 1783266231, want: 1783266231000},
+		{name: "millis", in: 1783266231000, want: 1783266231000},
+		{name: "micros", in: 1783266231000000, want: 1783266231000},
+		{name: "nanos", in: 1783266231000000000, want: 1783266231000},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizeTimestampMillis(tt.in); got != tt.want {
+				t.Fatalf("normalizeTimestampMillis(%d) = %d, want %d", tt.in, got, tt.want)
+			}
+		})
+	}
+}

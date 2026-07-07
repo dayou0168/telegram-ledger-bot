@@ -157,8 +157,8 @@ func (c *Client) FetchAccount(ctx context.Context, address, usdtContract string)
 		TransactionsIn:        result.TransactionsIn,
 		TransactionsOut:       result.TransactionsOut,
 		TotalTransactionCount: result.TotalTransactionCount,
-		CreatedAt:             result.DateCreated,
-		LatestOperationAt:     result.LatestOperationAt,
+		CreatedAt:             normalizeTimestampMillis(result.DateCreated),
+		LatestOperationAt:     normalizeTimestampMillis(result.LatestOperationAt),
 	}
 	for _, token := range result.TRC20TokenBalances {
 		if strings.EqualFold(token.TokenID, usdtContract) || strings.EqualFold(token.TokenAbbr, "USDT") {
@@ -306,6 +306,7 @@ func (t tronscanTransfer) toTransfer() Transfer {
 	if ts == 0 {
 		ts = t.Timestamp
 	}
+	ts = normalizeTimestampMillis(ts)
 	return Transfer{
 		Hash:           hash,
 		From:           first(t.From, t.FromAlt),
@@ -316,6 +317,21 @@ func (t tronscanTransfer) toTransfer() Transfer {
 		TokenDecimals:  firstInt(token.Decimals, token.Decimals2, t.Decimals, 6),
 		BlockTimestamp: ts,
 		Confirmed:      bool(t.Confirmed),
+	}
+}
+
+func normalizeTimestampMillis(ts int64) int64 {
+	switch {
+	case ts <= 0:
+		return 0
+	case ts < 1_000_000_000_000:
+		return ts * 1000
+	case ts > 10_000_000_000_000_000:
+		return ts / 1_000_000
+	case ts > 10_000_000_000_000:
+		return ts / 1000
+	default:
+		return ts
 	}
 }
 

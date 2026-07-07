@@ -14,7 +14,7 @@ import (
 )
 
 func (b *Bot) startAccounting(ctx context.Context, msg telegram.Message, user storage.User, now time.Time) error {
-	if !b.isRoot(user.ID) {
+	if !b.perms.HasGlobalLedgerAccess(user.ID) {
 		ok, err := b.isGroupOperator(ctx, msg.Chat.ID, user.ID)
 		if err != nil {
 			return err
@@ -23,7 +23,7 @@ func (b *Bot) startAccounting(ctx context.Context, msg telegram.Message, user st
 			return b.enqueueReplyText(ctx, sendPriorityNormal, "ledger_start_denied", msg.Chat.ID, msg.MessageID, "没有开启记账权限。", nil, now)
 		}
 	}
-	if b.cfg.HostUserID != 0 && user.ID == b.cfg.HostUserID {
+	if b.isHost(user.ID) {
 		_ = b.store.SetGroupOwner(ctx, msg.Chat.ID, user, now)
 	}
 	if err := b.store.SetGroupActive(ctx, msg.Chat.ID, true, now); err != nil {
@@ -407,21 +407,21 @@ func (b *Bot) isGroupOperator(ctx context.Context, chatID, userID int64) (bool, 
 }
 
 func (b *Bot) canUseLedger(ctx context.Context, chatID, userID int64) (bool, error) {
-	if b.isRoot(userID) {
+	if b.perms.HasGlobalLedgerAccess(userID) {
 		return true, nil
 	}
 	return b.isGroupOperator(ctx, chatID, userID)
 }
 
 func (b *Bot) canUseLedgerWithGroup(ctx context.Context, group storage.Group, userID int64) (bool, error) {
-	if group.AllMembersCanRecord || b.isRoot(userID) {
+	if group.AllMembersCanRecord || b.perms.HasGlobalLedgerAccess(userID) {
 		return true, nil
 	}
 	return b.isGroupOperator(ctx, group.ChatID, userID)
 }
 
 func (b *Bot) canManageGroup(ctx context.Context, chatID, userID int64) (bool, error) {
-	if b.isRoot(userID) {
+	if b.perms.CanManageAnyGroup(userID) {
 		return true, nil
 	}
 	return b.store.IsOwner(ctx, chatID, userID)

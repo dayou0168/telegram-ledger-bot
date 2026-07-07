@@ -73,7 +73,7 @@ func (b *Bot) handleBroadcastCallback(ctx context.Context, cb telegram.CallbackQ
 		}
 		return b.enqueueReplyText(ctx, sendPriorityNormal, "broadcast_cancel", chatID, replyTo, "已取消广播。", nil, time.Now().In(b.loc))
 	case cb.Data == "bc:all":
-		targets, err := b.store.ListAllowedBroadcastChats(ctx, cb.From.ID, b.isRoot(cb.From.ID))
+		targets, err := b.store.ListAllowedBroadcastChats(ctx, cb.From.ID, b.perms.HasGlobalBroadcastAccess(cb.From.ID))
 		if err != nil {
 			return err
 		}
@@ -106,7 +106,7 @@ func (b *Bot) handleBroadcastCallback(ctx context.Context, cb telegram.CallbackQ
 		if err != nil {
 			return b.tg.AnswerCallback(ctx, cb.ID, "群无效")
 		}
-		targets, err := b.store.ListAllowedBroadcastChats(ctx, cb.From.ID, b.isRoot(cb.From.ID))
+		targets, err := b.store.ListAllowedBroadcastChats(ctx, cb.From.ID, b.perms.HasGlobalBroadcastAccess(cb.From.ID))
 		if err != nil {
 			return err
 		}
@@ -128,7 +128,7 @@ func (b *Bot) sendBroadcastGroups(ctx context.Context, privateChatID, userID, re
 	}
 	var rows [][]telegram.InlineKeyboardButton
 	for _, group := range groups {
-		if !b.isRoot(userID) && !b.broadcastGroupAllowed(ctx, userID, group.Name) {
+		if !b.perms.HasGlobalBroadcastAccess(userID) && !b.broadcastGroupAllowed(ctx, userID, group.Name) {
 			continue
 		}
 		label := fmt.Sprintf("%s（%d个群）", group.Name, len(group.ChatIDs))
@@ -151,7 +151,7 @@ func (b *Bot) sendBroadcastGroups(ctx context.Context, privateChatID, userID, re
 }
 
 func (b *Bot) sendBroadcastChats(ctx context.Context, privateChatID, userID, replyTo int64) error {
-	targets, err := b.store.ListAllowedBroadcastChats(ctx, userID, b.isRoot(userID))
+	targets, err := b.store.ListAllowedBroadcastChats(ctx, userID, b.perms.HasGlobalBroadcastAccess(userID))
 	if err != nil {
 		return err
 	}
@@ -190,7 +190,7 @@ func (b *Bot) setBroadcastTargets(ctx context.Context, cb telegram.CallbackQuery
 	if err := b.tg.AnswerCallback(ctx, cb.ID, "已选择"); err != nil {
 		return err
 	}
-	ready, err := b.tg.SendMessage(ctx, cb.Message.Chat.ID, formatBroadcastReadyText(name, len(chatIDs), false), map[string]any{
+	ready, err := b.sendText(ctx, sendPriorityNormal, cb.Message.Chat.ID, formatBroadcastReadyText(name, len(chatIDs), false), map[string]any{
 		"reply_to_message_id": cb.Message.MessageID,
 		"reply_markup":        broadcastSessionKeyboard(name, false),
 	})
@@ -214,7 +214,7 @@ func (b *Bot) toggleBroadcastNotifyAll(ctx context.Context, cb telegram.Callback
 	if cb.Message == nil {
 		return nil
 	}
-	_, err := b.tg.EditMessageText(ctx, cb.Message.Chat.ID, cb.Message.MessageID, formatBroadcastReadyText(state.TargetName, len(state.ChatIDs), state.NotifyAll), map[string]any{
+	_, err := b.editText(ctx, cb.Message.Chat.ID, cb.Message.MessageID, formatBroadcastReadyText(state.TargetName, len(state.ChatIDs), state.NotifyAll), map[string]any{
 		"reply_markup": broadcastReadyKeyboard(state.NotifyAll),
 	})
 	return err
@@ -256,7 +256,7 @@ func (b *Bot) handleBroadcastMaterial(ctx context.Context, msg telegram.Message,
 	notifyAll := state.NotifyAll
 	operatorID := user.ID
 	sessionKeyboard := broadcastSessionKeyboard(targetName, notifyAll)
-	status, err := b.tg.SendMessage(ctx, msg.Chat.ID, formatBroadcastProgressText(mode, len(targets)), map[string]any{
+	status, err := b.sendText(ctx, sendPriorityNormal, msg.Chat.ID, formatBroadcastProgressText(mode, len(targets)), map[string]any{
 		"reply_markup": sessionKeyboard,
 	})
 	if err != nil {
@@ -265,7 +265,7 @@ func (b *Bot) handleBroadcastMaterial(ctx context.Context, msg telegram.Message,
 	b.broadcastPool.Submit(func(jobCtx context.Context) {
 		success, failed := b.copyBroadcast(jobCtx, operatorID, sourceChatID, sourceMessageID, targets, mode, targetName, notifyAll)
 		text := formatBroadcastResultText(mode, success, failed, notifyAll)
-		if _, err := b.tg.EditMessageText(jobCtx, sourceChatID, status.MessageID, text, nil); err != nil {
+		if _, err := b.editText(jobCtx, sourceChatID, status.MessageID, text, nil); err != nil {
 			log.Printf("edit broadcast result: %v", err)
 			b.deleteMessageBestEffort(jobCtx, sourceChatID, status.MessageID)
 			if err := b.enqueueReliableText(jobCtx, sendPriorityLow, "broadcast_result", fmt.Sprintf("broadcast_result:%d:%d", sourceChatID, sourceMessageID), sourceChatID, text, map[string]any{"reply_markup": sessionKeyboard}, reliableMessageRef{}, time.Now().In(b.loc)); err != nil {
@@ -281,7 +281,7 @@ func (b *Bot) copyBroadcast(ctx context.Context, operatorID, fromChatID, message
 	failed := 0
 	now := time.Now().In(b.loc)
 	for _, targetChatID := range targetChatIDs {
-		targetMsg, err := b.tg.CopyMessage(ctx, targetChatID, fromChatID, messageID, nil)
+		targetMsg, err := b.copyMessage(ctx, targetChatID, fromChatID, messageID, nil)
 		if err != nil {
 			failed++
 			log.Printf("copy broadcast to %d: %v", targetChatID, err)
@@ -414,7 +414,7 @@ func isBroadcastTargetLabelText(text string) bool {
 
 func (b *Bot) refreshBroadcastSessionKeyboard(ctx context.Context, msg telegram.Message, state privateState) error {
 	oldControlMessageID := state.ControlMessageID
-	refresh, err := b.tg.SendMessage(ctx, msg.Chat.ID, formatBroadcastReadyText(state.TargetName, len(state.ChatIDs), state.NotifyAll), map[string]any{
+	refresh, err := b.sendText(ctx, sendPriorityNormal, msg.Chat.ID, formatBroadcastReadyText(state.TargetName, len(state.ChatIDs), state.NotifyAll), map[string]any{
 		"reply_markup": broadcastSessionKeyboard(state.TargetName, state.NotifyAll),
 	})
 	if err != nil {
@@ -439,7 +439,7 @@ func (b *Bot) deleteMessageBestEffort(ctx context.Context, chatID, messageID int
 }
 
 func (b *Bot) canUseBroadcast(ctx context.Context, userID int64) bool {
-	if b.isRoot(userID) {
+	if b.perms.HasGlobalBroadcastAccess(userID) {
 		return true
 	}
 	key := "broadcast:" + formatID(userID)
@@ -460,7 +460,7 @@ func (b *Bot) allowedChatsForBroadcastGroup(ctx context.Context, userID int64, n
 	if err != nil {
 		return nil, err
 	}
-	if b.isRoot(userID) {
+	if b.perms.HasGlobalBroadcastAccess(userID) {
 		return groupChats, nil
 	}
 	allowed, err := b.store.ListAllowedBroadcastChats(ctx, userID, false)

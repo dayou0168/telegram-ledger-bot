@@ -56,7 +56,7 @@ func (b *Bot) handleAddressValidation(ctx context.Context, msg telegram.Message,
 				"parse_mode":          "HTML",
 			}, reliableMessageRef{}, now)
 		}
-		_, err = b.tg.SendPhotoBytes(ctx, msg.Chat.ID, "usdt-address-verify.png", imageBytes, caption, map[string]any{
+		_, err = b.sendPhotoBytes(ctx, msg.Chat.ID, "usdt-address-verify.png", imageBytes, caption, map[string]any{
 			"reply_to_message_id": msg.MessageID,
 			"parse_mode":          "HTML",
 		})

@@ -1,311 +1,205 @@
-# Server Deployment
+# Telegram 记账机器人 Go v2.1 部署运维
 
-This bot can run with either Docker Compose or systemd. Docker Compose is the simpler first deployment path.
+当前发布主线是 Go v2.1。生产部署使用 GHCR 预构建镜像和 PostgreSQL，不再使用 Python 版、SQLite 或服务器源码构建作为默认路径。
 
-## Before Deploying
+## 部署基线
 
-Create the Telegram bot in BotFather and disable privacy mode:
+- 镜像：`ghcr.io/dayou0168/telegram-ledger-bot-go:2.1`
+- 数据库：PostgreSQL 16
+- 推荐入口：宝塔 Docker Compose
+- 推荐配置：4 核 8G
+- 网页账单和后台：容器 `8080` 端口，宝塔/Nginx/Cloudflare 走 HTTPS 反代
+
+## 准备 Telegram Bot
+
+在 BotFather 创建机器人，并关闭隐私模式：
 
 ```text
 /newbot
-/setprivacy -> choose bot -> Disable
+/setprivacy -> 选择机器人 -> Disable
 ```
 
-The `.env` value `TELEGRAM_API_BASE` must be a service root only:
+私聊机器人发送 `我的ID` 可以获取 Telegram 数字 ID。第一次部署前也可以先用临时测试 Token 启动，拿到 ID 后再切换正式配置。
 
-```env
-TELEGRAM_API_BASE=https://api.telegram.org
+## 宝塔 Docker Compose
+
+宝塔里进入 Docker -> Compose，新建项目后粘贴仓库根目录的 `docker-compose.ghcr.yml` 或 `docker-compose.yml`。两个文件都默认拉取 GHCR 镜像，并自带 PostgreSQL。
+
+启动前必须改这些值：
+
+```yaml
+TELEGRAM_BOT_TOKEN: "123456:replace-me"
+TELEGRAM_BOT_USERNAME: "your_bot_username"
+BOT_HOST_USER_ID: "123456789"
+DATABASE_URL: "postgres://ledger:change_this_strong_password@postgres:5432/ledger_bot?sslmode=disable"
+POSTGRES_PASSWORD: "change_this_strong_password"
 ```
 
-If using a self-hosted Telegram Bot API server:
+`POSTGRES_PASSWORD` 和 `DATABASE_URL` 里的密码必须一致。
 
-```env
-TELEGRAM_API_BASE=http://telegram-bot-api:8081
+常用选填：
+
+```yaml
+DEFAULT_OPERATOR_USER_IDS: ""
+PUBLIC_BILL_BASE_URL: "https://bot.example.com"
+ADMIN_WEB_TOKEN: "change_this_admin_password"
+TRONGRID_API_KEY: ""
 ```
 
-Do not include `/bot<TOKEN>/sendMessage`; the bot appends that path itself.
+高级配置已经在 Compose 文件里分区注释。默认值按 4 核 8G 调整：
 
-## Option A: Docker Compose
+```yaml
+BOT_WORKER_THREADS: "16"
+BOT_CONTROL_THREADS: "6"
+BOT_CHAIN_THREADS: "12"
+BOT_RATE_THREADS: "2"
+BOT_BROADCAST_THREADS: "4"
+BOT_QUERY_THREADS: "4"
+BOT_NOTIFICATION_THREADS: "6"
+BOT_QUEUE_SIZE: "4096"
+```
 
-On an Ubuntu server:
+启动后看日志：
 
 ```bash
-sudo apt update
-sudo apt install -y git docker.io docker-compose-plugin
-sudo systemctl enable --now docker
-```
-
-Upload or clone the project to the server, then:
-
-```bash
-cd /opt/ledger-bot
-cp .env.example .env
-nano .env
-mkdir -p data
-docker compose up -d --build
 docker compose logs -f ledger-bot
 ```
 
-Minimum `.env`:
+看到机器人开始 long polling，且没有 PostgreSQL 连接错误，即为基础启动成功。
 
-```env
-TELEGRAM_BOT_TOKEN=123456:replace-me
-TELEGRAM_BOT_USERNAME=your_bot_username
-TELEGRAM_API_BASE=https://api.telegram.org
-BOT_DB_PATH=data/ledger_bot.db
-BOT_TIMEZONE=Asia/Shanghai
-BOT_HOST_USER_ID=123456789
-DEFAULT_OPERATOR_USER_IDS=
-BOT_WORKER_THREADS=16
-BOT_CONTROL_THREADS=6
-BOT_CHAIN_THREADS=12
-BOT_RATE_THREADS=1
-BOT_BROADCAST_THREADS=4
-BOT_QUERY_THREADS=4
-BOT_NOTIFICATION_THREADS=6
-BOT_HOST_CHECK_TTL_SECONDS=600
-PUBLIC_BILL_BASE_URL=
-PUBLIC_BILL_URL_TEMPLATE=
-PUBLIC_BILL_BOT_NAME=LEDGER_BOT
-BILL_WEB_ENABLED=1
-BILL_WEB_HOST=0.0.0.0
-BILL_WEB_PORT=8080
-BILL_WEB_TOKEN=
-ADMIN_WEB_TOKEN=
-TRONSCAN_API_BASE=https://apilist.tronscanapi.com/api
-TRONGRID_API_KEY=
-TRON_POLL_INTERVAL_SECONDS=1
-TRONSCAN_GLOBAL_SCAN_PAGES=1
-TRON_ADDRESS_BACKFILL_SECONDS=60
-P2P_RATE_API_BASE=https://p2p.army/api/fapi
-P2P_RATE_FRONT_API=NextVOF2Ozuh36mW0TCv
-P2P_RATE_MARKET=okx
-P2P_RATE_FIAT_UNIT=CNY
-P2P_RATE_ASSET=USDT
-P2P_RATE_TRADE_METHODS=aliPay
-P2P_RATE_REFRESH_SECONDS=60
-P2P_RATE_CACHE_TTL_SECONDS=180
+## 权限说明
+
+权限以 `go-ledger/internal/permissions` 当前规则为准：
+
+- `BOT_HOST_USER_ID` 是唯一宿主，必填。
+- `DEFAULT_OPERATOR_USER_IDS` 是程序默认操作人，选填，多个 ID 用英文逗号、空格或分号分隔。
+- 宿主和默认操作人都是全局权限用户。
+- 全局权限用户可以邀请机器人进群、在任意群记账、使用群发/分组广播、使用地址监听、管理任意群。
+- 普通用户发送 `开始` 只会激活记账，不会变成宿主或默认操作人。
+- 单群操作员是群级权限，由宿主或默认操作人在群内管理。
+- 邀请机器人进群的人如果不是宿主或默认操作人，机器人会自动退出。
+
+## 域名、Cloudflare 和反向代理
+
+如果只用 Telegram 记账，机器人不需要公网入站端口。只有网页账单和后台需要域名。
+
+推荐流程：
+
+1. 在 Cloudflare 添加 `A` 记录，例如 `bot.example.com -> 服务器 IP`。
+2. SSL/TLS 模式建议使用 `Full` 或 `Full (strict)`。
+3. 宝塔创建站点 `bot.example.com`，申请 SSL。
+4. 宝塔反向代理到：
+
+```text
+http://127.0.0.1:8080
 ```
 
-Send `我的ID` to the bot in private chat to get your Telegram ID, then put it in `BOT_HOST_USER_ID`. The bot has exactly one host. This value is required: if that host is not in a group, the bot leaves that group automatically. Sending `开始` only activates accounting; it does not promote the sender. Default operators are managed only by maintainers through `DEFAULT_OPERATOR_USER_IDS`; they can invite the bot into groups, record in any group, and use private `群发广播` / `分组广播`, but they cannot keep the bot in a group without the host present and cannot become group owner by sending `开始`.
+5. Compose 里填写：
 
-Useful commands:
+```yaml
+PUBLIC_BILL_BASE_URL: "https://bot.example.com"
+ADMIN_WEB_ENABLED: "1"
+ADMIN_WEB_HOST: "0.0.0.0"
+ADMIN_WEB_PORT: "8080"
+ADMIN_WEB_TOKEN: "change_this_admin_password"
+```
+
+账单短链接格式：
+
+```text
+https://bot.example.com/b/-1001234567890/20260705
+```
+
+后台入口：
+
+```text
+https://bot.example.com/admin
+```
+
+宿主或默认操作人可以在私聊菜单点击 `⚙后台管理` 打开后台。公网部署时必须设置强 `ADMIN_WEB_TOKEN`。
+
+## 更新镜像
+
+宝塔面板里可以直接重启 Compose 项目。命令行更新：
+
+```bash
+docker compose pull
+docker compose up -d
+docker compose logs -f ledger-bot
+```
+
+如果只改环境变量，重启即可：
 
 ```bash
 docker compose restart ledger-bot
+```
+
+## PostgreSQL 备份
+
+Compose 使用 Docker 卷 `ledger_pg_data` 保存 PostgreSQL 数据。建议用 `pg_dump` 做可迁移备份：
+
+```bash
+mkdir -p backups
+docker exec ledger-postgres pg_dump -U ledger -d ledger_bot > backups/ledger_bot_$(date +%F_%H%M%S).sql
+```
+
+压缩备份：
+
+```bash
+gzip backups/ledger_bot_*.sql
+```
+
+建议把 `backups/` 同步到服务器外部位置，例如另一台机器、对象存储或网盘。
+
+## 恢复
+
+先启动 PostgreSQL，再把 SQL 导入空库：
+
+```bash
+docker compose up -d postgres
+cat backups/ledger_bot.sql | docker exec -i ledger-postgres psql -U ledger -d ledger_bot
+docker compose up -d ledger-bot
+```
+
+恢复后验证：
+
+```bash
 docker compose logs -f ledger-bot
-docker compose down
 ```
 
-## Option A1: BaoTa Docker Compose
-
-If you use the prebuilt GitHub Container Registry image, BaoTa only needs a Compose script. You do not need to upload source code.
-
-Use the repository file `docker-compose.ghcr.yml`. It is the BaoTa-ready Compose script, with Chinese comments for every setting and placeholders for the values that must be filled.
-
-Docker will create the persistent volume automatically. The SQLite database stays in `ledger_bot_data`.
-
-## Built-in bill website
-
-The image serves bill pages on port `8080` when `BILL_WEB_ENABLED=1`.
-
-For Baota/Nginx:
-
-1. Point your domain, for example `bot.example.com`, to the server IP.
-2. Create a Baota website for that domain and apply for an SSL certificate.
-3. Add a reverse proxy from the HTTPS site to `http://127.0.0.1:8080`.
-4. Set:
-
-```env
-PUBLIC_BILL_BASE_URL=https://bot.example.com
-PUBLIC_BILL_URL_TEMPLATE=
-BILL_WEB_ENABLED=1
-BILL_WEB_PORT=8080
-BILL_WEB_TOKEN=replace-with-random-text
-ADMIN_WEB_TOKEN=replace-with-admin-password
-```
-
-The Telegram bill button then opens `/bill/{chat_id}/{day}` on your own domain. If `BILL_WEB_TOKEN` is empty, the bill URL is public; for production use, set a random token. The admin backend is `/admin`; set `ADMIN_WEB_TOKEN` as the login password.
-
-The built-in web server also supports legacy-style `/day_xxb.php` links. Use `created_at=YYYY-MM-DD` to open a historical bill, and append `download=excel` to download the current bill window as an `.xlsx` file named like `账单_日期_群名_时间戳.xlsx`.
-
-The source-build path below is only needed if you want BaoTa to build the image on your server.
-
-Recommended project path:
-
-```text
-/www/wwwroot/ledger-bot
-```
-
-Upload the whole project folder to that path, then create:
-
-```text
-/www/wwwroot/ledger-bot/.env
-```
-
-Minimum `.env`:
-
-```env
-TELEGRAM_BOT_TOKEN=123456:replace-me
-TELEGRAM_BOT_USERNAME=your_bot_username
-TELEGRAM_API_BASE=https://api.telegram.org
-BOT_DB_PATH=data/ledger_bot.db
-BOT_TIMEZONE=Asia/Shanghai
-BOT_HOST_USER_ID=123456789
-DEFAULT_OPERATOR_USER_IDS=
-BOT_WORKER_THREADS=16
-BOT_CONTROL_THREADS=6
-BOT_CHAIN_THREADS=12
-BOT_RATE_THREADS=1
-BOT_BROADCAST_THREADS=4
-BOT_QUERY_THREADS=4
-BOT_NOTIFICATION_THREADS=6
-BOT_HOST_CHECK_TTL_SECONDS=600
-PUBLIC_BILL_BASE_URL=
-PUBLIC_BILL_URL_TEMPLATE=
-PUBLIC_BILL_BOT_NAME=LEDGER_BOT
-BILL_WEB_ENABLED=1
-BILL_WEB_HOST=0.0.0.0
-BILL_WEB_PORT=8080
-BILL_WEB_TOKEN=
-ADMIN_WEB_TOKEN=
-
-TRONSCAN_API_BASE=https://apilist.tronscanapi.com/api
-TRONGRID_API_KEY=
-TRON_USDT_CONTRACT=TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t
-TRON_POLL_INTERVAL_SECONDS=1
-TRON_INITIAL_LOOKBACK_MINUTES=15
-TRONSCAN_GLOBAL_SCAN_PAGES=1
-TRON_ADDRESS_BACKFILL_SECONDS=60
-P2P_RATE_API_BASE=https://p2p.army/api/fapi
-P2P_RATE_FRONT_API=NextVOF2Ozuh36mW0TCv
-P2P_RATE_MARKET=okx
-P2P_RATE_FIAT_UNIT=CNY
-P2P_RATE_ASSET=USDT
-P2P_RATE_TRADE_METHODS=aliPay
-P2P_RATE_REFRESH_SECONDS=60
-P2P_RATE_CACHE_TTL_SECONDS=180
-```
-
-In BaoTa:
-
-1. Open Docker -> Compose.
-2. Create a new Compose project.
-3. Set project directory to `/www/wwwroot/ledger-bot`.
-4. Use the repository `docker-compose.yml`.
-5. Start the project.
-6. Open logs and look for:
-
-```text
-Ledger bot is running.
-```
-
-This bot does not need a website port mapping. It uses Telegram long polling and outbound HTTP requests to Telegram/Tronscan.
-
-If BaoTa asks for Compose content directly, paste:
-
-```yaml
-services:
-  ledger-bot:
-    build: .
-    container_name: ledger-bot
-    restart: unless-stopped
-    env_file:
-      - .env
-    volumes:
-      - ./data:/app/data
-```
-
-Restart after code/config changes:
-
-```text
-Docker -> Compose -> ledger-bot -> Restart
-```
-
-Back up this file regularly:
-
-```text
-/www/wwwroot/ledger-bot/data/ledger_bot.db
-```
-
-## Option B: systemd
-
-Install Python:
-
-```bash
-sudo apt update
-sudo apt install -y python3.12 python3.12-venv git
-sudo useradd --system --create-home --shell /usr/sbin/nologin ledgerbot
-sudo mkdir -p /opt/ledger-bot
-sudo chown ledgerbot:ledgerbot /opt/ledger-bot
-```
-
-Copy the project into `/opt/ledger-bot`, then:
-
-```bash
-cd /opt/ledger-bot
-sudo -u ledgerbot python3.12 -m venv .venv
-sudo -u ledgerbot .venv/bin/pip install -r requirements.txt
-sudo -u ledgerbot cp .env.example .env
-sudo -u ledgerbot nano .env
-sudo cp deploy/systemd/ledger-bot.service /etc/systemd/system/ledger-bot.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now ledger-bot
-sudo journalctl -u ledger-bot -f
-```
-
-Restart after code or config changes:
-
-```bash
-sudo systemctl restart ledger-bot
-sudo journalctl -u ledger-bot -f
-```
-
-## Telegram Group Setup
-
-Add the bot to a test group and promote it to administrator. Recommended permissions:
-
-- Send messages
-- Pin messages, if using accounting pin
-- Restrict members, if using `上课` / `下课`
-
-Then test in the group:
-
-```text
-开始
-设置汇率10
-设置费率3
-+1000
-+1000/9.2
-下发100U
-+0
-显示账单
-```
-
-Permission check: the configured `BOT_HOST_USER_ID` must be in the group. A default operator may send `开始`, but that does not make the default operator the highest permission user.
-
-Private chat tests:
+再在 Telegram 测试：
 
 ```text
 /start
 我的ID
-地址监听
-只有宿主、默认操作人、一级操作人和下级操作人可用；点击地址监听面板里的按钮添加地址、备注和最小提醒金额
-群列表
-点击群发广播/分组广播按钮选择目标并发送测试内容
-点击后台管理进入 /admin 管理分组、权限和广播替换
+开始
++0
 ```
 
-## Backup
+## 常见检查
 
-Back up the SQLite database regularly:
+查看容器：
 
 ```bash
-cp /opt/ledger-bot/data/ledger_bot.db /opt/ledger-bot/data/ledger_bot.$(date +%F-%H%M%S).db
+docker ps
 ```
 
-For Docker Compose deployments, the database is in:
+查看数据库健康：
 
-```text
-/opt/ledger-bot/data/ledger_bot.db
+```bash
+docker exec ledger-postgres pg_isready -U ledger -d ledger_bot
 ```
+
+查看机器人日志：
+
+```bash
+docker compose logs --tail=200 ledger-bot
+```
+
+测试反代：
+
+```bash
+curl -I https://bot.example.com/admin
+```
+
+如果网页打不开，优先检查 `PUBLIC_BILL_BASE_URL` 是否带 `https://`，宝塔反代目标是否是 `http://127.0.0.1:8080`，以及 Cloudflare SSL 模式是否正确。

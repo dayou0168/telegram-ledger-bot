@@ -11,6 +11,7 @@ import (
 
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/config"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/p2p"
+	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/permissions"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/telegram"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/tron"
@@ -23,6 +24,7 @@ type Bot struct {
 	tg    *telegram.Client
 	tron  *tron.Client
 	p2p   *p2p.Client
+	perms permissions.Policy
 	loc   *time.Location
 
 	dispatcher    *worker.Dispatcher
@@ -57,6 +59,7 @@ func New(cfg config.Config, store *storage.Store, tg *telegram.Client, tronClien
 		tg:               tg,
 		tron:             tronClient,
 		p2p:              p2pClient,
+		perms:            permissions.NewPolicy(cfg.HostUserID, cfg.DefaultOperatorIDs),
 		loc:              loc,
 		dispatcher:       worker.NewDispatcher(),
 		ledgerPool:       worker.NewPool("ledger", cfg.LedgerWorkers, cfg.QueueSize),
@@ -358,7 +361,7 @@ func (b *Bot) handleMyChatMember(ctx context.Context, upd telegram.ChatMemberUpd
 	switch upd.NewChatMember.Status {
 	case "member", "administrator", "restricted":
 		if !b.canInvite(upd.From.ID) {
-			_, _ = b.tg.SendMessage(ctx, upd.Chat.ID, "邀请人没有授权，机器人将自动退出。", nil)
+			_, _ = b.sendText(ctx, sendPriorityNormal, upd.Chat.ID, "邀请人没有授权，机器人将自动退出。", nil)
 			return b.tg.LeaveChat(ctx, upd.Chat.ID)
 		}
 		if err := b.store.EnsureGroup(ctx, upd.Chat.ID, upd.Chat.Title, now); err != nil {
@@ -438,13 +441,17 @@ func (b *Bot) touchUserCached(ctx context.Context, chatID int64, user storage.Us
 }
 
 func (b *Bot) canInvite(userID int64) bool {
-	return b.isRoot(userID)
+	return b.perms.CanInviteBot(userID)
+}
+
+func (b *Bot) isHost(userID int64) bool {
+	return b.perms.IsHost(userID)
 }
 
 func (b *Bot) isRoot(userID int64) bool {
-	if b.cfg.HostUserID != 0 && userID == b.cfg.HostUserID {
-		return true
-	}
-	_, ok := b.cfg.DefaultOperatorIDs[userID]
-	return ok
+	return b.isPrivileged(userID)
+}
+
+func (b *Bot) isPrivileged(userID int64) bool {
+	return b.perms.IsPrivileged(userID)
 }

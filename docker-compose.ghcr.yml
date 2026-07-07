@@ -67,7 +67,7 @@ services:
       # 所有业务时间使用北京时间。
       BOT_TIMEZONE: "Asia/Shanghai"
 
-      # 日本 4 核 8G 推荐并发池。这里是最大并发上限，不是长期占满。
+      # 4 核 8G 推荐并发池。这里是最大并发上限，不是长期占满。
       BOT_WORKER_THREADS: "16"
       BOT_CONTROL_THREADS: "6"
       BOT_CHAIN_THREADS: "12"
@@ -87,6 +87,8 @@ services:
       TRON_USDT_CONTRACT: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
       TRON_POLL_INTERVAL_SECONDS: "1"
       TRONSCAN_GLOBAL_SCAN_PAGES: "1"
+      TRON_ADDRESS_SCAN_PAGES: "3"
+      TRON_ADDRESS_SCAN_CONCURRENCY: "8"
       TRON_ADDRESS_BACKFILL_SECONDS: "60"
       TRON_INITIAL_LOOKBACK_MINUTES: "15"
 

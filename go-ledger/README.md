@@ -49,10 +49,10 @@ docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.1
 docker build -t telegram-ledger-bot-go:dev .
 ```
 
-推荐直接用本目录的 `docker-compose.yml` 启动，里面已经包含 PostgreSQL，默认拉取 `ghcr.io/dayou0168/telegram-ledger-bot-go:2.1`：
+推荐直接用仓库根目录的 `docker-compose.yml` 或 `docker-compose.ghcr.yml` 启动，里面已经包含 PostgreSQL，默认拉取 `ghcr.io/dayou0168/telegram-ledger-bot-go:2.1`：
 
 ```bash
-docker compose up -d --build
+docker compose -f ../docker-compose.yml up -d
 ```
 
 核心环境变量：

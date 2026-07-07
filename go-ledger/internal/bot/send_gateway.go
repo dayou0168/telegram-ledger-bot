@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/telegram"
 )
@@ -160,4 +161,109 @@ func (b *Bot) sendText(ctx context.Context, priority sendPriority, chatID int64,
 		}
 	}
 	return b.tg.SendMessage(ctx, chatID, text, opts)
+}
+
+func (b *Bot) copyMessage(ctx context.Context, chatID, fromChatID, messageID int64, opts map[string]any) (telegram.Message, error) {
+	if err := b.waitTelegramSlot(ctx, chatID); err != nil {
+		return telegram.Message{}, err
+	}
+	msg, err := b.tg.CopyMessage(ctx, chatID, fromChatID, messageID, cloneSendOptions(opts))
+	if retry, waitErr := waitTelegramRetry(ctx, err); waitErr != nil {
+		return telegram.Message{}, waitErr
+	} else if retry {
+		if err := b.waitTelegramSlot(ctx, chatID); err != nil {
+			return telegram.Message{}, err
+		}
+		return b.tg.CopyMessage(ctx, chatID, fromChatID, messageID, cloneSendOptions(opts))
+	}
+	return msg, err
+}
+
+func (b *Bot) editText(ctx context.Context, chatID, messageID int64, text string, opts map[string]any) (telegram.Message, error) {
+	if err := b.waitTelegramSlot(ctx, chatID); err != nil {
+		return telegram.Message{}, err
+	}
+	msg, err := b.tg.EditMessageText(ctx, chatID, messageID, text, cloneSendOptions(opts))
+	if retry, waitErr := waitTelegramRetry(ctx, err); waitErr != nil {
+		return telegram.Message{}, waitErr
+	} else if retry {
+		if err := b.waitTelegramSlot(ctx, chatID); err != nil {
+			return telegram.Message{}, err
+		}
+		return b.tg.EditMessageText(ctx, chatID, messageID, text, cloneSendOptions(opts))
+	}
+	return msg, err
+}
+
+func (b *Bot) editCaption(ctx context.Context, chatID, messageID int64, caption string, opts map[string]any) (telegram.Message, error) {
+	if err := b.waitTelegramSlot(ctx, chatID); err != nil {
+		return telegram.Message{}, err
+	}
+	msg, err := b.tg.EditMessageCaption(ctx, chatID, messageID, caption, cloneSendOptions(opts))
+	if retry, waitErr := waitTelegramRetry(ctx, err); waitErr != nil {
+		return telegram.Message{}, waitErr
+	} else if retry {
+		if err := b.waitTelegramSlot(ctx, chatID); err != nil {
+			return telegram.Message{}, err
+		}
+		return b.tg.EditMessageCaption(ctx, chatID, messageID, caption, cloneSendOptions(opts))
+	}
+	return msg, err
+}
+
+func (b *Bot) sendPhotoBytes(ctx context.Context, chatID int64, filename string, data []byte, caption string, opts map[string]any) (telegram.Message, error) {
+	if err := b.waitTelegramSlot(ctx, chatID); err != nil {
+		return telegram.Message{}, err
+	}
+	msg, err := b.tg.SendPhotoBytes(ctx, chatID, filename, data, caption, cloneSendOptions(opts))
+	if retry, waitErr := waitTelegramRetry(ctx, err); waitErr != nil {
+		return telegram.Message{}, waitErr
+	} else if retry {
+		if err := b.waitTelegramSlot(ctx, chatID); err != nil {
+			return telegram.Message{}, err
+		}
+		return b.tg.SendPhotoBytes(ctx, chatID, filename, data, caption, cloneSendOptions(opts))
+	}
+	return msg, err
+}
+
+func (b *Bot) editPhotoBytes(ctx context.Context, chatID, messageID int64, filename string, data []byte, caption string, opts map[string]any) (telegram.Message, error) {
+	if err := b.waitTelegramSlot(ctx, chatID); err != nil {
+		return telegram.Message{}, err
+	}
+	msg, err := b.tg.EditMessagePhotoBytes(ctx, chatID, messageID, filename, data, caption, cloneSendOptions(opts))
+	if retry, waitErr := waitTelegramRetry(ctx, err); waitErr != nil {
+		return telegram.Message{}, waitErr
+	} else if retry {
+		if err := b.waitTelegramSlot(ctx, chatID); err != nil {
+			return telegram.Message{}, err
+		}
+		return b.tg.EditMessagePhotoBytes(ctx, chatID, messageID, filename, data, caption, cloneSendOptions(opts))
+	}
+	return msg, err
+}
+
+func (b *Bot) waitTelegramSlot(ctx context.Context, chatID int64) error {
+	if b.telegramLimiter == nil {
+		return nil
+	}
+	return b.telegramLimiter.Wait(ctx, chatID)
+}
+
+func waitTelegramRetry(ctx context.Context, err error) (bool, error) {
+	if err == nil {
+		return false, nil
+	}
+	retryAfter, ok := telegram.RetryAfter(err)
+	if !ok {
+		return false, nil
+	}
+	timer := time.NewTimer(retryAfter + time.Second)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false, ctx.Err()
+	case <-timer.C:
+		return true, nil
+	}
 }
