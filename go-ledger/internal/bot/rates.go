@@ -50,8 +50,8 @@ func (b *Bot) handleZ0(ctx context.Context, msg telegram.Message) error {
 		} else {
 			text = formatZ0(entries)
 		}
-		if _, err := b.sendText(jobCtx, sendPriorityNormal, chatID, text, map[string]any{"parse_mode": "HTML"}); err != nil {
-			log.Printf("send z0 result: %v", err)
+		if err := b.enqueueReliableText(jobCtx, sendPriorityNormal, "z0_result", messageScopedDedupe("z0_result", chatID, msg.MessageID), chatID, text, map[string]any{"parse_mode": "HTML"}, reliableMessageRef{}, time.Now().In(b.loc)); err != nil {
+			log.Printf("enqueue z0 result: %v", err)
 		}
 	})
 	return nil
@@ -61,28 +61,27 @@ func (b *Bot) handleZRateSetting(ctx context.Context, msg telegram.Message, user
 	if ok, err := b.canUseLedger(ctx, msg.Chat.ID, user.ID); err != nil {
 		return err
 	} else if !ok {
-		_, err := b.tg.SendMessage(ctx, msg.Chat.ID, "没有设置汇率权限。", map[string]any{"reply_to_message_id": msg.MessageID})
-		return err
+		return b.enqueueReplyText(ctx, sendPriorityNormal, "zrate_denied", msg.Chat.ID, msg.MessageID, "没有设置汇率权限。", nil, now)
 	}
 	chatID := msg.Chat.ID
 	b.ratePool.Submit(func(jobCtx context.Context) {
 		entries, err := b.rateBook(jobCtx)
 		if err != nil {
-			_, _ = b.sendText(jobCtx, sendPriorityNormal, chatID, "设置失败：实时汇率暂不可用："+err.Error(), nil)
+			_ = b.enqueueReliableText(jobCtx, sendPriorityNormal, "zrate_result", messageScopedDedupe("zrate_result", chatID, msg.MessageID), chatID, "设置失败：实时汇率暂不可用："+err.Error(), nil, reliableMessageRef{}, time.Now().In(b.loc))
 			return
 		}
 		if cmd.Rank < 1 || cmd.Rank > len(entries) {
-			_, _ = b.sendText(jobCtx, sendPriorityNormal, chatID, "设置失败：没有这个 Z 档位。", nil)
+			_ = b.enqueueReliableText(jobCtx, sendPriorityNormal, "zrate_result", messageScopedDedupe("zrate_result", chatID, msg.MessageID), chatID, "设置失败：没有这个 Z 档位。", nil, reliableMessageRef{}, time.Now().In(b.loc))
 			return
 		}
 		base := parseRat(entries[cmd.Rank-1].Price)
 		if base == nil {
-			_, _ = b.sendText(jobCtx, sendPriorityNormal, chatID, "设置失败：档位价格格式异常。", nil)
+			_ = b.enqueueReliableText(jobCtx, sendPriorityNormal, "zrate_result", messageScopedDedupe("zrate_result", chatID, msg.MessageID), chatID, "设置失败：档位价格格式异常。", nil, reliableMessageRef{}, time.Now().In(b.loc))
 			return
 		}
 		rate := new(big.Rat).Add(base, cmd.Offset)
 		if rate.Sign() <= 0 {
-			_, _ = b.sendText(jobCtx, sendPriorityNormal, chatID, "设置失败：偏移后的汇率必须大于0。", nil)
+			_ = b.enqueueReliableText(jobCtx, sendPriorityNormal, "zrate_result", messageScopedDedupe("zrate_result", chatID, msg.MessageID), chatID, "设置失败：偏移后的汇率必须大于0。", nil, reliableMessageRef{}, time.Now().In(b.loc))
 			return
 		}
 		rateText := formatRat(rate, 8)
@@ -90,7 +89,7 @@ func (b *Bot) handleZRateSetting(ctx context.Context, msg telegram.Message, user
 		offset := formatSigned(cmd.Offset)
 		if err := b.store.SetGroupRealtimeExchangeRate(jobCtx, chatID, rateText, source, cmd.Rank, offset, now); err != nil {
 			log.Printf("set z rate: %v", err)
-			_, _ = b.sendText(jobCtx, sendPriorityNormal, chatID, "设置失败：数据库写入失败。", nil)
+			_ = b.enqueueReliableText(jobCtx, sendPriorityNormal, "zrate_result", messageScopedDedupe("zrate_result", chatID, msg.MessageID), chatID, "设置失败：数据库写入失败。", nil, reliableMessageRef{}, time.Now().In(b.loc))
 			return
 		}
 		text := fmt.Sprintf("操作成功：Z%d 基准%s，偏移%s，当前汇率%s",
@@ -99,8 +98,8 @@ func (b *Bot) handleZRateSetting(ctx context.Context, msg telegram.Message, user
 			formatSigned(cmd.Offset),
 			rateText,
 		)
-		if _, err := b.sendText(jobCtx, sendPriorityNormal, chatID, text, nil); err != nil {
-			log.Printf("send z rate result: %v", err)
+		if err := b.enqueueReliableText(jobCtx, sendPriorityNormal, "zrate_result", messageScopedDedupe("zrate_result", chatID, msg.MessageID), chatID, text, nil, reliableMessageRef{}, time.Now().In(b.loc)); err != nil {
+			log.Printf("enqueue z rate result: %v", err)
 		}
 	})
 	return nil

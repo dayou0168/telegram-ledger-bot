@@ -282,6 +282,11 @@ func (s *Store) migrate(ctx context.Context) error {
 			text TEXT NOT NULL,
 			parse_mode TEXT NOT NULL DEFAULT '',
 			disable_preview BOOLEAN NOT NULL DEFAULT FALSE,
+			reply_to_message_id BIGINT NOT NULL DEFAULT 0,
+			reply_markup_json TEXT NOT NULL DEFAULT '',
+			reference_kind TEXT NOT NULL DEFAULT '',
+			reference_id BIGINT NOT NULL DEFAULT 0,
+			priority INTEGER NOT NULL DEFAULT 1,
 			status TEXT NOT NULL DEFAULT 'pending',
 			attempts INTEGER NOT NULL DEFAULT 0,
 			next_attempt_at TIMESTAMPTZ NOT NULL,
@@ -290,11 +295,19 @@ func (s *Store) migrate(ctx context.Context) error {
 			updated_at TIMESTAMPTZ NOT NULL,
 			sent_at TIMESTAMPTZ
 		)`,
+		`ALTER TABLE notification_outbox ADD COLUMN IF NOT EXISTS reply_to_message_id BIGINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE notification_outbox ADD COLUMN IF NOT EXISTS reply_markup_json TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE notification_outbox ADD COLUMN IF NOT EXISTS reference_kind TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE notification_outbox ADD COLUMN IF NOT EXISTS reference_id BIGINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE notification_outbox ADD COLUMN IF NOT EXISTS priority INTEGER NOT NULL DEFAULT 1`,
 		`CREATE INDEX IF NOT EXISTS idx_notification_outbox_due
 			ON notification_outbox(status, next_attempt_at, id)
 			WHERE status IN ('pending', 'failed', 'sending')`,
 		`CREATE INDEX IF NOT EXISTS idx_notification_outbox_chat
 			ON notification_outbox(chat_id, created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_notification_outbox_reference
+			ON notification_outbox(reference_kind, reference_id)
+			WHERE reference_kind <> ''`,
 	}
 	for _, statement := range statements {
 		if _, err := s.pool.Exec(ctx, statement); err != nil {
@@ -921,6 +934,21 @@ func (s *Store) SetRecordBotMessage(ctx context.Context, recordID, botMessageID 
 	return err
 }
 
+func (s *Store) GetRecord(ctx context.Context, recordID int64) (Record, bool, error) {
+	row := s.pool.QueryRow(ctx, `SELECT id, chat_id, day_key, kind, currency, amount, rate, fee_rate, result_usdt,
+		subject_user_id, subject_name, actor_user_id, actor_name, source_message_id, bot_message_id, remark, created_at, deleted_at
+		FROM records
+		WHERE id=$1`, recordID)
+	record, err := scanRecord(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Record{}, false, nil
+		}
+		return Record{}, false, err
+	}
+	return record, true, nil
+}
+
 func (s *Store) ListRecordsForDay(ctx context.Context, chatID int64, dayKey string) ([]Record, error) {
 	rows, err := s.pool.Query(ctx, `SELECT id, chat_id, day_key, kind, currency, amount, rate, fee_rate, result_usdt,
 		subject_user_id, subject_name, actor_user_id, actor_name, source_message_id, bot_message_id, remark, created_at, deleted_at
@@ -1252,14 +1280,48 @@ func (s *Store) RecordChainNotificationOutbox(ctx context.Context, owner int64, 
 	}
 	dedupeKey := fmt.Sprintf("chain:%d:%s:%s:%s", owner, address, txHash, direction)
 	if _, err := tx.Exec(ctx, `INSERT INTO notification_outbox(
-			kind, dedupe_key, chat_id, text, parse_mode, disable_preview, status,
+			kind, dedupe_key, chat_id, text, parse_mode, disable_preview, priority, status,
 			attempts, next_attempt_at, created_at, updated_at
-		) VALUES('chain', $1, $2, $3, $4, $5, 'pending', 0, $6, $6, $6)
+		) VALUES('chain', $1, $2, $3, $4, $5, 0, 'pending', 0, $6, $6, $6)
 		ON CONFLICT(dedupe_key) DO NOTHING`,
 		dedupeKey, chatID, text, parseMode, disablePreview, now); err != nil {
 		return false, err
 	}
 	return true, tx.Commit(ctx)
+}
+
+func (s *Store) EnqueueNotification(ctx context.Context, item NotificationOutbox, now time.Time) (bool, error) {
+	item.Kind = strings.TrimSpace(item.Kind)
+	item.DedupeKey = strings.TrimSpace(item.DedupeKey)
+	item.ParseMode = strings.TrimSpace(item.ParseMode)
+	item.ReplyMarkupJSON = strings.TrimSpace(item.ReplyMarkupJSON)
+	item.ReferenceKind = strings.TrimSpace(item.ReferenceKind)
+	if item.Kind == "" {
+		return false, errors.New("notification kind is empty")
+	}
+	if item.DedupeKey == "" {
+		return false, errors.New("notification dedupe key is empty")
+	}
+	tag, err := s.pool.Exec(ctx, `INSERT INTO notification_outbox(
+			kind, dedupe_key, chat_id, text, parse_mode, disable_preview,
+			reply_to_message_id, reply_markup_json, reference_kind, reference_id, priority,
+			status, attempts, next_attempt_at, created_at, updated_at
+		) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending', 0, $12, $12, $12)
+		ON CONFLICT(dedupe_key) DO NOTHING`,
+		item.Kind,
+		item.DedupeKey,
+		item.ChatID,
+		item.Text,
+		item.ParseMode,
+		item.DisablePreview,
+		item.ReplyToMessageID,
+		item.ReplyMarkupJSON,
+		item.ReferenceKind,
+		item.ReferenceID,
+		item.Priority,
+		now,
+	)
+	return tag.RowsAffected() == 1, err
 }
 
 func (s *Store) ClaimDueNotifications(ctx context.Context, limit int, now time.Time) ([]NotificationOutbox, error) {
@@ -1283,7 +1345,8 @@ func (s *Store) ClaimDueNotifications(ctx context.Context, limit int, now time.T
 		FROM next
 		WHERE n.id = next.id
 		RETURNING n.id, n.kind, n.dedupe_key, n.chat_id, n.text, n.parse_mode,
-			n.disable_preview, n.status, n.attempts, n.next_attempt_at, n.last_error,
+			n.disable_preview, n.reply_to_message_id, n.reply_markup_json,
+			n.reference_kind, n.reference_id, n.priority, n.status, n.attempts, n.next_attempt_at, n.last_error,
 			n.created_at, n.updated_at, n.sent_at`, now, limit, staleBefore)
 	if err != nil {
 		return nil, err
@@ -1300,6 +1363,11 @@ func (s *Store) ClaimDueNotifications(ctx context.Context, limit int, now time.T
 			&item.Text,
 			&item.ParseMode,
 			&item.DisablePreview,
+			&item.ReplyToMessageID,
+			&item.ReplyMarkupJSON,
+			&item.ReferenceKind,
+			&item.ReferenceID,
+			&item.Priority,
 			&item.Status,
 			&item.Attempts,
 			&item.NextAttemptAt,
@@ -1315,10 +1383,19 @@ func (s *Store) ClaimDueNotifications(ctx context.Context, limit int, now time.T
 	return out, rows.Err()
 }
 
-func (s *Store) MarkNotificationSent(ctx context.Context, id int64, now time.Time) error {
-	_, err := s.pool.Exec(ctx, `UPDATE notification_outbox
-		SET status='sent', sent_at=$2, updated_at=$2, last_error=''
-		WHERE id=$1`, id, now)
+func (s *Store) MarkNotificationSent(ctx context.Context, id int64, messageID int64, now time.Time) error {
+	_, err := s.pool.Exec(ctx, `WITH marked AS (
+			UPDATE notification_outbox
+			SET status='sent', sent_at=$3, updated_at=$3, last_error=''
+			WHERE id=$1
+			RETURNING reference_kind, reference_id
+		)
+		UPDATE records r
+		SET bot_message_id=$2
+		FROM marked
+		WHERE marked.reference_kind='ledger_record'
+			AND marked.reference_id=r.id
+			AND $2 > 0`, id, messageID, now)
 	return err
 }
 

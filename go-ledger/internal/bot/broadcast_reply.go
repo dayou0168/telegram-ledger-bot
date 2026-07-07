@@ -35,11 +35,11 @@ func (b *Bot) notifyBroadcastReplyAsync(ctx context.Context, msg telegram.Messag
 			replyLinkButtons(msg, delivery),
 		}}
 		for recipient := range b.broadcastReplyRecipients(delivery.OperatorUserID) {
-			if _, err := b.tg.SendMessage(jobCtx, recipient, text, map[string]any{
+			if err := b.enqueueReliableText(jobCtx, sendPriorityNormal, "broadcast_reply_notice", fmt.Sprintf("broadcast_reply_notice:%d:%d:%d", recipient, chatID, msg.MessageID), recipient, text, map[string]any{
 				"parse_mode":   "HTML",
 				"reply_markup": keyboard,
-			}); err != nil {
-				log.Printf("send broadcast reply notice: %v", err)
+			}, reliableMessageRef{}, time.Now().In(b.loc)); err != nil {
+				log.Printf("enqueue broadcast reply notice: %v", err)
 			}
 		}
 	})
@@ -73,10 +73,7 @@ func (b *Bot) handleBroadcastReplyCallback(ctx context.Context, cb telegram.Call
 	if cb.Message == nil {
 		return nil
 	}
-	_, err = b.tg.SendMessage(ctx, cb.Message.Chat.ID, "请直接发送要回复的内容；文字、图片或文件都会复制到目标群。发“返回”结束快速回复。", map[string]any{
-		"reply_to_message_id": cb.Message.MessageID,
-	})
-	return err
+	return b.enqueueReplyText(ctx, sendPriorityNormal, "quick_reply_prompt", cb.Message.Chat.ID, cb.Message.MessageID, "请直接发送要回复的内容；文字、图片或文件都会复制到目标群。发“返回”结束快速回复。", nil, time.Now().In(b.loc))
 }
 
 func (b *Bot) handleQuickReplyMaterial(ctx context.Context, msg telegram.Message, user storage.User, state privateState) error {
@@ -88,13 +85,12 @@ func (b *Bot) handleQuickReplyMaterial(ctx context.Context, msg telegram.Message
 	replyTo := state.QuickReplyMessageID
 	if targetChatID == 0 || replyTo == 0 {
 		b.privateStates.Delete(formatID(user.ID))
-		_, err := b.tg.SendMessage(ctx, msg.Chat.ID, "快速回复目标已失效，请重新点回复通知。", map[string]any{"reply_to_message_id": msg.MessageID})
-		return err
+		return b.enqueueReplyText(ctx, sendPriorityNormal, "quick_reply_lost", msg.Chat.ID, msg.MessageID, "快速回复目标已失效，请重新点回复通知。", nil, time.Now().In(b.loc))
 	}
 	b.notifyPool.Submit(func(sendCtx context.Context) {
 		if _, err := b.tg.CopyMessage(sendCtx, targetChatID, msg.Chat.ID, msg.MessageID, map[string]any{"reply_to_message_id": replyTo}); err != nil {
 			log.Printf("send quick reply: %v", err)
-			_, _ = b.tg.SendMessage(sendCtx, msg.Chat.ID, "快速回复发送失败："+err.Error(), map[string]any{"reply_to_message_id": msg.MessageID})
+			_ = b.enqueueReplyText(sendCtx, sendPriorityNormal, "quick_reply_failed", msg.Chat.ID, msg.MessageID, "快速回复发送失败："+err.Error(), nil, time.Now().In(b.loc))
 			return
 		}
 	})

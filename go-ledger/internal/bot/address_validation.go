@@ -51,24 +51,28 @@ func (b *Bot) handleAddressValidation(ctx context.Context, msg telegram.Message,
 		caption := formatFirstAddressValidationCaption(validation, account, b.loc)
 		imageBytes, err := buildAddressVerifyPNG(address)
 		if err != nil {
-			_, sendErr := b.tg.SendMessage(ctx, msg.Chat.ID, caption, map[string]any{
+			return b.enqueueReliableText(ctx, sendPriorityNormal, "address_validation_first_text", messageScopedDedupe("address_validation_first_text", msg.Chat.ID, msg.MessageID), msg.Chat.ID, caption, map[string]any{
 				"reply_to_message_id": msg.MessageID,
 				"parse_mode":          "HTML",
-			})
-			return sendErr
+			}, reliableMessageRef{}, now)
 		}
 		_, err = b.tg.SendPhotoBytes(ctx, msg.Chat.ID, "usdt-address-verify.png", imageBytes, caption, map[string]any{
 			"reply_to_message_id": msg.MessageID,
 			"parse_mode":          "HTML",
 		})
-		return err
+		if err != nil {
+			return b.enqueueReliableText(ctx, sendPriorityNormal, "address_validation_first_text", messageScopedDedupe("address_validation_first_text", msg.Chat.ID, msg.MessageID), msg.Chat.ID, caption, map[string]any{
+				"reply_to_message_id": msg.MessageID,
+				"parse_mode":          "HTML",
+			}, reliableMessageRef{}, now)
+		}
+		return nil
 	}
 	caption := formatRepeatAddressValidationCaption(validation)
-	_, err = b.tg.SendMessage(ctx, msg.Chat.ID, caption, map[string]any{
+	return b.enqueueReliableText(ctx, sendPriorityNormal, "address_validation_repeat", messageScopedDedupe("address_validation_repeat", msg.Chat.ID, msg.MessageID), msg.Chat.ID, caption, map[string]any{
 		"reply_to_message_id": msg.MessageID,
 		"parse_mode":          "HTML",
-	})
-	return err
+	}, reliableMessageRef{}, now)
 }
 
 func (b *Bot) hydrateAddressValidationNames(ctx context.Context, chatID int64, v *storage.AddressValidation) {

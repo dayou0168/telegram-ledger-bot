@@ -42,11 +42,10 @@ func (b *Bot) sendAddressWatchMenu(ctx context.Context, chatID, ownerID, replyTo
 	}
 	text := formatAddressWatchMenuText(targets)
 	keyboard := telegram.InlineKeyboardMarkup{InlineKeyboard: addressWatchKeyboard(targets)}
-	_, err = b.tg.SendMessage(ctx, chatID, text, map[string]any{
+	return b.enqueueReliableText(ctx, sendPriorityNormal, "address_watch_menu", fmt.Sprintf("address_watch_menu:%d:%d:%d", chatID, ownerID, time.Now().UnixNano()), chatID, text, map[string]any{
 		"parse_mode":   "HTML",
 		"reply_markup": keyboard,
-	})
-	return err
+	}, reliableMessageRef{}, time.Now().In(b.loc))
 }
 
 func (b *Bot) handleAddressWatchCallback(ctx context.Context, cb telegram.CallbackQuery) error {
@@ -67,22 +66,19 @@ func (b *Bot) handleAddressWatchCallback(ctx context.Context, cb telegram.Callba
 		if err := b.tg.AnswerCallback(ctx, cb.ID, "请输入监听地址"); err != nil {
 			return err
 		}
-		_, err := b.tg.SendMessage(ctx, chatID, "请发送要监听的 TRC20 地址，可在地址后面加备注。\n例如：TGhAAy... 监控地址", nil)
-		return err
+		return b.enqueueReliableText(ctx, sendPriorityNormal, "watch_add_prompt", fmt.Sprintf("watch_add_prompt:%d:%d:%d", chatID, cb.From.ID, now.UnixNano()), chatID, "请发送要监听的 TRC20 地址，可在地址后面加备注。\n例如：TGhAAy... 监控地址", nil, reliableMessageRef{}, now)
 	case cb.Data == "watch:remove":
 		b.privateStates.Set(formatID(cb.From.ID), privateState{Mode: "watch_remove", CreatedAt: now})
 		if err := b.tg.AnswerCallback(ctx, cb.ID, "请输入要删除的地址"); err != nil {
 			return err
 		}
-		_, err := b.tg.SendMessage(ctx, chatID, "请发送要删除的 TRC20 监听地址。", nil)
-		return err
+		return b.enqueueReliableText(ctx, sendPriorityNormal, "watch_remove_prompt", fmt.Sprintf("watch_remove_prompt:%d:%d:%d", chatID, cb.From.ID, now.UnixNano()), chatID, "请发送要删除的 TRC20 监听地址。", nil, reliableMessageRef{}, now)
 	case cb.Data == "watch:min":
 		b.privateStates.Set(formatID(cb.From.ID), privateState{Mode: "watch_min", CreatedAt: now})
 		if err := b.tg.AnswerCallback(ctx, cb.ID, "请输入最小金额"); err != nil {
 			return err
 		}
-		_, err := b.tg.SendMessage(ctx, chatID, "请发送最小提醒金额，低于这个 USDT 金额不提醒。\n例如：10；发送 0 表示全部提醒。", nil)
-		return err
+		return b.enqueueReliableText(ctx, sendPriorityNormal, "watch_min_prompt", fmt.Sprintf("watch_min_prompt:%d:%d:%d", chatID, cb.From.ID, now.UnixNano()), chatID, "请发送最小提醒金额，低于这个 USDT 金额不提醒。\n例如：10；发送 0 表示全部提醒。", nil, reliableMessageRef{}, now)
 	case cb.Data == "watch:income", cb.Data == "watch:expense", cb.Data == "watch:trx":
 		return b.toggleAddressWatchSetting(ctx, cb, now)
 	case strings.HasPrefix(cb.Data, "watch:open:"):
@@ -119,8 +115,7 @@ func (b *Bot) handleAddressWatchState(ctx context.Context, msg telegram.Message,
 	case "watch_add":
 		address, label := parseWatchAddressAndLabel(text)
 		if address == "" {
-			_, err := b.tg.SendMessage(ctx, msg.Chat.ID, "地址格式不支持，请发送 T 开头的 TRC20 地址。", map[string]any{"reply_to_message_id": msg.MessageID})
-			return err
+			return b.enqueueReplyText(ctx, sendPriorityNormal, "watch_add_invalid", msg.Chat.ID, msg.MessageID, "地址格式不支持，请发送 T 开头的 TRC20 地址。", nil, now)
 		}
 		if err := b.addWatchFromPrivate(ctx, msg, user, address, label, now); err != nil {
 			return err
@@ -129,8 +124,7 @@ func (b *Bot) handleAddressWatchState(ctx context.Context, msg telegram.Message,
 	case "watch_remove":
 		address := strings.Fields(text)
 		if len(address) == 0 || !isTRC20Address(address[0]) {
-			_, err := b.tg.SendMessage(ctx, msg.Chat.ID, "地址格式不支持，请发送要删除的 TRC20 地址。", map[string]any{"reply_to_message_id": msg.MessageID})
-			return err
+			return b.enqueueReplyText(ctx, sendPriorityNormal, "watch_remove_invalid", msg.Chat.ID, msg.MessageID, "地址格式不支持，请发送要删除的 TRC20 地址。", nil, now)
 		}
 		if err := b.removeWatchFromPrivate(ctx, msg, user, address[0], now); err != nil {
 			return err
@@ -139,8 +133,7 @@ func (b *Bot) handleAddressWatchState(ctx context.Context, msg telegram.Message,
 	case "watch_min":
 		minAmount := formatRat(parseRat(text), 2)
 		if parseRat(text) == nil || parseRat(text).Sign() < 0 {
-			_, err := b.tg.SendMessage(ctx, msg.Chat.ID, "最小提醒金额格式不正确，请发送大于等于 0 的数字。", map[string]any{"reply_to_message_id": msg.MessageID})
-			return err
+			return b.enqueueReplyText(ctx, sendPriorityNormal, "watch_min_invalid", msg.Chat.ID, msg.MessageID, "最小提醒金额格式不正确，请发送大于等于 0 的数字。", nil, now)
 		}
 		settings, err := b.store.GetWatchSettings(ctx, user.ID)
 		if err != nil {
@@ -151,28 +144,26 @@ func (b *Bot) handleAddressWatchState(ctx context.Context, msg telegram.Message,
 			return err
 		}
 		b.watchTargetCache.Clear()
-		_, _ = b.tg.SendMessage(ctx, msg.Chat.ID, "最小提醒金额已设置为 "+minAmount+" USDT。", map[string]any{"reply_to_message_id": msg.MessageID})
+		_ = b.enqueueReplyText(ctx, sendPriorityNormal, "watch_min_ok", msg.Chat.ID, msg.MessageID, "最小提醒金额已设置为 "+minAmount+" USDT。", nil, now)
 		return b.sendAddressWatchMenu(ctx, msg.Chat.ID, user.ID, msg.MessageID)
 	case "watch_target_min":
 		minAmount := formatRat(parseRat(text), 2)
 		if parseRat(text) == nil || parseRat(text).Sign() < 0 {
-			_, err := b.tg.SendMessage(ctx, msg.Chat.ID, "最小提醒金额格式不正确，请发送大于等于 0 的数字。", nil)
-			return err
+			return b.enqueueReplyText(ctx, sendPriorityNormal, "watch_target_min_invalid", msg.Chat.ID, msg.MessageID, "最小提醒金额格式不正确，请发送大于等于 0 的数字。", nil, now)
 		}
 		target, ok, err := b.store.GetWatchTarget(ctx, user.ID, state.WatchAddress)
 		if err != nil {
 			return err
 		}
 		if !ok {
-			_, err := b.tg.SendMessage(ctx, msg.Chat.ID, "没有找到这个监听地址。", nil)
-			return err
+			return b.enqueueReplyText(ctx, sendPriorityNormal, "watch_target_min_lost", msg.Chat.ID, msg.MessageID, "没有找到这个监听地址。", nil, now)
 		}
 		target.MinNotifyAmount = minAmount
 		if _, err := b.store.UpdateWatchTarget(ctx, target, now); err != nil {
 			return err
 		}
 		b.watchTargetCache.Clear()
-		_, _ = b.tg.SendMessage(ctx, msg.Chat.ID, "最小提醒金额已设置为 "+minAmount+" USDT。", nil)
+		_ = b.enqueueReplyText(ctx, sendPriorityNormal, "watch_target_min_ok", msg.Chat.ID, msg.MessageID, "最小提醒金额已设置为 "+minAmount+" USDT。", nil, now)
 		return b.sendAddressWatchDetail(ctx, msg.Chat.ID, user.ID, target.Address)
 	case "watch_target_label":
 		target, ok, err := b.store.GetWatchTarget(ctx, user.ID, state.WatchAddress)
@@ -180,15 +171,14 @@ func (b *Bot) handleAddressWatchState(ctx context.Context, msg telegram.Message,
 			return err
 		}
 		if !ok {
-			_, err := b.tg.SendMessage(ctx, msg.Chat.ID, "没有找到这个监听地址。", nil)
-			return err
+			return b.enqueueReplyText(ctx, sendPriorityNormal, "watch_target_label_lost", msg.Chat.ID, msg.MessageID, "没有找到这个监听地址。", nil, now)
 		}
 		target.Label = normalizeWatchLabel(text)
 		if _, err := b.store.UpdateWatchTarget(ctx, target, now); err != nil {
 			return err
 		}
 		b.watchTargetCache.Clear()
-		_, _ = b.tg.SendMessage(ctx, msg.Chat.ID, "备注已保存。", nil)
+		_ = b.enqueueReplyText(ctx, sendPriorityNormal, "watch_target_label_ok", msg.Chat.ID, msg.MessageID, "备注已保存。", nil, now)
 		return b.sendAddressWatchDetail(ctx, msg.Chat.ID, user.ID, target.Address)
 	default:
 		return nil
@@ -243,15 +233,13 @@ func (b *Bot) handleAddressWatchTargetCallback(ctx context.Context, cb telegram.
 		if err := b.tg.AnswerCallback(ctx, cb.ID, "请输入最小金额"); err != nil {
 			return err
 		}
-		_, err := b.tg.SendMessage(ctx, chatID, "请发送这个地址的最小提醒金额，低于这个 USDT 金额不提醒。\n例如：10；发送 0 表示全部提醒。", nil)
-		return err
+		return b.enqueueReliableText(ctx, sendPriorityNormal, "watch_target_min_prompt", fmt.Sprintf("watch_target_min_prompt:%d:%d:%d", chatID, cb.From.ID, now.UnixNano()), chatID, "请发送这个地址的最小提醒金额，低于这个 USDT 金额不提醒。\n例如：10；发送 0 表示全部提醒。", nil, reliableMessageRef{}, now)
 	case "label":
 		b.privateStates.Set(formatID(cb.From.ID), privateState{Mode: "watch_target_label", WatchAddress: address, CreatedAt: now})
 		if err := b.tg.AnswerCallback(ctx, cb.ID, "请输入备注"); err != nil {
 			return err
 		}
-		_, err := b.tg.SendMessage(ctx, chatID, "请发送这个地址的备注。发送“清空”可删除备注。", nil)
-		return err
+		return b.enqueueReliableText(ctx, sendPriorityNormal, "watch_target_label_prompt", fmt.Sprintf("watch_target_label_prompt:%d:%d:%d", chatID, cb.From.ID, now.UnixNano()), chatID, "请发送这个地址的备注。发送“清空”可删除备注。", nil, reliableMessageRef{}, now)
 	case "del":
 		removed, err := b.store.RemoveWatch(ctx, cb.From.ID, address, now)
 		if err != nil {
@@ -308,19 +296,16 @@ func (b *Bot) toggleAddressWatchSetting(ctx context.Context, cb telegram.Callbac
 
 func (b *Bot) addWatchFromPrivate(ctx context.Context, msg telegram.Message, user storage.User, address, label string, now time.Time) error {
 	if !b.canUseAddressWatch(ctx, user.ID) {
-		_, err := b.tg.SendMessage(ctx, msg.Chat.ID, addressWatchDeniedText, map[string]any{"reply_to_message_id": msg.MessageID})
-		return err
+		return b.enqueueReplyText(ctx, sendPriorityNormal, "watch_add_denied", msg.Chat.ID, msg.MessageID, addressWatchDeniedText, nil, now)
 	}
 	if !isTRC20Address(address) {
-		_, err := b.tg.SendMessage(ctx, msg.Chat.ID, "地址格式不支持。USDT 监听当前只支持 TRC20 的 T 开头地址。", map[string]any{"reply_to_message_id": msg.MessageID})
-		return err
+		return b.enqueueReplyText(ctx, sendPriorityNormal, "watch_add_bad_address", msg.Chat.ID, msg.MessageID, "地址格式不支持。USDT 监听当前只支持 TRC20 的 T 开头地址。", nil, now)
 	}
 	if err := b.store.AddWatch(ctx, user.ID, address, strings.TrimSpace(label), now); err != nil {
 		return err
 	}
 	b.watchTargetCache.Clear()
-	_, err := b.tg.SendMessage(ctx, msg.Chat.ID, "监听地址已保存。", map[string]any{"reply_to_message_id": msg.MessageID})
-	return err
+	return b.enqueueReplyText(ctx, sendPriorityNormal, "watch_add_ok", msg.Chat.ID, msg.MessageID, "监听地址已保存。", nil, now)
 }
 
 func (b *Bot) editAddressWatchMenu(ctx context.Context, chatID, messageID, ownerID int64) error {
@@ -343,16 +328,14 @@ func (b *Bot) sendAddressWatchDetail(ctx context.Context, chatID, ownerID int64,
 		return err
 	}
 	if !ok {
-		_, err := b.tg.SendMessage(ctx, chatID, "没有找到这个监听地址。", nil)
-		return err
+		return b.enqueueReliableText(ctx, sendPriorityNormal, "watch_detail_lost", fmt.Sprintf("watch_detail_lost:%d:%d:%d", chatID, ownerID, time.Now().UnixNano()), chatID, "没有找到这个监听地址。", nil, reliableMessageRef{}, time.Now().In(b.loc))
 	}
-	_, err = b.tg.SendMessage(ctx, chatID, formatAddressWatchDetailText(target), map[string]any{
+	return b.enqueueReliableText(ctx, sendPriorityNormal, "watch_detail", fmt.Sprintf("watch_detail:%d:%d:%s:%d", chatID, ownerID, target.Address, time.Now().UnixNano()), chatID, formatAddressWatchDetailText(target), map[string]any{
 		"parse_mode": "HTML",
 		"reply_markup": telegram.InlineKeyboardMarkup{
 			InlineKeyboard: addressWatchDetailKeyboard(target),
 		},
-	})
-	return err
+	}, reliableMessageRef{}, time.Now().In(b.loc))
 }
 
 func (b *Bot) editAddressWatchDetail(ctx context.Context, chatID, messageID, ownerID int64, address string) error {
@@ -484,8 +467,7 @@ func normalizeWatchLabel(text string) string {
 
 func (b *Bot) removeWatchFromPrivate(ctx context.Context, msg telegram.Message, user storage.User, address string, now time.Time) error {
 	if !b.canUseAddressWatch(ctx, user.ID) {
-		_, err := b.tg.SendMessage(ctx, msg.Chat.ID, addressWatchDeniedText, map[string]any{"reply_to_message_id": msg.MessageID})
-		return err
+		return b.enqueueReplyText(ctx, sendPriorityNormal, "watch_remove_denied", msg.Chat.ID, msg.MessageID, addressWatchDeniedText, nil, now)
 	}
 	removed, err := b.store.RemoveWatch(ctx, user.ID, address, now)
 	if err != nil {
@@ -498,8 +480,7 @@ func (b *Bot) removeWatchFromPrivate(ctx context.Context, msg telegram.Message, 
 	if !removed {
 		text = "没有找到这个监听地址。"
 	}
-	_, err = b.tg.SendMessage(ctx, msg.Chat.ID, text, map[string]any{"reply_to_message_id": msg.MessageID})
-	return err
+	return b.enqueueReplyText(ctx, sendPriorityNormal, "watch_remove_result", msg.Chat.ID, msg.MessageID, text, nil, now)
 }
 
 func (b *Bot) addressWatchScheduler(ctx context.Context) {

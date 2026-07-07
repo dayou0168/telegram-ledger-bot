@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/telegram"
@@ -42,16 +43,14 @@ func (b *Bot) sendUIDLookup(ctx context.Context, chatID, replyTo, userID int64) 
 		OneTimeKeyboard: true,
 	}
 	text := fmt.Sprintf("你的 Telegram UID：%d\n\n可以点击下方按钮选择用户获取 UID，也可以让对方私聊机器人发送“我的ID”。", userID)
-	_, err := b.tg.SendMessage(ctx, chatID, text, map[string]any{
+	return b.enqueueReliableText(ctx, sendPriorityNormal, "uid_lookup", messageScopedDedupe("uid_lookup", chatID, replyTo), chatID, text, map[string]any{
 		"reply_to_message_id": replyTo,
 		"reply_markup":        keyboard,
-	})
-	return err
+	}, reliableMessageRef{}, time.Now().In(b.loc))
 }
 
 func (b *Bot) sendPrivateText(ctx context.Context, chatID, replyTo int64, text string) error {
-	_, err := b.tg.SendMessage(ctx, chatID, text, map[string]any{"reply_to_message_id": replyTo})
-	return err
+	return b.enqueueReplyText(ctx, sendPriorityNormal, "private_text", chatID, replyTo, text, nil, time.Now().In(b.loc))
 }
 
 func (b *Bot) sendAdminEntry(ctx context.Context, chatID, replyTo int64) error {
@@ -66,8 +65,7 @@ func (b *Bot) sendAdminEntry(ctx context.Context, chatID, replyTo int64) error {
 	} else {
 		text += "\n\n当前没有配置 PUBLIC_BILL_BASE_URL，公网使用时请先在 Compose 里填写你的 HTTPS 域名。"
 	}
-	_, err := b.tg.SendMessage(ctx, chatID, text, opts)
-	return err
+	return b.enqueueReliableText(ctx, sendPriorityNormal, "admin_entry", messageScopedDedupe("admin_entry", chatID, replyTo), chatID, text, opts, reliableMessageRef{}, time.Now().In(b.loc))
 }
 
 func privateStartHelp() string {

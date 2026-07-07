@@ -143,18 +143,23 @@ type AddressValidation struct {
 }
 
 type NotificationOutbox struct {
-	ID             int64
-	Kind           string
-	DedupeKey      string
-	ChatID         int64
-	Text           string
-	ParseMode      string
-	DisablePreview bool
-	Status         string
-	Attempts       int
-	NextAttemptAt  time.Time
-	LastError      string
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
-	SentAt         *time.Time
+	ID               int64
+	Kind             string
+	DedupeKey        string
+	ChatID           int64
+	Text             string
+	ParseMode        string
+	DisablePreview   bool
+	ReplyToMessageID int64
+	ReplyMarkupJSON  string
+	ReferenceKind    string
+	ReferenceID      int64
+	Priority         int
+	Status           string
+	Attempts         int
+	NextAttemptAt    time.Time
+	LastError        string
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	SentAt           *time.Time
 }

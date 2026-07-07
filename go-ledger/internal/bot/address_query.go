@@ -18,11 +18,11 @@ func (b *Bot) handleTRXAddressQuery(ctx context.Context, msg telegram.Message, a
 	replyTo := msg.MessageID
 	b.queryPool.Submit(func(jobCtx context.Context) {
 		text := b.queryTRXAddressText(jobCtx, address)
-		if _, err := b.sendText(jobCtx, sendPriorityNormal, chatID, text, map[string]any{
+		if err := b.enqueueReliableText(jobCtx, sendPriorityNormal, "trx_query_result", messageScopedDedupe("trx_query_result", chatID, replyTo), chatID, text, map[string]any{
 			"reply_to_message_id": replyTo,
 			"parse_mode":          "HTML",
-		}); err != nil {
-			log.Printf("send trx address query: %v", err)
+		}, reliableMessageRef{}, time.Now().In(b.loc)); err != nil {
+			log.Printf("enqueue trx address query: %v", err)
 		}
 	})
 	return nil

@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"fmt"
 	"html"
 	"log"
 	"strings"
@@ -15,26 +16,21 @@ func (b *Bot) handleBusinessMode(ctx context.Context, msg telegram.Message, user
 	if ok, err := b.canManageGroup(ctx, msg.Chat.ID, user.ID); err != nil {
 		return err
 	} else if !ok {
-		_, err := b.tg.SendMessage(ctx, msg.Chat.ID, "没有上课/下课权限。", map[string]any{"reply_to_message_id": msg.MessageID})
-		return err
+		return b.enqueueReplyText(ctx, sendPriorityNormal, "business_mode_denied", msg.Chat.ID, msg.MessageID, "没有上课/下课权限。", nil, now)
 	}
 	if err := b.store.SetGroupBusinessOpen(ctx, msg.Chat.ID, open, now); err != nil {
 		return err
 	}
 	perms := groupSendPermissions(open)
 	if err := b.tg.SetChatPermissions(ctx, msg.Chat.ID, perms); err != nil {
-		_, sendErr := b.tg.SendMessage(ctx, msg.Chat.ID, "设置群发言权限失败，请确认机器人是管理员并拥有管理群权限。", map[string]any{"reply_to_message_id": msg.MessageID})
-		if sendErr != nil {
-			return err
-		}
+		_ = b.enqueueReplyText(ctx, sendPriorityNormal, "business_mode_failed", msg.Chat.ID, msg.MessageID, "设置群发言权限失败，请确认机器人是管理员并拥有管理群权限。", nil, now)
 		return err
 	}
 	text := "已上课，全员发送消息权限已开启。"
 	if !open {
 		text = "已下课，全员发送消息权限已关闭。"
 	}
-	_, err := b.tg.SendMessage(ctx, msg.Chat.ID, text, map[string]any{"reply_to_message_id": msg.MessageID})
-	return err
+	return b.enqueueReplyText(ctx, sendPriorityNormal, "business_mode_ok", msg.Chat.ID, msg.MessageID, text, nil, now)
 }
 
 func groupSendPermissions(open bool) telegram.ChatPermissions {
@@ -56,8 +52,7 @@ func (b *Bot) handleNotifyAll(ctx context.Context, msg telegram.Message, user st
 	if ok, err := b.canManageGroup(ctx, msg.Chat.ID, user.ID); err != nil {
 		return err
 	} else if !ok {
-		_, err := b.tg.SendMessage(ctx, msg.Chat.ID, "没有通知所有人权限。", map[string]any{"reply_to_message_id": msg.MessageID})
-		return err
+		return b.enqueueReplyText(ctx, sendPriorityNormal, "notify_all_denied", msg.Chat.ID, msg.MessageID, "没有通知所有人权限。", nil, time.Now().In(b.loc))
 	}
 	b.notifyAllInChatAsync(ctx, msg.Chat.ID, msg.MessageID)
 	return nil
@@ -71,15 +66,15 @@ func (b *Bot) notifyAllInChatAsync(ctx context.Context, chatID, replyTo int64) {
 			return
 		}
 		if len(users) == 0 {
-			_, _ = b.sendText(jobCtx, sendPriorityLow, chatID, "暂无可通知成员。", map[string]any{"reply_to_message_id": replyTo})
+			_ = b.enqueueReliableText(jobCtx, sendPriorityLow, "notify_all_empty", messageScopedDedupe("notify_all_empty", chatID, replyTo), chatID, "暂无可通知成员。", map[string]any{"reply_to_message_id": replyTo}, reliableMessageRef{}, time.Now().In(b.loc))
 			return
 		}
-		for _, chunk := range mentionChunks(users, 3400) {
-			if _, err := b.sendText(jobCtx, sendPriorityLow, chatID, chunk, map[string]any{
+		for i, chunk := range mentionChunks(users, 3400) {
+			if err := b.enqueueReliableText(jobCtx, sendPriorityLow, "notify_all_chunk", fmt.Sprintf("notify_all_chunk:%d:%d:%d", chatID, replyTo, i), chatID, chunk, map[string]any{
 				"reply_to_message_id": replyTo,
 				"parse_mode":          "HTML",
-			}); err != nil {
-				log.Printf("notify all send: %v", err)
+			}, reliableMessageRef{}, time.Now().In(b.loc)); err != nil {
+				log.Printf("notify all enqueue: %v", err)
 			}
 		}
 	})

@@ -2,6 +2,8 @@ package bot
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"log"
 	"time"
 
@@ -63,6 +65,44 @@ func (b *Bot) drainNotificationOutbox(ctx context.Context) {
 }
 
 func (b *Bot) sendOutboxNotification(ctx context.Context, item storage.NotificationOutbox) {
+	text, opts, err := b.renderOutboxMessage(ctx, item)
+	if err != nil {
+		now := time.Now().In(b.loc)
+		if markErr := b.store.MarkNotificationFailed(ctx, item.ID, err.Error(), now.Add(notificationRetryDelay(item.Attempts, err)), now); markErr != nil {
+			log.Printf("mark notification render failed %d: %v", item.ID, markErr)
+		}
+		return
+	}
+	message, err := b.sendText(ctx, outboxSendPriority(item.Priority), item.ChatID, text, opts)
+	now := time.Now().In(b.loc)
+	if err == nil {
+		if err := b.store.MarkNotificationSent(ctx, item.ID, message.MessageID, now); err != nil {
+			log.Printf("mark notification sent %d: %v", item.ID, err)
+		}
+		return
+	}
+	delay := notificationRetryDelay(item.Attempts, err)
+	if err := b.store.MarkNotificationFailed(ctx, item.ID, err.Error(), now.Add(delay), now); err != nil {
+		log.Printf("mark notification failed %d: %v", item.ID, err)
+	}
+}
+
+func (b *Bot) renderOutboxMessage(ctx context.Context, item storage.NotificationOutbox) (string, map[string]any, error) {
+	if item.Kind == "ledger_bill" && item.ReferenceKind == "ledger_record" && item.ReferenceID > 0 {
+		record, ok, err := b.store.GetRecord(ctx, item.ReferenceID)
+		if err != nil {
+			return "", nil, err
+		}
+		if !ok {
+			return "", nil, fmt.Errorf("ledger record %d not found", item.ReferenceID)
+		}
+		return b.renderBillMessage(ctx, record.ChatID, record.DayKey, item.ReplyToMessageID, "")
+	}
+	opts := notificationOptions(item)
+	return item.Text, opts, nil
+}
+
+func notificationOptions(item storage.NotificationOutbox) map[string]any {
 	opts := map[string]any{}
 	if item.ParseMode != "" {
 		opts["parse_mode"] = item.ParseMode
@@ -71,17 +111,26 @@ func (b *Bot) sendOutboxNotification(ctx context.Context, item storage.Notificat
 		opts["disable_web_page_preview"] = true
 		opts["link_preview_options"] = map[string]any{"is_disabled": true}
 	}
-	_, err := b.sendText(ctx, sendPriorityHigh, item.ChatID, item.Text, opts)
-	now := time.Now().In(b.loc)
-	if err == nil {
-		if err := b.store.MarkNotificationSent(ctx, item.ID, now); err != nil {
-			log.Printf("mark notification sent %d: %v", item.ID, err)
-		}
-		return
+	if item.ReplyToMessageID > 0 {
+		opts["reply_to_message_id"] = item.ReplyToMessageID
 	}
-	delay := notificationRetryDelay(item.Attempts, err)
-	if err := b.store.MarkNotificationFailed(ctx, item.ID, err.Error(), now.Add(delay), now); err != nil {
-		log.Printf("mark notification failed %d: %v", item.ID, err)
+	if item.ReplyMarkupJSON != "" {
+		var markup any
+		if err := json.Unmarshal([]byte(item.ReplyMarkupJSON), &markup); err == nil {
+			opts["reply_markup"] = markup
+		}
+	}
+	return opts
+}
+
+func outboxSendPriority(value int) sendPriority {
+	switch sendPriority(value) {
+	case sendPriorityHigh:
+		return sendPriorityHigh
+	case sendPriorityLow:
+		return sendPriorityLow
+	default:
+		return sendPriorityNormal
 	}
 }
 

@@ -248,8 +248,7 @@ func (b *Bot) handleMessage(ctx context.Context, msg telegram.Message) error {
 			if err != nil {
 				return nil
 			}
-			_, err = b.tg.SendMessage(ctx, msg.Chat.ID, strings.TrimSpace(text)+"="+formatCalculationResult(result), nil)
-			return err
+			return b.enqueueReplyText(ctx, sendPriorityNormal, "calc_result", msg.Chat.ID, msg.MessageID, strings.TrimSpace(text)+"="+formatCalculationResult(result), nil, now)
 		}
 		return nil
 	}
@@ -281,16 +280,14 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg telegram.Message, us
 		return b.sendPrivateMenu(ctx, msg.Chat.ID, msg.MessageID)
 	}
 	if text == "我的ID" || strings.EqualFold(text, "id") || text == "/id" {
-		_, err := b.tg.SendMessage(ctx, msg.Chat.ID, fmt.Sprintf("你的 Telegram ID：%d", user.ID), map[string]any{"reply_to_message_id": msg.MessageID})
-		return err
+		return b.enqueueReplyText(ctx, sendPriorityNormal, "private_my_id", msg.Chat.ID, msg.MessageID, fmt.Sprintf("你的 Telegram ID：%d", user.ID), nil, now)
 	}
 	if address, ok := parseTRXAddressQuery(text); ok {
 		return b.handleTRXAddressQuery(ctx, msg, address)
 	}
 	if text == "🔔地址监听" || text == "地址监听" || text == "监听地址" {
 		if !b.canUseAddressWatch(ctx, user.ID) {
-			_, err := b.tg.SendMessage(ctx, msg.Chat.ID, addressWatchDeniedText, map[string]any{"reply_to_message_id": msg.MessageID})
-			return err
+			return b.enqueueReplyText(ctx, sendPriorityNormal, "private_watch_denied", msg.Chat.ID, msg.MessageID, addressWatchDeniedText, nil, now)
 		}
 		return b.sendAddressWatchMenu(ctx, msg.Chat.ID, user.ID, msg.MessageID)
 	}
@@ -315,8 +312,7 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg telegram.Message, us
 
 func (b *Bot) handleUsersShared(ctx context.Context, msg telegram.Message) error {
 	if msg.UsersShared == nil || len(msg.UsersShared.Users) == 0 {
-		_, err := b.tg.SendMessage(ctx, msg.Chat.ID, "没有获取到用户 UID。", map[string]any{"reply_to_message_id": msg.MessageID})
-		return err
+		return b.enqueueReplyText(ctx, sendPriorityNormal, "users_shared_empty", msg.Chat.ID, msg.MessageID, "没有获取到用户 UID。", nil, time.Now().In(b.loc))
 	}
 	var out strings.Builder
 	out.WriteString("已获取用户 UID：")
@@ -332,8 +328,7 @@ func (b *Bot) handleUsersShared(ctx context.Context, msg telegram.Message) error
 		}
 		out.WriteString(formatID(shared.UserID))
 	}
-	_, err := b.tg.SendMessage(ctx, msg.Chat.ID, out.String(), map[string]any{"reply_to_message_id": msg.MessageID})
-	return err
+	return b.enqueueReplyText(ctx, sendPriorityNormal, "users_shared_result", msg.Chat.ID, msg.MessageID, out.String(), nil, time.Now().In(b.loc))
 }
 
 func (b *Bot) handleCallback(ctx context.Context, cb telegram.CallbackQuery) error {
@@ -375,11 +370,10 @@ func (b *Bot) handleMyChatMember(ctx context.Context, upd telegram.ChatMemberUpd
 }
 
 func (b *Bot) sendPrivateMenu(ctx context.Context, chatID int64, replyTo int64) error {
-	_, err := b.tg.SendMessage(ctx, chatID, "请选择功能：", map[string]any{
+	return b.enqueueReliableText(ctx, sendPriorityNormal, "private_menu", messageScopedDedupe("private_menu", chatID, replyTo), chatID, "请选择功能：", map[string]any{
 		"reply_to_message_id": replyTo,
 		"reply_markup":        privateMenuKeyboard(),
-	})
-	return err
+	}, reliableMessageRef{}, time.Now().In(b.loc))
 }
 
 func privateMenuKeyboard() telegram.ReplyKeyboardMarkup {
@@ -400,8 +394,12 @@ func (b *Bot) sendGroupMessageAsync(ctx context.Context, chatID int64, text stri
 		if replyTo > 0 {
 			opts["reply_to_message_id"] = replyTo
 		}
-		if _, err := b.tg.SendMessage(sendCtx, chatID, text, opts); err != nil {
-			log.Printf("send group message %d: %v", chatID, err)
+		dedupeKey := messageScopedDedupe("group_message", chatID, replyTo)
+		if replyTo == 0 {
+			dedupeKey = fmt.Sprintf("group_message:%d:%d", chatID, time.Now().UnixNano())
+		}
+		if err := b.enqueueReliableText(sendCtx, sendPriorityNormal, "group_message", dedupeKey, chatID, text, opts, reliableMessageRef{}, time.Now().In(b.loc)); err != nil {
+			log.Printf("enqueue group message %d: %v", chatID, err)
 		}
 	})
 }

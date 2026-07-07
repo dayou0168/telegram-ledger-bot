@@ -36,8 +36,7 @@ func isBroadcastMenuText(text string) bool {
 
 func (b *Bot) sendBroadcastMenu(ctx context.Context, msg telegram.Message, user storage.User, text string) error {
 	if !b.canUseBroadcast(ctx, user.ID) {
-		_, err := b.tg.SendMessage(ctx, msg.Chat.ID, "没有广播权限。", map[string]any{"reply_to_message_id": msg.MessageID})
-		return err
+		return b.enqueueReplyText(ctx, sendPriorityNormal, "broadcast_denied", msg.Chat.ID, msg.MessageID, "没有广播权限。", nil, time.Now().In(b.loc))
 	}
 	switch strings.TrimSpace(text) {
 	case "📣分组广播", "分组广播":
@@ -50,11 +49,10 @@ func (b *Bot) sendBroadcastMenu(ctx context.Context, msg telegram.Message, user 
 			{{Text: "选择分组广播", CallbackData: "bc:groups"}, {Text: "选择单群发送", CallbackData: "bc:chats"}},
 			{{Text: "取消", CallbackData: "bc:cancel"}},
 		}}
-		_, err := b.tg.SendMessage(ctx, msg.Chat.ID, "请选择广播目标。选定后，直接发送文字、图片、图片+文字或文件即可广播；可连续发送，发“返回”结束。", map[string]any{
+		return b.enqueueReliableText(ctx, sendPriorityNormal, "broadcast_menu", messageScopedDedupe("broadcast_menu", msg.Chat.ID, msg.MessageID), msg.Chat.ID, "请选择广播目标。选定后，直接发送文字、图片、图片+文字或文件即可广播；可连续发送，发“返回”结束。", map[string]any{
 			"reply_to_message_id": msg.MessageID,
 			"reply_markup":        keyboard,
-		})
-		return err
+		}, reliableMessageRef{}, time.Now().In(b.loc))
 	}
 }
 
@@ -73,8 +71,7 @@ func (b *Bot) handleBroadcastCallback(ctx context.Context, cb telegram.CallbackQ
 		if err := b.tg.AnswerCallback(ctx, cb.ID, "已取消"); err != nil {
 			return err
 		}
-		_, err := b.tg.SendMessage(ctx, chatID, "已取消广播。", map[string]any{"reply_to_message_id": replyTo})
-		return err
+		return b.enqueueReplyText(ctx, sendPriorityNormal, "broadcast_cancel", chatID, replyTo, "已取消广播。", nil, time.Now().In(b.loc))
 	case cb.Data == "bc:all":
 		targets, err := b.store.ListAllowedBroadcastChats(ctx, cb.From.ID, b.isRoot(cb.From.ID))
 		if err != nil {
@@ -147,11 +144,10 @@ func (b *Bot) sendBroadcastGroups(ctx context.Context, privateChatID, userID, re
 	if len(rows) == 1 {
 		text = "暂无可用广播分组，请先在后台创建分组并添加群。"
 	}
-	_, err = b.tg.SendMessage(ctx, privateChatID, text, map[string]any{
+	return b.enqueueReliableText(ctx, sendPriorityNormal, "broadcast_groups", messageScopedDedupe("broadcast_groups", privateChatID, replyTo), privateChatID, text, map[string]any{
 		"reply_to_message_id": replyTo,
 		"reply_markup":        telegram.InlineKeyboardMarkup{InlineKeyboard: rows},
-	})
-	return err
+	}, reliableMessageRef{}, time.Now().In(b.loc))
 }
 
 func (b *Bot) sendBroadcastChats(ctx context.Context, privateChatID, userID, replyTo int64) error {
@@ -175,11 +171,10 @@ func (b *Bot) sendBroadcastChats(ctx context.Context, privateChatID, userID, rep
 	if len(rows) == 1 {
 		text = "暂无可用群。机器人进群或群内有人发言后，会自动保存群组。"
 	}
-	_, err = b.tg.SendMessage(ctx, privateChatID, text, map[string]any{
+	return b.enqueueReliableText(ctx, sendPriorityNormal, "broadcast_chats", messageScopedDedupe("broadcast_chats", privateChatID, replyTo), privateChatID, text, map[string]any{
 		"reply_to_message_id": replyTo,
 		"reply_markup":        telegram.InlineKeyboardMarkup{InlineKeyboard: rows},
-	})
-	return err
+	}, reliableMessageRef{}, time.Now().In(b.loc))
 }
 
 func (b *Bot) setBroadcastTargets(ctx context.Context, cb telegram.CallbackQuery, mode, name string, chatIDs []int64) error {
@@ -228,8 +223,7 @@ func (b *Bot) toggleBroadcastNotifyAll(ctx context.Context, cb telegram.Callback
 func (b *Bot) handleBroadcastMaterial(ctx context.Context, msg telegram.Message, user storage.User, state privateState, now time.Time) error {
 	if len(state.ChatIDs) == 0 {
 		b.privateStates.Delete(formatID(user.ID))
-		_, err := b.tg.SendMessage(ctx, msg.Chat.ID, "广播目标已失效，请重新选择。", map[string]any{"reply_to_message_id": msg.MessageID})
-		return err
+		return b.enqueueReplyText(ctx, sendPriorityNormal, "broadcast_target_lost", msg.Chat.ID, msg.MessageID, "广播目标已失效，请重新选择。", nil, now)
 	}
 	if msg.Text == "菜单" || msg.Text == "/start" {
 		b.privateStates.Delete(formatID(user.ID))
@@ -274,8 +268,8 @@ func (b *Bot) handleBroadcastMaterial(ctx context.Context, msg telegram.Message,
 		if _, err := b.tg.EditMessageText(jobCtx, sourceChatID, status.MessageID, text, nil); err != nil {
 			log.Printf("edit broadcast result: %v", err)
 			b.deleteMessageBestEffort(jobCtx, sourceChatID, status.MessageID)
-			if _, err := b.sendText(jobCtx, sendPriorityLow, sourceChatID, text, map[string]any{"reply_markup": sessionKeyboard}); err != nil {
-				log.Printf("send broadcast result fallback: %v", err)
+			if err := b.enqueueReliableText(jobCtx, sendPriorityLow, "broadcast_result", fmt.Sprintf("broadcast_result:%d:%d", sourceChatID, sourceMessageID), sourceChatID, text, map[string]any{"reply_markup": sessionKeyboard}, reliableMessageRef{}, time.Now().In(b.loc)); err != nil {
+				log.Printf("enqueue broadcast result fallback: %v", err)
 			}
 		}
 	})
