@@ -209,6 +209,9 @@ func (b *Bot) handleMessage(ctx context.Context, msg telegram.Message) error {
 	if text == "" {
 		return nil
 	}
+	if !b.cfg.LedgerEnabled {
+		return nil
+	}
 	switch text {
 	case "开始":
 		return b.startAccounting(ctx, msg, user, now)

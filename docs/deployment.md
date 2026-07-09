@@ -93,6 +93,84 @@ docker compose logs -f ledger-bot
 docker compose logs -f ledger-chain-watcher
 ```
 
+## 场景 A1：宝塔宿主机 PostgreSQL
+
+如果你已经在宝塔里安装 PostgreSQL，并且希望数据库运行在宿主机上，Docker Compose 里只跑机器人和 watcher，请使用仓库根目录：
+
+```text
+docker-compose.baota-host-pg.yml
+```
+
+这个 Compose 只包含：
+
+```text
+ledger-chain-watcher
+ledger-bot
+```
+
+它不包含 PostgreSQL 容器，也不创建数据库 volume。两个容器都通过：
+
+```yaml
+extra_hosts:
+  - "host.docker.internal:host-gateway"
+```
+
+访问宿主机 PostgreSQL。
+
+宝塔 PostgreSQL 里先创建两个数据库，数据库名不要带下划线、横杠、中文、空格或特殊符号：
+
+```text
+ledgerchainwatcher
+ledgerbotmain
+```
+
+推荐以后第二个机器人使用：
+
+```text
+ledgerbotforward
+```
+
+Compose 里的数据库连接示例：
+
+```yaml
+CHAIN_WATCHER_DATABASE_URL: "postgres://ledger:改成你的PostgreSQL强密码@host.docker.internal:5432/ledgerchainwatcher?sslmode=disable"
+DATABASE_URL: "postgres://ledger:改成你的PostgreSQL强密码@host.docker.internal:5432/ledgerbotmain?sslmode=disable"
+```
+
+需要确认宝塔 PostgreSQL 允许来自 Docker 容器的连接。如果连接失败，优先检查：
+
+```text
+PostgreSQL 监听地址
+pg_hba.conf 允许 Docker 网段
+宝塔安全/系统防火墙没有拦截 5432
+数据库用户名和密码是否正确
+```
+
+watcher 和 bot 的凭据仍然必须成对：
+
+```yaml
+CHAIN_WATCHER_BOTS: "ledger-main:change_this_chain_watcher_secret"
+CHAIN_WATCHER_BOT_ID: "ledger-main"
+CHAIN_WATCHER_SECRET: "change_this_chain_watcher_secret"
+```
+
+安全边界：
+
+```text
+ledger-chain-watcher 只 expose 8090，不映射公网端口。
+ledger-bot 映射 8080:8080，用于宝塔/Nginx 反向代理后台和网页账单。
+ADMIN_WEB_TOKEN 不要和 CHAIN_WATCHER_SECRET 共用。
+多个机器人实例仍然要使用不同数据库、不同端口、不同 PUBLIC_BILL_BASE_URL、不同 ADMIN_WEB_TOKEN。
+```
+
+旧转发/广播机器人升级到 Go 版时，如果这个实例只用于群发广播，不需要群内记账，请在该实例设置：
+
+```yaml
+BOT_LEDGER_ENABLED: "0"
+```
+
+关闭后，机器人仍会保存群组、处理私聊广播菜单和广播回复通知，但群内 `+100`、`下发100U`、`设置费率` 等记账命令会被静默忽略，不会在非记账群里提示“没有操作权限”。
+
 ## 场景 B：多机器人共享 watcher
 
 多机器人时，推荐拆成多个宝塔 Compose 项目：

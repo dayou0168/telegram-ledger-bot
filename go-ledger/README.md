@@ -64,6 +64,7 @@ BOT_HOST_USER_ID=123456789
 DATABASE_URL=postgres://ledger:change_this_strong_password@postgres:5432/ledger_bot?sslmode=disable
 PUBLIC_BILL_BASE_URL=https://bot.example.com
 ADMIN_WEB_TOKEN=change_this_admin_password
+BOT_LEDGER_ENABLED=1
 CHAIN_WATCHER_URL=http://ledger-chain-watcher:8090
 CHAIN_WATCHER_BOT_ID=ledger-main
 CHAIN_WATCHER_SECRET=change_this_chain_watcher_secret

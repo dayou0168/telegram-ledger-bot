@@ -53,6 +53,10 @@ docker pull ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.2
 
 宝塔 Docker Compose 可以直接使用仓库里的 [docker-compose.ghcr.yml](docker-compose.ghcr.yml)。这个文件默认拉取 `ghcr.io/dayou0168/telegram-ledger-bot-go:2.2` 和 `ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.2`，包含 PostgreSQL、共享链上监听、后台网页端口和常用环境变量。
 
+如果 PostgreSQL 已经安装在宿主机/宝塔里，使用 [docker-compose.baota-host-pg.yml](docker-compose.baota-host-pg.yml)。这个文件只运行 `ledger-chain-watcher` 和 `ledger-bot`，通过 `host.docker.internal` 连接宿主机 PostgreSQL。
+
+如果是把旧转发/广播机器人升级到 Go 版，只想保留广播能力，不希望群内 `+100`、`下发100U` 之类内容触发记账回复，请在对应实例中设置 `BOT_LEDGER_ENABLED=0`。
+
 本地源码构建和更完整的 Go 运行说明见 [go-ledger/README.md](go-ledger/README.md)。
 
 1. 复制配置：
