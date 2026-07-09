@@ -9,6 +9,7 @@
 - 数据库：每个机器人实例独立 PostgreSQL 16
 - 链上监听：多个机器人共享 `ledger-chain-watcher`，watcher 使用独立 PostgreSQL 保存订阅、匹配事件和投递游标
 - 推荐入口：宝塔 Docker Compose
+- watcher 部署模式：Compose 版是在同一个 Compose 项目里运行 `chain-postgres` 独立容器和 `ledger-chain-watcher` 独立容器；宿主机 systemd 版适合 PostgreSQL 已在宝塔/宿主机安装的服务器
 - 推荐配置：4 核 8G 起步；多机器人或链上监听压力高时优先增加 CPU、内存和 NVMe
 - 网页账单和后台：每个机器人实例独立域名或独立宿主端口
 
@@ -25,7 +26,7 @@
 
 ## 场景 A：单机器人一体部署
 
-只有一个机器人时，可以直接使用仓库根目录 `docker-compose.yml` 或 `docker-compose.ghcr.yml`。这个 Compose 同时包含：
+只有一个机器人时，可以直接使用仓库根目录 `docker-compose.yml` 或 `docker-compose.ghcr.yml`。这个 Compose 项目同时包含：
 
 ```text
 postgres
@@ -33,6 +34,8 @@ chain-postgres
 ledger-chain-watcher
 ledger-bot
 ```
+
+Compose 版不建议把 PostgreSQL 和 watcher 塞进同一个容器。分成 `chain-postgres` 和 `ledger-chain-watcher` 两个容器，更利于数据卷持久化、升级、备份、健康检查和故障隔离；在宝塔里它们仍然属于同一个 Compose 项目，可以一起启动和停止。
 
 启动前必须改这些值：
 
@@ -175,6 +178,124 @@ ADMIN_WEB_TOKEN 不要和 CHAIN_WATCHER_SECRET 共用。
 
 日切后当前群记账激活状态自动失效，新业务日需要由有权限的人重新发送 `开始`；汇率、费率、操作员和广播配置继续保留。
 
+## 场景 A2：宿主机 systemd 运行 watcher
+
+如果 PostgreSQL 已经通过宝塔安装在宿主机上，也可以把 `ledger-chain-watcher` 直接跑在服务器宿主机上，机器人继续用宝塔 Docker Compose 部署。这种模式适合多个机器人共用同一个宿主机 watcher，且不想把 watcher 放进 Docker。
+
+仓库提供两个模板：
+
+```text
+deploy/ledger-chain-watcher.env.example
+deploy/ledger-chain-watcher.service
+```
+
+服务器上先创建 watcher 数据库，数据库名不要带下划线、横杠、中文、空格或特殊符号：
+
+```text
+ledgerchainwatcher
+```
+
+复制 env 文件：
+
+```bash
+mkdir -p /etc/ledger-chain-watcher
+cp deploy/ledger-chain-watcher.env.example /etc/ledger-chain-watcher/env
+chmod 600 /etc/ledger-chain-watcher/env
+```
+
+编辑 `/etc/ledger-chain-watcher/env`：
+
+```env
+CHAIN_WATCHER_DATABASE_URL=postgres://ledger:你的PostgreSQL密码@127.0.0.1:5432/ledgerchainwatcher?sslmode=disable
+CHAIN_WATCHER_ADDR=0.0.0.0:8090
+CHAIN_WATCHER_BOTS=tianzezsbot:换成随机内部密钥
+CHAIN_WATCHER_TRONSCAN_API_BASE=https://apilist.tronscanapi.com/api
+CHAIN_WATCHER_TRON_API_KEY=你的Tronscan API Key
+CHAIN_WATCHER_SOURCE_POLL_SECONDS=1
+CHAIN_WATCHER_GLOBAL_SCAN_PAGES=1
+CHAIN_WATCHER_LOOKBACK_SECONDS=600
+CHAIN_WATCHER_CLAIM_LEASE_SECONDS=30
+CHAIN_WATCHER_DELIVERY_RETRY_SECONDS=2
+BOT_TIMEZONE=Asia/Shanghai
+BOT_REQUEST_TIMEOUT=70
+```
+
+安装二进制到固定路径：
+
+```bash
+install -m 0755 ledger-chain-watcher /usr/local/bin/ledger-chain-watcher
+/usr/local/bin/ledger-chain-watcher --help
+```
+
+如果发布包里没有 `--help` 输出，也可以直接跳过这一步，用 systemd 启动后看日志。关键是 `/usr/local/bin/ledger-chain-watcher` 必须存在并可执行。
+
+安装 systemd service：
+
+```bash
+cp deploy/ledger-chain-watcher.service /etc/systemd/system/ledger-chain-watcher.service
+systemctl daemon-reload
+systemctl enable --now ledger-chain-watcher
+journalctl -u ledger-chain-watcher -f
+```
+
+模板默认不写死 `User=`。如果要用非 root 用户运行，请先创建用户，再确认该用户能读取 `/etc/ledger-chain-watcher/env` 和执行 `/usr/local/bin/ledger-chain-watcher`，然后在 service 里启用 `User=` / `Group=`。
+
+机器人 Compose 接入宿主机 watcher 时，机器人自己的数据库仍然写自己的 bot 库，不要改成 `ledgerchainwatcher`：
+
+```yaml
+extra_hosts:
+  - "host.docker.internal:host-gateway"
+environment:
+  DATABASE_URL: "postgres://ledger:密码@host.docker.internal:5432/ledgerbottianze?sslmode=disable"
+  CHAIN_WATCHER_URL: "http://host.docker.internal:8090"
+  CHAIN_WATCHER_BOT_ID: "tianzezsbot"
+  CHAIN_WATCHER_SECRET: "换成随机内部密钥"
+```
+
+Docker 20.10+ 推荐使用：
+
+```yaml
+extra_hosts:
+  - "host.docker.internal:host-gateway"
+```
+
+如果服务器 Docker 不支持 `host-gateway`，可以查 Docker 网桥 IP：
+
+```bash
+ip addr show docker0
+```
+
+然后把机器人配置成类似：
+
+```env
+CHAIN_WATCHER_URL=http://172.17.0.1:8090
+```
+
+安全边界：
+
+```text
+8090 不开放公网。
+宝塔安全组、云安全组和系统防火墙只允许本机/Docker 网段访问 8090。
+CHAIN_WATCHER_SECRET、ADMIN_WEB_TOKEN、PostgreSQL 密码三者不要混用。
+CHAIN_WATCHER_BOTS 泄露后，要同时更换 watcher env 和所有机器人 Compose 配置。
+```
+
+升级宿主机 watcher：
+
+```bash
+systemctl stop ledger-chain-watcher
+install -m 0755 ledger-chain-watcher /usr/local/bin/ledger-chain-watcher
+systemctl restart ledger-chain-watcher
+journalctl -u ledger-chain-watcher -f
+```
+
+如果只改 `/etc/ledger-chain-watcher/env`，不需要替换二进制，直接重启：
+
+```bash
+systemctl restart ledger-chain-watcher
+journalctl -u ledger-chain-watcher -f
+```
+
 ## 场景 B：多机器人共享 watcher
 
 多机器人时，推荐拆成多个宝塔 Compose 项目：
@@ -191,7 +312,7 @@ ledger-ops                  第二个独立 Go v2.2 机器人实例
 docker network create ledger-chain-net
 ```
 
-然后单独部署 `docker-compose.chain-watcher.yml`。它只运行：
+然后单独部署 `docker-compose.chain-watcher.yml`。它是一个独立 watcher Compose 项目，只运行两个服务/两个容器：
 
 ```text
 chain-postgres

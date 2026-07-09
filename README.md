@@ -53,9 +53,11 @@ docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.2
 docker pull ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.2
 ```
 
-宝塔 Docker Compose 可以直接使用仓库里的 [docker-compose.ghcr.yml](docker-compose.ghcr.yml)。这个文件默认拉取 `ghcr.io/dayou0168/telegram-ledger-bot-go:2.2` 和 `ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.2`，包含 PostgreSQL、共享链上监听、后台网页端口和常用环境变量。
+宝塔 Docker Compose 可以直接使用仓库里的 [docker-compose.ghcr.yml](docker-compose.ghcr.yml)。这个文件默认拉取 `ghcr.io/dayou0168/telegram-ledger-bot-go:2.2` 和 `ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.2`，在同一个 Compose 项目里用独立 PostgreSQL 容器和独立 watcher 容器组成全家桶，适合快速部署。
 
 如果 PostgreSQL 已经安装在宿主机/宝塔里，使用 [docker-compose.baota-host-pg.yml](docker-compose.baota-host-pg.yml)。这个文件只运行 `ledger-chain-watcher` 和 `ledger-bot`，通过 `host.docker.internal` 连接宿主机 PostgreSQL。
+
+如果希望 `ledger-chain-watcher` 直接跑在宿主机 systemd 里，使用 [deploy/ledger-chain-watcher.env.example](deploy/ledger-chain-watcher.env.example) 和 [deploy/ledger-chain-watcher.service](deploy/ledger-chain-watcher.service)。机器人 Compose 保留自己的 `DATABASE_URL`，并把 `CHAIN_WATCHER_URL` 配成 `http://host.docker.internal:8090` 或 Docker 网桥 IP。
 
 广播和记账是一体能力，不需要为“广播群”单独关闭机器人记账模块。群默认未开始记账；需要记账的群由宿主、默认操作人或本群操作员发送 `开始` 即可开启。
 
@@ -172,6 +174,11 @@ CHAIN_WATCHER_CLAIM_LEASE_SECONDS=30
 ```
 
 未来接 TRON Lite FullNode + Event Plugin V2 + Kafka 时，机器人配置保持不变，只切换 watcher 的数据源。
+
+watcher 有两种部署模式：
+
+- Compose 版：`docker-compose.ghcr.yml` 或 `docker-compose.chain-watcher.yml`，同一个 Compose 项目中包含 `chain-postgres` 独立容器和 `ledger-chain-watcher` 独立容器。这样更利于数据卷持久化、升级、备份、健康检查和故障隔离；宝塔里仍然是一套项目，一起启动/停止。
+- 宿主机版：PostgreSQL 在宝塔/宿主机上，`ledger-chain-watcher` 用 systemd 运行，模板见 `deploy/ledger-chain-watcher.env.example` 和 `deploy/ledger-chain-watcher.service`。机器人容器通过 `host.docker.internal` 或 `172.17.0.1` 访问 `8090`。
 
 宿主、默认操作人、一级操作人和下级操作人私聊点击 `🔔地址监听` 后，可用面板按钮添加监听地址、设置备注和最小提醒金额。普通用户不能使用地址监听。最小提醒金额表示小于这个数的 USDT 交易不提醒，设置 `0` 表示不限制。
 

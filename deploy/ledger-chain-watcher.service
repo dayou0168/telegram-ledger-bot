@@ -1,0 +1,23 @@
+[Unit]
+Description=Telegram Ledger Chain Watcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/ledger-chain-watcher/env
+ExecStart=/usr/local/bin/ledger-chain-watcher
+Restart=always
+RestartSec=5
+
+# 如需使用非 root 用户运行，请先创建用户并确认该用户能读取：
+# /etc/ledger-chain-watcher/env
+# 然后取消下面两行注释并替换成真实用户/用户组。
+# User=ledger
+# Group=ledger
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

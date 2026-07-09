@@ -49,11 +49,20 @@ docker build -t telegram-ledger-bot-go:dev .
 docker build --build-arg APP=chain-watcher -t telegram-ledger-chain-watcher:dev .
 ```
 
-推荐直接用仓库根目录的 `docker-compose.yml` 或 `docker-compose.ghcr.yml` 启动，里面已经包含 PostgreSQL 和 `ledger-chain-watcher`，默认拉取 `ghcr.io/dayou0168/telegram-ledger-bot-go:2.2` 与 `ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.2`：
+推荐直接用仓库根目录的 `docker-compose.yml` 或 `docker-compose.ghcr.yml` 启动，同一个 Compose 项目里包含 PostgreSQL 独立容器和 `ledger-chain-watcher` 独立容器，默认拉取 `ghcr.io/dayou0168/telegram-ledger-bot-go:2.2` 与 `ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.2`：
 
 ```bash
 docker compose -f ../docker-compose.yml up -d
 ```
+
+如果 `ledger-chain-watcher` 要跑在宿主机 systemd 里，仓库根目录提供：
+
+```text
+deploy/ledger-chain-watcher.env.example
+deploy/ledger-chain-watcher.service
+```
+
+机器人仍然用自己的 `DATABASE_URL` 连接自己的 PostgreSQL 数据库，并通过 `CHAIN_WATCHER_URL=http://host.docker.internal:8090` 或 Docker 网桥 IP 访问宿主机 watcher。
 
 核心环境变量：
 
