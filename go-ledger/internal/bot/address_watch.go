@@ -97,6 +97,7 @@ func (b *Bot) handleAddressWatchCallback(ctx context.Context, cb telegram.Callba
 		}
 		if removed {
 			b.watchTargetCache.Clear()
+			b.deleteChainWatcherSubscriptionAsync(ctx, cb.From.ID, address)
 			if err := b.tg.AnswerCallback(ctx, cb.ID, "已删除"); err != nil {
 				return err
 			}
@@ -163,6 +164,7 @@ func (b *Bot) handleAddressWatchState(ctx context.Context, msg telegram.Message,
 			return err
 		}
 		b.watchTargetCache.Clear()
+		b.syncChainWatcherTargetAsync(ctx, target)
 		_ = b.enqueueReplyText(ctx, sendPriorityNormal, "watch_target_min_ok", msg.Chat.ID, msg.MessageID, "最小提醒金额已设置为 "+minAmount+" USDT。", nil, now)
 		return b.sendAddressWatchDetail(ctx, msg.Chat.ID, user.ID, target.Address)
 	case "watch_target_label":
@@ -178,6 +180,7 @@ func (b *Bot) handleAddressWatchState(ctx context.Context, msg telegram.Message,
 			return err
 		}
 		b.watchTargetCache.Clear()
+		b.syncChainWatcherTargetAsync(ctx, target)
 		_ = b.enqueueReplyText(ctx, sendPriorityNormal, "watch_target_label_ok", msg.Chat.ID, msg.MessageID, "备注已保存。", nil, now)
 		return b.sendAddressWatchDetail(ctx, msg.Chat.ID, user.ID, target.Address)
 	default:
@@ -247,6 +250,9 @@ func (b *Bot) handleAddressWatchTargetCallback(ctx context.Context, cb telegram.
 		}
 		b.watchTargetCache.Clear()
 		if removed {
+			b.deleteChainWatcherSubscriptionAsync(ctx, cb.From.ID, address)
+		}
+		if removed {
 			if err := b.tg.AnswerCallback(ctx, cb.ID, "已删除"); err != nil {
 				return err
 			}
@@ -261,6 +267,7 @@ func (b *Bot) handleAddressWatchTargetCallback(ctx context.Context, cb telegram.
 		return err
 	}
 	b.watchTargetCache.Clear()
+	b.syncChainWatcherTargetAsync(ctx, target)
 	if err := b.tg.AnswerCallback(ctx, cb.ID, "已更新"); err != nil {
 		return err
 	}
@@ -305,6 +312,9 @@ func (b *Bot) addWatchFromPrivate(ctx context.Context, msg telegram.Message, use
 		return err
 	}
 	b.watchTargetCache.Clear()
+	if target, ok, err := b.store.GetWatchTarget(ctx, user.ID, address); err == nil && ok {
+		b.syncChainWatcherTargetAsync(ctx, target)
+	}
 	return b.enqueueReplyText(ctx, sendPriorityNormal, "watch_add_ok", msg.Chat.ID, msg.MessageID, "监听地址已保存。", nil, now)
 }
 
@@ -475,6 +485,7 @@ func (b *Bot) removeWatchFromPrivate(ctx context.Context, msg telegram.Message, 
 	}
 	if removed {
 		b.watchTargetCache.Clear()
+		b.deleteChainWatcherSubscriptionAsync(ctx, user.ID, address)
 	}
 	text := "监听地址已删除。"
 	if !removed {

@@ -119,6 +119,68 @@ type WatchTarget struct {
 	LatestTimestamp int64
 }
 
+type ChainWatcherBot struct {
+	BotID     string
+	Secret    string
+	Status    string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+type ChainWatcherSubscription struct {
+	BotID           string
+	ChatID          int64
+	OwnerUserID     int64
+	Address         string
+	Label           string
+	WatchIncome     bool
+	WatchExpense    bool
+	NotifyTRX       bool
+	MinNotifyAmount string
+	Active          bool
+	UpdatedAt       time.Time
+}
+
+type ChainWatcherEvent struct {
+	EventID        string
+	TxHash         string
+	Contract       string
+	From           string
+	To             string
+	Value          string
+	TokenSymbol    string
+	TokenAddress   string
+	TokenDecimals  int
+	BlockTimestamp int64
+	Confirmed      bool
+	Source         string
+}
+
+type ChainWatcherMatchedEvent struct {
+	DeliveryID     string
+	EventID        string
+	BotID          string
+	ChatID         int64
+	OwnerUserID    int64
+	WatchAddress   string
+	Label          string
+	Direction      string
+	TxHash         string
+	From           string
+	To             string
+	Value          string
+	TokenSymbol    string
+	TokenAddress   string
+	TokenDecimals  int
+	BlockTimestamp int64
+	Confirmed      bool
+	Status         string
+	Attempts       int
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+	DeliveredAt    *time.Time
+}
+
 type WatchSettings struct {
 	OwnerUserID     int64
 	WatchIncome     bool

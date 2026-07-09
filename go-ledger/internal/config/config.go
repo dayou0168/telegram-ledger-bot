@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const Version = "2.1.0"
+const Version = "2.2.0"
 
 type Config struct {
 	TelegramBotToken string
@@ -44,6 +44,11 @@ type Config struct {
 	TronGlobalPages            int
 	TronAddressPages           int
 	TronAddressScanConcurrency int
+	ChainWatcherURL            string
+	ChainWatcherBotID          string
+	ChainWatcherSecret         string
+	ChainWatcherPollInterval   time.Duration
+	ChainWatcherBatchSize      int
 	P2PRefreshEvery            time.Duration
 	P2PCacheTTL                time.Duration
 	P2PAPIBase                 string
@@ -91,6 +96,11 @@ func Load() (Config, error) {
 		TronGlobalPages:            intEnv("TRONSCAN_GLOBAL_SCAN_PAGES", 1),
 		TronAddressPages:           intEnv("TRON_ADDRESS_SCAN_PAGES", 3),
 		TronAddressScanConcurrency: intEnv("TRON_ADDRESS_SCAN_CONCURRENCY", 8),
+		ChainWatcherURL:            strings.TrimRight(strings.TrimSpace(os.Getenv("CHAIN_WATCHER_URL")), "/"),
+		ChainWatcherBotID:          strings.TrimSpace(os.Getenv("CHAIN_WATCHER_BOT_ID")),
+		ChainWatcherSecret:         strings.TrimSpace(os.Getenv("CHAIN_WATCHER_SECRET")),
+		ChainWatcherPollInterval:   secondsEnv("CHAIN_WATCHER_POLL_SECONDS", 1),
+		ChainWatcherBatchSize:      intEnv("CHAIN_WATCHER_BATCH_SIZE", 50),
 		P2PRefreshEvery:            secondsEnv("P2P_RATE_REFRESH_SECONDS", 60),
 		P2PCacheTTL:                secondsEnv("P2P_RATE_CACHE_TTL_SECONDS", 180),
 		P2PAPIBase:                 strings.TrimRight(env("P2P_RATE_API_BASE", "https://p2p.army/api/fapi"), "/"),
@@ -125,6 +135,66 @@ func Load() (Config, error) {
 	}
 	if cfg.TronAddressScanConcurrency < 1 {
 		cfg.TronAddressScanConcurrency = 1
+	}
+	if cfg.ChainWatcherBatchSize < 1 {
+		cfg.ChainWatcherBatchSize = 1
+	}
+	return cfg, nil
+}
+
+func (cfg Config) ChainWatcherEnabled() bool {
+	return cfg.ChainWatcherURL != "" && cfg.ChainWatcherBotID != "" && cfg.ChainWatcherSecret != ""
+}
+
+type ChainWatcherConfig struct {
+	DatabaseURL        string
+	ListenAddr         string
+	Timezone           string
+	RequestTimeout     time.Duration
+	TronAPIBase        string
+	TronAPIKey         string
+	USDTContract       string
+	PollInterval       time.Duration
+	GlobalPages        int
+	Lookback           time.Duration
+	BotCredentials     map[string]string
+	ClaimLease         time.Duration
+	DeliveryRetryEvery time.Duration
+}
+
+func LoadChainWatcher() (ChainWatcherConfig, error) {
+	cfg := ChainWatcherConfig{
+		DatabaseURL:        envAny([]string{"CHAIN_WATCHER_DATABASE_URL", "DATABASE_URL", "POSTGRES_DSN"}, "postgres://ledger:ledger@127.0.0.1:5432/ledger_bot?sslmode=disable"),
+		ListenAddr:         env("CHAIN_WATCHER_ADDR", ":8090"),
+		Timezone:           env("BOT_TIMEZONE", "Asia/Shanghai"),
+		RequestTimeout:     secondsEnv("BOT_REQUEST_TIMEOUT", 70),
+		TronAPIBase:        strings.TrimRight(envAny([]string{"CHAIN_WATCHER_TRONSCAN_API_BASE", "TRONSCAN_API_BASE", "TRONGRID_API_BASE"}, "https://apilist.tronscanapi.com/api"), "/"),
+		TronAPIKey:         strings.TrimSpace(envAny([]string{"CHAIN_WATCHER_TRON_API_KEY", "TRONGRID_API_KEY"}, "")),
+		USDTContract:       env("TRON_USDT_CONTRACT", "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"),
+		PollInterval:       secondsEnv("CHAIN_WATCHER_SOURCE_POLL_SECONDS", 1),
+		GlobalPages:        intEnv("CHAIN_WATCHER_GLOBAL_SCAN_PAGES", intEnv("TRONSCAN_GLOBAL_SCAN_PAGES", 1)),
+		Lookback:           secondsEnv("CHAIN_WATCHER_LOOKBACK_SECONDS", 600),
+		BotCredentials:     parseBotCredentials(os.Getenv("CHAIN_WATCHER_BOTS")),
+		ClaimLease:         secondsEnv("CHAIN_WATCHER_CLAIM_LEASE_SECONDS", 30),
+		DeliveryRetryEvery: secondsEnv("CHAIN_WATCHER_DELIVERY_RETRY_SECONDS", 2),
+	}
+	if strings.TrimSpace(cfg.DatabaseURL) == "" {
+		return cfg, errors.New("DATABASE_URL is required")
+	}
+	if cfg.PollInterval <= 0 {
+		cfg.PollInterval = time.Second
+	}
+	if cfg.GlobalPages < 1 {
+		cfg.GlobalPages = 1
+	}
+	if cfg.Lookback <= 0 {
+		cfg.Lookback = 10 * time.Minute
+	}
+	if cfg.ClaimLease <= 0 {
+		cfg.ClaimLease = 30 * time.Second
+	}
+	if cfg.DeliveryRetryEvery <= 0 {
+		cfg.DeliveryRetryEvery = 2 * time.Second
 	}
 	return cfg, nil
 }
@@ -214,4 +284,26 @@ func parseCSV(raw string) []string {
 		}
 	}
 	return values
+}
+
+func parseBotCredentials(raw string) map[string]string {
+	out := make(map[string]string)
+	for _, part := range strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ';' || r == '\n' || r == '\t'
+	}) {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		key, value, ok := strings.Cut(part, ":")
+		if !ok {
+			key, value, ok = strings.Cut(part, "=")
+		}
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if ok && key != "" && value != "" {
+			out[key] = value
+		}
+	}
+	return out
 }

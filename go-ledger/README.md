@@ -1,8 +1,6 @@
-# Telegram Ledger Bot Go Runtime v2.1
+# Telegram Ledger Bot Go Runtime v2.2
 
-这是机器人 Go 版 v2.1 主线，目标是把同步、异步、队列、并发、缓存和数据库从架构层面重新设计。
-
-Python 版 1.3 已作为旧稳定版封存；Go 版从 2.1 开始按 PostgreSQL-first 继续开发。当前已具备：
+这是机器人 Go 版 v2.2 主线，目标是把同步、异步、队列、并发、缓存、数据库和共享链上监听从架构层面重新设计。当前已具备：
 
 - Telegram long polling。
 - 按 `chat_id` / `user_id` 串行分发。
@@ -33,23 +31,25 @@ Python 版 1.3 已作为旧稳定版封存；Go 版从 2.1 开始按 PostgreSQL-
 - 群内发送 TRC20 地址会自动记录验证次数；首次出现回复防篡改核对图，重复出现显示上次发送人和本次发送人。
 - `查询T...` / `查询TRX地址 T...` 查询 TRON 地址余额、创建/活跃时间和最近 USDT 流水，走独立查询池。
 - 地址监听权限：宿主、默认操作人、一级/下级操作人；私聊按钮面板支持添加/删除地址、收入/支出/TRX 通知开关、最小提醒金额。
-- Tronscan 全局 USDT 主扫描，本地匹配监听地址，通知异步发送。
+- v2.2 链上监听通过共享 `ledger-chain-watcher` 获取链上数据；机器人侧继续保存监听地址、tx_hash 去重和 Telegram outbox。
 
 ## 构建
 
 推荐直接使用 GitHub Actions 构建发布的镜像：
 
 ```bash
-docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.1
+docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.2
+docker pull ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.2
 ```
 
 本目录也保留独立 Dockerfile，方便本地构建：
 
 ```bash
 docker build -t telegram-ledger-bot-go:dev .
+docker build --build-arg APP=chain-watcher -t telegram-ledger-chain-watcher:dev .
 ```
 
-推荐直接用仓库根目录的 `docker-compose.yml` 或 `docker-compose.ghcr.yml` 启动，里面已经包含 PostgreSQL，默认拉取 `ghcr.io/dayou0168/telegram-ledger-bot-go:2.1`：
+推荐直接用仓库根目录的 `docker-compose.yml` 或 `docker-compose.ghcr.yml` 启动，里面已经包含 PostgreSQL 和 `ledger-chain-watcher`，默认拉取 `ghcr.io/dayou0168/telegram-ledger-bot-go:2.2` 与 `ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.2`：
 
 ```bash
 docker compose -f ../docker-compose.yml up -d
@@ -64,6 +64,9 @@ BOT_HOST_USER_ID=123456789
 DATABASE_URL=postgres://ledger:change_this_strong_password@postgres:5432/ledger_bot?sslmode=disable
 PUBLIC_BILL_BASE_URL=https://bot.example.com
 ADMIN_WEB_TOKEN=change_this_admin_password
+CHAIN_WATCHER_URL=http://ledger-chain-watcher:8090
+CHAIN_WATCHER_BOT_ID=ledger-main
+CHAIN_WATCHER_SECRET=change_this_chain_watcher_secret
 ```
 
 ## 推荐默认并发
@@ -89,8 +92,8 @@ BOT_QUEUE_SIZE=4096
 - Telegram 更新去重、账本、权限、广播任务、链上通知都落 PostgreSQL。
 - 表设计从第一版就使用 `BIGINT` Telegram ID、`TIMESTAMPTZ` 时间、`BOOLEAN` 开关和高频组合索引。
 - 金额类字段在写库前统一格式化为两位小数，减少长尾小数导致的账单阅读问题。
-- SQLite 不再作为 v2.1 主线目标，避免后续再次迁移。
+- PostgreSQL 是 v2.2 的唯一主库目标，避免后续再次迁移。
 
-## 迁移原则
+## 启动原则
 
-Go 版直接按测试阶段空库启动，不导入 Python 1.3 的 SQLite 数据。等账单、广播、监听三块经过真实群测试后，再切换生产 Bot Token。
+Go v2.2 直接按 PostgreSQL 空库启动。等账单、广播、监听三块经过真实群测试后，再切换生产 Bot Token。多机器人部署时，每个机器人实例独立 PostgreSQL；只有 `ledger-chain-watcher` 共享。

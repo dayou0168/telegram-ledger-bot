@@ -1,0 +1,78 @@
+# Shared chain watcher for Telegram Ledger Bot Go v2.2
+#
+# 宝塔多机器人部署：
+# 1. 先创建外部网络：docker network create ledger-chain-net
+# 2. 单独创建 Compose 项目 ledger-chain-watcher，并粘贴本文件。
+# 3. 每个 Go v2.2 机器人实例加入 ledger-chain-net。
+# 4. 机器人使用 CHAIN_WATCHER_URL=http://ledger-chain-watcher:8090、
+#    CHAIN_WATCHER_BOT_ID 和 CHAIN_WATCHER_SECRET 接入。
+
+services:
+  chain-postgres:
+    image: postgres:16-alpine
+    container_name: ledger-chain-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: "ledger_chain_watcher"
+      POSTGRES_USER: "chainwatcher"
+      POSTGRES_PASSWORD: "change_this_chain_pg_password"
+      TZ: "Asia/Shanghai"
+    volumes:
+      - ledger_chain_watcher_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chainwatcher -d ledger_chain_watcher"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  ledger-chain-watcher:
+    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.2
+    container_name: ledger-chain-watcher
+    restart: unless-stopped
+    depends_on:
+      chain-postgres:
+        condition: service_healthy
+    environment:
+      CHAIN_WATCHER_DATABASE_URL: "postgres://chainwatcher:change_this_chain_pg_password@chain-postgres:5432/ledger_chain_watcher?sslmode=disable"
+      CHAIN_WATCHER_ADDR: ":8090"
+      BOT_TIMEZONE: "Asia/Shanghai"
+      BOT_REQUEST_TIMEOUT: "70"
+
+      # 允许接入 watcher 的机器人清单，格式：bot_id:secret。多个用英文逗号分隔。
+      # 示例：ledger-main:main_secret,ledger-forward:forward_secret
+      CHAIN_WATCHER_BOTS: "ledger-main:change_this_main_secret,ledger-forward:change_this_forward_secret"
+
+      # 第一版：统一请求 Tronscan/TronGrid。
+      CHAIN_WATCHER_TRONSCAN_API_BASE: "https://apilist.tronscanapi.com/api"
+      CHAIN_WATCHER_TRON_API_KEY: ""
+      TRON_USDT_CONTRACT: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+      CHAIN_WATCHER_SOURCE_POLL_SECONDS: "1"
+      CHAIN_WATCHER_GLOBAL_SCAN_PAGES: "1"
+      CHAIN_WATCHER_LOOKBACK_SECONDS: "600"
+      CHAIN_WATCHER_CLAIM_LEASE_SECONDS: "30"
+      CHAIN_WATCHER_DELIVERY_RETRY_SECONDS: "2"
+
+      # 未来接 TRON Lite FullNode + Event Plugin V2 + Kafka 时，再由链上监听实现线程扩展：
+      # CHAIN_WATCHER_SOURCE: "kafka"
+      # KAFKA_BROKERS: "tron-kafka:9092"
+      # KAFKA_TOPIC: "tron-events"
+    expose:
+      - "8090"
+    # 默认不暴露公网；需要宿主机调试时只绑定 127.0.0.1。
+    # ports:
+    #   - "127.0.0.1:18090:8090"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8090/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - default
+      - ledger-chain-net
+
+volumes:
+  ledger_chain_watcher_pg_data:
+
+networks:
+  ledger-chain-net:
+    external: true

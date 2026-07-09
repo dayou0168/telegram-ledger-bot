@@ -1,10 +1,12 @@
-# Telegram 记账机器人 Go v2.1 + PostgreSQL
+# Telegram 记账机器人 Go v2.2 + PostgreSQL + shared chain watcher
 #
-# 宝塔 Docker Compose 使用方法：
-# 1. 新建 Compose 项目，把本文件完整粘贴进去。
+# 单机器人一体部署：
+# 1. 新建宝塔 Compose 项目，把本文件完整粘贴进去。
 # 2. 先填写 TELEGRAM_BOT_TOKEN、TELEGRAM_BOT_USERNAME、BOT_HOST_USER_ID。
-# 3. 把 POSTGRES_PASSWORD 改成强密码，并同步修改 DATABASE_URL 里的密码。
-# 4. 如果要使用完整账单/后台，把 PUBLIC_BILL_BASE_URL 改成你的 HTTPS 域名，并填写 ADMIN_WEB_TOKEN。
+# 3. 分别修改机器人 PostgreSQL 和 watcher PostgreSQL 的密码。
+# 4. 填写 CHAIN_WATCHER_BOT_ID、CHAIN_WATCHER_SECRET，并同步到 watcher 的 CHAIN_WATCHER_BOTS。
+# 5. 如果使用 Tronscan/TronGrid 官方接口，在 watcher 服务里填写 CHAIN_WATCHER_TRON_API_KEY。
+# 6. 如果要使用完整账单/后台，把 PUBLIC_BILL_BASE_URL 改成你的 HTTPS 域名，并填写 ADMIN_WEB_TOKEN。
 
 services:
   postgres:
@@ -24,50 +26,89 @@ services:
       timeout: 5s
       retries: 10
 
+  chain-postgres:
+    image: postgres:16-alpine
+    container_name: ledger-chain-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: "ledger_chain_watcher"
+      POSTGRES_USER: "chainwatcher"
+      POSTGRES_PASSWORD: "change_this_chain_pg_password"
+      TZ: "Asia/Shanghai"
+    volumes:
+      - ledger_chain_watcher_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chainwatcher -d ledger_chain_watcher"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  ledger-chain-watcher:
+    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.2
+    container_name: ledger-chain-watcher
+    restart: unless-stopped
+    depends_on:
+      chain-postgres:
+        condition: service_healthy
+    environment:
+      CHAIN_WATCHER_DATABASE_URL: "postgres://chainwatcher:change_this_chain_pg_password@chain-postgres:5432/ledger_chain_watcher?sslmode=disable"
+      CHAIN_WATCHER_ADDR: ":8090"
+      BOT_TIMEZONE: "Asia/Shanghai"
+      BOT_REQUEST_TIMEOUT: "70"
+
+      # 允许接入 watcher 的机器人清单，格式：bot_id:secret。多个用英文逗号分隔。
+      CHAIN_WATCHER_BOTS: "ledger-main:change_this_chain_watcher_secret"
+
+      # 第一版：统一请求 Tronscan/TronGrid。多个机器人不再分别配置官网 API Key。
+      CHAIN_WATCHER_TRONSCAN_API_BASE: "https://apilist.tronscanapi.com/api"
+      CHAIN_WATCHER_TRON_API_KEY: ""
+      TRON_USDT_CONTRACT: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+      CHAIN_WATCHER_SOURCE_POLL_SECONDS: "1"
+      CHAIN_WATCHER_GLOBAL_SCAN_PAGES: "1"
+      CHAIN_WATCHER_LOOKBACK_SECONDS: "600"
+      CHAIN_WATCHER_CLAIM_LEASE_SECONDS: "30"
+      CHAIN_WATCHER_DELIVERY_RETRY_SECONDS: "2"
+
+      # 未来接 TRON Lite FullNode + Event Plugin V2 + Kafka 时，再由链上监听实现线程扩展：
+      # CHAIN_WATCHER_SOURCE: "kafka"
+      # KAFKA_BROKERS: "tron-kafka:9092"
+      # KAFKA_TOPIC: "tron-events"
+    expose:
+      - "8090"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8090/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   ledger-bot:
-    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.1
+    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.2
     container_name: ledger-bot-go
     restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
+      ledger-chain-watcher:
+        condition: service_healthy
     environment:
       # ==================== 必填配置 ====================
-
-      # 必填：BotFather 给你的机器人 Token。
       TELEGRAM_BOT_TOKEN: "123456:replace-me"
-
-      # 必填：机器人用户名，不要带 @。
       TELEGRAM_BOT_USERNAME: "your_bot_username"
-
-      # 必填：唯一宿主 Telegram 数字 ID。
-      # 私聊机器人发送“我的ID”获取。
       BOT_HOST_USER_ID: "123456789"
-
-      # 必填：PostgreSQL 连接地址。密码要和上面的 POSTGRES_PASSWORD 保持一致。
       DATABASE_URL: "postgres://ledger:change_this_strong_password@postgres:5432/ledger_bot?sslmode=disable"
 
+      # 必填：共享链上监听服务。BOT_ID 必须出现在 watcher 的 CHAIN_WATCHER_BOTS 中。
+      CHAIN_WATCHER_URL: "http://ledger-chain-watcher:8090"
+      CHAIN_WATCHER_BOT_ID: "ledger-main"
+      CHAIN_WATCHER_SECRET: "change_this_chain_watcher_secret"
+
       # ==================== 选填配置 ====================
-
-      # 选填：服务器默认操作人，多个用英文逗号分隔。
       DEFAULT_OPERATOR_USER_IDS: ""
-
-      # 选填但建议填写：你的网页账单/后台域名，必须带 https://。
-      # 示例：https://bot.example.com
       PUBLIC_BILL_BASE_URL: ""
-
-      # 选填但建议填写：后台管理登录密码。
       ADMIN_WEB_TOKEN: "change_this_admin_password"
 
-      # 选填但推荐：Tronscan API Key。不监听 USDT 地址可以留空。
-      TRONGRID_API_KEY: ""
-
       # ==================== 高级配置 ====================
-
-      # 所有业务时间使用北京时间。
       BOT_TIMEZONE: "Asia/Shanghai"
-
-      # 4 核 8G 推荐并发池。这里是最大并发上限，不是长期占满。
       BOT_WORKER_THREADS: "16"
       BOT_CONTROL_THREADS: "6"
       BOT_CHAIN_THREADS: "12"
@@ -76,23 +117,15 @@ services:
       BOT_QUERY_THREADS: "4"
       BOT_NOTIFICATION_THREADS: "6"
       BOT_QUEUE_SIZE: "4096"
-
-      # Telegram 官方 Bot API。后续如果自建 Bot API Server，再改这里。
       TELEGRAM_API_BASE: "https://api.telegram.org"
       BOT_POLL_TIMEOUT: "50"
       BOT_REQUEST_TIMEOUT: "30"
-
-      # Tronscan / TRC20 监听配置。
-      TRONSCAN_API_BASE: "https://apilist.tronscanapi.com/api"
       TRON_USDT_CONTRACT: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
       TRON_POLL_INTERVAL_SECONDS: "1"
-      TRONSCAN_GLOBAL_SCAN_PAGES: "1"
-      TRON_ADDRESS_SCAN_PAGES: "3"
-      TRON_ADDRESS_SCAN_CONCURRENCY: "8"
       TRON_ADDRESS_BACKFILL_SECONDS: "60"
       TRON_INITIAL_LOOKBACK_MINUTES: "15"
-
-      # Z0 / 实时汇率配置，默认 OKX OTC、CNY、USDT、支付宝档位。
+      CHAIN_WATCHER_POLL_SECONDS: "1"
+      CHAIN_WATCHER_BATCH_SIZE: "50"
       P2P_RATE_API_BASE: "https://p2p.army/api/fapi"
       P2P_RATE_FRONT_API: "NextVOF2Ozuh36mW0TCv"
       P2P_RATE_MARKET: "okx"
@@ -101,15 +134,12 @@ services:
       P2P_RATE_TRADE_METHODS: "aliPay"
       P2P_RATE_REFRESH_SECONDS: "60"
       P2P_RATE_CACHE_TTL_SECONDS: "180"
-
-      # 后台管理和短账单网页。
       ADMIN_WEB_ENABLED: "1"
       ADMIN_WEB_HOST: "0.0.0.0"
       ADMIN_WEB_PORT: "8080"
-
     ports:
-      # 宝塔/Nginx 反向代理目标：http://127.0.0.1:8080
       - "8080:8080"
 
 volumes:
   ledger_pg_data:
+  ledger_chain_watcher_pg_data:

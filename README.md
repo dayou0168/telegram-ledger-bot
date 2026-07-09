@@ -1,6 +1,6 @@
 # Telegram 群组记账机器人
 
-这是 Telegram 记账机器人 Go v2.1 主线，按群组使用，生产部署使用 PostgreSQL 和 GHCR 镜像。Python 版 1.3 已作为旧稳定版封存，不再作为当前发布入口。
+这是 Telegram 记账机器人 Go v2.2 主线，按群组使用，生产部署使用 PostgreSQL、GHCR 镜像和共享 `ledger-chain-watcher` 链上监听服务。
 
 ## 当前已支持功能
 
@@ -42,15 +42,16 @@
 - `开启记账置顶` / `关闭记账置顶`。
 - 每个群的 `🌐 完整账单` 按钮会按 `chat_id` 生成独立链接。
 
-## 运行 Go v2.1
+## 运行 Go v2.2
 
-推荐优先使用 Go v2.1 镜像和 PostgreSQL：
+推荐优先使用 Go v2.2 镜像、PostgreSQL 和共享 watcher：
 
 ```powershell
-docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.1
+docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.2
+docker pull ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.2
 ```
 
-宝塔 Docker Compose 可以直接使用仓库里的 [docker-compose.ghcr.yml](docker-compose.ghcr.yml)。这个文件默认拉取 `ghcr.io/dayou0168/telegram-ledger-bot-go:2.1`，包含 PostgreSQL、后台网页端口和常用环境变量。
+宝塔 Docker Compose 可以直接使用仓库里的 [docker-compose.ghcr.yml](docker-compose.ghcr.yml)。这个文件默认拉取 `ghcr.io/dayou0168/telegram-ledger-bot-go:2.2` 和 `ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.2`，包含 PostgreSQL、共享链上监听、后台网页端口和常用环境变量。
 
 本地源码构建和更完整的 Go 运行说明见 [go-ledger/README.md](go-ledger/README.md)。
 
@@ -67,6 +68,9 @@ TELEGRAM_BOT_TOKEN=123456:replace-me
 TELEGRAM_BOT_USERNAME=your_bot_username
 TELEGRAM_API_BASE=https://api.telegram.org
 DATABASE_URL=postgres://ledger:change_this_strong_password@postgres:5432/ledger_bot?sslmode=disable
+CHAIN_WATCHER_URL=http://ledger-chain-watcher:8090
+CHAIN_WATCHER_BOT_ID=ledger-main
+CHAIN_WATCHER_SECRET=change_this_chain_watcher_secret
 BOT_TIMEZONE=Asia/Shanghai
 BOT_HOST_USER_ID=123456789
 DEFAULT_OPERATOR_USER_IDS=
@@ -82,7 +86,7 @@ BOT_QUEUE_SIZE=4096
 
 先私聊机器人发送 `我的ID` 获取你的 Telegram ID，再填入 `BOT_HOST_USER_ID`。机器人只允许配置一个宿主。默认操作人可在 `.env` 的 `DEFAULT_OPERATOR_USER_IDS` 里用英文逗号分隔，只有维护程序的人员能通过改服务器配置添加或删除。
 
-并发池说明：默认按 4 核 8G 服务器优化。`BOT_WORKER_THREADS` 处理群内记账、撤销、群内设置等实时消息，同一群会按 FIFO 队列串行、不同群可并发；`BOT_CONTROL_THREADS` 处理私聊菜单、后台入口、广播控制台等私聊交互；`BOT_CHAIN_THREADS` 处理 USDT/TRX 链上监听并并行扫描监听地址；`BOT_RATE_THREADS` 处理 Z0 和实时汇率刷新；`BOT_BROADCAST_THREADS` 处理群发/分组广播，默认最多同时跑 4 个广播任务，单个广播任务内部仍按目标群逐个发送，避免触发 Telegram 限流；`BOT_QUERY_THREADS` 处理 TRX 地址查询等外部查询；`BOT_NOTIFICATION_THREADS` 处理广播发送通知、回复通知和通知素材复制。群内记账、私聊控制、广播、链上监听、汇率刷新、查询、通知互相隔离，避免某一类慢任务拖住其他版块。
+并发池说明：默认按 4 核 8G 服务器优化。`BOT_WORKER_THREADS` 处理群内记账、撤销、群内设置等实时消息，同一群会按 FIFO 队列串行、不同群可并发；`BOT_CONTROL_THREADS` 处理私聊菜单、后台入口、广播控制台等私聊交互；`BOT_CHAIN_THREADS` 处理 watcher 订阅同步和 matched events 领取；`BOT_RATE_THREADS` 处理 Z0 和实时汇率刷新；`BOT_BROADCAST_THREADS` 处理群发/分组广播，默认最多同时跑 4 个广播任务，单个广播任务内部仍按目标群逐个发送，避免触发 Telegram 限流；`BOT_QUERY_THREADS` 处理 TRX 地址查询等外部查询；`BOT_NOTIFICATION_THREADS` 处理广播发送通知、回复通知和通知素材复制。群内记账、私聊控制、广播、链上监听、汇率刷新、查询、通知互相隔离，避免某一类慢任务拖住其他版块。
 
 如果你用自建 Telegram Bot API Server，`TELEGRAM_API_BASE` 填服务根地址即可，例如：
 
@@ -134,21 +138,36 @@ https://bot.your-domain.example/day_xxb.php?chat_id=-100xxx&created_at=2026-07-0
 
 ### TRC20 链上监听
 
-使用 Tronscan 只读接口，不需要私钥。配置：
+Go v2.2 通过共享 `ledger-chain-watcher` 获取链上数据。多个机器人实例只配置内网 URL 和内部密钥，不再各自配置官网 API Key：
 
 ```env
-TRONSCAN_API_BASE=https://apilist.tronscanapi.com/api
-TRONGRID_API_KEY=
+CHAIN_WATCHER_URL=http://ledger-chain-watcher:8090
+CHAIN_WATCHER_BOT_ID=ledger-main
+CHAIN_WATCHER_SECRET=change_this_chain_watcher_secret
+CHAIN_WATCHER_POLL_SECONDS=1
+CHAIN_WATCHER_BATCH_SIZE=50
 TRON_USDT_CONTRACT=TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t
-TRON_POLL_INTERVAL_SECONDS=1
-TRON_INITIAL_LOOKBACK_MINUTES=15
-TRONSCAN_GLOBAL_SCAN_PAGES=1
-TRON_ADDRESS_BACKFILL_SECONDS=60
 ```
+
+`ledger-chain-watcher` 第一版统一请求 Tronscan/TronGrid：
+
+```env
+CHAIN_WATCHER_DATABASE_URL=postgres://chainwatcher:change_this_chain_pg_password@chain-postgres:5432/ledger_chain_watcher?sslmode=disable
+CHAIN_WATCHER_ADDR=:8090
+CHAIN_WATCHER_BOTS=ledger-main:change_this_chain_watcher_secret
+CHAIN_WATCHER_TRONSCAN_API_BASE=https://apilist.tronscanapi.com/api
+CHAIN_WATCHER_TRON_API_KEY=your_real_api_key
+CHAIN_WATCHER_SOURCE_POLL_SECONDS=1
+CHAIN_WATCHER_GLOBAL_SCAN_PAGES=1
+CHAIN_WATCHER_LOOKBACK_SECONDS=600
+CHAIN_WATCHER_CLAIM_LEASE_SECONDS=30
+```
+
+未来接 TRON Lite FullNode + Event Plugin V2 + Kafka 时，机器人配置保持不变，只切换 watcher 的数据源。
 
 宿主、默认操作人、一级操作人和下级操作人私聊点击 `🔔地址监听` 后，可用面板按钮添加监听地址、设置备注和最小提醒金额。普通用户不能使用地址监听。最小提醒金额表示小于这个数的 USDT 交易不提醒，设置 `0` 表示不限制。
 
-机器人会用独立后台线程定时请求 Tronscan 的 TRC20 交易接口，发现新的 USDT 收入/支出后私聊推送。默认 `TRON_POLL_INTERVAL_SECONDS=1`；主扫描每轮只拉一次 USDT 全网最新流水，然后在本地匹配所有监听地址，避免监听地址越多调用量越高。主扫描不会等待链上完全确认，接口返回 `confirmed=false` 的新交易也会先提醒；后续同一笔交易会按交易哈希去重，不会重复提醒。`TRONSCAN_GLOBAL_SCAN_PAGES` 控制每轮全局扫描页数，每页 50 条；默认 1 页调用量最低。`TRON_ADDRESS_BACKFILL_SECONDS` 控制按地址低频回补间隔，默认 60 秒，用于补漏。主网建议配置真实的 `TRONGRID_API_KEY`，这个旧变量名为了兼容已部署 Compose 继续保留，实际填写的是 Tronscan API Keys 页面里的令牌。没有 key 时保持空值，不要填中文占位符或 key 名称；填写 key 后程序会通过 `TRON-PRO-API-KEY` 请求头调用 Tronscan。key 被 Tronscan 拒绝时不会降级成无 key 请求。`TRON_INITIAL_LOOKBACK_MINUTES` 只控制首次监听或没有历史记录时的回看窗口。
+机器人保存监听地址、tx_hash 去重和 Telegram outbox；watcher 负责统一链上数据入口、统一解析、按多机器人订阅匹配和短期事件队列。机器人配置了 `CHAIN_WATCHER_URL`、`CHAIN_WATCHER_BOT_ID`、`CHAIN_WATCHER_SECRET` 后，会停用本机地址监听轮询，改为注册订阅并每秒领取 watcher matched events。同一笔交易仍按 `owner + address + tx_hash + direction` 去重，不会重复提醒。
 
 ### Z0 汇率查询
 
@@ -175,4 +194,4 @@ P2P_RATE_CACHE_TTL_SECONDS=180
 docker compose -f docker-compose.ghcr.yml up -d
 ```
 
-服务器部署见 [docs/deployment.md](docs/deployment.md)，当前发布优先用 Go v2.1 镜像和 Docker Compose。
+服务器部署见 [docs/deployment.md](docs/deployment.md)，当前发布目标优先用 Go v2.2 镜像、PostgreSQL、共享 `ledger-chain-watcher` 和 Docker Compose。

@@ -66,7 +66,7 @@ func TestSummarizeBillIncludesSubjectAndRateStats(t *testing.T) {
 	}
 }
 
-func TestBillTemplateRendersPythonStyleSections(t *testing.T) {
+func TestBillTemplateRendersReferenceStyleSections(t *testing.T) {
 	day := "2026-07-06"
 	data := billData{
 		Group:        storage.Group{ChatID: -1001, Title: "测试群"},
@@ -105,7 +105,7 @@ func TestBillHistoryTriggerUsesButtonFont(t *testing.T) {
 func TestAdminTemplateRendersSearchableTallSavedGroups(t *testing.T) {
 	var buf bytes.Buffer
 	err := adminTemplate.Execute(&buf, pageData{
-		Version: "2.1.0",
+		Version: "2.2.0",
 		Groups: []storage.Group{{
 			ChatID:    -1003720457420,
 			Title:     "测试群",

@@ -277,6 +277,85 @@ func (s *Store) migrate(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_chain_notifications_latest
 			ON chain_notifications(owner_user_id, address, block_timestamp DESC)`,
+		`CREATE TABLE IF NOT EXISTS chain_watcher_bots (
+			bot_id TEXT PRIMARY KEY,
+			secret TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'active',
+			created_at TIMESTAMPTZ NOT NULL,
+			updated_at TIMESTAMPTZ NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_bots_status
+			ON chain_watcher_bots(status, bot_id)`,
+		`CREATE TABLE IF NOT EXISTS chain_watcher_subscriptions (
+			bot_id TEXT NOT NULL,
+			chat_id BIGINT NOT NULL DEFAULT 0,
+			owner_user_id BIGINT NOT NULL,
+			address TEXT NOT NULL,
+			label TEXT NOT NULL DEFAULT '',
+			watch_income BOOLEAN NOT NULL DEFAULT TRUE,
+			watch_expense BOOLEAN NOT NULL DEFAULT TRUE,
+			notify_trx BOOLEAN NOT NULL DEFAULT TRUE,
+			min_notify_amount TEXT NOT NULL DEFAULT '0',
+			active BOOLEAN NOT NULL DEFAULT TRUE,
+			created_at TIMESTAMPTZ NOT NULL,
+			updated_at TIMESTAMPTZ NOT NULL,
+			PRIMARY KEY(bot_id, chat_id, owner_user_id, address)
+		)`,
+		`ALTER TABLE chain_watcher_subscriptions ADD COLUMN IF NOT EXISTS chat_id BIGINT NOT NULL DEFAULT 0`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_chain_watcher_subscriptions_identity
+			ON chain_watcher_subscriptions(bot_id, chat_id, owner_user_id, address)`,
+		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_subscriptions_active_address
+			ON chain_watcher_subscriptions(active, address, bot_id, chat_id, owner_user_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_subscriptions_bot_active
+			ON chain_watcher_subscriptions(bot_id, active, updated_at DESC)`,
+		`CREATE TABLE IF NOT EXISTS chain_watcher_events (
+			event_id TEXT PRIMARY KEY,
+			tx_hash TEXT NOT NULL,
+			contract TEXT NOT NULL DEFAULT '',
+			from_address TEXT NOT NULL,
+			to_address TEXT NOT NULL,
+			value TEXT NOT NULL,
+			token_symbol TEXT NOT NULL DEFAULT '',
+			token_address TEXT NOT NULL DEFAULT '',
+			token_decimals INTEGER NOT NULL DEFAULT 6,
+			block_timestamp BIGINT NOT NULL,
+			confirmed BOOLEAN NOT NULL DEFAULT FALSE,
+			source TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_events_tx
+			ON chain_watcher_events(tx_hash, block_timestamp DESC)`,
+		`CREATE TABLE IF NOT EXISTS chain_watcher_matched_events (
+			delivery_id TEXT PRIMARY KEY,
+			event_id TEXT NOT NULL,
+			bot_id TEXT NOT NULL,
+			chat_id BIGINT NOT NULL DEFAULT 0,
+			owner_user_id BIGINT NOT NULL,
+			watch_address TEXT NOT NULL,
+			label TEXT NOT NULL DEFAULT '',
+			direction TEXT NOT NULL,
+			tx_hash TEXT NOT NULL,
+			from_address TEXT NOT NULL,
+			to_address TEXT NOT NULL,
+			value TEXT NOT NULL,
+			token_symbol TEXT NOT NULL DEFAULT '',
+			token_address TEXT NOT NULL DEFAULT '',
+			token_decimals INTEGER NOT NULL DEFAULT 6,
+			block_timestamp BIGINT NOT NULL,
+			confirmed BOOLEAN NOT NULL DEFAULT FALSE,
+			status TEXT NOT NULL DEFAULT 'pending',
+			attempts INTEGER NOT NULL DEFAULT 0,
+			next_attempt_at TIMESTAMPTZ NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL,
+			updated_at TIMESTAMPTZ NOT NULL,
+			delivered_at TIMESTAMPTZ
+		)`,
+		`ALTER TABLE chain_watcher_matched_events ADD COLUMN IF NOT EXISTS chat_id BIGINT NOT NULL DEFAULT 0`,
+		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_matched_due
+			ON chain_watcher_matched_events(bot_id, status, next_attempt_at, created_at)
+			WHERE status IN ('pending', 'delivering')`,
+		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_matched_event
+			ON chain_watcher_matched_events(event_id, bot_id)`,
 		`CREATE TABLE IF NOT EXISTS notification_outbox (
 			id BIGSERIAL PRIMARY KEY,
 			kind TEXT NOT NULL,
@@ -322,6 +401,11 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	if _, err := s.pool.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
 		VALUES('2.1.0', NOW())
+		ON CONFLICT(version) DO NOTHING`); err != nil {
+		return fmt.Errorf("record schema migration: %w", err)
+	}
+	if _, err := s.pool.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
+		VALUES('2.2.0', NOW())
 		ON CONFLICT(version) DO NOTHING`); err != nil {
 		return fmt.Errorf("record schema migration: %w", err)
 	}
@@ -1413,6 +1497,285 @@ func (s *Store) MarkNotificationFailed(ctx context.Context, id int64, message st
 	_, err := s.pool.Exec(ctx, `UPDATE notification_outbox
 		SET status='failed', last_error=$2, next_attempt_at=$3, updated_at=$4
 		WHERE id=$1`, id, message, nextAttemptAt, now)
+	return err
+}
+
+func (s *Store) UpsertChainWatcherBot(ctx context.Context, botID, secret string, now time.Time) error {
+	botID = strings.TrimSpace(botID)
+	secret = strings.TrimSpace(secret)
+	if botID == "" {
+		return errors.New("chain watcher bot id is empty")
+	}
+	if secret == "" {
+		return errors.New("chain watcher bot secret is empty")
+	}
+	_, err := s.pool.Exec(ctx, `INSERT INTO chain_watcher_bots(bot_id, secret, status, created_at, updated_at)
+		VALUES($1, $2, 'active', $3, $3)
+		ON CONFLICT(bot_id) DO UPDATE SET secret=excluded.secret, status='active', updated_at=excluded.updated_at`,
+		botID, secret, now)
+	return err
+}
+
+func (s *Store) AuthenticateChainWatcherBot(ctx context.Context, botID, secret string) (bool, error) {
+	row := s.pool.QueryRow(ctx, `SELECT 1 FROM chain_watcher_bots
+		WHERE bot_id=$1 AND secret=$2 AND status='active'
+		LIMIT 1`, strings.TrimSpace(botID), strings.TrimSpace(secret))
+	var one int
+	err := row.Scan(&one)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func (s *Store) UpsertChainWatcherSubscription(ctx context.Context, sub ChainWatcherSubscription, now time.Time) error {
+	sub.BotID = strings.TrimSpace(sub.BotID)
+	sub.Address = strings.TrimSpace(sub.Address)
+	sub.Label = strings.TrimSpace(sub.Label)
+	sub.MinNotifyAmount = strings.TrimSpace(sub.MinNotifyAmount)
+	if sub.BotID == "" {
+		return errors.New("chain watcher subscription bot id is empty")
+	}
+	if sub.ChatID == 0 {
+		sub.ChatID = sub.OwnerUserID
+	}
+	if sub.OwnerUserID == 0 {
+		return errors.New("chain watcher subscription owner is empty")
+	}
+	if sub.Address == "" {
+		return errors.New("chain watcher subscription address is empty")
+	}
+	if sub.MinNotifyAmount == "" {
+		sub.MinNotifyAmount = "0"
+	}
+	_, err := s.pool.Exec(ctx, `INSERT INTO chain_watcher_subscriptions(
+			bot_id, chat_id, owner_user_id, address, label, watch_income, watch_expense, notify_trx, min_notify_amount,
+			active, created_at, updated_at
+		) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE, $10, $10)
+		ON CONFLICT(bot_id, chat_id, owner_user_id, address) DO UPDATE SET
+			label=excluded.label,
+			watch_income=excluded.watch_income,
+			watch_expense=excluded.watch_expense,
+			notify_trx=excluded.notify_trx,
+			min_notify_amount=excluded.min_notify_amount,
+			active=TRUE,
+			updated_at=excluded.updated_at`,
+		sub.BotID, sub.ChatID, sub.OwnerUserID, sub.Address, sub.Label, sub.WatchIncome, sub.WatchExpense, sub.NotifyTRX, sub.MinNotifyAmount, now)
+	return err
+}
+
+func (s *Store) RemoveChainWatcherSubscription(ctx context.Context, botID string, chatID int64, owner int64, address string, now time.Time) error {
+	if chatID == 0 {
+		chatID = owner
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE chain_watcher_subscriptions
+		SET active=FALSE, updated_at=$5
+		WHERE bot_id=$1 AND chat_id=$2 AND owner_user_id=$3 AND address=$4`,
+		strings.TrimSpace(botID), chatID, owner, strings.TrimSpace(address), now)
+	return err
+}
+
+func (s *Store) ReplaceChainWatcherSubscriptions(ctx context.Context, botID string, subs []ChainWatcherSubscription, now time.Time) error {
+	botID = strings.TrimSpace(botID)
+	if botID == "" {
+		return errors.New("chain watcher sync bot id is empty")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer rollback(ctx, tx)
+	if _, err := tx.Exec(ctx, `UPDATE chain_watcher_subscriptions SET active=FALSE, updated_at=$2 WHERE bot_id=$1`, botID, now); err != nil {
+		return err
+	}
+	for _, sub := range subs {
+		sub.BotID = botID
+		if sub.ChatID == 0 {
+			sub.ChatID = sub.OwnerUserID
+		}
+		sub.Address = strings.TrimSpace(sub.Address)
+		sub.Label = strings.TrimSpace(sub.Label)
+		sub.MinNotifyAmount = strings.TrimSpace(sub.MinNotifyAmount)
+		if sub.OwnerUserID == 0 || sub.Address == "" {
+			continue
+		}
+		if sub.MinNotifyAmount == "" {
+			sub.MinNotifyAmount = "0"
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO chain_watcher_subscriptions(
+				bot_id, chat_id, owner_user_id, address, label, watch_income, watch_expense, notify_trx, min_notify_amount,
+				active, created_at, updated_at
+			) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE, $10, $10)
+			ON CONFLICT(bot_id, chat_id, owner_user_id, address) DO UPDATE SET
+				label=excluded.label,
+				watch_income=excluded.watch_income,
+				watch_expense=excluded.watch_expense,
+				notify_trx=excluded.notify_trx,
+				min_notify_amount=excluded.min_notify_amount,
+				active=TRUE,
+				updated_at=excluded.updated_at`,
+			sub.BotID, sub.ChatID, sub.OwnerUserID, sub.Address, sub.Label, sub.WatchIncome, sub.WatchExpense, sub.NotifyTRX, sub.MinNotifyAmount, now); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Store) ListChainWatcherSubscriptions(ctx context.Context) ([]ChainWatcherSubscription, error) {
+	rows, err := s.pool.Query(ctx, `SELECT bot_id, chat_id, owner_user_id, address, label,
+		watch_income, watch_expense, notify_trx, min_notify_amount, active, updated_at
+		FROM chain_watcher_subscriptions
+		WHERE active=TRUE
+		ORDER BY address, bot_id, owner_user_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ChainWatcherSubscription
+	for rows.Next() {
+		var sub ChainWatcherSubscription
+		if err := rows.Scan(&sub.BotID, &sub.ChatID, &sub.OwnerUserID, &sub.Address, &sub.Label, &sub.WatchIncome, &sub.WatchExpense, &sub.NotifyTRX, &sub.MinNotifyAmount, &sub.Active, &sub.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, sub)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) RecordChainWatcherMatches(ctx context.Context, event ChainWatcherEvent, deliveries []ChainWatcherMatchedEvent, now time.Time) (int, error) {
+	event.EventID = strings.TrimSpace(event.EventID)
+	event.TxHash = strings.TrimSpace(event.TxHash)
+	if event.EventID == "" {
+		return 0, errors.New("chain watcher event id is empty")
+	}
+	if event.TxHash == "" {
+		return 0, errors.New("chain watcher tx hash is empty")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer rollback(ctx, tx)
+	if _, err := tx.Exec(ctx, `INSERT INTO chain_watcher_events(
+			event_id, tx_hash, contract, from_address, to_address, value, token_symbol, token_address,
+			token_decimals, block_timestamp, confirmed, source, created_at
+		) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		ON CONFLICT(event_id) DO NOTHING`,
+		event.EventID, event.TxHash, event.Contract, event.From, event.To, event.Value, event.TokenSymbol, event.TokenAddress,
+		event.TokenDecimals, event.BlockTimestamp, event.Confirmed, event.Source, now); err != nil {
+		return 0, err
+	}
+	inserted := 0
+	for _, d := range deliveries {
+		d.DeliveryID = strings.TrimSpace(d.DeliveryID)
+		if d.ChatID == 0 {
+			d.ChatID = d.OwnerUserID
+		}
+		if d.DeliveryID == "" || d.BotID == "" || d.ChatID == 0 || d.OwnerUserID == 0 || d.WatchAddress == "" {
+			continue
+		}
+		tag, err := tx.Exec(ctx, `INSERT INTO chain_watcher_matched_events(
+				delivery_id, event_id, bot_id, chat_id, owner_user_id, watch_address, label, direction,
+				tx_hash, from_address, to_address, value, token_symbol, token_address, token_decimals,
+				block_timestamp, confirmed, status, attempts, next_attempt_at, created_at, updated_at
+			) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'pending', 0, $18, $18, $18)
+			ON CONFLICT(delivery_id) DO NOTHING`,
+			d.DeliveryID, event.EventID, d.BotID, d.ChatID, d.OwnerUserID, d.WatchAddress, d.Label, d.Direction,
+			event.TxHash, event.From, event.To, event.Value, event.TokenSymbol, event.TokenAddress, event.TokenDecimals,
+			event.BlockTimestamp, event.Confirmed, now)
+		if err != nil {
+			return 0, err
+		}
+		inserted += int(tag.RowsAffected())
+	}
+	return inserted, tx.Commit(ctx)
+}
+
+func (s *Store) ClaimChainWatcherMatchedEvents(ctx context.Context, botID string, limit int, lease time.Duration, maxAge time.Duration, now time.Time) ([]ChainWatcherMatchedEvent, error) {
+	if limit < 1 {
+		limit = 1
+	}
+	if lease <= 0 {
+		lease = 30 * time.Second
+	}
+	if maxAge <= 0 {
+		maxAge = 10 * time.Minute
+	}
+	staleBefore := now.Add(-lease)
+	keepAfter := now.Add(-maxAge)
+	rows, err := s.pool.Query(ctx, `WITH next AS (
+			SELECT delivery_id
+			FROM chain_watcher_matched_events
+			WHERE bot_id=$1
+				AND (
+					status = 'pending'
+					OR (status = 'delivering' AND updated_at <= $4)
+				)
+				AND next_attempt_at <= $2
+				AND created_at >= $5
+			ORDER BY created_at ASC, delivery_id ASC
+			LIMIT $3
+			FOR UPDATE SKIP LOCKED
+		)
+		UPDATE chain_watcher_matched_events m
+		SET status='delivering',
+			attempts=m.attempts + 1,
+			updated_at=$2
+		FROM next
+		WHERE m.delivery_id=next.delivery_id
+		RETURNING m.delivery_id, m.event_id, m.bot_id, m.chat_id, m.owner_user_id, m.watch_address, m.label,
+			m.direction, m.tx_hash, m.from_address, m.to_address, m.value, m.token_symbol,
+			m.token_address, m.token_decimals, m.block_timestamp, m.confirmed, m.status, m.attempts,
+			m.created_at, m.updated_at, m.delivered_at`,
+		strings.TrimSpace(botID), now, limit, staleBefore, keepAfter)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ChainWatcherMatchedEvent
+	for rows.Next() {
+		var item ChainWatcherMatchedEvent
+		if err := rows.Scan(&item.DeliveryID, &item.EventID, &item.BotID, &item.ChatID, &item.OwnerUserID, &item.WatchAddress, &item.Label,
+			&item.Direction, &item.TxHash, &item.From, &item.To, &item.Value, &item.TokenSymbol,
+			&item.TokenAddress, &item.TokenDecimals, &item.BlockTimestamp, &item.Confirmed, &item.Status, &item.Attempts,
+			&item.CreatedAt, &item.UpdatedAt, &item.DeliveredAt); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) AckChainWatcherMatchedEvents(ctx context.Context, botID string, deliveryIDs []string, now time.Time) error {
+	if len(deliveryIDs) == 0 {
+		return nil
+	}
+	clean := make([]string, 0, len(deliveryIDs))
+	for _, id := range deliveryIDs {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			clean = append(clean, id)
+		}
+	}
+	if len(clean) == 0 {
+		return nil
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE chain_watcher_matched_events
+		SET status='delivered', delivered_at=$3, updated_at=$3
+		WHERE bot_id=$1 AND delivery_id = ANY($2)`,
+		strings.TrimSpace(botID), clean, now)
+	return err
+}
+
+func (s *Store) CleanupChainWatcherRetention(ctx context.Context, maxAge time.Duration, now time.Time) error {
+	if maxAge <= 0 {
+		maxAge = 10 * time.Minute
+	}
+	cutoff := now.Add(-maxAge)
+	if _, err := s.pool.Exec(ctx, `DELETE FROM chain_watcher_matched_events WHERE created_at < $1`, cutoff); err != nil {
+		return err
+	}
+	_, err := s.pool.Exec(ctx, `DELETE FROM chain_watcher_events WHERE created_at < $1`, cutoff)
 	return err
 }
 

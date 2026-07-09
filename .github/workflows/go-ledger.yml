@@ -56,11 +56,15 @@ jobs:
 
       - name: Build
         working-directory: go-ledger
-        run: go build ./cmd/ledger-bot
+        run: |
+          go build ./cmd/ledger-bot
+          go build ./cmd/chain-watcher
 
-      - name: Build Docker image
+      - name: Build Docker images
         working-directory: go-ledger
-        run: docker build -t telegram-ledger-bot-go:2.1 .
+        run: |
+          docker build --build-arg APP=ledger-bot -t telegram-ledger-bot-go:2.2 .
+          docker build --build-arg APP=chain-watcher -t telegram-ledger-chain-watcher:2.2 .
 
       - name: Login to GHCR
         if: github.event_name == 'push'
@@ -70,8 +74,13 @@ jobs:
         if: github.event_name == 'push'
         working-directory: go-ledger
         run: |
-          IMAGE="ghcr.io/${{ github.repository_owner }}/telegram-ledger-bot-go"
-          docker tag telegram-ledger-bot-go:2.1 "$IMAGE:2.1"
-          docker tag telegram-ledger-bot-go:2.1 "$IMAGE:latest"
-          docker push "$IMAGE:2.1"
-          docker push "$IMAGE:latest"
+          BOT_IMAGE="ghcr.io/${{ github.repository_owner }}/telegram-ledger-bot-go"
+          WATCHER_IMAGE="ghcr.io/${{ github.repository_owner }}/telegram-ledger-chain-watcher"
+          docker tag telegram-ledger-bot-go:2.2 "$BOT_IMAGE:2.2"
+          docker tag telegram-ledger-bot-go:2.2 "$BOT_IMAGE:latest"
+          docker tag telegram-ledger-chain-watcher:2.2 "$WATCHER_IMAGE:2.2"
+          docker tag telegram-ledger-chain-watcher:2.2 "$WATCHER_IMAGE:latest"
+          docker push "$BOT_IMAGE:2.2"
+          docker push "$BOT_IMAGE:latest"
+          docker push "$WATCHER_IMAGE:2.2"
+          docker push "$WATCHER_IMAGE:latest"

@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/chainclient"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/config"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/p2p"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/permissions"
@@ -23,9 +24,10 @@ type Bot struct {
 	store *storage.Store
 	tg    *telegram.Client
 	tron  *tron.Client
-	p2p   *p2p.Client
-	perms permissions.Policy
-	loc   *time.Location
+	p2p     *p2p.Client
+	watcher *chainclient.Client
+	perms   permissions.Policy
+	loc     *time.Location
 
 	dispatcher    *worker.Dispatcher
 	ledgerPool    *worker.Pool
@@ -59,6 +61,7 @@ func New(cfg config.Config, store *storage.Store, tg *telegram.Client, tronClien
 		tg:               tg,
 		tron:             tronClient,
 		p2p:              p2pClient,
+		watcher:          chainclient.New(cfg.ChainWatcherURL, cfg.ChainWatcherBotID, cfg.ChainWatcherSecret, cfg.RequestTimeout),
 		perms:            permissions.NewPolicy(cfg.HostUserID, cfg.DefaultOperatorIDs),
 		loc:              loc,
 		dispatcher:       worker.NewDispatcher(),
@@ -92,7 +95,12 @@ func (b *Bot) Run(ctx context.Context) error {
 	b.notifyPool.StartN(ctx, b.cfg.NotifyWorkers)
 	b.textGateway.Start(ctx)
 
-	go b.addressWatchScheduler(ctx)
+	if b.cfg.ChainWatcherEnabled() {
+		go b.chainWatcherSyncScheduler(ctx)
+		go b.chainWatcherEventScheduler(ctx)
+	} else {
+		go b.addressWatchScheduler(ctx)
+	}
 	go b.notificationOutboxScheduler(ctx)
 	go b.rateScheduler(ctx)
 

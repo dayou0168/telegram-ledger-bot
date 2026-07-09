@@ -1,6 +1,6 @@
-# Go Ledger Bot v2.1 Architecture
+# Go Ledger Bot v2.2 Architecture
 
-这个目录是 Telegram 记账机器人的 Go v2.1 主线。Python 1.3 已作为旧稳定版封存，Go 版不再延续 SQLite 设计，直接按 PostgreSQL-first 重建。当前测试阶段不导入旧数据库，直接空库起步。
+这个目录是 Telegram 记账机器人的 Go v2.2 主线。当前主线按 PostgreSQL-first 设计，生产部署、测试和发布都以 Go 运行时为准。
 
 ## 目标
 
@@ -8,7 +8,7 @@
 - 广播、链上监听、TRX 查询、汇率刷新互相隔离，慢任务不拖住实时消息。
 - 同一群账本严格串行，避免并发写入导致账本乱序。
 - 不把所有逻辑堆在一个 handler 中，按同步路径、异步任务、后台调度拆分。
-- PostgreSQL 作为生产主库，后续按需要再引入 Redis 做分布式缓存、限流和任务队列。
+- PostgreSQL 作为生产主库；多个机器人实例各自独立 PostgreSQL，共享链上监听服务 `ledger-chain-watcher`。
 
 ## 同步路径
 
@@ -32,7 +32,7 @@
 
 - 群发/分组广播。
 - 通知所有人。
-- 链上监听扫描。
+- 链上监听订阅同步和 watcher 事件领取。
 - TRX 地址查询。
 - Z0/实时汇率刷新。
 - 广播回复通知。
@@ -53,7 +53,7 @@ Go 版使用两层队列：
 2. 功能任务队列
    - `ledger_pool`: 群内记账和群设置。
    - `control_pool`: 私聊菜单、按钮回调、后台入口。
-   - `chain_pool`: 链上监听扫描。
+   - `chain_pool`: watcher 订阅同步、matched events 领取和本地入 outbox。
    - `rate_pool`: 汇率刷新和 Z0 查询。
    - `broadcast_pool`: 群发/分组广播。
    - `notify_pool`: 广播回复通知、链上提醒发送。
@@ -66,7 +66,7 @@ Go 版使用两层队列：
 - 群内账本：按群串行，跨群并发。
 - 热群加速：同一群账本写入仍串行，但回执发送、账单快照重算、通知、TRX 查询、缓存预热等旁路任务进入独立池。
 - 私聊控制台：按用户串行，跨用户并发。
-- 链上监听：主扫描单请求拉取全网 USDT 最新流水，本地匹配所有监听地址；按地址回补低频执行。
+- 链上监听：机器人同步监听地址到 `ledger-chain-watcher`，watcher 统一拉取链上流水并按 bot_id 投递匹配事件。
 - 广播：任务级并发，单个任务内部按目标群限速发送。
 - 通知：独立池，避免 Telegram 发送慢拖住监听或记账。
 - 少量群活跃时，空闲 CPU/内存优先服务这些热群：提前刷新权限/群配置缓存，异步发送回执，预计算账单摘要，维持地址监听索引，减少下一笔操作等待。
@@ -84,7 +84,7 @@ Go 版使用两层队列：
 
 ## 数据库策略
 
-v2.1 起直接使用 PostgreSQL：
+v2.2 起继续直接使用 PostgreSQL：
 
 - `pgxpool` 连接池，默认 `MaxConns=32`、`MinConns=4`。
 - Telegram ID 使用 `BIGINT`。
@@ -94,22 +94,17 @@ v2.1 起直接使用 PostgreSQL：
 - 幂等表记录 Telegram update 和链上 tx hash，避免重复处理。
 - 高频路径从第一版就建立组合索引：权限、账单日切窗口、撤销消息定位、地址监听目标、链上去重、广播回执定位。
 
-暂不继续维护 SQLite 主线，也不做旧库导入。测试阶段直接使用 PostgreSQL 空库验证 Go v2.1 的账本、广播、监听和后台逻辑。
+测试阶段直接使用 PostgreSQL 空库验证 Go v2.2 的账本、广播、监听和后台逻辑。
 
 ## 链上监听策略
 
-- 默认每秒主扫描 Tronscan `token_trc20/transfers`。
-- 主扫描不等待链上完全确认，接口返回就先提醒。
-- 本地匹配监听地址，避免 100 个地址每秒请求 100 次。
-- tx hash + owner + address + direction 去重。
-- 按地址低频回补用于补漏。
-- 通知发送进入 `notify_pool`，扫描线程不等待 Telegram 发送。
+- 机器人侧保存监听地址、监听开关、最小金额、tx_hash 去重和 Telegram outbox。
+- 机器人通过 `CHAIN_WATCHER_URL`、`CHAIN_WATCHER_BOT_ID`、`CHAIN_WATCHER_SECRET` 接入共享 watcher。
+- watcher 使用独立 PostgreSQL 保存 bot 凭据、订阅、链上事件、匹配事件和投递游标。
+- watcher 第一版统一请求 Tronscan/TronGrid，后续可切换 TRON Lite FullNode + Event Plugin V2 + Kafka。
+- watcher 按 `bot_id` 隔离订阅和投递；机器人实例之间不共享业务数据库。
+- 通知发送仍进入机器人 `notify_pool`，watcher 不直接发送 Telegram。
 
-## 迁移策略
+## 发布策略
 
-Go 版不会直接替换 Python 线上版本。推荐分阶段：
-
-1. Go 版跑通配置、长轮询、基础记账和地址监听。
-2. 广播、后台、网页账单逐块迁移。
-3. 真实测试群影子运行一段时间。
-4. 确认账单、广播、监听一致后切换生产 Bot Token。
+Go v2.2 是当前唯一发布主线。每次发布前按模块测试账本、广播、监听、后台、chain-watcher 和部署配置，确认后再推送镜像。

@@ -42,10 +42,10 @@ func TestPostgresStoreBasicFlow(t *testing.T) {
 		t.Fatalf("duplicate update claim should be false")
 	}
 
-	if err := store.EnsureGroup(ctx, chatID, "Go v2.1 test group", now); err != nil {
+	if err := store.EnsureGroup(ctx, chatID, "Go v2.2 test group", now); err != nil {
 		t.Fatalf("ensure group: %v", err)
 	}
-	user := User{ID: userID, Username: "go21", DisplayName: "Go 2.1"}
+	user := User{ID: userID, Username: "go22", DisplayName: "Go 2.2"}
 	if err := store.TouchUser(ctx, chatID, user, now); err != nil {
 		t.Fatalf("touch user: %v", err)
 	}
