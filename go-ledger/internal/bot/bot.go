@@ -209,9 +209,6 @@ func (b *Bot) handleMessage(ctx context.Context, msg telegram.Message) error {
 	if text == "" {
 		return nil
 	}
-	if !b.cfg.LedgerEnabled {
-		return nil
-	}
 	switch text {
 	case "开始":
 		return b.startAccounting(ctx, msg, user, now)
@@ -226,6 +223,14 @@ func (b *Bot) handleMessage(ctx context.Context, msg telegram.Message) error {
 		return b.handleNotifyAll(ctx, msg, user)
 	}
 	if isBillCommand(text) {
+		group, err := b.store.GetGroup(ctx, msg.Chat.ID)
+		if err != nil {
+			return err
+		}
+		ok, err := b.guardAccountingStarted(ctx, msg, user, group, now, "ledger_bill_inactive")
+		if err != nil || !ok {
+			return err
+		}
 		return b.sendBill(ctx, msg.Chat.ID, msg.MessageID, now, "")
 	}
 	if isZ0Command(text) {

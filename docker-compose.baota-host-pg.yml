@@ -7,8 +7,8 @@
 #
 # 宝塔 PostgreSQL 数据库名建议：
 # - watcher 数据库：ledgerchainwatcher
-# - 当前机器人数据库：ledgerbotmain
-# - 第二个机器人数据库：ledgerbotforward
+# - 每个机器人实例一个独立数据库，例如 ledgerbotmain、ledgerbottianze、ledgerbotforward
+# - 同一个机器人里的广播/转发数据和记账数据共用该机器人自己的数据库，不要拆成两个库
 # 数据库名不要使用下划线、横杠、中文、空格或特殊符号。
 
 services:
@@ -75,7 +75,10 @@ services:
       BOT_HOST_USER_ID: "123456789"
 
       # ==================== 必填配置：数据库 ====================
-      # 使用宿主机/宝塔 PostgreSQL。请先在宝塔里创建数据库 ledgerbotmain。
+      # 使用宿主机/宝塔 PostgreSQL。请先在宝塔里创建本机器人专用数据库。
+      # 这个库同时保存本机器人广播/转发配置和记账数据。
+      # 示例 ledgerbotmain 适合作为主机器人或未来迁移目标；
+      # 如果这是 tianzezsbot，可改为 ledgerbottianze。
       DATABASE_URL: "postgres://ledger:改成你的PostgreSQL强密码@host.docker.internal:5432/ledgerbotmain?sslmode=disable"
 
       # ==================== 必填配置：共享 chain-watcher ====================
@@ -88,10 +91,11 @@ services:
       # 默认操作人，多个 Telegram 数字 ID 用英文逗号分隔。
       DEFAULT_OPERATOR_USER_IDS: ""
 
-      # 是否启用群内记账功能。普通记账机器人保持 1。
-      # 如果是把旧转发/广播机器人升级成 Go 版，只用于群发广播，请改成 0，
-      # 这样群里有人发送 +100、下发100U 等内容时，机器人不会误判为记账命令并回复。
-      BOT_LEDGER_ENABLED: "1"
+      # 广播和记账是一体能力。每个群默认未开始记账，只保存群名并支持广播；
+      # 需要记账的群，由宿主、默认操作人或本群操作员在群里发送“开始”。
+      # 普通成员发送“开始”会提示没有操作权限；未开始群里的普通金额文本会被静默忽略。
+      # 日切后当前群记账激活状态自动失效；新业务日需要重新发送“开始”，
+      # 但汇率、费率、操作员和广播配置会继续保留。
 
       # 完整账单/后台公网域名，必须带 https://；不用网页账单可留空。
       PUBLIC_BILL_BASE_URL: ""

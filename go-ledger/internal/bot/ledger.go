@@ -13,6 +13,11 @@ import (
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/telegram"
 )
 
+const (
+	ledgerPermissionDeniedText = "没有操作权限。请管理员添加操作员。"
+	ledgerInactiveText         = "当前未开始记账，请先发送“开始”。"
+)
+
 func (b *Bot) startAccounting(ctx context.Context, msg telegram.Message, user storage.User, now time.Time) error {
 	if !b.perms.HasGlobalLedgerAccess(user.ID) {
 		ok, err := b.isGroupOperator(ctx, msg.Chat.ID, user.ID)
@@ -20,13 +25,18 @@ func (b *Bot) startAccounting(ctx context.Context, msg telegram.Message, user st
 			return err
 		}
 		if !ok {
-			return b.enqueueReplyText(ctx, sendPriorityNormal, "ledger_start_denied", msg.Chat.ID, msg.MessageID, "没有开启记账权限。", nil, now)
+			return b.enqueueReplyText(ctx, sendPriorityNormal, "ledger_start_denied", msg.Chat.ID, msg.MessageID, ledgerPermissionDeniedText, nil, now)
 		}
 	}
 	if b.isHost(user.ID) {
 		_ = b.store.SetGroupOwner(ctx, msg.Chat.ID, user, now)
 	}
-	if err := b.store.SetGroupActive(ctx, msg.Chat.ID, true, now); err != nil {
+	group, err := b.store.GetGroup(ctx, msg.Chat.ID)
+	if err != nil {
+		return err
+	}
+	activeDayKey := businessDayKey(now, group.CutoffHour)
+	if err := b.store.SetGroupActive(ctx, msg.Chat.ID, true, activeDayKey, now); err != nil {
 		return err
 	}
 	return b.enqueueReplyText(ctx, sendPriorityNormal, "ledger_start_ok", msg.Chat.ID, msg.MessageID, "机器人已开启，请开始记账", nil, now)
@@ -36,9 +46,9 @@ func (b *Bot) stopAccounting(ctx context.Context, msg telegram.Message, user sto
 	if ok, err := b.canUseLedger(ctx, msg.Chat.ID, user.ID); err != nil {
 		return err
 	} else if !ok {
-		return b.enqueueReplyText(ctx, sendPriorityNormal, "ledger_stop_denied", msg.Chat.ID, msg.MessageID, "没有停止记账权限。", nil, now)
+		return b.enqueueReplyText(ctx, sendPriorityNormal, "ledger_stop_denied", msg.Chat.ID, msg.MessageID, ledgerPermissionDeniedText, nil, now)
 	}
-	if err := b.store.SetGroupActive(ctx, msg.Chat.ID, false, now); err != nil {
+	if err := b.store.SetGroupActive(ctx, msg.Chat.ID, false, "", now); err != nil {
 		return err
 	}
 	return b.enqueueReplyText(ctx, sendPriorityNormal, "ledger_stop_ok", msg.Chat.ID, msg.MessageID, "已停止记账。发送“开始”可重新开启。", nil, now)
@@ -50,15 +60,22 @@ func (b *Bot) handleLedger(ctx context.Context, msg telegram.Message, user stora
 		return err
 	}
 	if cmd.Amount.Sign() == 0 {
+		ok, err := b.guardAccountingStarted(ctx, msg, user, group, now, "ledger_zero_inactive")
+		if err != nil || !ok {
+			return err
+		}
 		return b.sendBill(ctx, msg.Chat.ID, msg.MessageID, now, "")
-	}
-	if !group.Active {
-		return b.enqueueReplyText(ctx, sendPriorityNormal, "ledger_inactive", msg.Chat.ID, msg.MessageID, "当前未开始记账，请先发送“开始”。", nil, now)
 	}
 	if ok, err := b.canUseLedgerWithGroup(ctx, group, user.ID); err != nil {
 		return err
 	} else if !ok {
-		return b.enqueueReplyText(ctx, sendPriorityNormal, "ledger_record_denied", msg.Chat.ID, msg.MessageID, "没有操作权限。请管理员添加操作员。", nil, now)
+		if !groupAccountingActive(group, now) {
+			return nil
+		}
+		return b.enqueueReplyText(ctx, sendPriorityNormal, "ledger_record_denied", msg.Chat.ID, msg.MessageID, ledgerPermissionDeniedText, nil, now)
+	}
+	if !groupAccountingActive(group, now) {
+		return b.enqueueReplyText(ctx, sendPriorityNormal, "ledger_inactive", msg.Chat.ID, msg.MessageID, ledgerInactiveText, nil, now)
 	}
 
 	effectiveAmount := new(big.Rat).Set(cmd.Amount)
@@ -124,11 +141,32 @@ func ledgerSubjectFromMessage(msg telegram.Message, actor storage.User) storage.
 	return actor
 }
 
+func groupAccountingActive(group storage.Group, now time.Time) bool {
+	if !group.Active {
+		return false
+	}
+	return group.ActiveDayKey == businessDayKey(now, group.CutoffHour)
+}
+
+func (b *Bot) guardAccountingStarted(ctx context.Context, msg telegram.Message, user storage.User, group storage.Group, now time.Time, dedupeKind string) (bool, error) {
+	if groupAccountingActive(group, now) {
+		return true, nil
+	}
+	ok, err := b.canUseLedgerWithGroup(ctx, group, user.ID)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil
+	}
+	return false, b.enqueueReplyText(ctx, sendPriorityNormal, dedupeKind, msg.Chat.ID, msg.MessageID, ledgerInactiveText, nil, now)
+}
+
 func (b *Bot) handleSetting(ctx context.Context, msg telegram.Message, user storage.User, cmd settingCommand, now time.Time) error {
 	if ok, err := b.canUseLedger(ctx, msg.Chat.ID, user.ID); err != nil {
 		return err
 	} else if !ok {
-		return b.enqueueReplyText(ctx, sendPriorityNormal, "ledger_setting_denied", msg.Chat.ID, msg.MessageID, "没有设置权限。", nil, now)
+		return b.enqueueReplyText(ctx, sendPriorityNormal, "ledger_setting_denied", msg.Chat.ID, msg.MessageID, ledgerPermissionDeniedText, nil, now)
 	}
 	switch cmd.Kind {
 	case "fee":

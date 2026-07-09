@@ -19,7 +19,6 @@ type Config struct {
 
 	HostUserID         int64
 	DefaultOperatorIDs map[int64]struct{}
-	LedgerEnabled      bool
 
 	LedgerWorkers       int
 	ControlWorkers      int
@@ -74,7 +73,6 @@ func Load() (Config, error) {
 		Timezone:                   env("BOT_TIMEZONE", "Asia/Shanghai"),
 		HostUserID:                 int64Env("BOT_HOST_USER_ID", 0),
 		DefaultOperatorIDs:         parseIDs(os.Getenv("DEFAULT_OPERATOR_USER_IDS")),
-		LedgerEnabled:              boolEnv("BOT_LEDGER_ENABLED", true),
 		LedgerWorkers:              intEnv("BOT_WORKER_THREADS", 16),
 		ControlWorkers:             intEnv("BOT_CONTROL_THREADS", 6),
 		ChainWorkers:               intEnv("BOT_CHAIN_THREADS", 12),

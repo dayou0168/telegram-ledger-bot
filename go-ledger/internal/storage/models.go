@@ -12,6 +12,7 @@ type Group struct {
 	ChatID              int64
 	Title               string
 	Active              bool
+	ActiveDayKey        string
 	BusinessOpen        bool
 	OwnerUserID         int64
 	DepositRate         string

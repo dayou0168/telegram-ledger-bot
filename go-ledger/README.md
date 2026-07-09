@@ -8,12 +8,12 @@
 - PostgreSQL 主存储，启动时自动迁移 schema 和索引。
 - 金额保存统一四舍五入到小数点后 2 位；汇率保留必要精度。
 - 基础群保存、用户 touch、操作员权限表、账本记录表。
-- `开始` / `停止`，日切后不重置群配置，费率和汇率继续沿用。
+- `开始` / `停止`，日切后当前群记账激活状态失效，新业务日需要重新发送 `开始`；费率、汇率、操作员和广播配置继续沿用。
 - `上课` / `下课` 调用 Telegram 群权限开启或关闭全员发言，机器人需要群管理权限。
 - `设置费率3`、`设置汇率7.1`、`设置日切04`。
 - `+100`、`+100/7`、`+100*5/7.1`、`+100*3%`、`+100U`、`下发100U`、`下发5000/7.8`、`下发5000*5/7.1`；`下发100` 已禁用，避免误把人民币当 U。
 - 群内运算：`1000/6.8`、`1000/7.5-1000/6.8`、`(2+3)*4` 直接回复计算结果，不写入账单。
-- `+0`、`显示账单`、`账单` 生成当前业务日账单摘要。
+- `+0`、`显示账单`、`账单` 生成当前业务日账单摘要；未开始的新账期里普通成员静默，有权限的人会收到先发送 `开始` 的提示。
 - `通知所有人` 会在群内 @ 已发言成员，并按 Telegram 消息长度自动分段。
 - `清除今日账单` / `清除全部账单` 带二次确认，只清当前群账单，不重置群配置、汇率或费率。
 - 回复原始加账消息或机器人账单回执发送 `撤销` / `撤销入款` / `撤销下发`。
@@ -64,7 +64,6 @@ BOT_HOST_USER_ID=123456789
 DATABASE_URL=postgres://ledger:change_this_strong_password@postgres:5432/ledger_bot?sslmode=disable
 PUBLIC_BILL_BASE_URL=https://bot.example.com
 ADMIN_WEB_TOKEN=change_this_admin_password
-BOT_LEDGER_ENABLED=1
 CHAIN_WATCHER_URL=http://ledger-chain-watcher:8090
 CHAIN_WATCHER_BOT_ID=ledger-main
 CHAIN_WATCHER_SECRET=change_this_chain_watcher_secret
