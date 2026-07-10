@@ -82,6 +82,30 @@ func (c *Client) AckEvents(ctx context.Context, ids []string) error {
 	return c.post(ctx, "/v1/events/ack", chainwatcher.AckRequest{DeliveryIDs: ids}, nil)
 }
 
+func (c *Client) Health(ctx context.Context) error {
+	if !c.Enabled() {
+		return nil
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/healthz", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("chain watcher health http %d: %s", resp.StatusCode, string(body))
+	}
+	return nil
+}
+
 func (c *Client) post(ctx context.Context, path string, payload any, out any) error {
 	if !c.Enabled() {
 		return nil

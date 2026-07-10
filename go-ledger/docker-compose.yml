@@ -1,4 +1,4 @@
-# Telegram 记账机器人 Go v2.3 + PostgreSQL + shared chain watcher
+# Telegram 记账机器人 Go v2.3.1 + PostgreSQL + shared chain watcher
 #
 # 单机器人一体部署模板。多机器人共享 watcher 时，请使用仓库根目录
 # docker-compose.chain-watcher.yml 单独部署 watcher，再让每个机器人加入 ledger-chain-net。
@@ -39,7 +39,7 @@ services:
       retries: 10
 
   ledger-chain-watcher:
-    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3
+    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.1
     container_name: ledger-chain-watcher
     restart: unless-stopped
     depends_on:
@@ -55,9 +55,11 @@ services:
       CHAIN_WATCHER_TRON_API_KEY: ""
       TRON_USDT_CONTRACT: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
       CHAIN_WATCHER_SOURCE_POLL_SECONDS: "1"
-      CHAIN_WATCHER_GLOBAL_SCAN_PAGES: "1"
-      CHAIN_WATCHER_ADDRESS_SCAN_PAGES: "3"
-      CHAIN_WATCHER_ADDRESS_SCAN_CONCURRENCY: "8"
+      CHAIN_WATCHER_GLOBAL_SCAN_PAGES: "3"
+      CHAIN_WATCHER_ADDRESS_SCAN_INTERVAL_SECONDS: "30"
+      CHAIN_WATCHER_ADDRESS_SCAN_PAGES: "1"
+      CHAIN_WATCHER_ADDRESS_SCAN_CONCURRENCY: "1"
+      CHAIN_WATCHER_TRON_REQUEST_INTERVAL_MS: "250"
       CHAIN_WATCHER_LOOKBACK_SECONDS: "600"
       CHAIN_WATCHER_CLAIM_LEASE_SECONDS: "30"
       CHAIN_WATCHER_DELIVERY_RETRY_SECONDS: "2"
@@ -70,7 +72,7 @@ services:
       retries: 10
 
   ledger-bot:
-    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.3
+    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.1
     container_name: ledger-bot-go
     restart: unless-stopped
     depends_on:
@@ -86,7 +88,7 @@ services:
       CHAIN_WATCHER_URL: "http://ledger-chain-watcher:8090"
       CHAIN_WATCHER_BOT_ID: "ledger-main"
       CHAIN_WATCHER_SECRET: "change_this_chain_watcher_secret"
-      # Emergency fallback is off by default. Enabling it makes this bot scan addresses locally too.
+      # Emergency fallback stays off by default. Normal mode only consumes watcher events.
       CHAIN_WATCHER_EMERGENCY_FALLBACK: "false"
       DEFAULT_OPERATOR_USER_IDS: ""
       PUBLIC_BILL_BASE_URL: ""
@@ -105,7 +107,7 @@ services:
       TELEGRAM_API_BASE: "https://api.telegram.org"
       BOT_POLL_TIMEOUT: "50"
       BOT_REQUEST_TIMEOUT: "30"
-      # Only used when CHAIN_WATCHER_EMERGENCY_FALLBACK=true; leave empty for normal shared watcher mode.
+      # Automatic fallback uses public no-key API by default; fill only for persistent emergency mode.
       TRONGRID_API_KEY: ""
       TRON_USDT_CONTRACT: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
       TRON_POLL_INTERVAL_SECONDS: "1"
@@ -113,6 +115,11 @@ services:
       TRON_INITIAL_LOOKBACK_MINUTES: "15"
       CHAIN_WATCHER_POLL_SECONDS: "1"
       CHAIN_WATCHER_BATCH_SIZE: "50"
+      BOT_WATCHER_HEALTH_INTERVAL_SECONDS: "1"
+      BOT_WATCHER_FAIL_THRESHOLD: "2"
+      BOT_WATCHER_CLAIM_TIMEOUT_MS: "2000"
+      BOT_FALLBACK_POLL_SECONDS: "1"
+      BOT_FALLBACK_MAX_ACTIVE_SECONDS: "600"
       P2P_RATE_API_BASE: "https://p2p.army/api/fapi"
       P2P_RATE_FRONT_API: "NextVOF2Ozuh36mW0TCv"
       P2P_RATE_MARKET: "okx"

@@ -2,7 +2,9 @@ package tron
 
 import (
 	"encoding/json"
+	"net/http"
 	"testing"
+	"time"
 )
 
 func TestTronscanAddressTransferResponse(t *testing.T) {
@@ -38,6 +40,20 @@ func TestTronscanAddressTransferResponse(t *testing.T) {
 	}
 	if transfer.From != "TCYugQbJeHtUZF9vNmFExXMnCPNgN7kPPV" || transfer.To != "TWqcMjV7Wq2RHe2CSiKQHpkn6A7B2AWUPe" {
 		t.Fatalf("unexpected addresses: %+v", transfer)
+	}
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	now := time.Unix(1000, 0).UTC()
+	if got := parseRetryAfter("7", now); got != 7*time.Second {
+		t.Fatalf("numeric Retry-After = %s, want 7s", got)
+	}
+	when := now.Add(9 * time.Second).Format(http.TimeFormat)
+	if got := parseRetryAfter(when, now); got != 9*time.Second {
+		t.Fatalf("date Retry-After = %s, want 9s", got)
+	}
+	if got := parseRetryAfter("", now); got != 0 {
+		t.Fatalf("empty Retry-After = %s, want 0", got)
 	}
 }
 

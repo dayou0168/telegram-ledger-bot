@@ -9,13 +9,17 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 type Client struct {
-	baseURL string
-	apiKey  string
-	http    *http.Client
+	baseURL     string
+	apiKey      string
+	http        *http.Client
+	throttle    sync.Mutex
+	minInterval time.Duration
+	nextRequest time.Time
 }
 
 type Transfer struct {
@@ -48,6 +52,34 @@ func NewClient(baseURL, apiKey string, timeout time.Duration) *Client {
 		apiKey:  strings.TrimSpace(apiKey),
 		http:    &http.Client{Timeout: timeout},
 	}
+}
+
+type HTTPError struct {
+	StatusCode int
+	Body       string
+	RetryAfter time.Duration
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("tronscan http %d: %s", e.StatusCode, e.Body)
+}
+
+func (e *HTTPError) RateLimited() bool {
+	return e != nil && e.StatusCode == http.StatusTooManyRequests
+}
+
+func IsRateLimited(err error) (*HTTPError, bool) {
+	httpErr, ok := err.(*HTTPError)
+	return httpErr, ok && httpErr.RateLimited()
+}
+
+func (c *Client) SetMinRequestInterval(interval time.Duration) {
+	c.throttle.Lock()
+	defer c.throttle.Unlock()
+	if interval < 0 {
+		interval = 0
+	}
+	c.minInterval = interval
 }
 
 func (c *Client) FetchGlobalUSDTTransfers(ctx context.Context, contract string, minTimestamp int64, pages int) ([]Transfer, error) {
@@ -171,6 +203,9 @@ func (c *Client) FetchAccount(ctx context.Context, address, usdtContract string)
 }
 
 func (c *Client) get(ctx context.Context, path string, values url.Values, out any) error {
+	if err := c.waitThrottle(ctx); err != nil {
+		return err
+	}
 	apiURL := c.baseURL + path
 	if len(values) > 0 {
 		apiURL += "?" + values.Encode()
@@ -193,12 +228,62 @@ func (c *Client) get(ctx context.Context, path string, values url.Values, out an
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("tronscan http %d: %s", resp.StatusCode, string(raw))
+		return &HTTPError{
+			StatusCode: resp.StatusCode,
+			Body:       string(raw),
+			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
+		}
 	}
 	if err := json.Unmarshal(raw, out); err != nil {
 		return err
 	}
 	return nil
+}
+
+func (c *Client) waitThrottle(ctx context.Context) error {
+	c.throttle.Lock()
+	interval := c.minInterval
+	if interval <= 0 {
+		c.throttle.Unlock()
+		return nil
+	}
+	now := time.Now()
+	wait := c.nextRequest.Sub(now)
+	if wait <= 0 {
+		c.nextRequest = now.Add(interval)
+		c.throttle.Unlock()
+		return nil
+	}
+	c.nextRequest = c.nextRequest.Add(interval)
+	c.throttle.Unlock()
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func parseRetryAfter(raw string, now time.Time) time.Duration {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(raw); err == nil {
+		if seconds < 0 {
+			return 0
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	if at, err := http.ParseTime(raw); err == nil {
+		if at.Before(now) {
+			return 0
+		}
+		return at.Sub(now)
+	}
+	return 0
 }
 
 type tronscanTransferResponse struct {

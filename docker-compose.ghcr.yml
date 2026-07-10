@@ -1,4 +1,4 @@
-# Telegram 记账机器人 Go v2.3 + PostgreSQL + shared chain watcher
+# Telegram 记账机器人 Go v2.3.1 + PostgreSQL + shared chain watcher
 #
 # 宝塔 GHCR 模板：
 # 1. 单机器人一体部署可直接粘贴本文件。
@@ -42,7 +42,7 @@ services:
       retries: 10
 
   ledger-chain-watcher:
-    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3
+    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.1
     container_name: ledger-chain-watcher
     restart: unless-stopped
     depends_on:
@@ -58,9 +58,11 @@ services:
       CHAIN_WATCHER_TRON_API_KEY: ""
       TRON_USDT_CONTRACT: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
       CHAIN_WATCHER_SOURCE_POLL_SECONDS: "1"
-      CHAIN_WATCHER_GLOBAL_SCAN_PAGES: "1"
-      CHAIN_WATCHER_ADDRESS_SCAN_PAGES: "3"
-      CHAIN_WATCHER_ADDRESS_SCAN_CONCURRENCY: "8"
+      CHAIN_WATCHER_GLOBAL_SCAN_PAGES: "3"
+      CHAIN_WATCHER_ADDRESS_SCAN_INTERVAL_SECONDS: "30"
+      CHAIN_WATCHER_ADDRESS_SCAN_PAGES: "1"
+      CHAIN_WATCHER_ADDRESS_SCAN_CONCURRENCY: "1"
+      CHAIN_WATCHER_TRON_REQUEST_INTERVAL_MS: "250"
       CHAIN_WATCHER_LOOKBACK_SECONDS: "600"
       CHAIN_WATCHER_CLAIM_LEASE_SECONDS: "30"
       CHAIN_WATCHER_DELIVERY_RETRY_SECONDS: "2"
@@ -74,7 +76,7 @@ services:
       retries: 10
 
   ledger-bot:
-    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.3
+    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.1
     container_name: ledger-bot-go
     restart: unless-stopped
     depends_on:
@@ -91,7 +93,7 @@ services:
       CHAIN_WATCHER_URL: "http://ledger-chain-watcher:8090"
       CHAIN_WATCHER_BOT_ID: "ledger-main"
       CHAIN_WATCHER_SECRET: "change_this_chain_watcher_secret"
-      # 应急兜底默认关闭。开启后 bot 会同时本机扫链，增加 API 调用量，仅用于 watcher 故障排查。
+      # 常驻应急兜底默认关闭；正常模式下 bot 只消费 watcher 事件。
       CHAIN_WATCHER_EMERGENCY_FALLBACK: "false"
 
       # ==================== 选填配置 ====================
@@ -114,7 +116,7 @@ services:
       TELEGRAM_API_BASE: "https://api.telegram.org"
       BOT_POLL_TIMEOUT: "50"
       BOT_REQUEST_TIMEOUT: "30"
-      # 仅 CHAIN_WATCHER_EMERGENCY_FALLBACK=true 时，机器人本机扫链会使用这个 Key；默认共享 watcher 模式可留空。
+      # bot 自动 fallback 默认无 Key 使用公开 API；常驻应急模式需要 Key 时才填写。
       TRONGRID_API_KEY: ""
       TRON_USDT_CONTRACT: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
       TRON_POLL_INTERVAL_SECONDS: "1"
@@ -122,6 +124,11 @@ services:
       TRON_INITIAL_LOOKBACK_MINUTES: "15"
       CHAIN_WATCHER_POLL_SECONDS: "1"
       CHAIN_WATCHER_BATCH_SIZE: "50"
+      BOT_WATCHER_HEALTH_INTERVAL_SECONDS: "1"
+      BOT_WATCHER_FAIL_THRESHOLD: "2"
+      BOT_WATCHER_CLAIM_TIMEOUT_MS: "2000"
+      BOT_FALLBACK_POLL_SECONDS: "1"
+      BOT_FALLBACK_MAX_ACTIVE_SECONDS: "600"
       P2P_RATE_API_BASE: "https://p2p.army/api/fapi"
       P2P_RATE_FRONT_API: "NextVOF2Ozuh36mW0TCv"
       P2P_RATE_MARKET: "okx"

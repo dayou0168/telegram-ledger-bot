@@ -16,10 +16,12 @@ import (
 )
 
 type Server struct {
-	cfg   config.ChainWatcherConfig
-	store *storage.Store
-	tron  *tron.Client
-	http  *http.Server
+	cfg            config.ChainWatcherConfig
+	store          *storage.Store
+	tron           *tron.Client
+	http           *http.Server
+	globalBackoff  apiBackoff
+	addressBackoff apiBackoff
 }
 
 func NewServer(cfg config.ChainWatcherConfig, store *storage.Store, tronClient *tron.Client) *Server {
@@ -45,7 +47,9 @@ func (s *Server) Run(ctx context.Context) error {
 			return err
 		}
 	}
-	go s.sourceLoop(ctx)
+	go s.globalLoop(ctx)
+	go s.addressLoop(ctx)
+	go s.cleanupLoop(ctx)
 	errCh := make(chan error, 1)
 	go func() {
 		log.Printf("chain watcher listening on %s", s.cfg.ListenAddr)
@@ -66,13 +70,36 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 }
 
-func (s *Server) sourceLoop(ctx context.Context) {
+func (s *Server) globalLoop(ctx context.Context) {
 	ticker := time.NewTicker(s.cfg.PollInterval)
 	defer ticker.Stop()
 	for {
-		if err := s.pollOnce(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("chain watcher poll: %v", err)
+		s.pollGlobalSafely(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
 		}
+	}
+}
+
+func (s *Server) addressLoop(ctx context.Context) {
+	ticker := time.NewTicker(s.cfg.AddressInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.pollAddressSafely(ctx)
+		}
+	}
+}
+
+func (s *Server) cleanupLoop(ctx context.Context) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
 		if err := s.store.CleanupChainWatcherRetention(ctx, s.cfg.Lookback, time.Now()); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("chain watcher cleanup: %v", err)
 		}
@@ -84,7 +111,37 @@ func (s *Server) sourceLoop(ctx context.Context) {
 	}
 }
 
-func (s *Server) pollOnce(ctx context.Context) error {
+func (s *Server) pollGlobalSafely(ctx context.Context) {
+	if !s.globalBackoff.ready(time.Now()) {
+		return
+	}
+	if err := s.pollGlobalOnce(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		if s.globalBackoff.record(err, time.Now()) {
+			log.Printf("chain watcher global scan rate limited: %v", err)
+			return
+		}
+		log.Printf("chain watcher global scan: %v", err)
+		return
+	}
+	s.globalBackoff.reset()
+}
+
+func (s *Server) pollAddressSafely(ctx context.Context) {
+	if !s.addressBackoff.ready(time.Now()) {
+		return
+	}
+	if err := s.pollAddressOnce(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		if s.addressBackoff.record(err, time.Now()) {
+			log.Printf("chain watcher address scan rate limited: %v", err)
+			return
+		}
+		log.Printf("chain watcher address scan: %v", err)
+		return
+	}
+	s.addressBackoff.reset()
+}
+
+func (s *Server) pollGlobalOnce(ctx context.Context) error {
 	subs, err := s.store.ListChainWatcherSubscriptions(ctx)
 	if err != nil {
 		return err
@@ -106,6 +163,22 @@ func (s *Server) pollOnce(ctx context.Context) error {
 			return err
 		}
 	}
+	return nil
+}
+
+func (s *Server) pollAddressOnce(ctx context.Context) error {
+	subs, err := s.store.ListChainWatcherSubscriptions(ctx)
+	if err != nil {
+		return err
+	}
+	if len(subs) == 0 {
+		return nil
+	}
+	byAddress := make(map[string][]storage.ChainWatcherSubscription)
+	for _, sub := range subs {
+		byAddress[sub.Address] = append(byAddress[sub.Address], sub)
+	}
+	minTimestamp := time.Now().Add(-s.cfg.Lookback).UnixMilli()
 	return s.pollAddressTransfers(ctx, byAddress, minTimestamp)
 }
 
@@ -173,6 +246,52 @@ func (s *Server) recordTransferMatches(ctx context.Context, transfer tron.Transf
 	}
 	_, err := s.store.RecordChainWatcherMatches(ctx, event, deliveries, time.Now())
 	return err
+}
+
+type apiBackoff struct {
+	mu       sync.Mutex
+	until    time.Time
+	failures int
+}
+
+func (b *apiBackoff) ready(now time.Time) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.until.IsZero() || !now.Before(b.until)
+}
+
+func (b *apiBackoff) record(err error, now time.Time) bool {
+	httpErr, ok := tron.IsRateLimited(err)
+	if !ok {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.failures++
+	delay := httpErr.RetryAfter
+	if delay <= 0 {
+		delay = time.Duration(5*(1<<minInt(b.failures-1, 2))) * time.Second
+		delay += time.Duration(now.UnixNano() % 1_000_000_000)
+	}
+	if delay > 30*time.Second {
+		delay = 30 * time.Second
+	}
+	b.until = now.Add(delay)
+	return true
+}
+
+func (b *apiBackoff) reset() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.until = time.Time{}
+	b.failures = 0
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

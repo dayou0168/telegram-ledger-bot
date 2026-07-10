@@ -63,3 +63,63 @@ func TestLoadChainWatcherEmergencyFallbackDefaultAndEnv(t *testing.T) {
 		t.Fatal("ChainWatcherEmergencyFallback env = false, want true")
 	}
 }
+
+func TestLoadChainWatcherDefaults(t *testing.T) {
+	t.Setenv("CHAIN_WATCHER_SOURCE_POLL_SECONDS", "")
+	t.Setenv("CHAIN_WATCHER_GLOBAL_SCAN_PAGES", "")
+	t.Setenv("TRONSCAN_GLOBAL_SCAN_PAGES", "")
+	t.Setenv("CHAIN_WATCHER_ADDRESS_SCAN_INTERVAL_SECONDS", "")
+	t.Setenv("CHAIN_WATCHER_ADDRESS_SCAN_PAGES", "")
+	t.Setenv("CHAIN_WATCHER_ADDRESS_SCAN_CONCURRENCY", "")
+	t.Setenv("CHAIN_WATCHER_TRON_REQUEST_INTERVAL_MS", "")
+	cfg, err := LoadChainWatcher()
+	if err != nil {
+		t.Fatalf("LoadChainWatcher() error = %v", err)
+	}
+	if got := cfg.PollInterval.Seconds(); got != 1 {
+		t.Fatalf("PollInterval = %.0f seconds, want 1", got)
+	}
+	if cfg.GlobalPages != 3 {
+		t.Fatalf("GlobalPages = %d, want 3", cfg.GlobalPages)
+	}
+	if got := cfg.AddressInterval.Seconds(); got != 30 {
+		t.Fatalf("AddressInterval = %.0f seconds, want 30", got)
+	}
+	if cfg.AddressPages != 1 {
+		t.Fatalf("AddressPages = %d, want 1", cfg.AddressPages)
+	}
+	if cfg.AddressConcurrency != 1 {
+		t.Fatalf("AddressConcurrency = %d, want 1", cfg.AddressConcurrency)
+	}
+	if got := cfg.RequestInterval.Milliseconds(); got != 250 {
+		t.Fatalf("RequestInterval = %d ms, want 250", got)
+	}
+}
+
+func TestLoadBotWatcherFallbackDefaults(t *testing.T) {
+	t.Setenv("TELEGRAM_BOT_TOKEN", "token")
+	t.Setenv("BOT_WATCHER_HEALTH_INTERVAL_SECONDS", "")
+	t.Setenv("BOT_WATCHER_FAIL_THRESHOLD", "")
+	t.Setenv("BOT_WATCHER_CLAIM_TIMEOUT_MS", "")
+	t.Setenv("BOT_FALLBACK_POLL_SECONDS", "")
+	t.Setenv("BOT_FALLBACK_MAX_ACTIVE_SECONDS", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got := cfg.BotWatcherHealthInterval.Seconds(); got != 1 {
+		t.Fatalf("BotWatcherHealthInterval = %.0f seconds, want 1", got)
+	}
+	if cfg.BotWatcherFailThreshold != 2 {
+		t.Fatalf("BotWatcherFailThreshold = %d, want 2", cfg.BotWatcherFailThreshold)
+	}
+	if got := cfg.BotWatcherClaimTimeout.Milliseconds(); got != 2000 {
+		t.Fatalf("BotWatcherClaimTimeout = %d ms, want 2000", got)
+	}
+	if got := cfg.BotFallbackPollInterval.Seconds(); got != 1 {
+		t.Fatalf("BotFallbackPollInterval = %.0f seconds, want 1", got)
+	}
+	if got := cfg.BotFallbackMaxActive.Seconds(); got != 600 {
+		t.Fatalf("BotFallbackMaxActive = %.0f seconds, want 600", got)
+	}
+}

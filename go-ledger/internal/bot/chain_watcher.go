@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/chainwatcher"
@@ -32,7 +33,44 @@ func (b *Bot) chainWatcherEventScheduler(ctx context.Context) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
-		b.pollChainWatcherEvents(ctx)
+		b.pollChainWatcherEventsWithStatus(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (b *Bot) chainWatcherHealthScheduler(ctx context.Context) {
+	interval := b.cfg.BotWatcherHealthInterval
+	if interval <= 0 {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		b.checkChainWatcherHealth(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (b *Bot) chainWatcherFallbackScheduler(ctx context.Context) {
+	if b.cfg.ChainWatcherEmergencyFallback {
+		return
+	}
+	interval := b.cfg.BotFallbackPollInterval
+	if interval <= 0 {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		b.pollFallbackIfActive(ctx)
 		select {
 		case <-ctx.Done():
 			return
@@ -77,17 +115,28 @@ func (b *Bot) deleteChainWatcherSubscriptionAsync(ctx context.Context, owner int
 	})
 }
 
-func (b *Bot) pollChainWatcherEvents(ctx context.Context) {
-	if !b.cfg.ChainWatcherEnabled() {
-		return
-	}
-	events, err := b.watcher.ClaimEvents(ctx, b.cfg.ChainWatcherBatchSize)
+func (b *Bot) pollChainWatcherEventsWithStatus(ctx context.Context) {
+	err := b.pollChainWatcherEvents(ctx)
 	if err != nil {
 		log.Printf("claim chain watcher events: %v", err)
+		b.recordChainWatcherFailure("claim")
 		return
 	}
+	b.recordChainWatcherSuccess("claim")
+}
+
+func (b *Bot) pollChainWatcherEvents(ctx context.Context) error {
+	if !b.cfg.ChainWatcherEnabled() {
+		return nil
+	}
+	claimCtx, cancel := context.WithTimeout(ctx, b.cfg.BotWatcherClaimTimeout)
+	defer cancel()
+	events, err := b.watcher.ClaimEvents(claimCtx, b.cfg.ChainWatcherBatchSize)
+	if err != nil {
+		return err
+	}
 	if len(events) == 0 {
-		return
+		return nil
 	}
 	acked := make([]string, 0, len(events))
 	for _, event := range events {
@@ -98,10 +147,55 @@ func (b *Bot) pollChainWatcherEvents(ctx context.Context) {
 		acked = append(acked, event.DeliveryID)
 	}
 	if len(acked) == 0 {
-		return
+		return nil
 	}
 	if err := b.watcher.AckEvents(ctx, acked); err != nil {
-		log.Printf("ack chain watcher events: %v", err)
+		return err
+	}
+	return nil
+}
+
+func (b *Bot) checkChainWatcherHealth(ctx context.Context) {
+	if !b.cfg.ChainWatcherEnabled() {
+		return
+	}
+	healthCtx, cancel := context.WithTimeout(ctx, b.cfg.BotWatcherClaimTimeout)
+	defer cancel()
+	if err := b.watcher.Health(healthCtx); err != nil {
+		log.Printf("chain watcher health: %v", err)
+		b.recordChainWatcherFailure("health")
+		return
+	}
+	b.recordChainWatcherSuccess("health")
+}
+
+func (b *Bot) recordChainWatcherFailure(source string) {
+	if b.watcherFallback.recordFailure(time.Now()) {
+		log.Printf("chain watcher %s failed repeatedly; enabling temporary no-key fallback", source)
+	}
+}
+
+func (b *Bot) recordChainWatcherSuccess(source string) {
+	if b.watcherFallback.recordSuccess(time.Now()) {
+		log.Printf("chain watcher %s recovered; disabling temporary fallback", source)
+	}
+}
+
+func (b *Bot) pollFallbackIfActive(ctx context.Context) {
+	if !b.watcherFallback.active(time.Now()) {
+		return
+	}
+	if !b.watchRunning.CompareAndSwap(false, true) {
+		return
+	}
+	if !b.chainPool.Submit(func(jobCtx context.Context) {
+		defer b.watchRunning.Store(false)
+		if err := b.pollAddressWatchesWithClient(jobCtx, b.fallbackTron); err != nil {
+			log.Printf("poll fallback address watches: %v", err)
+		}
+	}) {
+		b.watchRunning.Store(false)
+		log.Printf("poll fallback address watches: chain queue is full")
 	}
 }
 
@@ -138,4 +232,73 @@ func (b *Bot) processChainWatcherEvent(ctx context.Context, event chainwatcher.M
 		b.kickNotificationOutbox()
 	}
 	return nil
+}
+
+const watcherRecoveryThreshold = 3
+
+type watcherFallbackController struct {
+	mu            sync.Mutex
+	failThreshold int
+	maxActive     time.Duration
+	failures      int
+	successes     int
+	activeNow     bool
+	exhausted     bool
+	startedAt     time.Time
+}
+
+func newWatcherFallbackController(failThreshold int, maxActive time.Duration) *watcherFallbackController {
+	if failThreshold < 1 {
+		failThreshold = 1
+	}
+	if maxActive <= 0 {
+		maxActive = 10 * time.Minute
+	}
+	return &watcherFallbackController{failThreshold: failThreshold, maxActive: maxActive}
+}
+
+func (c *watcherFallbackController) recordFailure(now time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.successes = 0
+	if c.exhausted {
+		return false
+	}
+	c.failures++
+	if c.activeNow || c.failures < c.failThreshold {
+		return false
+	}
+	c.activeNow = true
+	c.startedAt = now
+	return true
+}
+
+func (c *watcherFallbackController) recordSuccess(now time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.failures = 0
+	c.successes++
+	if c.successes < watcherRecoveryThreshold {
+		return false
+	}
+	changed := c.activeNow || c.exhausted
+	c.activeNow = false
+	c.exhausted = false
+	c.startedAt = time.Time{}
+	return changed
+}
+
+func (c *watcherFallbackController) active(now time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.activeNow {
+		return false
+	}
+	if c.maxActive > 0 && now.Sub(c.startedAt) >= c.maxActive {
+		c.activeNow = false
+		c.exhausted = true
+		c.failures = 0
+		return false
+	}
+	return true
 }

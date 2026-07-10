@@ -1,6 +1,6 @@
 # Telegram 群组记账机器人
 
-这是 Telegram 记账机器人 Go v2.3 主线，按群组使用，生产部署使用 PostgreSQL、GHCR 镜像和共享 `ledger-chain-watcher` 链上监听服务。
+这是 Telegram 记账机器人 Go v2.3.1 主线，按群组使用，生产部署使用 PostgreSQL、GHCR 镜像和共享 `ledger-chain-watcher` 链上监听服务。
 
 ## 当前已支持功能
 
@@ -44,20 +44,20 @@
 - `开启记账置顶` / `关闭记账置顶`。
 - 每个群的 `🌐 完整账单` 按钮会按 `chat_id` 生成独立链接。
 
-## 运行 Go v2.3
+## 运行 Go v2.3.1
 
-推荐优先使用 Go v2.3 镜像、PostgreSQL 和共享 watcher：
+推荐优先使用 Go v2.3.1 镜像、PostgreSQL 和共享 watcher：
 
 ```powershell
-docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.3
-docker pull ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3
+docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.1
+docker pull ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.1
 ```
 
-宝塔 Docker Compose 可以直接使用仓库里的 [docker-compose.ghcr.yml](docker-compose.ghcr.yml)。这个文件默认拉取 `ghcr.io/dayou0168/telegram-ledger-bot-go:2.3` 和 `ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3`，在同一个 Compose 项目里用独立 PostgreSQL 容器和独立 watcher 容器组成全家桶，适合快速部署。
+宝塔 Docker Compose 可以直接使用仓库里的 [docker-compose.ghcr.yml](docker-compose.ghcr.yml)。这个文件默认拉取 `ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.1` 和 `ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.1`，在同一个 Compose 项目里用独立 PostgreSQL 容器和独立 watcher 容器组成全家桶，适合快速部署。
 
 如果 PostgreSQL 已经安装在宿主机/宝塔里，使用 [docker-compose.baota-host-pg.yml](docker-compose.baota-host-pg.yml)。这个文件只运行 `ledger-chain-watcher` 和 `ledger-bot`，通过 `host.docker.internal` 连接宿主机 PostgreSQL。
 
-如果希望 `ledger-chain-watcher` 直接跑在宿主机 systemd 里，GitHub Release `v2.3` 会同时发布 `ledger-chain-watcher-v2.3-linux-amd64.tar.gz` 宿主机包，里面包含二进制、[deploy/ledger-chain-watcher.env.example](deploy/ledger-chain-watcher.env.example) 和 [deploy/ledger-chain-watcher.service](deploy/ledger-chain-watcher.service)。机器人 Compose 保留自己的 `DATABASE_URL`，并把 `CHAIN_WATCHER_URL` 配成 `http://host.docker.internal:8090` 或 Docker 网桥 IP。
+如果希望 `ledger-chain-watcher` 直接跑在宿主机 systemd 里，GitHub Release `v2.3.1` 会同时发布 `ledger-chain-watcher-v2.3.1-linux-amd64.tar.gz` 宿主机包，里面包含二进制、[deploy/ledger-chain-watcher.env.example](deploy/ledger-chain-watcher.env.example) 和 [deploy/ledger-chain-watcher.service](deploy/ledger-chain-watcher.service)。机器人 Compose 保留自己的 `DATABASE_URL`，并把 `CHAIN_WATCHER_URL` 配成 `http://host.docker.internal:8090` 或 Docker 网桥 IP。
 
 广播和记账是一体能力，不需要为“广播群”单独关闭机器人记账模块。群默认未开始记账；需要记账的群由宿主、默认操作人或本群操作员发送 `开始` 即可开启。
 
@@ -148,7 +148,7 @@ https://bot.your-domain.example/day_xxb.php?chat_id=-100xxx&created_at=2026-07-0
 
 ### TRC20 链上监听
 
-Go v2.3 通过共享 `ledger-chain-watcher` 获取链上数据。多个机器人实例只配置内网 URL 和内部密钥，不再各自配置官网 API Key：
+Go v2.3.1 通过共享 `ledger-chain-watcher` 获取链上数据。多个机器人实例只配置内网 URL 和内部密钥，不再各自配置官网 API Key：
 
 ```env
 CHAIN_WATCHER_URL=http://ledger-chain-watcher:8090
@@ -157,8 +157,13 @@ CHAIN_WATCHER_SECRET=change_this_chain_watcher_secret
 CHAIN_WATCHER_POLL_SECONDS=1
 CHAIN_WATCHER_BATCH_SIZE=50
 CHAIN_WATCHER_EMERGENCY_FALLBACK=false
+BOT_WATCHER_HEALTH_INTERVAL_SECONDS=1
+BOT_WATCHER_FAIL_THRESHOLD=2
+BOT_WATCHER_CLAIM_TIMEOUT_MS=2000
+BOT_FALLBACK_POLL_SECONDS=1
+BOT_FALLBACK_MAX_ACTIVE_SECONDS=600
 TRON_USDT_CONTRACT=TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t
-# 仅 CHAIN_WATCHER_EMERGENCY_FALLBACK=true 时给机器人本机扫链使用。
+# bot 自动 fallback 默认无 Key 使用公开 API；常驻应急模式需要 Key 时才填写。
 TRONGRID_API_KEY=
 ```
 
@@ -171,14 +176,16 @@ CHAIN_WATCHER_BOTS=ledger-main:change_this_chain_watcher_secret
 CHAIN_WATCHER_TRONSCAN_API_BASE=https://apilist.tronscanapi.com/api
 CHAIN_WATCHER_TRON_API_KEY=your_real_api_key
 CHAIN_WATCHER_SOURCE_POLL_SECONDS=1
-CHAIN_WATCHER_GLOBAL_SCAN_PAGES=1
-CHAIN_WATCHER_ADDRESS_SCAN_PAGES=3
-CHAIN_WATCHER_ADDRESS_SCAN_CONCURRENCY=8
+CHAIN_WATCHER_GLOBAL_SCAN_PAGES=3
+CHAIN_WATCHER_ADDRESS_SCAN_INTERVAL_SECONDS=30
+CHAIN_WATCHER_ADDRESS_SCAN_PAGES=1
+CHAIN_WATCHER_ADDRESS_SCAN_CONCURRENCY=1
+CHAIN_WATCHER_TRON_REQUEST_INTERVAL_MS=250
 CHAIN_WATCHER_LOOKBACK_SECONDS=600
 CHAIN_WATCHER_CLAIM_LEASE_SECONDS=30
 ```
 
-未来接 TRON Lite FullNode + Event Plugin V2 + Kafka 时，机器人配置保持不变，只切换 watcher 的数据源。
+watcher 的主通道每秒全局快扫 USDT 流水并写入 watcher DB，bot 仍通过 watcher claim matched events；watcher 内部每 30 秒按订阅地址做低频补偿扫描，补偿结果也写入同一套 watcher DB/subscriptions/matched_events。未来接 TRON Lite FullNode + Event Plugin V2 + Kafka 或第三方 Webhook/Streams 时，机器人配置保持不变，只切换 watcher 的数据源。
 
 watcher 有两种部署模式：
 
@@ -189,7 +196,7 @@ watcher 有两种部署模式：
 
 机器人保存监听地址、tx_hash 去重和 Telegram outbox；watcher 负责统一链上数据入口、统一解析、按多机器人订阅匹配和短期事件队列。机器人配置了 `CHAIN_WATCHER_URL`、`CHAIN_WATCHER_BOT_ID`、`CHAIN_WATCHER_SECRET` 后，默认停用本机地址监听轮询，改为注册订阅并每秒领取 watcher matched events。同一笔交易仍按 `owner + address + tx_hash + direction` 去重，不会重复提醒。
 
-`CHAIN_WATCHER_EMERGENCY_FALLBACK=false` 是应急开关，默认关闭。临时设为 `true` 后，机器人会在使用 watcher 的同时启用本机按地址扫链，适合 watcher 故障排查或短时兜底；它会让每个机器人重新产生 Tronscan/TronGrid API 调用，不建议长期打开。这个兜底走机器人侧 `TRONSCAN_API_BASE` / `TRONGRID_API_KEY`，不是 watcher 服务端的 `CHAIN_WATCHER_TRON_API_KEY`。
+`CHAIN_WATCHER_EMERGENCY_FALLBACK=false` 是常驻应急开关，默认关闭。正常模式下 bot 只消费 watcher；当 watcher health/claim 连续失败时，bot 会短时自动启用无 Key 公开 API fallback，只扫描本 bot 自己的监听地址并继续使用本地 `chain_notifications/outbox` 去重，最多运行 `BOT_FALLBACK_MAX_ACTIVE_SECONDS`。这个 fallback 仍依赖 Tronscan/TronGrid 公开 API，不是真正事件源；真正不依赖官方 API 的方案是 Lite FullNode + Event Plugin V2 + Kafka 或可靠 Webhook/Streams。
 
 ### Z0 汇率查询
 
@@ -216,4 +223,4 @@ P2P_RATE_CACHE_TTL_SECONDS=180
 docker compose -f docker-compose.ghcr.yml up -d
 ```
 
-服务器部署见 [docs/deployment.md](docs/deployment.md)，当前发布目标优先用 Go v2.3 镜像、PostgreSQL、共享 `ledger-chain-watcher` 和 Docker Compose。
+服务器部署见 [docs/deployment.md](docs/deployment.md)，当前发布目标优先用 Go v2.3.1 镜像、PostgreSQL、共享 `ledger-chain-watcher` 和 Docker Compose。

@@ -549,6 +549,10 @@ func (b *Bot) addressWatchScheduler(ctx context.Context) {
 }
 
 func (b *Bot) pollAddressWatches(ctx context.Context) error {
+	return b.pollAddressWatchesWithClient(ctx, b.tron)
+}
+
+func (b *Bot) pollAddressWatchesWithClient(ctx context.Context, tronClient *tron.Client) error {
 	targets, err := b.watchTargets(ctx)
 	if err != nil {
 		return err
@@ -581,7 +585,7 @@ func (b *Bot) pollAddressWatches(ctx context.Context) error {
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			transfers, err := b.tron.FetchAddressUSDTTransfersSincePages(ctx, address, b.cfg.USDTContract, 50, b.cfg.TronAddressPages, minTimestamp)
+			transfers, err := tronClient.FetchAddressUSDTTransfersSincePages(ctx, address, b.cfg.USDTContract, 50, b.cfg.TronAddressPages, minTimestamp)
 			if err != nil {
 				log.Printf("fetch watch transfers %s: %v", address, err)
 				return

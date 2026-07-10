@@ -28,6 +28,7 @@ func main() {
 	defer db.Close()
 
 	tronClient := tron.NewClient(cfg.TronAPIBase, cfg.TronAPIKey, cfg.RequestTimeout)
+	tronClient.SetMinRequestInterval(cfg.RequestInterval)
 	app := chainwatcher.NewServer(cfg, db, tronClient)
 	log.Printf("ledger chain watcher v%s is starting", config.Version)
 	if err := app.Run(ctx); err != nil && err != context.Canceled {

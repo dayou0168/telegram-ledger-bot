@@ -20,14 +20,15 @@ import (
 )
 
 type Bot struct {
-	cfg     config.Config
-	store   *storage.Store
-	tg      *telegram.Client
-	tron    *tron.Client
-	p2p     *p2p.Client
-	watcher *chainclient.Client
-	perms   permissions.Policy
-	loc     *time.Location
+	cfg          config.Config
+	store        *storage.Store
+	tg           *telegram.Client
+	tron         *tron.Client
+	fallbackTron *tron.Client
+	p2p          *p2p.Client
+	watcher      *chainclient.Client
+	perms        permissions.Policy
+	loc          *time.Location
 
 	dispatcher    *worker.Dispatcher
 	ledgerPool    *worker.Pool
@@ -48,6 +49,7 @@ type Bot struct {
 	telegramLimiter  *telegramRateLimiter
 	textGateway      *telegramTextGateway
 	watchRunning     atomic.Bool
+	watcherFallback  *watcherFallbackController
 }
 
 func New(cfg config.Config, store *storage.Store, tg *telegram.Client, tronClient *tron.Client, p2pClient *p2p.Client) *Bot {
@@ -60,6 +62,7 @@ func New(cfg config.Config, store *storage.Store, tg *telegram.Client, tronClien
 		store:            store,
 		tg:               tg,
 		tron:             tronClient,
+		fallbackTron:     tron.NewClient(cfg.TronAPIBase, "", cfg.RequestTimeout),
 		p2p:              p2pClient,
 		watcher:          chainclient.New(cfg.ChainWatcherURL, cfg.ChainWatcherBotID, cfg.ChainWatcherSecret, cfg.RequestTimeout),
 		perms:            permissions.NewPolicy(cfg.HostUserID, cfg.DefaultOperatorIDs),
@@ -80,6 +83,7 @@ func New(cfg config.Config, store *storage.Store, tg *telegram.Client, tronClien
 		privateStates:    newTTLCache[privateState](30 * time.Minute),
 		notificationWake: make(chan struct{}, 1),
 		telegramLimiter:  newTelegramRateLimiter(),
+		watcherFallback:  newWatcherFallbackController(cfg.BotWatcherFailThreshold, cfg.BotFallbackMaxActive),
 	}
 	bot.textGateway = newTelegramTextGateway(tg, bot.telegramLimiter, cfg.NotifyWorkers, cfg.QueueSize)
 	return bot
@@ -98,6 +102,8 @@ func (b *Bot) Run(ctx context.Context) error {
 	if b.cfg.ChainWatcherEnabled() {
 		go b.chainWatcherSyncScheduler(ctx)
 		go b.chainWatcherEventScheduler(ctx)
+		go b.chainWatcherHealthScheduler(ctx)
+		go b.chainWatcherFallbackScheduler(ctx)
 	}
 	if b.cfg.LocalAddressWatcherEnabled() {
 		go b.addressWatchScheduler(ctx)

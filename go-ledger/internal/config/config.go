@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const Version = "2.3.0"
+const Version = "2.3.1"
 
 type Config struct {
 	TelegramBotToken string
@@ -50,6 +50,11 @@ type Config struct {
 	ChainWatcherPollInterval      time.Duration
 	ChainWatcherBatchSize         int
 	ChainWatcherEmergencyFallback bool
+	BotWatcherHealthInterval      time.Duration
+	BotWatcherFailThreshold       int
+	BotWatcherClaimTimeout        time.Duration
+	BotFallbackPollInterval       time.Duration
+	BotFallbackMaxActive          time.Duration
 	P2PRefreshEvery               time.Duration
 	P2PCacheTTL                   time.Duration
 	P2PAPIBase                    string
@@ -104,6 +109,11 @@ func Load() (Config, error) {
 		ChainWatcherPollInterval:      secondsEnv("CHAIN_WATCHER_POLL_SECONDS", 1),
 		ChainWatcherBatchSize:         intEnv("CHAIN_WATCHER_BATCH_SIZE", 50),
 		ChainWatcherEmergencyFallback: boolEnv("CHAIN_WATCHER_EMERGENCY_FALLBACK", false),
+		BotWatcherHealthInterval:      secondsEnv("BOT_WATCHER_HEALTH_INTERVAL_SECONDS", 1),
+		BotWatcherFailThreshold:       intEnv("BOT_WATCHER_FAIL_THRESHOLD", 2),
+		BotWatcherClaimTimeout:        millisEnv("BOT_WATCHER_CLAIM_TIMEOUT_MS", 2000),
+		BotFallbackPollInterval:       secondsEnv("BOT_FALLBACK_POLL_SECONDS", 1),
+		BotFallbackMaxActive:          secondsEnv("BOT_FALLBACK_MAX_ACTIVE_SECONDS", 600),
 		P2PRefreshEvery:               secondsEnv("P2P_RATE_REFRESH_SECONDS", 60),
 		P2PCacheTTL:                   secondsEnv("P2P_RATE_CACHE_TTL_SECONDS", 180),
 		P2PAPIBase:                    strings.TrimRight(env("P2P_RATE_API_BASE", "https://p2p.army/api/fapi"), "/"),
@@ -143,6 +153,21 @@ func Load() (Config, error) {
 	if cfg.ChainWatcherBatchSize < 1 {
 		cfg.ChainWatcherBatchSize = 1
 	}
+	if cfg.BotWatcherHealthInterval <= 0 {
+		cfg.BotWatcherHealthInterval = time.Second
+	}
+	if cfg.BotWatcherFailThreshold < 1 {
+		cfg.BotWatcherFailThreshold = 1
+	}
+	if cfg.BotWatcherClaimTimeout <= 0 {
+		cfg.BotWatcherClaimTimeout = 2 * time.Second
+	}
+	if cfg.BotFallbackPollInterval <= 0 {
+		cfg.BotFallbackPollInterval = time.Second
+	}
+	if cfg.BotFallbackMaxActive <= 0 {
+		cfg.BotFallbackMaxActive = 10 * time.Minute
+	}
 	if cfg.AddressWatchFreeLimit < 0 {
 		cfg.AddressWatchFreeLimit = 0
 	}
@@ -167,8 +192,10 @@ type ChainWatcherConfig struct {
 	USDTContract       string
 	PollInterval       time.Duration
 	GlobalPages        int
+	AddressInterval    time.Duration
 	AddressPages       int
 	AddressConcurrency int
+	RequestInterval    time.Duration
 	Lookback           time.Duration
 	BotCredentials     map[string]string
 	ClaimLease         time.Duration
@@ -185,9 +212,11 @@ func LoadChainWatcher() (ChainWatcherConfig, error) {
 		TronAPIKey:         strings.TrimSpace(envAny([]string{"CHAIN_WATCHER_TRON_API_KEY", "TRONGRID_API_KEY"}, "")),
 		USDTContract:       env("TRON_USDT_CONTRACT", "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"),
 		PollInterval:       secondsEnv("CHAIN_WATCHER_SOURCE_POLL_SECONDS", 1),
-		GlobalPages:        intEnv("CHAIN_WATCHER_GLOBAL_SCAN_PAGES", intEnv("TRONSCAN_GLOBAL_SCAN_PAGES", 1)),
-		AddressPages:       intEnv("CHAIN_WATCHER_ADDRESS_SCAN_PAGES", 3),
-		AddressConcurrency: intEnv("CHAIN_WATCHER_ADDRESS_SCAN_CONCURRENCY", 8),
+		GlobalPages:        intEnv("CHAIN_WATCHER_GLOBAL_SCAN_PAGES", intEnv("TRONSCAN_GLOBAL_SCAN_PAGES", 3)),
+		AddressInterval:    secondsEnv("CHAIN_WATCHER_ADDRESS_SCAN_INTERVAL_SECONDS", 30),
+		AddressPages:       intEnv("CHAIN_WATCHER_ADDRESS_SCAN_PAGES", 1),
+		AddressConcurrency: intEnv("CHAIN_WATCHER_ADDRESS_SCAN_CONCURRENCY", 1),
+		RequestInterval:    millisEnv("CHAIN_WATCHER_TRON_REQUEST_INTERVAL_MS", 250),
 		Lookback:           secondsEnv("CHAIN_WATCHER_LOOKBACK_SECONDS", 600),
 		BotCredentials:     parseBotCredentials(os.Getenv("CHAIN_WATCHER_BOTS")),
 		ClaimLease:         secondsEnv("CHAIN_WATCHER_CLAIM_LEASE_SECONDS", 30),
@@ -202,6 +231,9 @@ func LoadChainWatcher() (ChainWatcherConfig, error) {
 	if cfg.GlobalPages < 1 {
 		cfg.GlobalPages = 1
 	}
+	if cfg.AddressInterval <= 0 {
+		cfg.AddressInterval = 30 * time.Second
+	}
 	if cfg.AddressPages < 1 {
 		cfg.AddressPages = 1
 	}
@@ -210,6 +242,9 @@ func LoadChainWatcher() (ChainWatcherConfig, error) {
 	}
 	if cfg.Lookback <= 0 {
 		cfg.Lookback = 10 * time.Minute
+	}
+	if cfg.RequestInterval < 0 {
+		cfg.RequestInterval = 0
 	}
 	if cfg.ClaimLease <= 0 {
 		cfg.ClaimLease = 30 * time.Second
@@ -278,6 +313,10 @@ func boolEnv(key string, fallback bool) bool {
 
 func secondsEnv(key string, fallback int) time.Duration {
 	return time.Duration(intEnv(key, fallback)) * time.Second
+}
+
+func millisEnv(key string, fallback int) time.Duration {
+	return time.Duration(intEnv(key, fallback)) * time.Millisecond
 }
 
 func parseIDs(raw string) map[int64]struct{} {
