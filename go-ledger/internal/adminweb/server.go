@@ -37,6 +37,7 @@ type pageData struct {
 	Permissions []storage.BroadcastPermission
 	Replace     storage.BroadcastReplaceSetting
 	ChatNames   map[int64]string
+	OpLabels    map[int64]string
 }
 
 type billData struct {
@@ -502,6 +503,10 @@ func (s *Server) loadPageData(ctx context.Context, message string) (pageData, er
 	for _, group := range groups {
 		chatNames[group.ChatID] = group.Title
 	}
+	opLabels := make(map[int64]string, len(operators))
+	for _, op := range operators {
+		opLabels[op.UserID] = operatorLabel(op)
+	}
 	return pageData{
 		Version:     config.Version,
 		TokenUnset:  s.cfg.AdminWebToken == "",
@@ -512,6 +517,7 @@ func (s *Server) loadPageData(ctx context.Context, message string) (pageData, er
 		Permissions: permissions,
 		Replace:     replace,
 		ChatNames:   chatNames,
+		OpLabels:    opLabels,
 	}, nil
 }
 
@@ -556,6 +562,36 @@ func permissionTarget(p storage.BroadcastPermission, names map[int64]string) str
 		name = strconv.FormatInt(p.ChatID, 10)
 	}
 	return "单群：" + name
+}
+
+func operatorLabel(op storage.BroadcastOperator) string {
+	return operatorIDLabel(op.UserID, op.Remark)
+}
+
+func operatorIDLabel(userID int64, remark string) string {
+	id := strconv.FormatInt(userID, 10)
+	remark = strings.TrimSpace(remark)
+	if remark == "" {
+		return id
+	}
+	return remark + "（" + id + "）"
+}
+
+func permissionUserLabel(p storage.BroadcastPermission, labels map[int64]string) string {
+	if label := labels[p.UserID]; label != "" {
+		return label
+	}
+	return strconv.FormatInt(p.UserID, 10)
+}
+
+func grantorLabel(p storage.BroadcastPermission, labels map[int64]string) string {
+	if p.GrantedBy == 0 {
+		return "后台管理"
+	}
+	if label := labels[p.GrantedBy]; label != "" {
+		return label
+	}
+	return strconv.FormatInt(p.GrantedBy, 10)
 }
 
 func parseBillPath(path string) (int64, string, string, bool) {
@@ -1249,8 +1285,11 @@ func containsFold(value, query string) bool {
 }
 
 var adminTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
-	"chatLabel":        chatLabel,
-	"permissionTarget": permissionTarget,
+	"chatLabel":           chatLabel,
+	"operatorLabel":       operatorLabel,
+	"permissionTarget":    permissionTarget,
+	"permissionUserLabel": permissionUserLabel,
+	"grantorLabel":        grantorLabel,
 }).Parse(adminHTML))
 
 var loginTemplate = template.Must(template.New("login").Parse(loginHTML))
@@ -1297,7 +1336,7 @@ const adminHTML = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Telegram 记账机器人后台</title>
 <style>
-:root{--bg:#eaf1f7;--panel:#fff;--line:#c8d6e6;--ink:#0e1b2f;--muted:#5b6f88;--navy:#14223a;--gold:#d8b45d;--blue:#2d6cdf}
+:root{--bg:#eaf1f7;--panel:#fff;--line:#c8d6e6;--ink:#0e1b2f;--muted:#5b6f88;--navy:#14223a;--gold:#d8b45d;--blue:#2d6cdf;--soft:#f5f8fc}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Arial,"Microsoft YaHei",sans-serif;font-size:14px}
 .wrap{max-width:1240px;margin:0 auto;padding:22px}
 .top{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px 20px;display:flex;justify-content:space-between;gap:16px;align-items:center}
@@ -1317,7 +1356,8 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 .table-tools{display:flex;gap:8px;align-items:center;margin:8px 0 10px}.table-tools input{flex:1;width:100%}.scroll{max-height:280px;overflow:auto;border:1px solid #dce5ef;border-radius:6px}.scroll.tall{max-height:520px}.scroll table{margin:0;border:0}.scroll th:first-child,.scroll td:first-child{border-left:0}.scroll th:last-child,.scroll td:last-child{border-right:0}.scroll th{position:sticky;top:0;z-index:1}
 .pill{display:inline-block;border:1px solid #d5e1ec;background:#f7fafc;border-radius:999px;padding:3px 9px;color:#40566f}
 .actions{display:flex;gap:8px;flex-wrap:wrap}.mini{height:32px;padding:0 10px}
-@media(max-width:900px){.top{align-items:flex-start;flex-direction:column}.row,.row.two{grid-template-columns:1fr}.btn{width:100%}}
+.toolbar-forms{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,.45fr);gap:12px;margin-bottom:14px}.inline-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px}.section-title{margin:4px 0 8px;font-size:15px;font-weight:800;color:#243852}.member-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:14px}.member-form{border:1px solid #dce5ef;background:var(--soft);border-radius:8px;padding:12px;min-width:0}.member-form select{width:100%;margin-bottom:8px}.member-form select[multiple]{height:220px;min-height:220px;background:#fff}.group-name-list{max-width:760px;text-align:left;line-height:1.65}.permission-panels{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:14px}.permission-panel{border:1px solid #dce5ef;background:var(--soft);border-radius:8px;padding:12px}.permission-panel form{display:grid;grid-template-columns:minmax(180px,.8fr) 150px minmax(180px,1fr) minmax(180px,1fr) auto;gap:8px;align-items:start}.permission-table td:first-child,.operator-name{text-align:left}.field-label{display:block;margin:0 0 5px;color:var(--muted);font-size:12px;font-weight:700}.field-stack{min-width:0}.field-stack select{width:100%}.field-stack.disabled{opacity:.45}
+@media(max-width:900px){.top{align-items:flex-start;flex-direction:column}.row,.row.two,.toolbar-forms,.member-grid,.permission-panels,.permission-panel form{grid-template-columns:1fr}.btn{width:100%}}
 </style>
 </head>
 <body><main class="wrap">
@@ -1354,50 +1394,62 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 <div class="card wide">
 <h2>广播分组</h2>
 <p class="hint">先创建分组，再用下方多选框批量添加或移除群组。页面显示群名，数据库仍用群 ID 去重。</p>
-<form method="post" action="/admin/group/save" class="row two">
+<div class="toolbar-forms">
+<form method="post" action="/admin/group/save" class="inline-form">
 <input name="name" placeholder="输入新分组名，例如 财务">
 <button class="btn" type="submit">新建/更新分组</button>
 </form>
-<form method="post" action="/admin/group/delete" class="row two">
+<form method="post" action="/admin/group/delete" class="inline-form">
 <select name="name">{{range .BGroups}}<option value="{{.Name}}">{{.Name}}</option>{{end}}</select>
 <button class="btn" type="submit">删除分组</button>
 </form>
-<div class="row">
-<form method="post" action="/admin/group/add">
-<select class="full" name="name">{{range .BGroups}}<option value="{{.Name}}">{{.Name}}</option>{{end}}</select>
-<select class="full" name="chat_id" multiple>{{range .Groups}}<option value="{{.ChatID}}">{{chatLabel .}}</option>{{end}}</select>
-<button class="btn full" type="submit">批量添加群组</button>
+</div>
+<div class="member-grid">
+<form method="post" action="/admin/group/add" class="member-form">
+<div class="section-title">添加群组到分组</div>
+<label><span class="field-label">目标分组</span><select name="name">{{range .BGroups}}<option value="{{.Name}}">{{.Name}}</option>{{end}}</select></label>
+<label><span class="field-label">选择要加入的群，可按 Ctrl/Shift 多选</span><select name="chat_id" multiple>{{range .Groups}}<option value="{{.ChatID}}">{{chatLabel .}}</option>{{end}}</select></label>
+<button class="btn full" type="submit">添加到分组</button>
 </form>
-<form method="post" action="/admin/group/remove">
-<select class="full" name="name">{{range .BGroups}}<option value="{{.Name}}">{{.Name}}</option>{{end}}</select>
-<select class="full" name="chat_id" multiple>{{range .Groups}}<option value="{{.ChatID}}">{{chatLabel .}}</option>{{end}}</select>
-<button class="btn full" type="submit">批量移除群组</button>
+<form method="post" action="/admin/group/remove" class="member-form">
+<div class="section-title">从分组移除群组</div>
+<label><span class="field-label">目标分组</span><select name="name">{{range .BGroups}}<option value="{{.Name}}">{{.Name}}</option>{{end}}</select></label>
+<label><span class="field-label">选择要移除的群，可按 Ctrl/Shift 多选</span><select name="chat_id" multiple>{{range .Groups}}<option value="{{.ChatID}}">{{chatLabel .}}</option>{{end}}</select></label>
+<button class="btn full" type="submit">从分组移除</button>
 </form>
+</div>
 <div class="scroll"><table><thead><tr><th>分组</th><th>群数</th><th>群组</th></tr></thead><tbody>
 {{range .BGroups}}<tr><td>{{.Name}}</td><td>{{len .ChatIDs}}</td><td>{{range $i,$n := .ChatNames}}{{if $i}}、{{end}}{{$n}}{{end}}</td></tr>{{else}}<tr><td colspan="3">暂无广播分组</td></tr>{{end}}
 </tbody></table></div>
-</div>
 </div>
 
 <div class="card wide">
 <h2>广播权限</h2>
 <p class="hint">给普通广播操作人授权分组或单群。授权后，私聊机器人选择群发、分组广播或单群发送时只会看到允许的目标。</p>
-<form method="post" action="/admin/permission/grant" class="row">
-<select name="user_id">{{range .BOperators}}<option value="{{.UserID}}">{{.UserID}} {{.Remark}}</option>{{end}}</select>
-<select name="target"><option value="group">授权分组</option><option value="chat">授权单群</option></select>
-<select name="group_name">{{range .BGroups}}<option value="{{.Name}}">{{.Name}}</option>{{end}}</select>
-<select name="chat_id">{{range .Groups}}<option value="{{.ChatID}}">{{chatLabel .}}</option>{{end}}</select>
+<div class="permission-panels">
+<div class="permission-panel">
+<div class="section-title">授权广播目标</div>
+<form method="post" action="/admin/permission/grant" class="permission-form">
+<label class="field-stack"><span class="field-label">操作人</span><select name="user_id">{{range .BOperators}}<option value="{{.UserID}}">{{operatorLabel .}}</option>{{end}}</select></label>
+<label class="field-stack"><span class="field-label">权限类型</span><select class="target-type" name="target"><option value="group">分组</option><option value="chat">单群</option></select></label>
+<label class="field-stack target-group"><span class="field-label">选择分组</span><select name="group_name">{{range .BGroups}}<option value="{{.Name}}">{{.Name}}</option>{{end}}</select></label>
+<label class="field-stack target-chat"><span class="field-label">选择单群</span><select name="chat_id">{{range .Groups}}<option value="{{.ChatID}}">{{chatLabel .}}</option>{{end}}</select></label>
 <button class="btn" type="submit">授权</button>
 </form>
-<form method="post" action="/admin/permission/revoke" class="row">
-<select name="user_id">{{range .BOperators}}<option value="{{.UserID}}">{{.UserID}} {{.Remark}}</option>{{end}}</select>
-<select name="target"><option value="group">取消分组</option><option value="chat">取消单群</option></select>
-<select name="group_name">{{range .BGroups}}<option value="{{.Name}}">{{.Name}}</option>{{end}}</select>
-<select name="chat_id">{{range .Groups}}<option value="{{.ChatID}}">{{chatLabel .}}</option>{{end}}</select>
+</div>
+<div class="permission-panel">
+<div class="section-title">取消广播权限</div>
+<form method="post" action="/admin/permission/revoke" class="permission-form">
+<label class="field-stack"><span class="field-label">操作人</span><select name="user_id">{{range .BOperators}}<option value="{{.UserID}}">{{operatorLabel .}}</option>{{end}}</select></label>
+<label class="field-stack"><span class="field-label">权限类型</span><select class="target-type" name="target"><option value="group">分组</option><option value="chat">单群</option></select></label>
+<label class="field-stack target-group"><span class="field-label">选择分组</span><select name="group_name">{{range .BGroups}}<option value="{{.Name}}">{{.Name}}</option>{{end}}</select></label>
+<label class="field-stack target-chat"><span class="field-label">选择单群</span><select name="chat_id">{{range .Groups}}<option value="{{.ChatID}}">{{chatLabel .}}</option>{{end}}</select></label>
 <button class="btn" type="submit">取消授权</button>
 </form>
-<div class="scroll"><table><thead><tr><th>UID</th><th>权限</th><th>授权人</th></tr></thead><tbody>
-{{range .Permissions}}<tr><td>{{.UserID}}</td><td>{{permissionTarget . $.ChatNames}}</td><td>{{.GrantedBy}}</td></tr>{{else}}<tr><td colspan="3">暂无权限</td></tr>{{end}}
+</div>
+</div>
+<div class="scroll"><table class="permission-table"><thead><tr><th>操作人</th><th>权限范围</th><th>授权来源</th></tr></thead><tbody>
+{{range .Permissions}}<tr><td>{{permissionUserLabel . $.OpLabels}}</td><td>{{permissionTarget . $.ChatNames}}</td><td>{{grantorLabel . $.OpLabels}}</td></tr>{{else}}<tr><td colspan="3">暂无权限</td></tr>{{end}}
 </tbody></table></div>
 </div>
 
@@ -1426,6 +1478,26 @@ if(groupSearch){
     });
   });
 }
+document.querySelectorAll('.permission-form').forEach(function(form){
+  const type=form.querySelector('.target-type');
+  const group=form.querySelector('.target-group');
+  const chat=form.querySelector('.target-chat');
+  function syncTarget(){
+    const useChat=type && type.value==='chat';
+    if(group){
+      group.classList.toggle('disabled', useChat);
+      const select=group.querySelector('select');
+      if(select){select.disabled=useChat;}
+    }
+    if(chat){
+      chat.classList.toggle('disabled', !useChat);
+      const select=chat.querySelector('select');
+      if(select){select.disabled=!useChat;}
+    }
+  }
+  if(type){type.addEventListener('change',syncTarget);}
+  syncTarget();
+});
 </script>
 </main></body></html>`
 
