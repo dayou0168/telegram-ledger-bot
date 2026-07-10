@@ -3,6 +3,7 @@ package adminweb
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
@@ -551,6 +552,65 @@ func chatLabel(group storage.Group) string {
 		return group.Title
 	}
 	return strconv.FormatInt(group.ChatID, 10)
+}
+
+func chatBroadcastGroups(group storage.Group, bgroups []storage.BroadcastGroup) string {
+	names := make([]string, 0, 2)
+	for _, bgroup := range bgroups {
+		for _, chatID := range bgroup.ChatIDs {
+			if chatID == group.ChatID {
+				names = append(names, bgroup.Name)
+				break
+			}
+		}
+	}
+	payload, err := json.Marshal(names)
+	if err != nil {
+		return "[]"
+	}
+	return string(payload)
+}
+
+func permissionGroupUsers(groupName string, permissions []storage.BroadcastPermission) string {
+	userIDs := make([]int64, 0, 2)
+	for _, permission := range permissions {
+		if permission.Target == "group" && permission.GroupName == groupName {
+			userIDs = append(userIDs, permission.UserID)
+		}
+	}
+	return userIDsJSON(userIDs)
+}
+
+func permissionChatUsers(group storage.Group, permissions []storage.BroadcastPermission) string {
+	userIDs := make([]int64, 0, 2)
+	for _, permission := range permissions {
+		if permission.Target == "chat" && permission.ChatID == group.ChatID {
+			userIDs = append(userIDs, permission.UserID)
+		}
+	}
+	return userIDsJSON(userIDs)
+}
+
+func userIDsJSON(userIDs []int64) string {
+	seen := make(map[int64]struct{}, len(userIDs))
+	unique := make([]int64, 0, len(userIDs))
+	for _, userID := range userIDs {
+		if _, ok := seen[userID]; ok {
+			continue
+		}
+		seen[userID] = struct{}{}
+		unique = append(unique, userID)
+	}
+	sort.Slice(unique, func(i, j int) bool { return unique[i] < unique[j] })
+	values := make([]string, 0, len(unique))
+	for _, userID := range unique {
+		values = append(values, strconv.FormatInt(userID, 10))
+	}
+	payload, err := json.Marshal(values)
+	if err != nil {
+		return "[]"
+	}
+	return string(payload)
 }
 
 func permissionTarget(p storage.BroadcastPermission, names map[int64]string) string {
@@ -1285,11 +1345,14 @@ func containsFold(value, query string) bool {
 }
 
 var adminTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
-	"chatLabel":           chatLabel,
-	"operatorLabel":       operatorLabel,
-	"permissionTarget":    permissionTarget,
-	"permissionUserLabel": permissionUserLabel,
-	"grantorLabel":        grantorLabel,
+	"chatLabel":            chatLabel,
+	"chatBroadcastGroups":  chatBroadcastGroups,
+	"permissionGroupUsers": permissionGroupUsers,
+	"permissionChatUsers":  permissionChatUsers,
+	"operatorLabel":        operatorLabel,
+	"permissionTarget":     permissionTarget,
+	"permissionUserLabel":  permissionUserLabel,
+	"grantorLabel":         grantorLabel,
 }).Parse(adminHTML))
 
 var loginTemplate = template.Must(template.New("login").Parse(loginHTML))
@@ -1405,16 +1468,18 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 </form>
 </div>
 <div class="member-grid">
-<form method="post" action="/admin/group/add" class="member-form">
+<form method="post" action="/admin/group/add" class="member-form" data-mode="add">
 <div class="section-title">添加群组到分组</div>
-<label><span class="field-label">目标分组</span><select name="name">{{range .BGroups}}<option value="{{.Name}}">{{.Name}}</option>{{end}}</select></label>
-<label><span class="field-label">选择要加入的群，可按 Ctrl/Shift 多选</span><select name="chat_id" multiple>{{range .Groups}}<option value="{{.ChatID}}">{{chatLabel .}}</option>{{end}}</select></label>
+<label><span class="field-label">目标分组</span><select class="member-group-select" name="name">{{range .BGroups}}<option value="{{.Name}}">{{.Name}}</option>{{end}}</select></label>
+<label><span class="field-label">选择要加入的群，可按 Ctrl/Shift 多选</span><select class="member-chat-select" name="chat_id" multiple>{{range .Groups}}<option value="{{.ChatID}}" data-groups="{{chatBroadcastGroups . $.BGroups}}">{{chatLabel .}}</option>{{end}}</select></label>
+<div class="hint member-empty" hidden>当前分组没有可选择的群。</div>
 <button class="btn full" type="submit">添加到分组</button>
 </form>
-<form method="post" action="/admin/group/remove" class="member-form">
+<form method="post" action="/admin/group/remove" class="member-form" data-mode="remove">
 <div class="section-title">从分组移除群组</div>
-<label><span class="field-label">目标分组</span><select name="name">{{range .BGroups}}<option value="{{.Name}}">{{.Name}}</option>{{end}}</select></label>
-<label><span class="field-label">选择要移除的群，可按 Ctrl/Shift 多选</span><select name="chat_id" multiple>{{range .Groups}}<option value="{{.ChatID}}">{{chatLabel .}}</option>{{end}}</select></label>
+<label><span class="field-label">目标分组</span><select class="member-group-select" name="name">{{range .BGroups}}<option value="{{.Name}}">{{.Name}}</option>{{end}}</select></label>
+<label><span class="field-label">选择要移除的群，可按 Ctrl/Shift 多选</span><select class="member-chat-select" name="chat_id" multiple>{{range .Groups}}<option value="{{.ChatID}}" data-groups="{{chatBroadcastGroups . $.BGroups}}">{{chatLabel .}}</option>{{end}}</select></label>
+<div class="hint member-empty" hidden>当前分组没有可移除的群。</div>
 <button class="btn full" type="submit">从分组移除</button>
 </form>
 </div>
@@ -1429,21 +1494,21 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 <div class="permission-panels">
 <div class="permission-panel">
 <div class="section-title">授权广播目标</div>
-<form method="post" action="/admin/permission/grant" class="permission-form">
-<label class="field-stack"><span class="field-label">操作人</span><select name="user_id">{{range .BOperators}}<option value="{{.UserID}}">{{operatorLabel .}}</option>{{end}}</select></label>
+<form method="post" action="/admin/permission/grant" class="permission-form" data-mode="grant">
+<label class="field-stack"><span class="field-label">操作人</span><select class="permission-user-select" name="user_id">{{range .BOperators}}<option value="{{.UserID}}">{{operatorLabel .}}</option>{{end}}</select></label>
 <label class="field-stack"><span class="field-label">权限类型</span><select class="target-type" name="target"><option value="group">分组</option><option value="chat">单群</option></select></label>
-<label class="field-stack target-group"><span class="field-label">选择分组</span><select name="group_name">{{range .BGroups}}<option value="{{.Name}}">{{.Name}}</option>{{end}}</select></label>
-<label class="field-stack target-chat"><span class="field-label">选择单群</span><select name="chat_id">{{range .Groups}}<option value="{{.ChatID}}">{{chatLabel .}}</option>{{end}}</select></label>
+<label class="field-stack target-group"><span class="field-label">选择分组</span><select class="permission-group-select" name="group_name">{{range .BGroups}}<option value="{{.Name}}" data-users="{{permissionGroupUsers .Name $.Permissions}}">{{.Name}}</option>{{end}}</select></label>
+<label class="field-stack target-chat"><span class="field-label">选择单群</span><select class="permission-chat-select" name="chat_id">{{range .Groups}}<option value="{{.ChatID}}" data-users="{{permissionChatUsers . $.Permissions}}">{{chatLabel .}}</option>{{end}}</select></label>
 <button class="btn" type="submit">授权</button>
 </form>
 </div>
 <div class="permission-panel">
 <div class="section-title">取消广播权限</div>
-<form method="post" action="/admin/permission/revoke" class="permission-form">
-<label class="field-stack"><span class="field-label">操作人</span><select name="user_id">{{range .BOperators}}<option value="{{.UserID}}">{{operatorLabel .}}</option>{{end}}</select></label>
+<form method="post" action="/admin/permission/revoke" class="permission-form" data-mode="revoke">
+<label class="field-stack"><span class="field-label">操作人</span><select class="permission-user-select" name="user_id">{{range .BOperators}}<option value="{{.UserID}}">{{operatorLabel .}}</option>{{end}}</select></label>
 <label class="field-stack"><span class="field-label">权限类型</span><select class="target-type" name="target"><option value="group">分组</option><option value="chat">单群</option></select></label>
-<label class="field-stack target-group"><span class="field-label">选择分组</span><select name="group_name">{{range .BGroups}}<option value="{{.Name}}">{{.Name}}</option>{{end}}</select></label>
-<label class="field-stack target-chat"><span class="field-label">选择单群</span><select name="chat_id">{{range .Groups}}<option value="{{.ChatID}}">{{chatLabel .}}</option>{{end}}</select></label>
+<label class="field-stack target-group"><span class="field-label">选择分组</span><select class="permission-group-select" name="group_name">{{range .BGroups}}<option value="{{.Name}}" data-users="{{permissionGroupUsers .Name $.Permissions}}">{{.Name}}</option>{{end}}</select></label>
+<label class="field-stack target-chat"><span class="field-label">选择单群</span><select class="permission-chat-select" name="chat_id">{{range .Groups}}<option value="{{.ChatID}}" data-users="{{permissionChatUsers . $.Permissions}}">{{chatLabel .}}</option>{{end}}</select></label>
 <button class="btn" type="submit">取消授权</button>
 </form>
 </div>
@@ -1479,24 +1544,79 @@ if(groupSearch){
   });
 }
 document.querySelectorAll('.permission-form').forEach(function(form){
+  const mode=form.dataset.mode || 'grant';
+  const user=form.querySelector('.permission-user-select');
   const type=form.querySelector('.target-type');
   const group=form.querySelector('.target-group');
   const chat=form.querySelector('.target-chat');
+  const groupSelect=form.querySelector('.permission-group-select');
+  const chatSelect=form.querySelector('.permission-chat-select');
+  function optionUsers(option){
+    try{return JSON.parse(option.dataset.users || '[]').map(String);}catch(e){return [];}
+  }
+  function syncPermissionSelect(select, userID){
+    if(!select){return 0;}
+    let visible=0;
+    let firstVisible=null;
+    let selectedVisible=false;
+    Array.from(select.options).forEach(function(option){
+      const hasPermission=optionUsers(option).includes(String(userID || ''));
+      const show=mode==='revoke'?hasPermission:!hasPermission;
+      option.hidden=!show;
+      option.disabled=!show;
+      if(show){
+        visible++;
+        if(!firstVisible){firstVisible=option;}
+        if(option.selected){selectedVisible=true;}
+      }else{
+        option.selected=false;
+      }
+    });
+    if(!selectedVisible && firstVisible){firstVisible.selected=true;}
+    return visible;
+  }
   function syncTarget(){
     const useChat=type && type.value==='chat';
+    const userID=user ? user.value : '';
+    const groupVisible=syncPermissionSelect(groupSelect,userID);
+    const chatVisible=syncPermissionSelect(chatSelect,userID);
     if(group){
-      group.classList.toggle('disabled', useChat);
-      const select=group.querySelector('select');
-      if(select){select.disabled=useChat;}
+      group.classList.toggle('disabled', useChat || groupVisible===0);
+      if(groupSelect){groupSelect.disabled=useChat || groupVisible===0;}
     }
     if(chat){
-      chat.classList.toggle('disabled', !useChat);
-      const select=chat.querySelector('select');
-      if(select){select.disabled=!useChat;}
+      chat.classList.toggle('disabled', !useChat || chatVisible===0);
+      if(chatSelect){chatSelect.disabled=!useChat || chatVisible===0;}
     }
   }
   if(type){type.addEventListener('change',syncTarget);}
+  if(user){user.addEventListener('change',syncTarget);}
   syncTarget();
+});
+document.querySelectorAll('.member-form').forEach(function(form){
+  const mode=form.dataset.mode || 'add';
+  const groupSelect=form.querySelector('.member-group-select');
+  const chatSelect=form.querySelector('.member-chat-select');
+  const empty=form.querySelector('.member-empty');
+  function optionGroups(option){
+    try{return JSON.parse(option.dataset.groups || '[]');}catch(e){return [];}
+  }
+  function syncMemberOptions(){
+    if(!groupSelect || !chatSelect){return;}
+    const groupName=groupSelect.value || '';
+    let visible=0;
+    Array.from(chatSelect.options).forEach(function(option){
+      const inGroup=optionGroups(option).includes(groupName);
+      const show=mode==='remove'?inGroup:!inGroup;
+      option.hidden=!show;
+      option.disabled=!show;
+      if(!show){option.selected=false;}
+      if(show){visible++;}
+    });
+    if(empty){empty.hidden=visible!==0;}
+  }
+  if(groupSelect){groupSelect.addEventListener('change',syncMemberOptions);}
+  syncMemberOptions();
 });
 </script>
 </main></body></html>`
