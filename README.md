@@ -2,6 +2,8 @@
 
 这是 Telegram 记账机器人 Go v2.3.1 主线，按群组使用，生产部署使用 PostgreSQL、GHCR 镜像和共享 `ledger-chain-watcher` 链上监听服务。
 
+重装系统或换机器前后的当前状态交接见 [docs/reinstall-handoff.md](docs/reinstall-handoff.md)。
+
 ## 当前已支持功能
 
 - 每个群默认只保存群名、支持广播和转发回复通知，不会记账；有权限的人在群内发送 `开始` 后，才激活该群记账。
