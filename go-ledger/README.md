@@ -1,6 +1,6 @@
-# Telegram Ledger Bot Go Runtime v2.2
+# Telegram Ledger Bot Go Runtime v2.3
 
-这是机器人 Go 版 v2.2 主线，目标是把同步、异步、队列、并发、缓存、数据库和共享链上监听从架构层面重新设计。当前已具备：
+这是机器人 Go 版 v2.3 主线，目标是把同步、异步、队列、并发、缓存、数据库和共享链上监听从架构层面重新设计。当前已具备：
 
 - Telegram long polling。
 - 按 `chat_id` / `user_id` 串行分发。
@@ -20,26 +20,26 @@
 - 回复用户或输入 `@用户名` 添加/删除本群操作员。
 - 加账写库和 Telegram 账单回执发送拆开：同群写库串行，回执异步有序发送，并保存机器人回执消息 ID 供撤销定位。
 - 完整账单按钮使用短链接：`/b/{chat_id}/{yyyymmdd}`，不再拼接冗长的 `begintime/endtime` 参数。
-- 内置后台管理和短账单网页，后台通过 `ADMIN_WEB_TOKEN` 登录；账单页支持历史日期、上一天/下一天、高级筛选和下载 `.xlsx`。
+- 内置后台管理和短账单网页，后台支持 Telegram 临时登录链接，`ADMIN_WEB_TOKEN` 保留为宿主紧急入口和会话签名密钥；账单页支持历史日期、上一天/下一天、高级筛选和下载 `.xlsx`。
 - 私聊按钮式广播入口：群发、分组广播、单群发送；选定目标后可连续发送文字、图片、图片+文字或文件，不再逐条确认。
 - 广播目标选择后可切换“通知所有人”，开启后广播投递到目标群会自动追加 @ 已发言成员。
-- 私聊菜单已接入详细说明、UID 查询和后台管理入口；后台入口会使用 `PUBLIC_BILL_BASE_URL/admin`。
+- 私聊菜单已接入详细说明、UID 查询和后台管理入口；后台入口会生成 5 分钟有效的 `PUBLIC_BILL_BASE_URL/admin/login?ticket=...` 登录链接。
 - 广播回复通知：群成员回复投递消息时，原操作人会收到私聊通知，可快速回复并定位消息。
 - 广播替换：后台可开关，仅对单群发送生效；群成员回复投递消息时，可把原投递消息替换成固定图片/文字。
 - `Z0` 查询 OKX OTC 商家所有实时汇率 TOP10，`Z1 -0.1` / `设置汇率 Z1 -0.1` 可按档位偏移设置群汇率。
 - 实时汇率全局定时刷新，默认 60 秒刷新一次，所有群共用缓存。
 - 群内发送 TRC20 地址会自动记录验证次数；首次出现回复防篡改核对图，重复出现显示上次发送人和本次发送人。
 - `查询T...` / `查询TRX地址 T...` 查询 TRON 地址余额、创建/活跃时间和最近 USDT 流水，走独立查询池。
-- 地址监听权限：宿主、默认操作人、一级/下级操作人；私聊按钮面板支持添加/删除地址、收入/支出/TRX 通知开关、最小提醒金额。
-- v2.2 链上监听通过共享 `ledger-chain-watcher` 获取链上数据；机器人侧继续保存监听地址、tx_hash 去重和 Telegram outbox。
+- 地址监听权限：普通用户最多 2 个监听地址；宿主、默认操作人、一级/下级操作人不受数量限制。私聊按钮面板支持添加/删除地址、收入/支出/TRX 通知开关、最小提醒金额。
+- v2.3 链上监听通过共享 `ledger-chain-watcher` 获取链上数据；机器人侧继续保存监听地址、tx_hash 去重和 Telegram outbox。
 
 ## 构建
 
 推荐直接使用 GitHub Actions 构建发布的镜像：
 
 ```bash
-docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.2
-docker pull ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.2
+docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.3
+docker pull ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3
 ```
 
 本目录也保留独立 Dockerfile，方便本地构建：
@@ -49,7 +49,7 @@ docker build -t telegram-ledger-bot-go:dev .
 docker build --build-arg APP=chain-watcher -t telegram-ledger-chain-watcher:dev .
 ```
 
-推荐直接用仓库根目录的 `docker-compose.yml` 或 `docker-compose.ghcr.yml` 启动，同一个 Compose 项目里包含 PostgreSQL 独立容器和 `ledger-chain-watcher` 独立容器，默认拉取 `ghcr.io/dayou0168/telegram-ledger-bot-go:2.2` 与 `ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.2`：
+推荐直接用仓库根目录的 `docker-compose.yml` 或 `docker-compose.ghcr.yml` 启动，同一个 Compose 项目里包含 PostgreSQL 独立容器和 `ledger-chain-watcher` 独立容器，默认拉取 `ghcr.io/dayou0168/telegram-ledger-bot-go:2.3` 与 `ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3`：
 
 ```bash
 docker compose -f ../docker-compose.yml up -d
@@ -62,7 +62,7 @@ deploy/ledger-chain-watcher.env.example
 deploy/ledger-chain-watcher.service
 ```
 
-GitHub Release `v2.2` 同时发布 `ledger-chain-watcher-v2.2-linux-amd64.tar.gz` 宿主机包，里面已经包含 Linux amd64 二进制和上述两个模板。
+GitHub Release `v2.3` 同时发布 `ledger-chain-watcher-v2.3-linux-amd64.tar.gz` 宿主机包，里面已经包含 Linux amd64 二进制和上述两个模板。
 
 机器人仍然用自己的 `DATABASE_URL` 连接自己的 PostgreSQL 数据库，并通过 `CHAIN_WATCHER_URL=http://host.docker.internal:8090` 或 Docker 网桥 IP 访问宿主机 watcher。
 
@@ -75,10 +75,15 @@ BOT_HOST_USER_ID=123456789
 DATABASE_URL=postgres://ledger:change_this_strong_password@postgres:5432/ledger_bot?sslmode=disable
 PUBLIC_BILL_BASE_URL=https://bot.example.com
 ADMIN_WEB_TOKEN=change_this_admin_password
+ADDRESS_WATCH_FREE_LIMIT=2
 CHAIN_WATCHER_URL=http://ledger-chain-watcher:8090
 CHAIN_WATCHER_BOT_ID=ledger-main
 CHAIN_WATCHER_SECRET=change_this_chain_watcher_secret
+CHAIN_WATCHER_EMERGENCY_FALLBACK=false
+TRONGRID_API_KEY=
 ```
+
+`CHAIN_WATCHER_EMERGENCY_FALLBACK` 是机器人侧应急开关，默认关闭。只有 watcher 故障排查或短时兜底时才临时设为 `true`，开启后机器人会在领取 watcher 事件的同时本机按地址扫链，会增加 Tronscan/TronGrid API 调用量。本机兜底使用机器人侧 `TRONGRID_API_KEY`，不是 watcher 的 `CHAIN_WATCHER_TRON_API_KEY`。
 
 ## 推荐默认并发
 
@@ -103,8 +108,8 @@ BOT_QUEUE_SIZE=4096
 - Telegram 更新去重、账本、权限、广播任务、链上通知都落 PostgreSQL。
 - 表设计从第一版就使用 `BIGINT` Telegram ID、`TIMESTAMPTZ` 时间、`BOOLEAN` 开关和高频组合索引。
 - 金额类字段在写库前统一格式化为两位小数，减少长尾小数导致的账单阅读问题。
-- PostgreSQL 是 v2.2 的唯一主库目标，避免后续再次迁移。
+- PostgreSQL 是 v2.3 的唯一主库目标，避免后续再次迁移。
 
 ## 启动原则
 
-Go v2.2 直接按 PostgreSQL 空库启动。等账单、广播、监听三块经过真实群测试后，再切换生产 Bot Token。多机器人部署时，每个机器人实例独立 PostgreSQL；只有 `ledger-chain-watcher` 共享。
+Go v2.3 直接按 PostgreSQL 空库启动。等账单、广播、监听三块经过真实群测试后，再切换生产 Bot Token。多机器人部署时，每个机器人实例独立 PostgreSQL；只有 `ledger-chain-watcher` 共享。

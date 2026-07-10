@@ -1,11 +1,11 @@
-# Telegram 记账机器人 Go v2.2 部署运维
+# Telegram 记账机器人 Go v2.3 部署运维
 
-当前发布目标是 Go v2.2。生产部署使用 GHCR 预构建镜像、PostgreSQL 和共享链上监听服务 `ledger-chain-watcher`。服务器上不需要源码构建作为默认路径。
+当前发布目标是 Go v2.3。生产部署使用 GHCR 预构建镜像、PostgreSQL 和共享链上监听服务 `ledger-chain-watcher`。服务器上不需要源码构建作为默认路径。
 
 ## 部署基线
 
-- 机器人镜像：`ghcr.io/dayou0168/telegram-ledger-bot-go:2.2`
-- watcher 镜像：`ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.2`
+- 机器人镜像：`ghcr.io/dayou0168/telegram-ledger-bot-go:2.3`
+- watcher 镜像：`ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3`
 - 数据库：每个机器人实例独立 PostgreSQL 16
 - 链上监听：多个机器人共享 `ledger-chain-watcher`，watcher 使用独立 PostgreSQL 保存订阅、匹配事件和投递游标
 - 推荐入口：宝塔 Docker Compose
@@ -48,6 +48,8 @@ DATABASE_URL: "postgres://ledger:change_this_strong_password@postgres:5432/ledge
 CHAIN_WATCHER_SECRET: "change_this_chain_watcher_secret"
 CHAIN_WATCHER_URL: "http://ledger-chain-watcher:8090"
 CHAIN_WATCHER_BOT_ID: "ledger-main"
+CHAIN_WATCHER_EMERGENCY_FALLBACK: "false"
+TRONGRID_API_KEY: ""
 ```
 
 `CHAIN_WATCHER_BOT_ID` 和 `CHAIN_WATCHER_SECRET` 必须同步写入 watcher 的 `CHAIN_WATCHER_BOTS`：
@@ -63,10 +65,14 @@ CHAIN_WATCHER_TRONSCAN_API_BASE: "https://apilist.tronscanapi.com/api"
 CHAIN_WATCHER_TRON_API_KEY: "your_real_api_key"
 CHAIN_WATCHER_SOURCE_POLL_SECONDS: "1"
 CHAIN_WATCHER_GLOBAL_SCAN_PAGES: "1"
+CHAIN_WATCHER_ADDRESS_SCAN_PAGES: "3"
+CHAIN_WATCHER_ADDRESS_SCAN_CONCURRENCY: "8"
 CHAIN_WATCHER_LOOKBACK_SECONDS: "600"
 ```
 
 `CHAIN_WATCHER_TRON_API_KEY` 只放在 watcher 里，机器人实例不再各自配置官网 API Key。
+
+`CHAIN_WATCHER_EMERGENCY_FALLBACK` 是机器人侧应急兜底开关，默认保持 `false`。临时设为 `true` 后，机器人会在使用 watcher 的同时本机按地址扫链，会增加 Tronscan/TronGrid API 调用量，只建议 watcher 故障排查或短时兜底时使用。本机兜底使用机器人侧 `TRONSCAN_API_BASE` / `TRONGRID_API_KEY`；只修改 watcher 的 `CHAIN_WATCHER_TRON_API_KEY` 不会给机器人本机扫描带 Key。
 
 常用选填：
 
@@ -74,6 +80,7 @@ CHAIN_WATCHER_LOOKBACK_SECONDS: "600"
 DEFAULT_OPERATOR_USER_IDS: ""
 PUBLIC_BILL_BASE_URL: "https://bot.example.com"
 ADMIN_WEB_TOKEN: "change_this_admin_password"
+ADDRESS_WATCH_FREE_LIMIT: "2"
 ```
 
 高级并发默认值按 4 核 8G 调整：
@@ -213,6 +220,8 @@ CHAIN_WATCHER_TRONSCAN_API_BASE=https://apilist.tronscanapi.com/api
 CHAIN_WATCHER_TRON_API_KEY=你的Tronscan API Key
 CHAIN_WATCHER_SOURCE_POLL_SECONDS=1
 CHAIN_WATCHER_GLOBAL_SCAN_PAGES=1
+CHAIN_WATCHER_ADDRESS_SCAN_PAGES=3
+CHAIN_WATCHER_ADDRESS_SCAN_CONCURRENCY=8
 CHAIN_WATCHER_LOOKBACK_SECONDS=600
 CHAIN_WATCHER_CLAIM_LEASE_SECONDS=30
 CHAIN_WATCHER_DELIVERY_RETRY_SECONDS=2
@@ -220,14 +229,14 @@ BOT_TIMEZONE=Asia/Shanghai
 BOT_REQUEST_TIMEOUT=70
 ```
 
-下载 v2.2 发布包并安装二进制到固定路径：
+下载 v2.3 发布包并安装二进制到固定路径：
 
 ```bash
 cd /tmp
-wget -O ledger-chain-watcher-v2.2-linux-amd64.tar.gz \
-  https://github.com/dayou0168/telegram-ledger-bot/releases/download/v2.2/ledger-chain-watcher-v2.2-linux-amd64.tar.gz
-tar -xzf ledger-chain-watcher-v2.2-linux-amd64.tar.gz
-install -m 0755 ledger-chain-watcher-v2.2-linux-amd64/ledger-chain-watcher /usr/local/bin/ledger-chain-watcher
+wget -O ledger-chain-watcher-v2.3-linux-amd64.tar.gz \
+  https://github.com/dayou0168/telegram-ledger-bot/releases/download/v2.3/ledger-chain-watcher-v2.3-linux-amd64.tar.gz
+tar -xzf ledger-chain-watcher-v2.3-linux-amd64.tar.gz
+install -m 0755 ledger-chain-watcher-v2.3-linux-amd64/ledger-chain-watcher /usr/local/bin/ledger-chain-watcher
 /usr/local/bin/ledger-chain-watcher --help
 ```
 
@@ -254,6 +263,8 @@ environment:
   CHAIN_WATCHER_URL: "http://host.docker.internal:8090"
   CHAIN_WATCHER_BOT_ID: "tianzezsbot"
   CHAIN_WATCHER_SECRET: "换成随机内部密钥"
+  CHAIN_WATCHER_EMERGENCY_FALLBACK: "false"
+  TRONGRID_API_KEY: ""
 ```
 
 Docker 20.10+ 推荐使用：
@@ -307,7 +318,7 @@ journalctl -u ledger-chain-watcher -f
 ```text
 ledger-chain-watcher        共享链上监听服务和 watcher PostgreSQL
 ledger-main                 当前记账机器人实例
-ledger-ops                  第二个独立 Go v2.2 机器人实例
+ledger-ops                  第二个独立 Go v2.3 机器人实例
 ```
 
 先创建共享 Docker 网络：
@@ -335,6 +346,7 @@ services:
       CHAIN_WATCHER_URL: "http://ledger-chain-watcher:8090"
       CHAIN_WATCHER_BOT_ID: "ledger-main"
       CHAIN_WATCHER_SECRET: "change_this_chain_watcher_secret"
+      CHAIN_WATCHER_EMERGENCY_FALLBACK: "false"
 
 networks:
   ledger-chain-net:
@@ -414,7 +426,7 @@ ports:
 
 ## 未来接 TRON Lite FullNode + Kafka
 
-v2.2 第一版 watcher 统一请求 Tronscan/TronGrid。未来切换自建节点时，机器人配置不变，只调整 watcher：
+v2.3 第一版 watcher 统一请求 Tronscan/TronGrid。未来切换自建节点时，机器人配置不变，只调整 watcher：
 
 ```yaml
 CHAIN_WATCHER_SOURCE: "kafka"
@@ -443,6 +455,8 @@ default.replication.factor=1
 - `DEFAULT_OPERATOR_USER_IDS` 是程序默认操作人，选填，多个 ID 用英文逗号、空格或分号分隔。
 - 宿主和默认操作人都是全局权限用户。
 - 全局权限用户可以邀请机器人进群、在任意群记账、使用群发/分组广播、使用地址监听、管理任意群。
+- 普通用户可以在私聊使用地址监听，默认最多 2 个 active 地址；通过 `ADDRESS_WATCH_FREE_LIMIT` 调整。宿主、默认操作人和操作人不受此数量限制。
+- 后台入口优先通过私聊机器人生成 5 分钟有效的 Telegram 身份登录链接；`ADMIN_WEB_TOKEN` 仍作为宿主紧急入口和会话签名密钥。
 - 普通用户发送 `开始` 会被拒绝，不会激活记账，也不会变成宿主或默认操作人。
 - 单群操作员是群级权限，由宿主或默认操作人在群内管理。
 - 邀请机器人进群的人如果不是宿主或默认操作人，机器人会自动退出。

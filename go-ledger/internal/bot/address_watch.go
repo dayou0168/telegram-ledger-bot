@@ -16,19 +16,26 @@ import (
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/tron"
 )
 
-const addressWatchDeniedText = "没有地址监听权限。只有宿主、一级操作人和下级操作人可以使用。"
-
-func (b *Bot) canUseAddressWatch(ctx context.Context, userID int64) bool {
+func (b *Bot) hasUnlimitedAddressWatch(ctx context.Context, userID int64) bool {
 	if b.perms.HasGlobalAddressWatchAccess(userID) {
 		return true
 	}
-	key := "broadcast:" + formatID(userID)
+	key := "address_watch_unlimited:" + formatID(userID)
 	if value, ok := b.operatorCache.Get(key); ok {
 		return value
 	}
-	value, err := b.store.IsBroadcastOperator(ctx, userID)
+	broadcastOperator, err := b.store.IsBroadcastOperator(ctx, userID)
 	if err != nil {
 		log.Printf("check address watch operator %d: %v", userID, err)
+		return false
+	}
+	if broadcastOperator {
+		b.operatorCache.Set(key, true)
+		return true
+	}
+	value, err := b.store.IsAnyOperator(ctx, userID)
+	if err != nil {
+		log.Printf("check ledger operator for address watch %d: %v", userID, err)
 		return false
 	}
 	b.operatorCache.Set(key, value)
@@ -302,11 +309,11 @@ func (b *Bot) toggleAddressWatchSetting(ctx context.Context, cb telegram.Callbac
 }
 
 func (b *Bot) addWatchFromPrivate(ctx context.Context, msg telegram.Message, user storage.User, address, label string, now time.Time) error {
-	if !b.canUseAddressWatch(ctx, user.ID) {
-		return b.enqueueReplyText(ctx, sendPriorityNormal, "watch_add_denied", msg.Chat.ID, msg.MessageID, addressWatchDeniedText, nil, now)
-	}
 	if !isTRC20Address(address) {
 		return b.enqueueReplyText(ctx, sendPriorityNormal, "watch_add_bad_address", msg.Chat.ID, msg.MessageID, "地址格式不支持。USDT 监听当前只支持 TRC20 的 T 开头地址。", nil, now)
+	}
+	if err := b.guardAddressWatchLimit(ctx, msg, user.ID, address, now); err != nil {
+		return err
 	}
 	if err := b.store.AddWatch(ctx, user.ID, address, strings.TrimSpace(label), now); err != nil {
 		return err
@@ -316,6 +323,29 @@ func (b *Bot) addWatchFromPrivate(ctx context.Context, msg telegram.Message, use
 		b.syncChainWatcherTargetAsync(ctx, target)
 	}
 	return b.enqueueReplyText(ctx, sendPriorityNormal, "watch_add_ok", msg.Chat.ID, msg.MessageID, "监听地址已保存。", nil, now)
+}
+
+func (b *Bot) guardAddressWatchLimit(ctx context.Context, msg telegram.Message, userID int64, address string, now time.Time) error {
+	if b.hasUnlimitedAddressWatch(ctx, userID) {
+		return nil
+	}
+	if _, ok, err := b.store.GetWatchTarget(ctx, userID, address); err != nil {
+		return err
+	} else if ok {
+		return nil
+	}
+	limit := b.cfg.AddressWatchFreeLimit
+	if limit <= 0 {
+		return b.enqueueReplyText(ctx, sendPriorityNormal, "watch_add_limited_closed", msg.Chat.ID, msg.MessageID, "当前暂未开放普通用户添加监听地址。", nil, now)
+	}
+	count, err := b.store.CountActiveWatchTargetsForOwner(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if count >= limit {
+		return b.enqueueReplyText(ctx, sendPriorityNormal, "watch_add_limited", msg.Chat.ID, msg.MessageID, fmt.Sprintf("普通用户最多只能监听 %d 个地址。请先删除不需要的监听地址。", limit), nil, now)
+	}
+	return nil
 }
 
 func (b *Bot) editAddressWatchMenu(ctx context.Context, chatID, messageID, ownerID int64) error {
@@ -476,9 +506,6 @@ func normalizeWatchLabel(text string) string {
 }
 
 func (b *Bot) removeWatchFromPrivate(ctx context.Context, msg telegram.Message, user storage.User, address string, now time.Time) error {
-	if !b.canUseAddressWatch(ctx, user.ID) {
-		return b.enqueueReplyText(ctx, sendPriorityNormal, "watch_remove_denied", msg.Chat.ID, msg.MessageID, addressWatchDeniedText, nil, now)
-	}
 	removed, err := b.store.RemoveWatch(ctx, user.ID, address, now)
 	if err != nil {
 		return err

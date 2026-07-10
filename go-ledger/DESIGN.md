@@ -1,6 +1,6 @@
-# Go Ledger Bot v2.2 Architecture
+# Go Ledger Bot v2.3 Architecture
 
-这个目录是 Telegram 记账机器人的 Go v2.2 主线。当前主线按 PostgreSQL-first 设计，生产部署、测试和发布都以 Go 运行时为准。
+这个目录是 Telegram 记账机器人的 Go v2.3 主线。当前主线按 PostgreSQL-first 设计，生产部署、测试和发布都以 Go 运行时为准。
 
 ## 目标
 
@@ -84,7 +84,7 @@ Go 版使用两层队列：
 
 ## 数据库策略
 
-v2.2 起继续直接使用 PostgreSQL：
+v2.3 起继续直接使用 PostgreSQL：
 
 - `pgxpool` 连接池，默认 `MaxConns=32`、`MinConns=4`。
 - Telegram ID 使用 `BIGINT`。
@@ -94,7 +94,7 @@ v2.2 起继续直接使用 PostgreSQL：
 - 幂等表记录 Telegram update 和链上 tx hash，避免重复处理。
 - 高频路径从第一版就建立组合索引：权限、账单日切窗口、撤销消息定位、地址监听目标、链上去重、广播回执定位。
 
-测试阶段直接使用 PostgreSQL 空库验证 Go v2.2 的账本、广播、监听和后台逻辑。
+测试阶段直接使用 PostgreSQL 空库验证 Go v2.3 的账本、广播、监听和后台逻辑。
 
 ## 链上监听策略
 
@@ -107,4 +107,4 @@ v2.2 起继续直接使用 PostgreSQL：
 
 ## 发布策略
 
-Go v2.2 是当前唯一发布主线。每次发布前按模块测试账本、广播、监听、后台、chain-watcher 和部署配置，确认后再推送镜像。
+Go v2.3 是当前唯一发布主线。每次发布前按模块测试账本、广播、监听、后台、chain-watcher 和部署配置，确认后再推送镜像。

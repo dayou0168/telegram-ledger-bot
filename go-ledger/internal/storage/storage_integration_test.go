@@ -42,10 +42,10 @@ func TestPostgresStoreBasicFlow(t *testing.T) {
 		t.Fatalf("duplicate update claim should be false")
 	}
 
-	if err := store.EnsureGroup(ctx, chatID, "Go v2.2 test group", now); err != nil {
+	if err := store.EnsureGroup(ctx, chatID, "Go v2.3 test group", now); err != nil {
 		t.Fatalf("ensure group: %v", err)
 	}
-	user := User{ID: userID, Username: "go22", DisplayName: "Go 2.2"}
+	user := User{ID: userID, Username: "go23", DisplayName: "Go 2.3"}
 	if err := store.TouchUser(ctx, chatID, user, now); err != nil {
 		t.Fatalf("touch user: %v", err)
 	}
@@ -107,6 +107,32 @@ func TestPostgresStoreBasicFlow(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("watch target was not returned")
+	}
+	count, err := store.CountActiveWatchTargetsForOwner(ctx, userID)
+	if err != nil {
+		t.Fatalf("count watch targets: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("active watch target count = %d, want 1", count)
+	}
+
+	tokenHash := "ticket-" + time.Now().Format("150405.000000000")
+	if err := store.CreateAdminLoginTicket(ctx, tokenHash, userID, "operator", now.Add(time.Minute), now); err != nil {
+		t.Fatalf("create admin login ticket: %v", err)
+	}
+	ticket, ok, err := store.ConsumeAdminLoginTicket(ctx, tokenHash, now)
+	if err != nil {
+		t.Fatalf("consume admin login ticket: %v", err)
+	}
+	if !ok || ticket.UserID != userID || ticket.Role != "operator" {
+		t.Fatalf("unexpected admin ticket: ok=%v ticket=%+v", ok, ticket)
+	}
+	_, ok, err = store.ConsumeAdminLoginTicket(ctx, tokenHash, now)
+	if err != nil {
+		t.Fatalf("consume used admin login ticket: %v", err)
+	}
+	if ok {
+		t.Fatal("admin login ticket should be single use")
 	}
 
 	inserted, err := store.RecordChainNotification(ctx, userID, address, "txhash-"+time.Now().Format("150405.000000000"), "income", now.UnixMilli(), now)

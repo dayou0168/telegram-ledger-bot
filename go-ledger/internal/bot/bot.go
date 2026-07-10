@@ -20,10 +20,10 @@ import (
 )
 
 type Bot struct {
-	cfg   config.Config
-	store *storage.Store
-	tg    *telegram.Client
-	tron  *tron.Client
+	cfg     config.Config
+	store   *storage.Store
+	tg      *telegram.Client
+	tron    *tron.Client
 	p2p     *p2p.Client
 	watcher *chainclient.Client
 	perms   permissions.Policy
@@ -98,7 +98,8 @@ func (b *Bot) Run(ctx context.Context) error {
 	if b.cfg.ChainWatcherEnabled() {
 		go b.chainWatcherSyncScheduler(ctx)
 		go b.chainWatcherEventScheduler(ctx)
-	} else {
+	}
+	if b.cfg.LocalAddressWatcherEnabled() {
 		go b.addressWatchScheduler(ctx)
 	}
 	go b.notificationOutboxScheduler(ctx)
@@ -305,9 +306,6 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg telegram.Message, us
 		return b.handleTRXAddressQuery(ctx, msg, address)
 	}
 	if text == "🔔地址监听" || text == "地址监听" || text == "监听地址" {
-		if !b.canUseAddressWatch(ctx, user.ID) {
-			return b.enqueueReplyText(ctx, sendPriorityNormal, "private_watch_denied", msg.Chat.ID, msg.MessageID, addressWatchDeniedText, nil, now)
-		}
 		return b.sendAddressWatchMenu(ctx, msg.Chat.ID, user.ID, msg.MessageID)
 	}
 	if handled, err := b.handlePrivateShortcut(ctx, msg, user, text); handled || err != nil {
@@ -351,9 +349,6 @@ func (b *Bot) handleUsersShared(ctx context.Context, msg telegram.Message) error
 }
 
 func (b *Bot) handleCallback(ctx context.Context, cb telegram.CallbackQuery) error {
-	if strings.HasPrefix(cb.Data, "watch:") && !b.canUseAddressWatch(ctx, cb.From.ID) {
-		return b.tg.AnswerCallback(ctx, cb.ID, addressWatchDeniedText)
-	}
 	if strings.HasPrefix(cb.Data, "watch:") {
 		return b.handleAddressWatchCallback(ctx, cb)
 	}

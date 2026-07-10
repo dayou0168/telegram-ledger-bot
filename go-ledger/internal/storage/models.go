@@ -191,6 +191,15 @@ type WatchSettings struct {
 	UpdatedAt       time.Time
 }
 
+type AdminLoginTicket struct {
+	TokenHash string
+	UserID    int64
+	Role      string
+	ExpiresAt time.Time
+	UsedAt    *time.Time
+	CreatedAt time.Time
+}
+
 type AddressValidation struct {
 	ChatID           int64
 	Address          string

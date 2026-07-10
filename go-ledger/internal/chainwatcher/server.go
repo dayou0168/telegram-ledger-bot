@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/config"
@@ -100,23 +101,78 @@ func (s *Server) pollOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	now := time.Now()
 	for _, transfer := range transfers {
-		candidates := append([]storage.ChainWatcherSubscription{}, byAddress[transfer.From]...)
-		candidates = append(candidates, byAddress[transfer.To]...)
-		if len(candidates) == 0 {
-			continue
-		}
-		event := TransferEvent(transfer, "tronscan")
-		deliveries := MatchTransfer(transfer, candidates)
-		if len(deliveries) == 0 {
-			continue
-		}
-		if _, err := s.store.RecordChainWatcherMatches(ctx, event, deliveries, now); err != nil {
+		if err := s.recordTransferMatches(ctx, transfer, byAddress); err != nil {
 			return err
 		}
 	}
-	return nil
+	return s.pollAddressTransfers(ctx, byAddress, minTimestamp)
+}
+
+func (s *Server) pollAddressTransfers(ctx context.Context, byAddress map[string][]storage.ChainWatcherSubscription, minTimestamp int64) error {
+	if len(byAddress) == 0 {
+		return nil
+	}
+	concurrency := s.cfg.AddressConcurrency
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	sem := make(chan struct{}, concurrency)
+	errCh := make(chan error, 1)
+	var wg sync.WaitGroup
+	for address := range byAddress {
+		address := address
+		select {
+		case <-ctx.Done():
+			wg.Wait()
+			return ctx.Err()
+		case sem <- struct{}{}:
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			transfers, err := s.tron.FetchAddressUSDTTransfersSincePages(ctx, address, s.cfg.USDTContract, 50, s.cfg.AddressPages, minTimestamp)
+			if err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+				return
+			}
+			for _, transfer := range transfers {
+				if err := s.recordTransferMatches(ctx, transfer, byAddress); err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	select {
+	case err := <-errCh:
+		return err
+	default:
+		return nil
+	}
+}
+
+func (s *Server) recordTransferMatches(ctx context.Context, transfer tron.Transfer, byAddress map[string][]storage.ChainWatcherSubscription) error {
+	candidates := append([]storage.ChainWatcherSubscription{}, byAddress[transfer.From]...)
+	candidates = append(candidates, byAddress[transfer.To]...)
+	if len(candidates) == 0 {
+		return nil
+	}
+	event := TransferEvent(transfer, "tronscan")
+	deliveries := MatchTransfer(transfer, candidates)
+	if len(deliveries) == 0 {
+		return nil
+	}
+	_, err := s.store.RecordChainWatcherMatches(ctx, event, deliveries, time.Now())
+	return err
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/adminauth"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/config"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
 	"github.com/xuri/excelize/v2"
@@ -23,22 +24,29 @@ import (
 
 const adminCookieName = "ledger_admin_token"
 
+type adminContextKey struct{}
+
 type Server struct {
 	cfg   config.Config
 	store *storage.Store
 }
 
 type pageData struct {
-	Version     string
-	TokenUnset  bool
-	Message     string
-	Groups      []storage.Group
-	BGroups     []storage.BroadcastGroup
-	BOperators  []storage.BroadcastOperator
-	Permissions []storage.BroadcastPermission
-	Replace     storage.BroadcastReplaceSetting
-	ChatNames   map[int64]string
-	OpLabels    map[int64]string
+	Version         string
+	TokenUnset      bool
+	Message         string
+	Groups          []storage.Group
+	BGroups         []storage.BroadcastGroup
+	BOperators      []storage.BroadcastOperator
+	Permissions     []storage.BroadcastPermission
+	Replace         storage.BroadcastReplaceSetting
+	WatchTargets    []storage.WatchTarget
+	AdminUserID     int64
+	AdminRole       string
+	AdminRoleLabel  string
+	CanManageGlobal bool
+	ChatNames       map[int64]string
+	OpLabels        map[int64]string
 }
 
 type billData struct {
@@ -122,6 +130,8 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("/admin/operator/disable", s.withAuth(s.disableOperator))
 	mux.HandleFunc("/admin/permission/grant", s.withAuth(s.grantPermission))
 	mux.HandleFunc("/admin/permission/revoke", s.withAuth(s.revokePermission))
+	mux.HandleFunc("/admin/watch/save", s.withAuth(s.saveWatchTarget))
+	mux.HandleFunc("/admin/watch/remove", s.withAuth(s.removeWatchTarget))
 	mux.HandleFunc("/admin/replace/save", s.withAuth(s.saveReplace))
 
 	addr := fmt.Sprintf("%s:%d", s.cfg.AdminWebHost, s.cfg.AdminWebPort)
@@ -252,6 +262,10 @@ func (s *Server) downloadBill(w http.ResponseWriter, group storage.Group, dayKey
 }
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
+	if ticket := strings.TrimSpace(r.URL.Query().Get("ticket")); ticket != "" {
+		s.loginWithTicket(w, r, ticket)
+		return
+	}
 	if r.Method == http.MethodGet {
 		renderLogin(w, s.cfg.AdminWebToken == "", "")
 		return
@@ -260,17 +274,53 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if strings.TrimSpace(s.cfg.AdminWebToken) == "" {
+		renderLogin(w, true, "未配置 ADMIN_WEB_TOKEN，无法创建后台会话")
+		return
+	}
 	if s.cfg.AdminWebToken != "" && r.FormValue("password") != s.cfg.AdminWebToken {
 		renderLogin(w, false, "密码不正确")
 		return
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     adminCookieName,
-		Value:    s.cfg.AdminWebToken,
-		Path:     "/admin",
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   86400 * 7,
+	if s.cfg.HostUserID <= 0 {
+		renderLogin(w, s.cfg.AdminWebToken == "", "未配置宿主 UID，无法创建后台会话")
+		return
+	}
+	s.setAdminCookie(w, adminauth.Session{
+		UserID:    s.cfg.HostUserID,
+		Role:      adminauth.RoleHost,
+		ExpiresAt: time.Now().Add(adminauth.SessionTTL),
+	})
+	http.Redirect(w, r, "/admin", http.StatusSeeOther)
+}
+
+func (s *Server) loginWithTicket(w http.ResponseWriter, r *http.Request, ticket string) {
+	now := time.Now()
+	if strings.TrimSpace(s.cfg.AdminWebToken) == "" {
+		renderLogin(w, true, "未配置 ADMIN_WEB_TOKEN，无法创建后台会话")
+		return
+	}
+	item, ok, err := s.store.ConsumeAdminLoginTicket(r.Context(), adminauth.HashToken(ticket), now)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !ok || !adminauth.IsAllowedRole(item.Role) {
+		renderLogin(w, s.cfg.AdminWebToken == "", "后台登录链接无效或已过期")
+		return
+	}
+	if ok, err := s.adminSessionAllowed(r.Context(), adminauth.Session{UserID: item.UserID, Role: item.Role, ExpiresAt: item.ExpiresAt}); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	} else if !ok {
+		renderLogin(w, s.cfg.AdminWebToken == "", "后台登录身份已失效")
+		return
+	}
+	_ = s.store.CleanupAdminLoginTickets(r.Context(), now.Add(-24*time.Hour))
+	s.setAdminCookie(w, adminauth.Session{
+		UserID:    item.UserID,
+		Role:      item.Role,
+		ExpiresAt: now.Add(adminauth.SessionTTL),
 	})
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
 }
@@ -282,21 +332,99 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.cfg.AdminWebToken == "" {
-			next(w, r)
+		if session, ok := s.adminSessionFromRequest(r); ok {
+			allowed, err := s.adminSessionAllowed(r.Context(), session)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if !allowed {
+				http.SetCookie(w, &http.Cookie{Name: adminCookieName, Path: "/admin", MaxAge: -1})
+				http.Redirect(w, r, "/admin/login", http.StatusSeeOther)
+				return
+			}
+			ctx := context.WithValue(r.Context(), adminContextKey{}, session)
+			next(w, r.WithContext(ctx))
 			return
 		}
-		cookie, err := r.Cookie(adminCookieName)
-		if err != nil || cookie.Value != s.cfg.AdminWebToken {
-			http.Redirect(w, r, "/admin/login", http.StatusSeeOther)
-			return
-		}
-		next(w, r)
+		http.Redirect(w, r, "/admin/login", http.StatusSeeOther)
 	}
 }
 
+func (s *Server) adminSessionFromRequest(r *http.Request) (adminauth.Session, bool) {
+	if strings.TrimSpace(s.adminSessionSecret()) == "" {
+		return adminauth.Session{}, false
+	}
+	cookie, err := r.Cookie(adminCookieName)
+	if err != nil {
+		return adminauth.Session{}, false
+	}
+	return adminauth.VerifySession(cookie.Value, s.adminSessionSecret(), time.Now())
+}
+
+func (s *Server) adminSessionAllowed(ctx context.Context, session adminauth.Session) (bool, error) {
+	switch session.Role {
+	case adminauth.RoleHost:
+		return s.cfg.HostUserID > 0 && session.UserID == s.cfg.HostUserID, nil
+	case adminauth.RoleDefaultOperator:
+		if session.UserID <= 0 {
+			return false, nil
+		}
+		_, ok := s.cfg.DefaultOperatorIDs[session.UserID]
+		return ok, nil
+	case adminauth.RoleOperator:
+		if session.UserID <= 0 {
+			return false, nil
+		}
+		broadcastOperator, err := s.store.IsBroadcastOperator(ctx, session.UserID)
+		if err != nil {
+			return false, err
+		}
+		if broadcastOperator {
+			return true, nil
+		}
+		return s.store.IsAnyOperator(ctx, session.UserID)
+	default:
+		return false, nil
+	}
+}
+
+func (s *Server) setAdminCookie(w http.ResponseWriter, session adminauth.Session) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     adminCookieName,
+		Value:    adminauth.SignSession(session, s.adminSessionSecret()),
+		Path:     "/admin",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int(time.Until(session.ExpiresAt).Seconds()),
+	})
+}
+
+func (s *Server) adminSessionSecret() string {
+	return strings.TrimSpace(s.cfg.AdminWebToken)
+}
+
+func adminSessionFromContext(ctx context.Context) adminauth.Session {
+	if session, ok := ctx.Value(adminContextKey{}).(adminauth.Session); ok {
+		return session
+	}
+	return adminauth.Session{}
+}
+
+func adminCanManageGlobal(session adminauth.Session) bool {
+	return adminauth.IsHost(session.Role)
+}
+
+func requireGlobalAdmin(w http.ResponseWriter, r *http.Request) bool {
+	if adminCanManageGlobal(adminSessionFromContext(r.Context())) {
+		return true
+	}
+	http.Error(w, "没有后台管理权限", http.StatusForbidden)
+	return false
+}
+
 func (s *Server) index(w http.ResponseWriter, r *http.Request) {
-	data, err := s.loadPageData(r.Context(), r.URL.Query().Get("msg"))
+	data, err := s.loadPageData(r.Context(), r.URL.Query().Get("msg"), adminSessionFromContext(r.Context()))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -308,6 +436,9 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) saveGroup(w http.ResponseWriter, r *http.Request) {
+	if !requireGlobalAdmin(w, r) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Redirect(w, r, "/admin", http.StatusSeeOther)
 		return
@@ -329,6 +460,9 @@ func (s *Server) saveGroup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deleteGroup(w http.ResponseWriter, r *http.Request) {
+	if !requireGlobalAdmin(w, r) {
+		return
+	}
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -354,6 +488,9 @@ func (s *Server) removeGroupChats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) changeGroupChats(w http.ResponseWriter, r *http.Request, add bool) {
+	if !requireGlobalAdmin(w, r) {
+		return
+	}
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -379,6 +516,9 @@ func (s *Server) changeGroupChats(w http.ResponseWriter, r *http.Request, add bo
 }
 
 func (s *Server) saveOperator(w http.ResponseWriter, r *http.Request) {
+	if !requireGlobalAdmin(w, r) {
+		return
+	}
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -396,6 +536,9 @@ func (s *Server) saveOperator(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) disableOperator(w http.ResponseWriter, r *http.Request) {
+	if !requireGlobalAdmin(w, r) {
+		return
+	}
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -410,6 +553,9 @@ func (s *Server) disableOperator(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) grantPermission(w http.ResponseWriter, r *http.Request) {
+	if !requireGlobalAdmin(w, r) {
+		return
+	}
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -426,6 +572,9 @@ func (s *Server) grantPermission(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) revokePermission(w http.ResponseWriter, r *http.Request) {
+	if !requireGlobalAdmin(w, r) {
+		return
+	}
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -442,7 +591,77 @@ func (s *Server) revokePermission(w http.ResponseWriter, r *http.Request) {
 	redirectMsg(w, r, "权限已取消")
 }
 
+func (s *Server) saveWatchTarget(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	session := adminSessionFromContext(r.Context())
+	owner, address, ok := s.watchFormIdentity(w, r, session)
+	if !ok {
+		return
+	}
+	target, exists, err := s.store.GetWatchTarget(r.Context(), owner, address)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !exists {
+		redirectMsg(w, r, "监听地址不存在")
+		return
+	}
+	target.Label = strings.TrimSpace(r.FormValue("label"))
+	target.WatchIncome = r.FormValue("watch_income") == "1"
+	target.WatchExpense = r.FormValue("watch_expense") == "1"
+	target.NotifyTRX = r.FormValue("notify_trx") == "1"
+	target.MinNotifyAmount = normalizeAdminMinAmount(r.FormValue("min_notify_amount"))
+	if _, err := s.store.UpdateWatchTarget(r.Context(), target, time.Now()); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	redirectMsg(w, r, "监听地址已保存")
+}
+
+func (s *Server) removeWatchTarget(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	session := adminSessionFromContext(r.Context())
+	owner, address, ok := s.watchFormIdentity(w, r, session)
+	if !ok {
+		return
+	}
+	removed, err := s.store.RemoveWatch(r.Context(), owner, address, time.Now())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !removed {
+		redirectMsg(w, r, "监听地址不存在")
+		return
+	}
+	redirectMsg(w, r, "监听地址已删除")
+}
+
+func (s *Server) watchFormIdentity(w http.ResponseWriter, r *http.Request, session adminauth.Session) (int64, string, bool) {
+	owner, _ := strconv.ParseInt(strings.TrimSpace(r.FormValue("owner_user_id")), 10, 64)
+	address := strings.TrimSpace(r.FormValue("address"))
+	if owner <= 0 || address == "" {
+		redirectMsg(w, r, "监听地址参数不完整")
+		return 0, "", false
+	}
+	if !adminauth.IsHost(session.Role) && owner != session.UserID {
+		http.Error(w, "没有权限操作其他人的监听地址", http.StatusForbidden)
+		return 0, "", false
+	}
+	return owner, address, true
+}
+
 func (s *Server) saveReplace(w http.ResponseWriter, r *http.Request) {
+	if !requireGlobalAdmin(w, r) {
+		return
+	}
 	if err := r.ParseMultipartForm(8 << 20); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -479,24 +698,44 @@ func (s *Server) saveReplace(w http.ResponseWriter, r *http.Request) {
 	redirectMsg(w, r, "广播替换设置已保存")
 }
 
-func (s *Server) loadPageData(ctx context.Context, message string) (pageData, error) {
-	groups, err := s.store.ListGroups(ctx)
-	if err != nil {
-		return pageData{}, err
+func (s *Server) loadPageData(ctx context.Context, message string, session adminauth.Session) (pageData, error) {
+	canManageGlobal := adminCanManageGlobal(session)
+	var (
+		groups      []storage.Group
+		bgroups     []storage.BroadcastGroup
+		operators   []storage.BroadcastOperator
+		permissions []storage.BroadcastPermission
+		replace     storage.BroadcastReplaceSetting
+		err         error
+	)
+	if canManageGlobal {
+		groups, err = s.store.ListGroups(ctx)
+		if err != nil {
+			return pageData{}, err
+		}
+		bgroups, err = s.store.ListBroadcastGroups(ctx)
+		if err != nil {
+			return pageData{}, err
+		}
+		operators, err = s.store.ListBroadcastOperators(ctx)
+		if err != nil {
+			return pageData{}, err
+		}
+		permissions, err = s.store.ListBroadcastPermissions(ctx)
+		if err != nil {
+			return pageData{}, err
+		}
+		replace, err = s.store.GetBroadcastReplaceSetting(ctx)
+		if err != nil {
+			return pageData{}, err
+		}
 	}
-	bgroups, err := s.store.ListBroadcastGroups(ctx)
-	if err != nil {
-		return pageData{}, err
+	var watchTargets []storage.WatchTarget
+	if adminauth.IsHost(session.Role) {
+		watchTargets, err = s.store.ListWatchTargets(ctx)
+	} else {
+		watchTargets, err = s.store.ListWatchTargetsForOwner(ctx, session.UserID)
 	}
-	operators, err := s.store.ListBroadcastOperators(ctx)
-	if err != nil {
-		return pageData{}, err
-	}
-	permissions, err := s.store.ListBroadcastPermissions(ctx)
-	if err != nil {
-		return pageData{}, err
-	}
-	replace, err := s.store.GetBroadcastReplaceSetting(ctx)
 	if err != nil {
 		return pageData{}, err
 	}
@@ -509,16 +748,21 @@ func (s *Server) loadPageData(ctx context.Context, message string) (pageData, er
 		opLabels[op.UserID] = operatorLabel(op)
 	}
 	return pageData{
-		Version:     config.Version,
-		TokenUnset:  s.cfg.AdminWebToken == "",
-		Message:     message,
-		Groups:      groups,
-		BGroups:     bgroups,
-		BOperators:  operators,
-		Permissions: permissions,
-		Replace:     replace,
-		ChatNames:   chatNames,
-		OpLabels:    opLabels,
+		Version:         config.Version,
+		TokenUnset:      s.cfg.AdminWebToken == "",
+		Message:         message,
+		Groups:          groups,
+		BGroups:         bgroups,
+		BOperators:      operators,
+		Permissions:     permissions,
+		Replace:         replace,
+		WatchTargets:    watchTargets,
+		AdminUserID:     session.UserID,
+		AdminRole:       session.Role,
+		AdminRoleLabel:  adminauth.RoleLabel(session.Role),
+		CanManageGlobal: canManageGlobal,
+		ChatNames:       chatNames,
+		OpLabels:        opLabels,
 	}, nil
 }
 
@@ -625,23 +869,35 @@ func permissionTarget(p storage.BroadcastPermission, names map[int64]string) str
 }
 
 func operatorLabel(op storage.BroadcastOperator) string {
-	return operatorIDLabel(op.UserID, op.Remark)
+	remark := strings.TrimSpace(op.Remark)
+	if remark != "" {
+		return remark
+	}
+	return "未备注操作人 " + maskedUserID(op.UserID)
 }
 
-func operatorIDLabel(userID int64, remark string) string {
-	id := strconv.FormatInt(userID, 10)
-	remark = strings.TrimSpace(remark)
-	if remark == "" {
-		return id
+func operatorSourceLabel(op storage.BroadcastOperator, labels map[int64]string) string {
+	if op.CreatedBy == 0 {
+		return "后台管理"
 	}
-	return remark + "（" + id + "）"
+	if label := labels[op.CreatedBy]; label != "" {
+		return label
+	}
+	return "已授权操作人 " + maskedUserID(op.CreatedBy)
+}
+
+func adminTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format("2006-01-02 15:04")
 }
 
 func permissionUserLabel(p storage.BroadcastPermission, labels map[int64]string) string {
 	if label := labels[p.UserID]; label != "" {
 		return label
 	}
-	return strconv.FormatInt(p.UserID, 10)
+	return "未备注操作人 " + maskedUserID(p.UserID)
 }
 
 func grantorLabel(p storage.BroadcastPermission, labels map[int64]string) string {
@@ -651,7 +907,32 @@ func grantorLabel(p storage.BroadcastPermission, labels map[int64]string) string
 	if label := labels[p.GrantedBy]; label != "" {
 		return label
 	}
-	return strconv.FormatInt(p.GrantedBy, 10)
+	return "已授权操作人 " + maskedUserID(p.GrantedBy)
+}
+
+func watchOwnerLabel(target storage.WatchTarget, labels map[int64]string) string {
+	if label := labels[target.OwnerUserID]; label != "" {
+		return label
+	}
+	return "用户 " + maskedUserID(target.OwnerUserID)
+}
+
+func maskedUserID(userID int64) string {
+	if userID <= 0 {
+		return ""
+	}
+	text := strconv.FormatInt(userID, 10)
+	if len(text) <= 4 {
+		return "****" + text
+	}
+	return "****" + text[len(text)-4:]
+}
+
+func watchLatestTime(target storage.WatchTarget) string {
+	if target.LatestTimestamp <= 0 {
+		return "暂无"
+	}
+	return time.UnixMilli(target.LatestTimestamp).Format("2006-01-02 15:04:05")
 }
 
 func parseBillPath(path string) (int64, string, string, bool) {
@@ -1344,15 +1625,27 @@ func containsFold(value, query string) bool {
 	return strings.Contains(strings.ToLower(value), strings.ToLower(query))
 }
 
+func normalizeAdminMinAmount(raw string) string {
+	value := parseBillRat(strings.TrimSpace(raw))
+	if value == nil || value.Sign() < 0 {
+		return "0"
+	}
+	return formatBillRat(value, 2)
+}
+
 var adminTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
 	"chatLabel":            chatLabel,
 	"chatBroadcastGroups":  chatBroadcastGroups,
 	"permissionGroupUsers": permissionGroupUsers,
 	"permissionChatUsers":  permissionChatUsers,
 	"operatorLabel":        operatorLabel,
+	"operatorSourceLabel":  operatorSourceLabel,
+	"adminTime":            adminTime,
 	"permissionTarget":     permissionTarget,
 	"permissionUserLabel":  permissionUserLabel,
 	"grantorLabel":         grantorLabel,
+	"watchOwnerLabel":      watchOwnerLabel,
+	"watchLatestTime":      watchLatestTime,
 }).Parse(adminHTML))
 
 var loginTemplate = template.Must(template.New("login").Parse(loginHTML))
@@ -1408,9 +1701,11 @@ const adminHTML = `<!doctype html>
 .btn.secondary{background:#fff;color:var(--navy);border:1px solid var(--line)}
 .msg{margin-top:14px;background:#eef8ff;border:1px solid #b8d8ff;color:#16437b;border-radius:6px;padding:10px 12px}
 .warn{margin-top:14px;background:#fff7dd;border:1px solid #e1bd5f;border-radius:6px;padding:10px 12px}
+.tabs{margin-top:16px;display:flex;gap:8px;flex-wrap:wrap}.tab-btn{height:38px;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--navy);font-weight:800;padding:0 14px;cursor:pointer}.tab-btn.active{background:var(--navy);color:#fff;border-color:var(--navy)}
 .grid{margin-top:16px;display:grid;grid-template-columns:minmax(0,1fr);gap:16px;align-items:start}
 .card{background:var(--panel);border:1px solid var(--line);border-top:4px solid var(--gold);border-radius:8px;padding:18px;min-width:0}
 .card.wide{grid-column:auto}
+.tab-card{display:none}.tab-card.active{display:block}
 h2{font-size:21px;margin:0 0 12px}.hint{color:var(--muted);margin:0 0 12px;line-height:1.55}
 .row{display:grid;grid-template-columns:1fr 1fr auto;gap:8px;margin-bottom:8px}.row.two{grid-template-columns:1fr auto}.row.one{grid-template-columns:1fr}
 input,select,textarea{border:1px solid #b8c8dc;border-radius:6px;background:#fff;color:var(--ink);min-height:38px;padding:8px 10px;font-size:14px;min-width:0}
@@ -1420,19 +1715,32 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 .pill{display:inline-block;border:1px solid #d5e1ec;background:#f7fafc;border-radius:999px;padding:3px 9px;color:#40566f}
 .actions{display:flex;gap:8px;flex-wrap:wrap}.mini{height:32px;padding:0 10px}
 .toolbar-forms{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,.45fr);gap:12px;margin-bottom:14px}.inline-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px}.section-title{margin:4px 0 8px;font-size:15px;font-weight:800;color:#243852}.member-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:14px}.member-form{border:1px solid #dce5ef;background:var(--soft);border-radius:8px;padding:12px;min-width:0}.member-form select{width:100%;margin-bottom:8px}.member-form select[multiple]{height:220px;min-height:220px;background:#fff}.group-name-list{max-width:760px;text-align:left;line-height:1.65}.permission-panels{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:14px}.permission-panel{border:1px solid #dce5ef;background:var(--soft);border-radius:8px;padding:12px;min-width:0}.permission-panel form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;align-items:end}.permission-panel .btn{grid-column:1/-1;justify-self:start;min-width:180px}.permission-table td:first-child,.operator-name{text-align:left}.field-label{display:block;margin:0 0 5px;color:var(--muted);font-size:12px;font-weight:700}.field-stack{min-width:0}.field-stack select{width:100%}.field-stack.disabled{opacity:.45}
-@media(max-width:900px){.top{align-items:flex-start;flex-direction:column}.row,.row.two,.toolbar-forms,.member-grid,.permission-panels,.permission-panel form{grid-template-columns:1fr}.btn{width:100%}}
+.watch-panel{max-height:620px;overflow:auto;border:1px solid #dce5ef;border-radius:8px;background:#fff}.watch-panel form{margin:0}.watch-head,.watch-row{display:grid;grid-template-columns:minmax(130px,.7fr) minmax(330px,1.6fr) minmax(150px,.7fr) repeat(3,88px) minmax(110px,.5fr) auto auto;gap:8px;align-items:center}.watch-head{position:sticky;top:0;z-index:1;background:#f4f7fb;font-weight:800;padding:10px;border-bottom:1px solid #dce5ef;text-align:center}.watch-row{padding:10px;border-bottom:1px solid #e7eef6}.watch-row:last-child{border-bottom:0}.watch-row code{word-break:break-all;color:#173f82}.watch-row .owner{font-weight:700}.watch-row .latest{color:var(--muted);font-size:12px}.watch-check{display:flex;gap:5px;align-items:center;justify-content:center}.watch-check input{min-height:auto}.watch-row .btn{height:34px;min-width:64px;padding:0 10px}.watch-empty{border:1px dashed #cbd8e8;border-radius:8px;padding:22px;text-align:center;color:var(--muted);background:var(--soft)}
+@media(max-width:900px){.top{align-items:flex-start;flex-direction:column}.row,.row.two,.toolbar-forms,.member-grid,.permission-panels,.permission-panel form{grid-template-columns:1fr}.watch-head{display:none}.watch-row{grid-template-columns:1fr}.btn{width:100%}}
 </style>
 </head>
 <body><main class="wrap">
 <section class="top">
-<div><div class="brand">Telegram 记账机器人</div><div class="title">后台管理</div><div class="sub">Go v{{.Version}} · 群组、广播分组、操作人和权限</div></div>
+<div><div class="brand">Telegram 记账机器人</div><div class="title">后台管理</div><div class="sub">Go v{{.Version}} · {{.AdminRoleLabel}} · {{if .CanManageGlobal}}群组、广播分组、操作人、地址监听和权限{{else}}地址监听{{end}}</div></div>
 <div class="actions"><a class="btn secondary" href="/admin">刷新</a><a class="btn secondary" href="/admin/logout">退出</a></div>
 </section>
 {{if .TokenUnset}}<div class="warn">当前没有配置 ADMIN_WEB_TOKEN，公网部署请先设置后台密码。</div>{{end}}
 {{if .Message}}<div class="msg">{{.Message}}</div>{{end}}
+<nav class="tabs" aria-label="后台模块">
+{{if .CanManageGlobal}}
+<button class="tab-btn active" type="button" data-admin-tab-target="groups">已保存群组</button>
+<button class="tab-btn" type="button" data-admin-tab-target="broadcast">广播分组</button>
+<button class="tab-btn" type="button" data-admin-tab-target="permissions">权限/操作人</button>
+{{end}}
+<button class="tab-btn {{if not .CanManageGlobal}}active{{end}}" type="button" data-admin-tab-target="watch">地址监听</button>
+{{if .CanManageGlobal}}
+<button class="tab-btn" type="button" data-admin-tab-target="replace">广播替换</button>
+{{end}}
+</nav>
 
 <section class="grid">
-<div class="card">
+{{if .CanManageGlobal}}
+<div class="card tab-card active" data-admin-tab="groups">
 <h2>已保存群组</h2>
 <p class="hint">机器人被邀请进群，或群内有人发言后会自动保存群名；群改名后也会更新。</p>
 <div class="table-tools"><input id="saved-group-search" type="search" placeholder="搜索群名或群ID"></div>
@@ -1441,20 +1749,20 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 </tbody></table></div>
 </div>
 
-<div class="card">
-<h2>广播操作人</h2>
-<p class="hint">宿主和默认操作人拥有全部广播权限；这里添加的是普通广播操作人，需要再授权分组或单群。</p>
+<div class="card tab-card" data-admin-tab="permissions">
+<h2>一级操作人 / 操作人</h2>
+<p class="hint">宿主和默认操作人拥有全部广播权限；这里添加的是普通广播操作人，需要再授权分组或单群。页面不直接显示 UID，保存时仍按 UID 精确处理。</p>
 <form method="post" action="/admin/operator/save" class="row">
 <input name="user_id" placeholder="操作人 UID">
 <input name="remark" placeholder="备注，可选">
 <button class="btn" type="submit">保存</button>
 </form>
-<div class="scroll"><table><thead><tr><th>UID</th><th>备注</th><th>状态</th><th>操作</th></tr></thead><tbody>
-{{range .BOperators}}<tr><td>{{.UserID}}</td><td>{{.Remark}}</td><td><span class="pill">{{.Status}}</span></td><td><form method="post" action="/admin/operator/disable"><input type="hidden" name="user_id" value="{{.UserID}}"><button class="btn mini" type="submit">禁用</button></form></td></tr>{{else}}<tr><td colspan="4">暂无广播操作人</td></tr>{{end}}
+<div class="scroll"><table><thead><tr><th>操作人</th><th>授权来源</th><th>授权时间</th><th>状态</th><th>操作</th></tr></thead><tbody>
+{{range .BOperators}}<tr><td>{{operatorLabel .}}</td><td>{{operatorSourceLabel . $.OpLabels}}</td><td>{{adminTime .CreatedAt}}</td><td><span class="pill">{{.Status}}</span></td><td><form method="post" action="/admin/operator/disable"><input type="hidden" name="user_id" value="{{.UserID}}"><button class="btn mini" type="submit">禁用</button></form></td></tr>{{else}}<tr><td colspan="5">暂无广播操作人</td></tr>{{end}}
 </tbody></table></div>
 </div>
 
-<div class="card wide">
+<div class="card wide tab-card" data-admin-tab="broadcast">
 <h2>广播分组</h2>
 <p class="hint">先创建分组，再用下方多选框批量添加或移除群组。页面显示群名，数据库仍用群 ID 去重。</p>
 <div class="toolbar-forms">
@@ -1488,7 +1796,7 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 </tbody></table></div>
 </div>
 
-<div class="card wide">
+<div class="card wide tab-card" data-admin-tab="permissions">
 <h2>广播权限</h2>
 <p class="hint">给普通广播操作人授权分组或单群。授权后，私聊机器人选择群发、分组广播或单群发送时只会看到允许的目标。</p>
 <div class="permission-panels">
@@ -1517,8 +1825,41 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 {{range .Permissions}}<tr><td>{{permissionUserLabel . $.OpLabels}}</td><td>{{permissionTarget . $.ChatNames}}</td><td>{{grantorLabel . $.OpLabels}}</td></tr>{{else}}<tr><td colspan="3">暂无权限</td></tr>{{end}}
 </tbody></table></div>
 </div>
+{{end}}
 
-<div class="card wide">
+<div class="card wide tab-card {{if not .CanManageGlobal}}active{{end}}" data-admin-tab="watch">
+<h2>地址监听</h2>
+<p class="hint">宿主可查看全部监听地址；一级操作人和操作人只显示自己监听的地址。普通用户不能进入后台，只能在私聊机器人里管理自己的监听地址。</p>
+{{if .WatchTargets}}
+<div class="watch-panel">
+<div class="watch-head"><div>所属用户</div><div>地址</div><div>备注</div><div>收入</div><div>支出</div><div>TRX</div><div>最小提醒</div><div>保存</div><div>删除</div></div>
+{{range $i,$w := .WatchTargets}}
+<form id="watch-save-{{$i}}" method="post" action="/admin/watch/save">
+<input type="hidden" name="owner_user_id" value="{{$w.OwnerUserID}}">
+<input type="hidden" name="address" value="{{$w.Address}}">
+</form>
+<form id="watch-remove-{{$i}}" method="post" action="/admin/watch/remove">
+<input type="hidden" name="owner_user_id" value="{{$w.OwnerUserID}}">
+<input type="hidden" name="address" value="{{$w.Address}}">
+</form>
+<div class="watch-row">
+<div><div class="owner">{{watchOwnerLabel $w $.OpLabels}}</div><div class="latest">最近交易：{{watchLatestTime $w}}</div></div>
+<code>{{$w.Address}}</code>
+<input form="watch-save-{{$i}}" name="label" value="{{$w.Label}}" placeholder="备注">
+<label class="watch-check"><input form="watch-save-{{$i}}" type="checkbox" name="watch_income" value="1" {{if $w.WatchIncome}}checked{{end}}>收入</label>
+<label class="watch-check"><input form="watch-save-{{$i}}" type="checkbox" name="watch_expense" value="1" {{if $w.WatchExpense}}checked{{end}}>支出</label>
+<label class="watch-check"><input form="watch-save-{{$i}}" type="checkbox" name="notify_trx" value="1" {{if $w.NotifyTRX}}checked{{end}}>TRX</label>
+<input form="watch-save-{{$i}}" name="min_notify_amount" value="{{$w.MinNotifyAmount}}" placeholder="USDT">
+<button class="btn mini" form="watch-save-{{$i}}" type="submit">保存</button>
+<button class="btn mini secondary" form="watch-remove-{{$i}}" type="submit">删除</button>
+</div>
+{{end}}
+</div>
+{{else}}<div class="watch-empty">暂无监听地址</div>{{end}}
+</div>
+
+{{if .CanManageGlobal}}
+<div class="card wide tab-card" data-admin-tab="replace">
 <h2>广播替换</h2>
 <p class="hint">开启后，仅对“单群发送”的投递消息生效：群成员回复该投递消息时，机器人会尝试把原投递消息替换为这里设置的固定图片/文字，然后再通知操作人。</p>
 <form method="post" action="/admin/replace/save" enctype="multipart/form-data">
@@ -1532,8 +1873,23 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 <p class="hint">当前状态：{{if .Replace.Enabled}}开启{{else}}关闭{{end}}。{{if .Replace.ImageName}}当前图片：{{.Replace.ImageName}}{{else}}当前没有固定图片{{end}}</p>
 </form>
 </div>
+{{end}}
 </section>
 <script>
+const adminTabs=Array.from(document.querySelectorAll('.tab-btn'));
+const adminCards=Array.from(document.querySelectorAll('.tab-card'));
+function setAdminTab(name){
+  if(!adminTabs.length){return;}
+  if(!adminTabs.some(function(btn){return btn.dataset.adminTabTarget===name;})){name=adminTabs[0].dataset.adminTabTarget;}
+  adminTabs.forEach(function(btn){btn.classList.toggle('active',btn.dataset.adminTabTarget===name);});
+  adminCards.forEach(function(card){card.classList.toggle('active',card.dataset.adminTab===name);});
+  try{localStorage.setItem('ledger-admin-tab',name);}catch(e){}
+  if(location.hash !== '#'+name){history.replaceState(null,'','#'+name);}
+}
+adminTabs.forEach(function(btn){btn.addEventListener('click',function(){setAdminTab(btn.dataset.adminTabTarget);});});
+let initialTab=(location.hash || '').slice(1);
+if(!initialTab){try{initialTab=localStorage.getItem('ledger-admin-tab') || '';}catch(e){}}
+setAdminTab(initialTab || 'groups');
 const groupSearch=document.getElementById('saved-group-search');
 if(groupSearch){
   groupSearch.addEventListener('input',function(){

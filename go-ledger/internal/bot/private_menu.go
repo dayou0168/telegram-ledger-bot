@@ -3,9 +3,11 @@ package bot
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
+	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/adminauth"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/telegram"
 )
@@ -19,7 +21,7 @@ func (b *Bot) handlePrivateShortcut(ctx context.Context, msg telegram.Message, u
 	case "🔎查询UID", "查询UID":
 		return true, b.sendUIDLookup(ctx, msg.Chat.ID, msg.MessageID, user.ID)
 	case "⚙后台管理", "后台管理", "👥广播权限", "广播权限", "🔁广播替换", "广播替换":
-		return true, b.sendAdminEntry(ctx, msg.Chat.ID, msg.MessageID)
+		return true, b.sendAdminEntry(ctx, msg.Chat.ID, msg.MessageID, user.ID)
 	default:
 		return false, nil
 	}
@@ -53,12 +55,30 @@ func (b *Bot) sendPrivateText(ctx context.Context, chatID, replyTo int64, text s
 	return b.enqueueReplyText(ctx, sendPriorityNormal, "private_text", chatID, replyTo, text, nil, time.Now().In(b.loc))
 }
 
-func (b *Bot) sendAdminEntry(ctx context.Context, chatID, replyTo int64) error {
-	text := "后台管理用于设置广播分组、广播权限、广播替换和查看已保存群。"
+func (b *Bot) sendAdminEntry(ctx context.Context, chatID, replyTo, userID int64) error {
+	role, allowed, err := b.adminRoleForUser(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return b.enqueueReliableText(ctx, sendPriorityNormal, "admin_entry_denied", messageScopedDedupe("admin_entry_denied", chatID, replyTo), chatID, "没有后台权限。只有宿主、一级操作人和操作人可以进入后台。", map[string]any{
+			"reply_to_message_id": replyTo,
+		}, reliableMessageRef{}, time.Now().In(b.loc))
+	}
+
+	text := "后台管理用于设置群组、广播分组、广播权限、地址监听和广播替换。"
 	opts := map[string]any{"reply_to_message_id": replyTo}
 	if b.cfg.PublicBillBaseURL != "" {
-		link := b.cfg.PublicBillBaseURL + "/admin"
-		text += "\n\n后台入口：" + link
+		token, err := adminauth.NewToken()
+		if err != nil {
+			return err
+		}
+		now := time.Now().In(b.loc)
+		if err := b.store.CreateAdminLoginTicket(ctx, adminauth.HashToken(token), userID, role, now.Add(adminauth.TicketTTL), now); err != nil {
+			return err
+		}
+		link := strings.TrimRight(b.cfg.PublicBillBaseURL, "/") + "/admin/login?ticket=" + url.QueryEscape(token)
+		text += fmt.Sprintf("\n\n身份：%s\n后台入口 5 分钟内有效：%s", adminauth.RoleLabel(role), link)
 		opts["reply_markup"] = telegram.InlineKeyboardMarkup{InlineKeyboard: [][]telegram.InlineKeyboardButton{
 			{{Text: "打开后台管理", URL: link}},
 		}}
@@ -66,6 +86,30 @@ func (b *Bot) sendAdminEntry(ctx context.Context, chatID, replyTo int64) error {
 		text += "\n\n当前没有配置 PUBLIC_BILL_BASE_URL，公网使用时请先在 Compose 里填写你的 HTTPS 域名。"
 	}
 	return b.enqueueReliableText(ctx, sendPriorityNormal, "admin_entry", messageScopedDedupe("admin_entry", chatID, replyTo), chatID, text, opts, reliableMessageRef{}, time.Now().In(b.loc))
+}
+
+func (b *Bot) adminRoleForUser(ctx context.Context, userID int64) (string, bool, error) {
+	if b.perms.IsHost(userID) {
+		return adminauth.RoleHost, true, nil
+	}
+	if b.perms.IsDefaultOperator(userID) {
+		return adminauth.RoleDefaultOperator, true, nil
+	}
+	ok, err := b.store.IsBroadcastOperator(ctx, userID)
+	if err != nil {
+		return "", false, err
+	}
+	if ok {
+		return adminauth.RoleOperator, true, nil
+	}
+	ok, err = b.store.IsAnyOperator(ctx, userID)
+	if err != nil {
+		return "", false, err
+	}
+	if ok {
+		return adminauth.RoleOperator, true, nil
+	}
+	return "", false, nil
 }
 
 func privateStartHelp() string {

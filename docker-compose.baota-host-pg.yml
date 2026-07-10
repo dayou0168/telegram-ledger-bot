@@ -1,4 +1,4 @@
-# Telegram 记账机器人 Go v2.2 + 宝塔宿主机 PostgreSQL
+# Telegram 记账机器人 Go v2.3 + 宝塔宿主机 PostgreSQL
 #
 # 适用场景：
 # - PostgreSQL 已经在宿主机/宝塔里安装好。
@@ -13,7 +13,7 @@
 
 services:
   ledger-chain-watcher:
-    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.2
+    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3
     container_name: ledger-chain-watcher
     restart: unless-stopped
     extra_hosts:
@@ -42,6 +42,8 @@ services:
       TRON_USDT_CONTRACT: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
       CHAIN_WATCHER_SOURCE_POLL_SECONDS: "1"
       CHAIN_WATCHER_GLOBAL_SCAN_PAGES: "1"
+      CHAIN_WATCHER_ADDRESS_SCAN_PAGES: "3"
+      CHAIN_WATCHER_ADDRESS_SCAN_CONCURRENCY: "8"
       CHAIN_WATCHER_LOOKBACK_SECONDS: "600"
       CHAIN_WATCHER_CLAIM_LEASE_SECONDS: "30"
       CHAIN_WATCHER_DELIVERY_RETRY_SECONDS: "2"
@@ -60,7 +62,7 @@ services:
       retries: 10
 
   ledger-bot:
-    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.2
+    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.3
     container_name: ledger-bot-go
     restart: unless-stopped
     depends_on:
@@ -86,6 +88,8 @@ services:
       CHAIN_WATCHER_URL: "http://ledger-chain-watcher:8090"
       CHAIN_WATCHER_BOT_ID: "ledger-main"
       CHAIN_WATCHER_SECRET: "change_this_chain_watcher_secret"
+      # 应急兜底默认关闭。开启后 bot 会同时本机扫链，增加 API 调用量，仅用于 watcher 故障排查。
+      CHAIN_WATCHER_EMERGENCY_FALLBACK: "false"
 
       # ==================== 选填配置 ====================
       # 默认操作人，多个 Telegram 数字 ID 用英文逗号分隔。
@@ -103,6 +107,9 @@ services:
       # 后台登录密码。公网部署必须填写随机强密码；不要和 CHAIN_WATCHER_SECRET 共用。
       ADMIN_WEB_TOKEN: "change_this_admin_password"
 
+      # 普通用户最多可监听几个地址；宿主、默认操作人和操作人不受限制。
+      ADDRESS_WATCH_FREE_LIMIT: "2"
+
       # ==================== 高级默认值 ====================
       BOT_TIMEZONE: "Asia/Shanghai"
       BOT_WORKER_THREADS: "16"
@@ -116,6 +123,8 @@ services:
       TELEGRAM_API_BASE: "https://api.telegram.org"
       BOT_POLL_TIMEOUT: "50"
       BOT_REQUEST_TIMEOUT: "70"
+      # 仅 CHAIN_WATCHER_EMERGENCY_FALLBACK=true 时，机器人本机扫链会使用这个 Key；默认共享 watcher 模式可留空。
+      TRONGRID_API_KEY: ""
       TRON_USDT_CONTRACT: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
       TRON_POLL_INTERVAL_SECONDS: "1"
       TRON_ADDRESS_BACKFILL_SECONDS: "60"

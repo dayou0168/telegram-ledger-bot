@@ -158,6 +158,18 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_broadcast_permissions_group
 			ON broadcast_operator_permissions(user_id, target, group_name)
 			WHERE target = 'group'`,
+		`CREATE TABLE IF NOT EXISTS admin_login_tickets (
+			token_hash TEXT PRIMARY KEY,
+			user_id BIGINT NOT NULL,
+			role TEXT NOT NULL,
+			expires_at TIMESTAMPTZ NOT NULL,
+			used_at TIMESTAMPTZ,
+			created_at TIMESTAMPTZ NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_admin_login_tickets_user
+			ON admin_login_tickets(user_id, created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_admin_login_tickets_expires
+			ON admin_login_tickets(expires_at)`,
 		`CREATE TABLE IF NOT EXISTS broadcast_deliveries (
 			id BIGSERIAL PRIMARY KEY,
 			operator_user_id BIGINT NOT NULL,
@@ -411,6 +423,11 @@ func (s *Store) migrate(ctx context.Context) error {
 		ON CONFLICT(version) DO NOTHING`); err != nil {
 		return fmt.Errorf("record schema migration: %w", err)
 	}
+	if _, err := s.pool.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
+		VALUES('2.3.0', NOW())
+		ON CONFLICT(version) DO NOTHING`); err != nil {
+		return fmt.Errorf("record schema migration: %w", err)
+	}
 	return nil
 }
 
@@ -612,6 +629,16 @@ func (s *Store) IsOperator(ctx context.Context, chatID, userID int64) (bool, err
 	return err == nil, err
 }
 
+func (s *Store) IsAnyOperator(ctx context.Context, userID int64) (bool, error) {
+	row := s.pool.QueryRow(ctx, `SELECT 1 FROM operators WHERE user_id=$1 LIMIT 1`, userID)
+	var one int
+	err := row.Scan(&one)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
 func (s *Store) IsOwner(ctx context.Context, chatID, userID int64) (bool, error) {
 	row := s.pool.QueryRow(ctx, `SELECT 1 FROM groups WHERE chat_id=$1 AND owner_user_id=$2 LIMIT 1`, chatID, userID)
 	var one int
@@ -709,6 +736,42 @@ func (s *Store) ListBroadcastOperators(ctx context.Context) ([]BroadcastOperator
 		operators = append(operators, op)
 	}
 	return operators, rows.Err()
+}
+
+func (s *Store) CreateAdminLoginTicket(ctx context.Context, tokenHash string, userID int64, role string, expiresAt, now time.Time) error {
+	tokenHash = strings.TrimSpace(tokenHash)
+	role = strings.TrimSpace(role)
+	if tokenHash == "" {
+		return errors.New("admin login ticket token hash is empty")
+	}
+	if userID <= 0 {
+		return errors.New("admin login ticket user id is empty")
+	}
+	if role == "" {
+		return errors.New("admin login ticket role is empty")
+	}
+	_, err := s.pool.Exec(ctx, `INSERT INTO admin_login_tickets(token_hash, user_id, role, expires_at, created_at)
+		VALUES($1, $2, $3, $4, $5)
+		ON CONFLICT(token_hash) DO NOTHING`, tokenHash, userID, role, expiresAt, now)
+	return err
+}
+
+func (s *Store) ConsumeAdminLoginTicket(ctx context.Context, tokenHash string, now time.Time) (AdminLoginTicket, bool, error) {
+	row := s.pool.QueryRow(ctx, `UPDATE admin_login_tickets
+		SET used_at=$2
+		WHERE token_hash=$1 AND used_at IS NULL AND expires_at > $2
+		RETURNING token_hash, user_id, role, expires_at, used_at, created_at`, strings.TrimSpace(tokenHash), now)
+	var ticket AdminLoginTicket
+	err := row.Scan(&ticket.TokenHash, &ticket.UserID, &ticket.Role, &ticket.ExpiresAt, &ticket.UsedAt, &ticket.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return AdminLoginTicket{}, false, nil
+	}
+	return ticket, err == nil, err
+}
+
+func (s *Store) CleanupAdminLoginTickets(ctx context.Context, cutoff time.Time) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM admin_login_tickets WHERE expires_at < $1 OR used_at IS NOT NULL`, cutoff)
+	return err
 }
 
 func (s *Store) UpsertBroadcastGroup(ctx context.Context, name string, createdBy int64, now time.Time) error {
@@ -1175,6 +1238,13 @@ func (s *Store) ListWatchTargetsForOwner(ctx context.Context, owner int64) ([]Wa
 		targets = append(targets, t)
 	}
 	return targets, rows.Err()
+}
+
+func (s *Store) CountActiveWatchTargetsForOwner(ctx context.Context, owner int64) (int, error) {
+	row := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM address_watches WHERE owner_user_id=$1 AND active=TRUE`, owner)
+	var count int
+	err := row.Scan(&count)
+	return count, err
 }
 
 func (s *Store) GetWatchSettings(ctx context.Context, owner int64) (WatchSettings, error) {
