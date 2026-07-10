@@ -177,4 +177,10 @@ func TestAdminTemplateRendersReadableBroadcastManagement(t *testing.T) {
 	if strings.Contains(html, ">0</td>") {
 		t.Fatal("admin permission table should not render raw granted_by=0")
 	}
+	if !strings.Contains(adminHTML, ".permission-panel form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))") {
+		t.Fatal("permission form should wrap inside each panel instead of using a wide five-column row")
+	}
+	if strings.Contains(adminHTML, "grid-template-columns:minmax(180px,.8fr) 150px") {
+		t.Fatal("permission form should not use the old overflowing five-column layout")
+	}
 }
