@@ -62,6 +62,8 @@ deploy/ledger-chain-watcher.env.example
 deploy/ledger-chain-watcher.service
 ```
 
+GitHub Release `v2.2` 同时发布 `ledger-chain-watcher-v2.2-linux-amd64.tar.gz` 宿主机包，里面已经包含 Linux amd64 二进制和上述两个模板。
+
 机器人仍然用自己的 `DATABASE_URL` 连接自己的 PostgreSQL 数据库，并通过 `CHAIN_WATCHER_URL=http://host.docker.internal:8090` 或 Docker 网桥 IP 访问宿主机 watcher。
 
 核心环境变量：

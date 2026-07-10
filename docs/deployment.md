@@ -220,14 +220,18 @@ BOT_TIMEZONE=Asia/Shanghai
 BOT_REQUEST_TIMEOUT=70
 ```
 
-安装二进制到固定路径：
+下载 v2.2 发布包并安装二进制到固定路径：
 
 ```bash
-install -m 0755 ledger-chain-watcher /usr/local/bin/ledger-chain-watcher
+cd /tmp
+wget -O ledger-chain-watcher-v2.2-linux-amd64.tar.gz \
+  https://github.com/dayou0168/telegram-ledger-bot/releases/download/v2.2/ledger-chain-watcher-v2.2-linux-amd64.tar.gz
+tar -xzf ledger-chain-watcher-v2.2-linux-amd64.tar.gz
+install -m 0755 ledger-chain-watcher-v2.2-linux-amd64/ledger-chain-watcher /usr/local/bin/ledger-chain-watcher
 /usr/local/bin/ledger-chain-watcher --help
 ```
 
-如果发布包里没有 `--help` 输出，也可以直接跳过这一步，用 systemd 启动后看日志。关键是 `/usr/local/bin/ledger-chain-watcher` 必须存在并可执行。
+发布包里同时包含 `ledger-chain-watcher.env.example` 和 `ledger-chain-watcher.service`，也可以直接从解压目录复制。关键是 `/usr/local/bin/ledger-chain-watcher` 必须存在并可执行。
 
 安装 systemd service：
 

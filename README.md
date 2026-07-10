@@ -57,7 +57,7 @@ docker pull ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.2
 
 如果 PostgreSQL 已经安装在宿主机/宝塔里，使用 [docker-compose.baota-host-pg.yml](docker-compose.baota-host-pg.yml)。这个文件只运行 `ledger-chain-watcher` 和 `ledger-bot`，通过 `host.docker.internal` 连接宿主机 PostgreSQL。
 
-如果希望 `ledger-chain-watcher` 直接跑在宿主机 systemd 里，使用 [deploy/ledger-chain-watcher.env.example](deploy/ledger-chain-watcher.env.example) 和 [deploy/ledger-chain-watcher.service](deploy/ledger-chain-watcher.service)。机器人 Compose 保留自己的 `DATABASE_URL`，并把 `CHAIN_WATCHER_URL` 配成 `http://host.docker.internal:8090` 或 Docker 网桥 IP。
+如果希望 `ledger-chain-watcher` 直接跑在宿主机 systemd 里，GitHub Release `v2.2` 会同时发布 `ledger-chain-watcher-v2.2-linux-amd64.tar.gz` 宿主机包，里面包含二进制、[deploy/ledger-chain-watcher.env.example](deploy/ledger-chain-watcher.env.example) 和 [deploy/ledger-chain-watcher.service](deploy/ledger-chain-watcher.service)。机器人 Compose 保留自己的 `DATABASE_URL`，并把 `CHAIN_WATCHER_URL` 配成 `http://host.docker.internal:8090` 或 Docker 网桥 IP。
 
 广播和记账是一体能力，不需要为“广播群”单独关闭机器人记账模块。群默认未开始记账；需要记账的群由宿主、默认操作人或本群操作员发送 `开始` 即可开启。
 
