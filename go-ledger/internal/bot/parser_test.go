@@ -64,6 +64,9 @@ func TestOpenBillCommandOnlyPlusZero(t *testing.T) {
 	if !isBillCommand("+0") || !isOpenBillCommand("+0") {
 		t.Fatal("+0 should be an open bill query command")
 	}
+	if got := classifyMessageCommand("+0", "supergroup"); got != "ledger_bill" {
+		t.Fatalf("+0 command classification = %q, want ledger_bill", got)
+	}
 	for _, text := range []string{"账单", "显示账单", "+100", "下发100U"} {
 		if isOpenBillCommand(text) {
 			t.Fatalf("%q should not bypass ledger permission checks", text)

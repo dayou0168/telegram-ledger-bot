@@ -1,9 +1,12 @@
 package tron
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -63,6 +66,38 @@ func TestIsRateLimitedUnwrapsHTTPError(t *testing.T) {
 	httpErr, ok := IsRateLimited(err)
 	if !ok || httpErr == nil || httpErr.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("IsRateLimited() = %#v %v, want wrapped 429", httpErr, ok)
+	}
+}
+
+func TestAddressFetchMetricsCountsPages(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		start := r.URL.Query().Get("start")
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"token_transfers":[`)
+		if start == "0" {
+			for i := 0; i < 50; i++ {
+				if i > 0 {
+					fmt.Fprint(w, ",")
+				}
+				fmt.Fprintf(w, `{"transaction_id":"hash%s","from_address":"TFrom","to_address":"TTo","quant":"1","block_ts":%s,"confirmed":1,"tokenInfo":{"tokenId":"TR7","tokenAbbr":"USDT","tokenDecimal":6}}`, strconv.Itoa(i), strconv.FormatInt(200000-int64(i), 10))
+			}
+		}
+		fmt.Fprint(w, `]}`)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", time.Second)
+	result, err := client.FetchAddressUSDTTransfersSincePagesWithMetrics(context.Background(), "TTo", "TR7", 50, 3, 1000)
+	if err != nil {
+		t.Fatalf("FetchAddressUSDTTransfersSincePagesWithMetrics() error = %v", err)
+	}
+	if calls != 2 || result.Metrics.Calls != 2 || result.Metrics.Pages != 2 {
+		t.Fatalf("calls/pages = handler:%d metrics:%d/%d, want 2/2/2", calls, result.Metrics.Calls, result.Metrics.Pages)
+	}
+	if len(result.Transfers) != 50 {
+		t.Fatalf("transfers = %d, want 50", len(result.Transfers))
 	}
 }
 

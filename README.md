@@ -1,6 +1,6 @@
-# Telegram 群组记账机器人
+﻿# Telegram 群组记账机器人
 
-这是 Telegram 记账机器人 Go v2.3.6 主线，按群组使用，生产部署使用 PostgreSQL、GHCR 镜像和共享 `ledger-chain-watcher` 链上监听服务。
+这是 Telegram 记账机器人 Go v2.3.7 主线，按群组使用，生产部署使用 PostgreSQL、GHCR 镜像和共享 `ledger-chain-watcher` 链上监听服务。
 
 重装系统或换机器前后的当前状态交接见 [docs/reinstall-handoff.md](docs/reinstall-handoff.md)。
 
@@ -46,20 +46,20 @@
 - `开启记账置顶` / `关闭记账置顶`。
 - 每个群的 `🌐 完整账单` 按钮会按 `chat_id` 生成独立链接。
 
-## 运行 Go v2.3.6
+## 运行 Go v2.3.7
 
-推荐优先使用 Go v2.3.6 镜像、PostgreSQL 和共享 watcher：
+推荐优先使用 Go v2.3.7 镜像、PostgreSQL 和共享 watcher：
 
 ```powershell
-docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.6
-docker pull ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.6
+docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.7
+docker pull ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.7
 ```
 
-宝塔 Docker Compose 可以直接使用仓库里的 [docker-compose.ghcr.yml](docker-compose.ghcr.yml)。这个文件默认拉取 `ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.6` 和 `ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.6`，在同一个 Compose 项目里用独立 PostgreSQL 容器和独立 watcher 容器组成全家桶，适合快速部署。
+宝塔 Docker Compose 可以直接使用仓库里的 [docker-compose.ghcr.yml](docker-compose.ghcr.yml)。这个文件默认拉取 `ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.7` 和 `ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.7`，在同一个 Compose 项目里用独立 PostgreSQL 容器和独立 watcher 容器组成全家桶，适合快速部署。
 
 如果 PostgreSQL 已经安装在宿主机/宝塔里，使用 [docker-compose.baota-host-pg.yml](docker-compose.baota-host-pg.yml)。这个文件只运行 `ledger-chain-watcher` 和 `ledger-bot`，通过 `host.docker.internal` 连接宿主机 PostgreSQL。
 
-如果希望 `ledger-chain-watcher` 直接跑在宿主机 systemd 里，GitHub Release `v2.3.6` 会同时发布 `ledger-chain-watcher-v2.3.6-linux-amd64.tar.gz` 宿主机包，里面包含二进制、[deploy/ledger-chain-watcher.env.example](deploy/ledger-chain-watcher.env.example) 和 [deploy/ledger-chain-watcher.service](deploy/ledger-chain-watcher.service)。机器人 Compose 保留自己的 `DATABASE_URL`，并把 `CHAIN_WATCHER_URL` 配成 `http://host.docker.internal:8090` 或 Docker 网桥 IP。
+如果希望 `ledger-chain-watcher` 直接跑在宿主机 systemd 里，GitHub Release `v2.3.7` 会同时发布 `ledger-chain-watcher-v2.3.7-linux-amd64.tar.gz` 宿主机包，里面包含二进制、[deploy/ledger-chain-watcher.env.example](deploy/ledger-chain-watcher.env.example) 和 [deploy/ledger-chain-watcher.service](deploy/ledger-chain-watcher.service)。机器人 Compose 保留自己的 `DATABASE_URL`，并把 `CHAIN_WATCHER_URL` 配成 `http://host.docker.internal:8090` 或 Docker 网桥 IP。
 
 广播和记账是一体能力，不需要为“广播群”单独关闭机器人记账模块。群默认未开始记账；需要记账的群由宿主、默认操作人或本群操作员发送 `开始` 即可开启。
 
@@ -150,7 +150,7 @@ https://bot.your-domain.example/day_xxb.php?chat_id=-100xxx&created_at=2026-07-0
 
 ### TRC20 链上监听
 
-Go v2.3.6 通过共享 `ledger-chain-watcher` 获取链上数据。多个机器人实例只配置内网 URL 和内部密钥，不再各自配置官网 API Key：
+Go v2.3.7 通过共享 `ledger-chain-watcher` 获取链上数据。多个机器人实例只配置内网 URL 和内部密钥，不再各自配置官网 API Key：
 
 ```env
 CHAIN_WATCHER_URL=http://ledger-chain-watcher:8090
@@ -199,7 +199,7 @@ watcher 有两种部署模式：
 
 机器人保存监听地址、tx_hash 去重和 Telegram outbox；watcher 负责统一链上数据入口、统一解析、按多机器人订阅匹配和短期事件队列。机器人配置了 `CHAIN_WATCHER_URL`、`CHAIN_WATCHER_BOT_ID`、`CHAIN_WATCHER_SECRET` 后，默认停用本机地址监听轮询，改为注册订阅并每秒领取 watcher matched events。同一笔交易仍按 `owner + address + tx_hash + direction` 去重，不会重复提醒。
 
-`/healthz` 只表示 watcher 进程存活；`/readyz` 和 `/status` 会暴露链源是否可用、最近全局扫描成功时间、429 backoff、pending/claim lag 和 retention 清理统计。bot 自动 fallback 依据 `/readyz` 的链源状态，不把“没有新交易”误判为故障。
+`/healthz` 只表示 watcher 进程存活；`/readyz` 和 `/status` 会暴露链源是否可用、最近全局扫描成功时间、429 backoff、pending/claim lag 和 retention 清理统计。`/status` 的 `global`/`address` 还包含最近扫描的 `api_wait_ms`、`api_fetch_ms`、`parse_ms`、`match_ms`、`write_ms`、`api_call_count`、`page_count`、`overlap_skipped` 和最近 5 轮摘要，便于判断延迟和 API 调用量。bot 自动 fallback 依据 `/readyz` 的链源状态，不把“没有新交易”误判为故障。
 
 `CHAIN_WATCHER_EMERGENCY_FALLBACK=false` 是常驻应急开关，默认关闭。正常模式下 bot 只消费 watcher；当 watcher ready/claim 连续失败时，bot 会短时自动启用无 Key 公开 API fallback，只扫描本 bot 自己的监听地址并继续使用本地 `chain_notifications/outbox` 去重，最多运行 `BOT_FALLBACK_MAX_ACTIVE_SECONDS`。这个 fallback 仍依赖 Tronscan/TronGrid 公开 API，不是真正事件源；真正不依赖官方 API 的方案是 Lite FullNode + Event Plugin V2 + Kafka 或可靠 Webhook/Streams。
 
@@ -228,4 +228,4 @@ P2P_RATE_CACHE_TTL_SECONDS=180
 docker compose -f docker-compose.ghcr.yml up -d
 ```
 
-服务器部署见 [docs/deployment.md](docs/deployment.md)，当前发布目标优先用 Go v2.3.6 镜像、PostgreSQL、共享 `ledger-chain-watcher` 和 Docker Compose。
+服务器部署见 [docs/deployment.md](docs/deployment.md)，当前发布目标优先用 Go v2.3.7 镜像、PostgreSQL、共享 `ledger-chain-watcher` 和 Docker Compose。

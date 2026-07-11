@@ -2,6 +2,7 @@ package adminweb
 
 import (
 	"bytes"
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -206,6 +207,34 @@ func TestParseBroadcastPermissionFormValidatesInput(t *testing.T) {
 	}
 }
 
+type testPermissionInvalidator struct {
+	broadcastUserID int64
+	watchTargets    bool
+}
+
+func (i *testPermissionInvalidator) InvalidateBroadcastPermission(userID int64) {
+	i.broadcastUserID = userID
+}
+
+func (i *testPermissionInvalidator) InvalidateWatchTargets() {
+	i.watchTargets = true
+}
+
+func TestServerPermissionInvalidatorHooks(t *testing.T) {
+	invalidator := &testPermissionInvalidator{}
+	s := New(config.Config{}, nil, invalidator)
+
+	s.invalidateBroadcastPermission(2002)
+	s.invalidateWatchTargets()
+
+	if invalidator.broadcastUserID != 2002 {
+		t.Fatalf("broadcast invalidation user = %d, want 2002", invalidator.broadcastUserID)
+	}
+	if !invalidator.watchTargets {
+		t.Fatal("watch target invalidation hook was not called")
+	}
+}
+
 func TestNormalizeCleanupTime(t *testing.T) {
 	for raw, want := range map[string]string{
 		"8:05":  "08:05",
@@ -259,6 +288,21 @@ func TestNormalizeCleanupDelay(t *testing.T) {
 	}
 }
 
+func TestOutboxErrorHint(t *testing.T) {
+	cases := map[string]string{
+		"telegram sendMessage: 429 Too Many Requests retry_after=4": "Telegram 限流 429",
+		"telegram sendMessage: 502 bad gateway":                     "Telegram 5xx",
+		"context deadline exceeded":                                 "网络超时",
+		"notification queue is full":                                "本地通知队列已满",
+		"":                                                          "无错误",
+	}
+	for raw, want := range cases {
+		if got := outboxErrorHint(raw); !strings.Contains(got, want) {
+			t.Fatalf("outboxErrorHint(%q) = %q, want contains %q", raw, got, want)
+		}
+	}
+}
+
 func TestAdminTemplateRendersSearchableTallSavedGroups(t *testing.T) {
 	var buf bytes.Buffer
 	err := adminTemplate.Execute(&buf, pageData{
@@ -302,8 +346,9 @@ func TestAdminTemplateRendersReadableBroadcastManagement(t *testing.T) {
 			{ChatID: -1002, Title: "扫码群引导", UpdatedAt: time.Date(2026, 7, 6, 14, 24, 0, 0, time.UTC)},
 		},
 		BGroups: []storage.BroadcastGroup{{Name: "出款", ChatIDs: []int64{-1001}, ChatNames: []string{"出款群"}}},
-		BOperators: []storage.BroadcastOperator{{
+		BOperators: []storage.GlobalOperator{{
 			UserID:                              7611260151,
+			Level:                               "primary",
 			Status:                              "active",
 			Remark:                              "柚子",
 			PrivateCleanupEnabled:               true,
@@ -314,6 +359,7 @@ func TestAdminTemplateRendersReadableBroadcastManagement(t *testing.T) {
 			CreatedAt:                           time.Date(2026, 7, 6, 15, 0, 0, 0, time.UTC),
 		}, {
 			UserID:    8453656635,
+			Level:     "secondary",
 			Status:    "active",
 			CreatedBy: 7611260151,
 			CreatedAt: time.Date(2026, 7, 6, 15, 30, 0, 0, time.UTC),
@@ -351,6 +397,9 @@ func TestAdminTemplateRendersReadableBroadcastManagement(t *testing.T) {
 		`data-admin-tab-target="permissions"`,
 		`data-admin-tab-target="watch"`,
 		`data-admin-tab-target="replace"`,
+		`一级 / 下级操作人`,
+		`一级操作人`,
+		`下级操作人`,
 		`class="toolbar-forms"`,
 		`添加群组到分组`,
 		`从分组移除群组`,
@@ -422,6 +471,9 @@ func TestAdminTemplateRendersReadableBroadcastManagement(t *testing.T) {
 	if strings.Contains(adminHTML, "grid-template-columns:minmax(180px,.8fr) 150px") {
 		t.Fatal("permission form should not use the old overflowing five-column layout")
 	}
+	if strings.Contains(html, `data-admin-tab-target="outbox"`) || strings.Contains(html, `发送网关 / Outbox 状态`) {
+		t.Fatal("admin main page should not render a permanent global outbox status tab")
+	}
 }
 
 func TestAdminTemplateForOperatorOnlyRendersWatchTab(t *testing.T) {
@@ -450,10 +502,21 @@ func TestAdminTemplateForOperatorOnlyRendersWatchTab(t *testing.T) {
 	if !strings.Contains(html, `class="card wide tab-card active" data-admin-tab="watch"`) {
 		t.Fatal("operator admin page should show watch card without waiting for JavaScript")
 	}
-	for _, blocked := range []string{`data-admin-tab-target="groups"`, `data-admin-tab-target="broadcast"`, `data-admin-tab-target="permissions"`, `data-admin-tab-target="replace"`, `广播权限`, `广播替换`} {
+	for _, blocked := range []string{`data-admin-tab-target="groups"`, `data-admin-tab-target="broadcast"`, `data-admin-tab-target="permissions"`, `data-admin-tab-target="outbox"`, `data-admin-tab-target="replace"`, `发送网关 / Outbox 状态`, `广播权限`, `广播替换`} {
 		if strings.Contains(html, blocked) {
 			t.Fatalf("operator admin page should not render global module %q", blocked)
 		}
+	}
+}
+
+func TestOutboxStatusRejectsOperator(t *testing.T) {
+	s := &Server{}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/admin/outbox/status", nil)
+	req = req.WithContext(context.WithValue(req.Context(), adminContextKey{}, adminauth.Session{UserID: 3003, Role: adminauth.RoleOperator}))
+	s.outboxStatus(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusForbidden)
 	}
 }
 

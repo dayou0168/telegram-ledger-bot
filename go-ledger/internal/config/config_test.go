@@ -139,3 +139,52 @@ func TestLoadSlowUpdateThreshold(t *testing.T) {
 		t.Fatalf("SlowUpdateThreshold = %d ms, want 1200", got)
 	}
 }
+
+func TestLoadBillSummaryCacheTTL(t *testing.T) {
+	t.Setenv("TELEGRAM_BOT_TOKEN", "token")
+	t.Setenv("BOT_BILL_SUMMARY_CACHE_TTL_SECONDS", "45")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got := cfg.BillSummaryCacheTTL.Seconds(); got != 45 {
+		t.Fatalf("BillSummaryCacheTTL = %.0f seconds, want 45", got)
+	}
+}
+
+func TestLoadOutboxRetentionDefaultsAndEnv(t *testing.T) {
+	t.Setenv("TELEGRAM_BOT_TOKEN", "token")
+	t.Setenv("BOT_OUTBOX_SENT_RETENTION_HOURS", "")
+	t.Setenv("BOT_OUTBOX_FAILED_RETENTION_HOURS", "")
+	t.Setenv("BOT_OUTBOX_STATS_WINDOW_HOURS", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got := cfg.OutboxSentRetention.Hours(); got != 72 {
+		t.Fatalf("OutboxSentRetention = %.0f hours, want 72", got)
+	}
+	if got := cfg.OutboxFailedRetention.Hours(); got != 24*14 {
+		t.Fatalf("OutboxFailedRetention = %.0f hours, want %d", got, 24*14)
+	}
+	if got := cfg.OutboxStatsWindow.Hours(); got != 72 {
+		t.Fatalf("OutboxStatsWindow = %.0f hours, want 72", got)
+	}
+
+	t.Setenv("BOT_OUTBOX_SENT_RETENTION_HOURS", "24")
+	t.Setenv("BOT_OUTBOX_FAILED_RETENTION_HOURS", "168")
+	t.Setenv("BOT_OUTBOX_STATS_WINDOW_HOURS", "12")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got := cfg.OutboxSentRetention.Hours(); got != 24 {
+		t.Fatalf("OutboxSentRetention env = %.0f hours, want 24", got)
+	}
+	if got := cfg.OutboxFailedRetention.Hours(); got != 168 {
+		t.Fatalf("OutboxFailedRetention env = %.0f hours, want 168", got)
+	}
+	if got := cfg.OutboxStatsWindow.Hours(); got != 12 {
+		t.Fatalf("OutboxStatsWindow env = %.0f hours, want 12", got)
+	}
+}

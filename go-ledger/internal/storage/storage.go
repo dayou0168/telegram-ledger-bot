@@ -144,6 +144,34 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_broadcast_operators_cleanup
 			ON broadcast_operators(private_cleanup_enabled, private_cleanup_time, user_id)
 			WHERE status='active'`,
+		`CREATE TABLE IF NOT EXISTS global_operators (
+			user_id BIGINT PRIMARY KEY,
+			level TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'active',
+			parent_user_id BIGINT,
+			created_by BIGINT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL,
+			disabled_by BIGINT,
+			disabled_at TIMESTAMPTZ,
+			remark TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_global_operators_status
+			ON global_operators(status, user_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_global_operators_level_status
+			ON global_operators(level, status, user_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_global_operators_parent_status
+			ON global_operators(parent_user_id, status, user_id)`,
+		`INSERT INTO global_operators(user_id, level, status, parent_user_id, created_by, created_at, remark)
+			SELECT user_id,
+				CASE WHEN created_by = 0 THEN 'primary' ELSE 'secondary' END,
+				'active',
+				NULLIF(created_by, 0),
+				created_by,
+				created_at,
+				remark
+			FROM broadcast_operators
+			WHERE status='active'
+			ON CONFLICT(user_id) DO NOTHING`,
 		`CREATE TABLE IF NOT EXISTS private_chat_messages (
 			id BIGSERIAL PRIMARY KEY,
 			operator_user_id BIGINT NOT NULL,
@@ -460,6 +488,17 @@ func (s *Store) migrate(ctx context.Context) error {
 			WHERE reference_kind <> ''`,
 		`CREATE INDEX IF NOT EXISTS idx_notification_outbox_status_priority
 			ON notification_outbox(status, priority, updated_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_notification_outbox_status_updated
+			ON notification_outbox(status, updated_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_notification_outbox_pending_created
+			ON notification_outbox(created_at)
+			WHERE status='pending'`,
+		`CREATE INDEX IF NOT EXISTS idx_notification_outbox_status_sent_at
+			ON notification_outbox(status, sent_at)
+			WHERE status='sent'`,
+		`CREATE INDEX IF NOT EXISTS idx_notification_outbox_failed_updated
+			ON notification_outbox(updated_at)
+			WHERE status='failed'`,
 	}
 	for _, statement := range statements {
 		if _, err := s.pool.Exec(ctx, statement); err != nil {
@@ -756,6 +795,142 @@ func (s *Store) IsBroadcastOperator(ctx context.Context, userID int64) (bool, er
 		return false, nil
 	}
 	return err == nil, err
+}
+
+func normalizeGlobalOperatorLevel(level string) (string, error) {
+	level = strings.TrimSpace(level)
+	switch level {
+	case "primary", "secondary":
+		return level, nil
+	default:
+		return "", errors.New("invalid global operator level")
+	}
+}
+
+func (s *Store) IsGlobalOperator(ctx context.Context, userID int64) (bool, error) {
+	row := s.pool.QueryRow(ctx, `SELECT 1 FROM global_operators WHERE user_id=$1 AND status='active' LIMIT 1`, userID)
+	var one int
+	err := row.Scan(&one)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func (s *Store) GetGlobalOperatorLevel(ctx context.Context, userID int64) (string, bool, error) {
+	row := s.pool.QueryRow(ctx, `SELECT level FROM global_operators WHERE user_id=$1 AND status='active' LIMIT 1`, userID)
+	var level string
+	err := row.Scan(&level)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	return level, err == nil, err
+}
+
+func (s *Store) UpsertGlobalOperator(ctx context.Context, userID int64, level string, parentUserID, createdBy int64, remark string, now time.Time) error {
+	if userID <= 0 {
+		return errors.New("global operator user id is empty")
+	}
+	level, err := normalizeGlobalOperatorLevel(level)
+	if err != nil {
+		return err
+	}
+	remark = strings.TrimSpace(remark)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer rollback(ctx, tx)
+	if _, err := tx.Exec(ctx, `INSERT INTO global_operators(user_id, level, status, parent_user_id, created_by, created_at, remark)
+		VALUES($1, $2, 'active', NULLIF($3, 0), $4, $5, $6)
+		ON CONFLICT(user_id) DO UPDATE SET
+			level=excluded.level,
+			status='active',
+			parent_user_id=excluded.parent_user_id,
+			remark=excluded.remark,
+			disabled_by=NULL,
+			disabled_at=NULL`,
+		userID, level, parentUserID, createdBy, now, remark); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO broadcast_operators(user_id, status, created_by, remark, created_at, updated_at)
+		VALUES($1, 'active', $2, $3, $4, $5)
+		ON CONFLICT(user_id) DO UPDATE SET status='active', remark=excluded.remark, updated_at=excluded.updated_at`,
+		userID, createdBy, remark, now, now); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Store) DisableGlobalOperator(ctx context.Context, userID, disabledBy int64, now time.Time) (bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer rollback(ctx, tx)
+	tag, err := tx.Exec(ctx, `UPDATE global_operators
+		SET status='disabled', disabled_by=$1, disabled_at=$2
+		WHERE user_id=$3 AND status <> 'disabled'`, disabledBy, now, userID)
+	if err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE broadcast_operators SET status='disabled', updated_at=$1 WHERE user_id=$2 AND status <> 'disabled'`,
+		now, userID); err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, tx.Commit(ctx)
+}
+
+func (s *Store) ListGlobalOperators(ctx context.Context) ([]GlobalOperator, error) {
+	rows, err := s.pool.Query(ctx, `SELECT g.user_id, g.level, g.status, COALESCE(g.parent_user_id, 0),
+			g.remark, g.created_by, g.created_at, COALESCE(g.disabled_by, 0), g.disabled_at,
+			COALESCE(b.private_cleanup_enabled, FALSE),
+			COALESCE(b.private_cleanup_time, ''),
+			COALESCE(b.private_cleanup_last_run_date, ''),
+			COALESCE(b.private_cleanup_bot_after_seconds, 0),
+			COALESCE(b.private_cleanup_incoming_enabled, FALSE),
+			COALESCE(b.private_cleanup_incoming_after_seconds, 0),
+			COALESCE(b.private_cleanup_scope, ''),
+			COALESCE(b.updated_at, g.created_at)
+		FROM global_operators g
+		LEFT JOIN broadcast_operators b ON b.user_id=g.user_id
+		ORDER BY g.status ASC, CASE WHEN g.level='primary' THEN 0 ELSE 1 END, g.created_at ASC, g.user_id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var operators []GlobalOperator
+	for rows.Next() {
+		var op GlobalOperator
+		var disabledAt pgtype.Timestamptz
+		if err := rows.Scan(
+			&op.UserID,
+			&op.Level,
+			&op.Status,
+			&op.ParentUserID,
+			&op.Remark,
+			&op.CreatedBy,
+			&op.CreatedAt,
+			&op.DisabledBy,
+			&disabledAt,
+			&op.PrivateCleanupEnabled,
+			&op.PrivateCleanupTime,
+			&op.PrivateCleanupLastRunDate,
+			&op.PrivateCleanupBotDeleteAfterSeconds,
+			&op.PrivateCleanupIncomingEnabled,
+			&op.PrivateCleanupIncomingAfterSeconds,
+			&op.PrivateCleanupScope,
+			&op.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		if disabledAt.Valid {
+			t := disabledAt.Time
+			op.DisabledAt = &t
+		}
+		operators = append(operators, op)
+	}
+	return operators, rows.Err()
 }
 
 func (s *Store) UpsertBroadcastOperator(ctx context.Context, userID, createdBy int64, remark string, now time.Time) error {
@@ -1290,12 +1465,19 @@ func (s *Store) AddBroadcastPermission(ctx context.Context, userID int64, target
 	if target != "chat" && target != "group" {
 		return errors.New("invalid broadcast permission target")
 	}
+	ok, err := s.IsGlobalOperator(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("broadcast permission user is not an active global operator")
+	}
 	if target == "chat" {
 		groupName = ""
 	} else {
 		chatID = 0
 	}
-	_, err := s.pool.Exec(ctx, `INSERT INTO broadcast_operator_permissions(user_id, target, chat_id, group_name, granted_by, created_at)
+	_, err = s.pool.Exec(ctx, `INSERT INTO broadcast_operator_permissions(user_id, target, chat_id, group_name, granted_by, created_at)
 		VALUES($1, $2, $3, $4, $5, $6)
 		ON CONFLICT DO NOTHING`, userID, target, chatID, groupName, grantedBy, now)
 	return err
@@ -1996,11 +2178,16 @@ func (s *Store) ClaimDueNotifications(ctx context.Context, limit int, maxAttempt
 	return out, rows.Err()
 }
 
-func (s *Store) NotificationOutboxStats(ctx context.Context) (NotificationOutboxStats, error) {
+func (s *Store) NotificationOutboxStats(ctx context.Context, since time.Time) (NotificationOutboxStats, error) {
+	if since.IsZero() {
+		since = time.Now().Add(-72 * time.Hour)
+	}
 	var stats NotificationOutboxStats
 	rows, err := s.pool.Query(ctx, `SELECT status, COUNT(*)
 		FROM notification_outbox
-		GROUP BY status`)
+		WHERE status IN ('pending', 'sending')
+		   OR (status IN ('sent', 'failed') AND updated_at >= $1)
+		GROUP BY status`, since)
 	if err != nil {
 		return stats, err
 	}
@@ -2031,7 +2218,7 @@ func (s *Store) NotificationOutboxStats(ctx context.Context) (NotificationOutbox
 	var oldest pgtype.Timestamptz
 	row := s.pool.QueryRow(ctx, `SELECT MIN(created_at)
 		FROM notification_outbox
-		WHERE status IN ('pending', 'failed', 'sending')`)
+		WHERE status='pending'`)
 	if err := row.Scan(&oldest); err != nil {
 		return stats, err
 	}
@@ -2043,16 +2230,19 @@ func (s *Store) NotificationOutboxStats(ctx context.Context) (NotificationOutbox
 	row = s.pool.QueryRow(ctx, `SELECT COALESCE(last_error, '')
 		FROM notification_outbox
 		WHERE last_error <> ''
+		  AND (status IN ('pending', 'sending') OR updated_at >= $1)
 		ORDER BY updated_at DESC, id DESC
-		LIMIT 1`)
+		LIMIT 1`, since)
 	if err := row.Scan(&stats.LastError); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return stats, err
 	}
 
 	rows, err = s.pool.Query(ctx, `SELECT priority, status, COUNT(*)
 		FROM notification_outbox
+		WHERE status IN ('pending', 'sending')
+		   OR (status IN ('sent', 'failed') AND updated_at >= $1)
 		GROUP BY priority, status
-		ORDER BY priority ASC, status ASC`)
+		ORDER BY priority ASC, status ASC`, since)
 	if err != nil {
 		return stats, err
 	}
@@ -2065,6 +2255,26 @@ func (s *Store) NotificationOutboxStats(ctx context.Context) (NotificationOutbox
 		stats.ByPriority = append(stats.ByPriority, item)
 	}
 	return stats, rows.Err()
+}
+
+func (s *Store) CleanupNotificationOutbox(ctx context.Context, sentBefore time.Time, failedBefore time.Time) (NotificationOutboxCleanupStats, error) {
+	var stats NotificationOutboxCleanupStats
+	tag, err := s.pool.Exec(ctx, `DELETE FROM notification_outbox
+		WHERE status='sent'
+		  AND sent_at IS NOT NULL
+		  AND sent_at < $1`, sentBefore)
+	if err != nil {
+		return stats, err
+	}
+	stats.SentDeleted = tag.RowsAffected()
+	tag, err = s.pool.Exec(ctx, `DELETE FROM notification_outbox
+		WHERE status='failed'
+		  AND updated_at < $1`, failedBefore)
+	if err != nil {
+		return stats, err
+	}
+	stats.FailedDeleted = tag.RowsAffected()
+	return stats, nil
 }
 
 func (s *Store) MarkNotificationSent(ctx context.Context, id int64, messageID int64, now time.Time) error {

@@ -116,43 +116,66 @@ func (b *Bot) deleteChainWatcherSubscriptionAsync(ctx context.Context, owner int
 }
 
 func (b *Bot) pollChainWatcherEventsWithStatus(ctx context.Context) {
-	err := b.pollChainWatcherEvents(ctx)
+	timing, err := b.pollChainWatcherEvents(ctx)
 	if err != nil {
+		timing.Error = err.Error()
+		b.watcherTiming.record(timing)
 		log.Printf("claim chain watcher events: %v", err)
 		b.recordChainWatcherFailure("claim")
 		return
 	}
+	b.watcherTiming.record(timing)
+	if timing.EventCount > 0 {
+		log.Printf("chain watcher timing: events=%d acked=%d claim_ms=%d notify_ms=%d outbox_ms=%d gateway_ms=%d ack_ms=%d",
+			timing.EventCount, timing.AckedCount, timing.ClaimDuration.Milliseconds(), timing.NotifyDuration.Milliseconds(),
+			timing.OutboxDuration.Milliseconds(), timing.GatewayDuration.Milliseconds(), timing.AckDuration.Milliseconds())
+	}
 	b.recordChainWatcherSuccess("claim")
 }
 
-func (b *Bot) pollChainWatcherEvents(ctx context.Context) error {
+func (b *Bot) pollChainWatcherEvents(ctx context.Context) (chainWatcherPollTiming, error) {
+	var timing chainWatcherPollTiming
+	timing.StartedAt = time.Now()
 	if !b.cfg.ChainWatcherEnabled() {
-		return nil
+		return timing, nil
 	}
 	claimCtx, cancel := context.WithTimeout(ctx, b.cfg.BotWatcherClaimTimeout)
 	defer cancel()
+	claimStarted := time.Now()
 	events, err := b.watcher.ClaimEvents(claimCtx, b.cfg.ChainWatcherBatchSize)
+	timing.ClaimDuration = time.Since(claimStarted)
 	if err != nil {
-		return err
+		timing.Error = err.Error()
+		return timing, err
 	}
+	timing.EventCount = len(events)
 	if len(events) == 0 {
-		return nil
+		return timing, nil
 	}
 	acked := make([]string, 0, len(events))
 	for _, event := range events {
-		if err := b.processChainWatcherEvent(ctx, event); err != nil {
+		notificationTiming, err := b.processChainWatcherEvent(ctx, event)
+		timing.NotifyDuration += notificationTiming.NotifyDuration
+		timing.OutboxDuration += notificationTiming.OutboxDuration
+		timing.GatewayDuration += notificationTiming.GatewayDuration
+		if err != nil {
 			log.Printf("process chain watcher event %s: %v", event.DeliveryID, err)
 			continue
 		}
 		acked = append(acked, event.DeliveryID)
 	}
+	timing.AckedCount = len(acked)
 	if len(acked) == 0 {
-		return nil
+		return timing, nil
 	}
+	ackStarted := time.Now()
 	if err := b.watcher.AckEvents(ctx, acked); err != nil {
-		return err
+		timing.AckDuration = time.Since(ackStarted)
+		timing.Error = err.Error()
+		return timing, err
 	}
-	return nil
+	timing.AckDuration = time.Since(ackStarted)
+	return timing, nil
 }
 
 func (b *Bot) checkChainWatcherHealth(ctx context.Context) {
@@ -205,7 +228,8 @@ func (b *Bot) pollFallbackIfActive(ctx context.Context) {
 	}
 }
 
-func (b *Bot) processChainWatcherEvent(ctx context.Context, event chainwatcher.MatchedEvent) error {
+func (b *Bot) processChainWatcherEvent(ctx context.Context, event chainwatcher.MatchedEvent) (notificationTiming, error) {
+	var timing notificationTiming
 	transfer := tron.Transfer{
 		Hash:           event.TxHash,
 		From:           event.From,
@@ -225,19 +249,25 @@ func (b *Bot) processChainWatcherEvent(ctx context.Context, event chainwatcher.M
 		WatchExpense:    event.Direction == "expense",
 		MinNotifyAmount: "0",
 	}
+	notifyStarted := time.Now()
 	text := b.formatTransferNotice(transfer, target, event.Direction)
+	timing.NotifyDuration = time.Since(notifyStarted)
 	chatID := event.ChatID
 	if chatID == 0 {
 		chatID = event.OwnerUserID
 	}
+	outboxStarted := time.Now()
 	inserted, err := b.store.RecordChainNotificationOutbox(ctx, event.OwnerUserID, event.WatchAddress, event.TxHash, event.Direction, event.BlockTimestamp, chatID, text, "HTML", true, time.Now().In(b.loc))
+	timing.OutboxDuration = time.Since(outboxStarted)
 	if err != nil {
-		return err
+		return timing, err
 	}
 	if inserted {
+		gatewayStarted := time.Now()
 		b.kickNotificationOutbox()
+		timing.GatewayDuration = time.Since(gatewayStarted)
 	}
-	return nil
+	return timing, nil
 }
 
 const watcherRecoveryThreshold = 3
@@ -251,6 +281,41 @@ type watcherFallbackController struct {
 	activeNow     bool
 	exhausted     bool
 	startedAt     time.Time
+}
+
+type notificationTiming struct {
+	NotifyDuration  time.Duration
+	OutboxDuration  time.Duration
+	GatewayDuration time.Duration
+}
+
+type chainWatcherPollTiming struct {
+	StartedAt       time.Time
+	EventCount      int
+	AckedCount      int
+	ClaimDuration   time.Duration
+	NotifyDuration  time.Duration
+	OutboxDuration  time.Duration
+	GatewayDuration time.Duration
+	AckDuration     time.Duration
+	Error           string
+}
+
+type chainWatcherTimingStatus struct {
+	mu     sync.Mutex
+	last   chainWatcherPollTiming
+	recent []chainWatcherPollTiming
+}
+
+func (s *chainWatcherTimingStatus) record(timing chainWatcherPollTiming) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.last = timing
+	s.recent = append(s.recent, timing)
+	if len(s.recent) > 5 {
+		copy(s.recent, s.recent[len(s.recent)-5:])
+		s.recent = s.recent[:5]
+	}
 }
 
 func newWatcherFallbackController(failThreshold int, maxActive time.Duration) *watcherFallbackController {

@@ -31,7 +31,7 @@ func (b *Bot) startAccounting(ctx context.Context, msg telegram.Message, user st
 	if b.isHost(user.ID) {
 		if err := b.store.SetGroupOwner(ctx, msg.Chat.ID, user, now); err == nil {
 			b.invalidateGroupCache(msg.Chat.ID)
-			b.operatorCache.Clear()
+			b.InvalidateAllPermissionCaches()
 		}
 	}
 	group, err := b.getGroupCached(ctx, msg.Chat.ID)
@@ -43,7 +43,7 @@ func (b *Bot) startAccounting(ctx context.Context, msg telegram.Message, user st
 		return err
 	}
 	b.invalidateGroupCache(msg.Chat.ID)
-	return b.enqueueReplyText(ctx, sendPriorityNormal, "ledger_start_ok", msg.Chat.ID, msg.MessageID, "机器人已开启，请开始记账", nil, now)
+	return b.enqueueLedgerText(ctx, sendPriorityNormal, "ledger_start_ok", msg.Chat.ID, msg.MessageID, "机器人已开启，请开始记账", nil, now)
 }
 
 func (b *Bot) stopAccounting(ctx context.Context, msg telegram.Message, user storage.User, now time.Time) error {
@@ -56,7 +56,7 @@ func (b *Bot) stopAccounting(ctx context.Context, msg telegram.Message, user sto
 		return err
 	}
 	b.invalidateGroupCache(msg.Chat.ID)
-	return b.enqueueReplyText(ctx, sendPriorityNormal, "ledger_stop_ok", msg.Chat.ID, msg.MessageID, "已停止记账。发送“开始”可重新开启。", nil, now)
+	return b.enqueueLedgerText(ctx, sendPriorityNormal, "ledger_stop_ok", msg.Chat.ID, msg.MessageID, "已停止记账。发送“开始”可重新开启。", nil, now)
 }
 
 func (b *Bot) handleLedger(ctx context.Context, msg telegram.Message, user storage.User, cmd ledgerCommand, now time.Time) error {
@@ -77,10 +77,10 @@ func (b *Bot) handleLedger(ctx context.Context, msg telegram.Message, user stora
 		if !groupAccountingActive(group, now) {
 			return nil
 		}
-		return b.enqueueReplyText(ctx, sendPriorityNormal, "ledger_record_denied", msg.Chat.ID, msg.MessageID, ledgerPermissionDeniedText, nil, now)
+		return b.enqueueLedgerText(ctx, sendPriorityNormal, "ledger_record_denied", msg.Chat.ID, msg.MessageID, ledgerPermissionDeniedText, nil, now)
 	}
 	if !groupAccountingActive(group, now) {
-		return b.enqueueReplyText(ctx, sendPriorityNormal, "ledger_inactive", msg.Chat.ID, msg.MessageID, ledgerInactiveText, nil, now)
+		return b.enqueueLedgerText(ctx, sendPriorityNormal, "ledger_inactive", msg.Chat.ID, msg.MessageID, ledgerInactiveText, nil, now)
 	}
 
 	effectiveAmount := new(big.Rat).Set(cmd.Amount)
@@ -137,7 +137,8 @@ func (b *Bot) handleLedger(ctx context.Context, msg telegram.Message, user stora
 	if err != nil {
 		return err
 	}
-	b.sendBillForRecordAsync(ctx, msg.Chat.ID, msg.MessageID, recordID, now)
+	b.invalidateBillSummaryCache(msg.Chat.ID, dayKey)
+	b.sendBillForRecordAsync(ctx, msg.Chat.ID, recordID, now)
 	return nil
 }
 
@@ -166,14 +167,14 @@ func (b *Bot) guardAccountingStarted(ctx context.Context, msg telegram.Message, 
 	if !ok {
 		return false, nil
 	}
-	return false, b.enqueueReplyText(ctx, sendPriorityNormal, dedupeKind, msg.Chat.ID, msg.MessageID, ledgerInactiveText, nil, now)
+	return false, b.enqueueLedgerText(ctx, sendPriorityNormal, dedupeKind, msg.Chat.ID, msg.MessageID, ledgerInactiveText, nil, now)
 }
 
 func (b *Bot) handleSetting(ctx context.Context, msg telegram.Message, user storage.User, cmd settingCommand, now time.Time) error {
 	if ok, err := b.canUseLedger(ctx, msg.Chat.ID, user.ID); err != nil {
 		return err
 	} else if !ok {
-		return b.enqueueReplyText(ctx, sendPriorityNormal, "ledger_setting_denied", msg.Chat.ID, msg.MessageID, ledgerPermissionDeniedText, nil, now)
+		return b.enqueueLedgerText(ctx, sendPriorityNormal, "ledger_setting_denied", msg.Chat.ID, msg.MessageID, ledgerPermissionDeniedText, nil, now)
 	}
 	switch cmd.Kind {
 	case "fee":
@@ -182,23 +183,23 @@ func (b *Bot) handleSetting(ctx context.Context, msg telegram.Message, user stor
 			return err
 		}
 		b.invalidateGroupCache(msg.Chat.ID)
-		return b.enqueueReplyText(ctx, sendPriorityNormal, "ledger_setting_fee", msg.Chat.ID, msg.MessageID, "操作成功：设置费率="+rate+"%", nil, now)
+		return b.enqueueLedgerText(ctx, sendPriorityNormal, "ledger_setting_fee", msg.Chat.ID, msg.MessageID, "操作成功：设置费率="+rate+"%", nil, now)
 	case "exchange_rate":
 		if cmd.Value == nil || cmd.Value.Sign() <= 0 {
-			return b.enqueueReplyText(ctx, sendPriorityNormal, "ledger_setting_rate_invalid", msg.Chat.ID, msg.MessageID, "汇率必须大于0。", nil, now)
+			return b.enqueueLedgerText(ctx, sendPriorityNormal, "ledger_setting_rate_invalid", msg.Chat.ID, msg.MessageID, "汇率必须大于0。", nil, now)
 		}
 		rate := formatRat(cmd.Value, 8)
 		if err := b.store.SetGroupExchangeRate(ctx, msg.Chat.ID, rate, now); err != nil {
 			return err
 		}
 		b.invalidateGroupCache(msg.Chat.ID)
-		return b.enqueueReplyText(ctx, sendPriorityNormal, "ledger_setting_rate", msg.Chat.ID, msg.MessageID, "操作成功：设置汇率="+rate, nil, now)
+		return b.enqueueLedgerText(ctx, sendPriorityNormal, "ledger_setting_rate", msg.Chat.ID, msg.MessageID, "操作成功：设置汇率="+rate, nil, now)
 	case "cutoff":
 		if err := b.store.SetGroupCutoffHour(ctx, msg.Chat.ID, cmd.CutoffHour, now); err != nil {
 			return err
 		}
 		b.invalidateGroupCache(msg.Chat.ID)
-		return b.enqueueReplyText(ctx, sendPriorityNormal, "ledger_setting_cutoff", msg.Chat.ID, msg.MessageID, fmt.Sprintf("操作成功：日切时间=%02d:00", cmd.CutoffHour), nil, now)
+		return b.enqueueLedgerText(ctx, sendPriorityNormal, "ledger_setting_cutoff", msg.Chat.ID, msg.MessageID, fmt.Sprintf("操作成功：日切时间=%02d:00", cmd.CutoffHour), nil, now)
 	default:
 		return nil
 	}
@@ -206,7 +207,7 @@ func (b *Bot) handleSetting(ctx context.Context, msg telegram.Message, user stor
 
 func (b *Bot) handleUndo(ctx context.Context, msg telegram.Message, user storage.User, kind string, now time.Time) error {
 	if msg.ReplyTo == nil {
-		return b.enqueueReplyText(ctx, sendPriorityNormal, "ledger_undo_no_reply", msg.Chat.ID, msg.MessageID, "请回复要撤销的原始加账消息或机器人账单回执。", nil, now)
+		return b.enqueueLedgerText(ctx, sendPriorityNormal, "ledger_undo_no_reply", msg.Chat.ID, msg.MessageID, "请回复要撤销的原始加账消息或机器人账单回执。", nil, now)
 	}
 	doneFind := measurePerfStage(ctx, "db_record_find")
 	record, ok, err := b.store.FindRecordByMessage(ctx, msg.Chat.ID, msg.ReplyTo.MessageID)
@@ -215,7 +216,7 @@ func (b *Bot) handleUndo(ctx context.Context, msg telegram.Message, user storage
 		return err
 	}
 	if !ok {
-		return b.enqueueReplyText(ctx, sendPriorityNormal, "ledger_undo_not_found", msg.Chat.ID, msg.MessageID, "没有找到可撤销的记录。", nil, now)
+		return b.enqueueLedgerText(ctx, sendPriorityNormal, "ledger_undo_not_found", msg.Chat.ID, msg.MessageID, "没有找到可撤销的记录。", nil, now)
 	}
 	if record.ActorUserID != user.ID {
 		manager, err := b.canManageGroup(ctx, msg.Chat.ID, user.ID)
@@ -223,7 +224,7 @@ func (b *Bot) handleUndo(ctx context.Context, msg telegram.Message, user storage
 			return err
 		}
 		if !manager {
-			return b.enqueueReplyText(ctx, sendPriorityNormal, "ledger_undo_denied", msg.Chat.ID, msg.MessageID, "只能撤销自己录入的记录。", nil, now)
+			return b.enqueueLedgerText(ctx, sendPriorityNormal, "ledger_undo_denied", msg.Chat.ID, msg.MessageID, "只能撤销自己录入的记录。", nil, now)
 		}
 	}
 	doneDelete := measurePerfStage(ctx, "db_record_delete")
@@ -233,8 +234,9 @@ func (b *Bot) handleUndo(ctx context.Context, msg telegram.Message, user storage
 		return err
 	}
 	if !deleted {
-		return b.enqueueReplyText(ctx, sendPriorityNormal, "ledger_undo_failed", msg.Chat.ID, msg.MessageID, "撤销失败，记录类型不匹配或已撤销。", nil, now)
+		return b.enqueueLedgerText(ctx, sendPriorityNormal, "ledger_undo_failed", msg.Chat.ID, msg.MessageID, "撤销失败，记录类型不匹配或已撤销。", nil, now)
 	}
+	b.invalidateBillSummaryCache(msg.Chat.ID, record.DayKey)
 	prefix := "已撤销"
 	if record.Kind == "deposit" {
 		prefix = "已撤销入款"
@@ -248,7 +250,7 @@ func (b *Bot) handleOperatorCommand(ctx context.Context, msg telegram.Message, u
 	if ok, err := b.canManageGroup(ctx, msg.Chat.ID, user.ID); err != nil {
 		return err
 	} else if !ok {
-		return b.enqueueReplyText(ctx, sendPriorityNormal, "ledger_operator_denied", msg.Chat.ID, msg.MessageID, "只有宿主或本群最高权限可以管理操作员。", nil, now)
+		return b.enqueueLedgerText(ctx, sendPriorityNormal, "ledger_operator_denied", msg.Chat.ID, msg.MessageID, "只有宿主或本群最高权限可以管理操作员。", nil, now)
 	}
 	add := strings.HasPrefix(text, "添加操作员") || strings.HasPrefix(text, "设置操作人")
 	remove := strings.HasPrefix(text, "删除操作员") || strings.HasPrefix(text, "移除操作人") || strings.HasPrefix(text, "删除操作人")
@@ -260,7 +262,7 @@ func (b *Bot) handleOperatorCommand(ctx context.Context, msg telegram.Message, u
 		return err
 	}
 	if len(targets) == 0 {
-		return b.enqueueReplyText(ctx, sendPriorityNormal, "ledger_operator_no_target", msg.Chat.ID, msg.MessageID, "请回复对方消息，或输入 @用户名。", nil, now)
+		return b.enqueueLedgerText(ctx, sendPriorityNormal, "ledger_operator_no_target", msg.Chat.ID, msg.MessageID, "请回复对方消息，或输入 @用户名。", nil, now)
 	}
 	var changed []string
 	for _, target := range targets {
@@ -274,8 +276,8 @@ func (b *Bot) handleOperatorCommand(ctx context.Context, msg telegram.Message, u
 			if err := b.store.AddOperator(ctx, msg.Chat.ID, target, user.ID, now); err != nil {
 				return err
 			}
-			b.operatorCache.Delete(formatID(msg.Chat.ID) + ":" + formatID(target.ID))
-			b.operatorCache.Delete(formatID(msg.Chat.ID) + ":" + formatID(user.ID))
+			b.InvalidateLedgerPermission(msg.Chat.ID, target.ID)
+			b.InvalidateLedgerPermission(msg.Chat.ID, user.ID)
 			changed = append(changed, target.DisplayName)
 			continue
 		}
@@ -284,8 +286,8 @@ func (b *Bot) handleOperatorCommand(ctx context.Context, msg telegram.Message, u
 			return err
 		}
 		if removed {
-			b.operatorCache.Delete(formatID(msg.Chat.ID) + ":" + formatID(target.ID))
-			b.operatorCache.Delete(formatID(msg.Chat.ID) + ":" + formatID(user.ID))
+			b.InvalidateLedgerPermission(msg.Chat.ID, target.ID)
+			b.InvalidateLedgerPermission(msg.Chat.ID, user.ID)
 			changed = append(changed, target.DisplayName)
 		}
 	}
@@ -300,7 +302,7 @@ func (b *Bot) handleOperatorCommand(ctx context.Context, msg telegram.Message, u
 	if len(missing) > 0 {
 		textOut += "\n未找到：" + strings.Join(missing, "、") + "\n对方需要先在群里发过消息，或直接回复对方消息操作。"
 	}
-	return b.enqueueReplyText(ctx, sendPriorityNormal, "ledger_operator_result", msg.Chat.ID, msg.MessageID, textOut, nil, now)
+	return b.enqueueLedgerText(ctx, sendPriorityNormal, "ledger_operator_result", msg.Chat.ID, msg.MessageID, textOut, nil, now)
 }
 
 func (b *Bot) handleListOperators(ctx context.Context, msg telegram.Message) error {
@@ -309,7 +311,7 @@ func (b *Bot) handleListOperators(ctx context.Context, msg telegram.Message) err
 		return err
 	}
 	if len(operators) == 0 {
-		return b.enqueueReplyText(ctx, sendPriorityNormal, "ledger_operator_list_empty", msg.Chat.ID, msg.MessageID, "当前没有操作员。", nil, time.Now().In(b.loc))
+		return b.enqueueLedgerText(ctx, sendPriorityNormal, "ledger_operator_list_empty", msg.Chat.ID, msg.MessageID, "当前没有操作员。", nil, time.Now().In(b.loc))
 	}
 	var out strings.Builder
 	out.WriteString("当前操作员：\n")
@@ -332,7 +334,7 @@ func (b *Bot) handleListOperators(ctx context.Context, msg telegram.Message) err
 		out.WriteString(formatID(op.UserID))
 		out.WriteString("）\n")
 	}
-	return b.enqueueReplyText(ctx, sendPriorityNormal, "ledger_operator_list", msg.Chat.ID, msg.MessageID, strings.TrimSpace(out.String()), nil, time.Now().In(b.loc))
+	return b.enqueueLedgerText(ctx, sendPriorityNormal, "ledger_operator_list", msg.Chat.ID, msg.MessageID, strings.TrimSpace(out.String()), nil, time.Now().In(b.loc))
 }
 
 func (b *Bot) operatorTargets(ctx context.Context, msg telegram.Message, text string) ([]storage.User, []string, error) {
@@ -362,19 +364,18 @@ func (b *Bot) operatorTargets(ctx context.Context, msg telegram.Message, text st
 	return targets, missing, nil
 }
 
-func (b *Bot) sendBillForRecordAsync(ctx context.Context, chatID, replyTo, recordID int64, now time.Time) {
+func (b *Bot) sendBillForRecordAsync(ctx context.Context, chatID, recordID int64, now time.Time) {
 	key := "send:" + strconv.FormatInt(chatID, 10)
 	b.dispatcher.Submit(ctx, key, b.notifyPool, func(sendCtx context.Context) {
 		item := storage.NotificationOutbox{
-			Kind:             "ledger_bill",
-			DedupeKey:        fmt.Sprintf("ledger_bill_record:%d", recordID),
-			ChatID:           chatID,
-			ParseMode:        "HTML",
-			DisablePreview:   true,
-			ReplyToMessageID: replyTo,
-			ReferenceKind:    "ledger_record",
-			ReferenceID:      recordID,
-			Priority:         int(sendPriorityHigh),
+			Kind:           "ledger_bill",
+			DedupeKey:      fmt.Sprintf("ledger_bill_record:%d", recordID),
+			ChatID:         chatID,
+			ParseMode:      "HTML",
+			DisablePreview: true,
+			ReferenceKind:  "ledger_record",
+			ReferenceID:    recordID,
+			Priority:       int(sendPriorityHigh),
 		}
 		inserted, err := b.store.EnqueueNotification(sendCtx, item, now)
 		if err != nil {
@@ -388,42 +389,42 @@ func (b *Bot) sendBillForRecordAsync(ctx context.Context, chatID, replyTo, recor
 }
 
 func (b *Bot) sendBill(ctx context.Context, chatID, replyTo int64, now time.Time, prefix string) error {
-	text, opts, err := b.renderBillMessageForTime(ctx, chatID, replyTo, now, prefix)
+	text, opts, err := b.renderBillMessageForTime(ctx, chatID, now, prefix)
 	if err != nil {
 		return err
 	}
-	return b.enqueueReliableText(ctx, sendPriorityHigh, "ledger_bill", messageScopedDedupe("ledger_bill", chatID, replyTo), chatID, text, opts, reliableMessageRef{}, now)
+	return b.enqueueReliableText(ctx, sendPriorityHigh, "ledger_bill", messageScopedDedupe("ledger_bill", chatID, replyTo), chatID, text, withoutReplyOptions(opts), reliableMessageRef{}, now)
 }
 
 func (b *Bot) sendBillMessage(ctx context.Context, chatID, replyTo int64, now time.Time, prefix string) (telegram.Message, error) {
-	text, opts, err := b.renderBillMessageForTime(ctx, chatID, replyTo, now, prefix)
+	text, opts, err := b.renderBillMessageForTime(ctx, chatID, now, prefix)
 	if err != nil {
 		return telegram.Message{}, err
 	}
-	return b.sendText(ctx, sendPriorityHigh, chatID, text, opts)
+	return b.sendText(ctx, sendPriorityHigh, chatID, text, withoutReplyOptions(opts))
 }
 
-func (b *Bot) renderBillMessageForTime(ctx context.Context, chatID, replyTo int64, now time.Time, prefix string) (string, map[string]any, error) {
+func (b *Bot) renderBillMessageForTime(ctx context.Context, chatID int64, now time.Time, prefix string) (string, map[string]any, error) {
 	group, err := b.getGroupCached(ctx, chatID)
 	if err != nil {
 		return "", nil, err
 	}
 	dayKey := businessDayKey(now, group.CutoffHour)
-	return b.renderBillMessageWithGroup(ctx, group, dayKey, replyTo, prefix)
+	return b.renderBillMessageWithGroup(ctx, group, dayKey, prefix)
 }
 
-func (b *Bot) renderBillMessage(ctx context.Context, chatID int64, dayKey string, replyTo int64, prefix string) (string, map[string]any, error) {
+func (b *Bot) renderBillMessage(ctx context.Context, chatID int64, dayKey string, prefix string) (string, map[string]any, error) {
 	group, err := b.getGroupCached(ctx, chatID)
 	if err != nil {
 		return "", nil, err
 	}
-	return b.renderBillMessageWithGroup(ctx, group, dayKey, replyTo, prefix)
+	return b.renderBillMessageWithGroup(ctx, group, dayKey, prefix)
 }
 
-func (b *Bot) renderBillMessageWithGroup(ctx context.Context, group storage.Group, dayKey string, replyTo int64, prefix string) (string, map[string]any, error) {
+func (b *Bot) renderBillMessageWithGroup(ctx context.Context, group storage.Group, dayKey string, prefix string) (string, map[string]any, error) {
 	chatID := group.ChatID
 	doneDB := measurePerfStage(ctx, "db_bill_summary")
-	data, err := b.store.GetBillSummaryForDay(ctx, chatID, dayKey, groupBillDefaultRecordLimit)
+	data, err := b.getBillSummaryCached(ctx, chatID, dayKey, groupBillDefaultRecordLimit)
 	doneDB()
 	if err != nil {
 		return "", nil, err
@@ -434,9 +435,6 @@ func (b *Bot) renderBillMessageWithGroup(ctx context.Context, group storage.Grou
 	opts := map[string]any{
 		"parse_mode":               "HTML",
 		"disable_web_page_preview": true,
-	}
-	if replyTo > 0 {
-		opts["reply_to_message_id"] = replyTo
 	}
 	if url := b.publicBillURL(chatID, dayKey); url != "" {
 		opts["reply_markup"] = telegram.InlineKeyboardMarkup{InlineKeyboard: [][]telegram.InlineKeyboardButton{
@@ -455,7 +453,7 @@ func (b *Bot) publicBillURL(chatID int64, dayKey string) string {
 }
 
 func (b *Bot) isGroupOperator(ctx context.Context, chatID, userID int64) (bool, error) {
-	key := formatID(chatID) + ":" + formatID(userID)
+	key := ledgerPermissionCacheKey(chatID, userID)
 	if value, ok := b.operatorCache.Get(key); ok {
 		markPerfCache(ctx, "operator", true)
 		return value, nil

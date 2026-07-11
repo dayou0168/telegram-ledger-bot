@@ -1,4 +1,4 @@
-name: Go Ledger Runtime
+﻿name: Go Ledger Runtime
 
 on:
   push:
@@ -65,30 +65,30 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf dist
-          mkdir -p dist/ledger-chain-watcher-v2.3.6-linux-amd64
+          mkdir -p dist/ledger-chain-watcher-v2.3.7-linux-amd64
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/ledger-chain-watcher-linux-amd64 ./cmd/chain-watcher
-          cp dist/ledger-chain-watcher-linux-amd64 dist/ledger-chain-watcher-v2.3.6-linux-amd64/ledger-chain-watcher
-          cp ../deploy/ledger-chain-watcher.env.example dist/ledger-chain-watcher-v2.3.6-linux-amd64/
-          cp ../deploy/ledger-chain-watcher.service dist/ledger-chain-watcher-v2.3.6-linux-amd64/
-          tar -C dist -czf dist/ledger-chain-watcher-v2.3.6-linux-amd64.tar.gz ledger-chain-watcher-v2.3.6-linux-amd64
+          cp dist/ledger-chain-watcher-linux-amd64 dist/ledger-chain-watcher-v2.3.7-linux-amd64/ledger-chain-watcher
+          cp ../deploy/ledger-chain-watcher.env.example dist/ledger-chain-watcher-v2.3.7-linux-amd64/
+          cp ../deploy/ledger-chain-watcher.service dist/ledger-chain-watcher-v2.3.7-linux-amd64/
+          tar -C dist -czf dist/ledger-chain-watcher-v2.3.7-linux-amd64.tar.gz ledger-chain-watcher-v2.3.7-linux-amd64
           sha256sum dist/ledger-chain-watcher-linux-amd64 > dist/ledger-chain-watcher-linux-amd64.sha256
-          sha256sum dist/ledger-chain-watcher-v2.3.6-linux-amd64.tar.gz > dist/ledger-chain-watcher-v2.3.6-linux-amd64.tar.gz.sha256
+          sha256sum dist/ledger-chain-watcher-v2.3.7-linux-amd64.tar.gz > dist/ledger-chain-watcher-v2.3.7-linux-amd64.tar.gz.sha256
 
       - name: Upload host chain watcher artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ledger-chain-watcher-v2.3.6-linux-amd64
+          name: ledger-chain-watcher-v2.3.7-linux-amd64
           path: |
             go-ledger/dist/ledger-chain-watcher-linux-amd64
             go-ledger/dist/ledger-chain-watcher-linux-amd64.sha256
-            go-ledger/dist/ledger-chain-watcher-v2.3.6-linux-amd64.tar.gz
-            go-ledger/dist/ledger-chain-watcher-v2.3.6-linux-amd64.tar.gz.sha256
+            go-ledger/dist/ledger-chain-watcher-v2.3.7-linux-amd64.tar.gz
+            go-ledger/dist/ledger-chain-watcher-v2.3.7-linux-amd64.tar.gz.sha256
 
       - name: Build Docker images
         working-directory: go-ledger
         run: |
-          docker build --build-arg APP=ledger-bot -t telegram-ledger-bot-go:2.3.6 .
-          docker build --build-arg APP=chain-watcher -t telegram-ledger-chain-watcher:2.3.6 .
+          docker build --build-arg APP=ledger-bot -t telegram-ledger-bot-go:2.3.7 .
+          docker build --build-arg APP=chain-watcher -t telegram-ledger-chain-watcher:2.3.7 .
 
       - name: Login to GHCR
         if: github.event_name == 'push'
@@ -100,13 +100,13 @@ jobs:
         run: |
           BOT_IMAGE="ghcr.io/${{ github.repository_owner }}/telegram-ledger-bot-go"
           WATCHER_IMAGE="ghcr.io/${{ github.repository_owner }}/telegram-ledger-chain-watcher"
-          docker tag telegram-ledger-bot-go:2.3.6 "$BOT_IMAGE:2.3.6"
-          docker tag telegram-ledger-bot-go:2.3.6 "$BOT_IMAGE:latest"
-          docker tag telegram-ledger-chain-watcher:2.3.6 "$WATCHER_IMAGE:2.3.6"
-          docker tag telegram-ledger-chain-watcher:2.3.6 "$WATCHER_IMAGE:latest"
-          docker push "$BOT_IMAGE:2.3.6"
+          docker tag telegram-ledger-bot-go:2.3.7 "$BOT_IMAGE:2.3.7"
+          docker tag telegram-ledger-bot-go:2.3.7 "$BOT_IMAGE:latest"
+          docker tag telegram-ledger-chain-watcher:2.3.7 "$WATCHER_IMAGE:2.3.7"
+          docker tag telegram-ledger-chain-watcher:2.3.7 "$WATCHER_IMAGE:latest"
+          docker push "$BOT_IMAGE:2.3.7"
           docker push "$BOT_IMAGE:latest"
-          docker push "$WATCHER_IMAGE:2.3.6"
+          docker push "$WATCHER_IMAGE:2.3.7"
           docker push "$WATCHER_IMAGE:latest"
 
       - name: Publish host chain watcher release asset
@@ -119,16 +119,16 @@ jobs:
           ASSETS=(
             "dist/ledger-chain-watcher-linux-amd64"
             "dist/ledger-chain-watcher-linux-amd64.sha256"
-            "dist/ledger-chain-watcher-v2.3.6-linux-amd64.tar.gz"
-            "dist/ledger-chain-watcher-v2.3.6-linux-amd64.tar.gz.sha256"
+            "dist/ledger-chain-watcher-v2.3.7-linux-amd64.tar.gz"
+            "dist/ledger-chain-watcher-v2.3.7-linux-amd64.tar.gz.sha256"
           )
-          if gh release view v2.3.6 --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release upload v2.3.6 "${ASSETS[@]}" --clobber --repo "${{ github.repository }}"
+          if gh release view v2.3.7 --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload v2.3.7 "${ASSETS[@]}" --clobber --repo "${{ github.repository }}"
           else
-            gh release create v2.3.6 "${ASSETS[@]}" \
+            gh release create v2.3.7 "${ASSETS[@]}" \
               --target "${{ github.sha }}" \
-              --title "Go v2.3.6" \
-              --notes "Go v2.3.6 runtime images and host ledger-chain-watcher binary." \
+              --title "Go v2.3.7" \
+              --notes "Go v2.3.7 runtime images and host ledger-chain-watcher binary." \
               --latest \
               --repo "${{ github.repository }}"
           fi

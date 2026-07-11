@@ -18,7 +18,7 @@ func TestReadyzReflectsSourceFailureAndEmptySuccess(t *testing.T) {
 		AddressMaxPerTick: 1,
 	}, nil, nil)
 
-	server.status.recordScanError("global", errTest("tronscan unavailable"), now.Add(5*time.Second), 10*time.Millisecond, now)
+	server.status.recordScanError("global", errTest("tronscan unavailable"), now.Add(5*time.Second), scanResult{}, 10*time.Millisecond, now)
 	rec := httptest.NewRecorder()
 	server.handleReady(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
 	if rec.Code != http.StatusServiceUnavailable {
@@ -65,9 +65,75 @@ func TestAddressScanSkipsNearNextGlobalPoll(t *testing.T) {
 	}
 }
 
+func TestGlobalScanOverlapIsCounted(t *testing.T) {
+	server := NewServer(config.ChainWatcherConfig{PollInterval: time.Second, AddressMaxPerTick: 1}, nil, nil)
+	if !server.tryStartScan("global") {
+		t.Fatal("first global scan should start")
+	}
+	if server.tryStartScan("global") {
+		t.Fatal("overlapping global scan should not start")
+	}
+	server.status.recordScanOverlap("global")
+	status := server.statusResponse(contextWithoutCancel{}, time.Now())
+	if status.Global.OverlapSkipped != 1 {
+		t.Fatalf("global overlap skipped = %d, want 1", status.Global.OverlapSkipped)
+	}
+	server.finishScan("global")
+	if !server.tryStartScan("global") {
+		t.Fatal("global scan should start after finish")
+	}
+}
+
+func TestStatusIncludesSegmentTimingsAndAPICounts(t *testing.T) {
+	server := NewServer(config.ChainWatcherConfig{PollInterval: time.Second, AddressMaxPerTick: 1}, nil, nil)
+	server.status.recordScanSuccess("global", scanResult{
+		TransferCount:    3,
+		MatchCount:       2,
+		AddressCount:     2,
+		APICallCount:     3,
+		PageCount:        3,
+		APIWaitDuration:  5 * time.Millisecond,
+		APIFetchDuration: 20 * time.Millisecond,
+		ParseDuration:    2 * time.Millisecond,
+		MatchDuration:    1 * time.Millisecond,
+		WriteDuration:    4 * time.Millisecond,
+	}, 40*time.Millisecond, time.Now())
+	status := server.statusResponse(contextWithoutCancel{}, time.Now())
+	if status.Global.APICallCount != 3 || status.Global.PageCount != 3 {
+		t.Fatalf("api counts = %d/%d, want 3/3", status.Global.APICallCount, status.Global.PageCount)
+	}
+	if status.Global.APIFetchMS != 20 || status.Global.ParseMS != 2 || status.Global.WriteMS != 4 {
+		t.Fatalf("timings = api:%d parse:%d write:%d", status.Global.APIFetchMS, status.Global.ParseMS, status.Global.WriteMS)
+	}
+	if len(status.Global.Recent) != 1 || status.Global.Recent[0].APICallCount != 3 {
+		t.Fatalf("recent status missing metrics: %#v", status.Global.Recent)
+	}
+}
+
+func TestAddressWatermarkMinTimestamp(t *testing.T) {
+	server := NewServer(config.ChainWatcherConfig{}, nil, nil)
+	if got := server.addressMinTimestamp("T1", 1000); got != 1000 {
+		t.Fatalf("empty watermark min = %d, want 1000", got)
+	}
+	server.updateAddressWatermark("T1", 50000)
+	if got := server.addressMinTimestamp("T1", 1000); got != 20000 {
+		t.Fatalf("watermark min = %d, want 20000", got)
+	}
+	if got := server.addressMinTimestamp("T1", 25000); got != 25000 {
+		t.Fatalf("watermark should not go before default min, got %d", got)
+	}
+}
+
 type errTest string
 
 func (e errTest) Error() string { return string(e) }
+
+type contextWithoutCancel struct{}
+
+func (contextWithoutCancel) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (contextWithoutCancel) Done() <-chan struct{}       { return nil }
+func (contextWithoutCancel) Err() error                  { return nil }
+func (contextWithoutCancel) Value(key any) any           { return nil }
 
 func joinStrings(values []string) string {
 	if len(values) == 0 {

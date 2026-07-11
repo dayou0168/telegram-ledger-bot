@@ -20,6 +20,73 @@ func TestInvalidateGroupCacheRemovesCachedSettings(t *testing.T) {
 	}
 }
 
+func TestInvalidateBillSummaryCacheRemovesCachedDay(t *testing.T) {
+	b := &Bot{billSummaryCache: newTTLCache[storage.BillSummaryData](time.Minute)}
+	key := billSummaryCacheKey(123, "2026-07-11", groupBillDefaultRecordLimit)
+	b.billSummaryCache.Set(key, storage.BillSummaryData{
+		Summary: storage.RecordDaySummary{DepositCount: 1, TotalDepositUSDT: "100"},
+	})
+	b.invalidateBillSummaryCache(123, "2026-07-11")
+	if _, ok := b.billSummaryCache.Get(key); ok {
+		t.Fatal("bill summary cache should be invalidated after ledger writes")
+	}
+}
+
+func TestInvalidateLedgerPermissionRemovesOperatorAndAddressWatchPrivilege(t *testing.T) {
+	b := &Bot{operatorCache: newTTLCache[bool](time.Minute)}
+	b.operatorCache.Set(ledgerPermissionCacheKey(-1001, 2002), true)
+	b.operatorCache.Set(addressWatchPrivilegeCacheKey(2002), true)
+
+	b.InvalidateLedgerPermission(-1001, 2002)
+
+	if _, ok := b.operatorCache.Get(ledgerPermissionCacheKey(-1001, 2002)); ok {
+		t.Fatal("ledger operator cache should be invalidated immediately")
+	}
+	if _, ok := b.operatorCache.Get(addressWatchPrivilegeCacheKey(2002)); ok {
+		t.Fatal("address watch privilege cache should be invalidated with ledger permission")
+	}
+}
+
+func TestInvalidateBroadcastPermissionRemovesOperatorAddressAndState(t *testing.T) {
+	b := &Bot{
+		operatorCache: newTTLCache[bool](time.Minute),
+		privateStates: newTTLCache[privateState](time.Minute),
+	}
+	b.operatorCache.Set(broadcastPermissionCacheKey(2002), true)
+	b.operatorCache.Set(addressWatchPrivilegeCacheKey(2002), true)
+	b.privateStates.Set(formatID(2002), privateState{Mode: "all", ChatIDs: []int64{-1001}})
+
+	b.InvalidateBroadcastPermission(2002)
+
+	if _, ok := b.operatorCache.Get(broadcastPermissionCacheKey(2002)); ok {
+		t.Fatal("broadcast operator cache should be invalidated immediately")
+	}
+	if _, ok := b.operatorCache.Get(addressWatchPrivilegeCacheKey(2002)); ok {
+		t.Fatal("address watch privilege cache should be invalidated with broadcast permission")
+	}
+	if _, ok := b.privateStates.Get(formatID(2002)); ok {
+		t.Fatal("broadcast private state should be invalidated immediately")
+	}
+}
+
+func TestInvalidateWatchTargetsClearsCachedTargets(t *testing.T) {
+	b := &Bot{watchTargetCache: newTTLCache[[]storage.WatchTarget](time.Minute)}
+	b.watchTargetCache.Set("all", []storage.WatchTarget{{OwnerUserID: 2002, Address: "TGhAAySHUUcEGua33pZZ88wP3bA6X5eQuZ"}})
+
+	b.InvalidateWatchTargets()
+
+	if _, ok := b.watchTargetCache.Get("all"); ok {
+		t.Fatal("watch target cache should be invalidated immediately")
+	}
+}
+
+func TestIntersectChatIDsFiltersStaleBroadcastTargets(t *testing.T) {
+	got := intersectChatIDs([]int64{-1001, -1002, -1003}, []int64{-1002, -1004})
+	if len(got) != 1 || got[0] != -1002 {
+		t.Fatalf("intersectChatIDs = %v, want [-1002]", got)
+	}
+}
+
 func TestPerfTraceSlowLogRedactsMessageText(t *testing.T) {
 	var buf bytes.Buffer
 	oldWriter := log.Writer()

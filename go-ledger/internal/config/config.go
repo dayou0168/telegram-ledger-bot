@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const Version = "2.3.6"
+const Version = "2.3.7"
 
 type Config struct {
 	TelegramBotToken string
@@ -20,24 +20,28 @@ type Config struct {
 	HostUserID         int64
 	DefaultOperatorIDs map[int64]struct{}
 
-	LedgerWorkers       int
-	ControlWorkers      int
-	ChainWorkers        int
-	RateWorkers         int
-	BroadcastWorkers    int
-	QueryWorkers        int
-	NotifyWorkers       int
-	QueueSize           int
-	GroupCacheTTL       time.Duration
-	UserTouchCacheTTL   time.Duration
-	OperatorCacheTTL    time.Duration
-	WatchCacheTTL       time.Duration
-	SlowUpdateThreshold time.Duration
-	PollTimeout         time.Duration
-	RequestTimeout      time.Duration
-	TronPollInterval    time.Duration
-	TronBackfillEvery   time.Duration
-	TronLookbackMinutes int
+	LedgerWorkers         int
+	ControlWorkers        int
+	ChainWorkers          int
+	RateWorkers           int
+	BroadcastWorkers      int
+	QueryWorkers          int
+	NotifyWorkers         int
+	QueueSize             int
+	OutboxSentRetention   time.Duration
+	OutboxFailedRetention time.Duration
+	OutboxStatsWindow     time.Duration
+	GroupCacheTTL         time.Duration
+	BillSummaryCacheTTL   time.Duration
+	UserTouchCacheTTL     time.Duration
+	OperatorCacheTTL      time.Duration
+	WatchCacheTTL         time.Duration
+	SlowUpdateThreshold   time.Duration
+	PollTimeout           time.Duration
+	RequestTimeout        time.Duration
+	TronPollInterval      time.Duration
+	TronBackfillEvery     time.Duration
+	TronLookbackMinutes   int
 
 	TronAPIBase                   string
 	TronAPIKey                    string
@@ -91,7 +95,11 @@ func Load() (Config, error) {
 		QueryWorkers:                  intEnv("BOT_QUERY_THREADS", 4),
 		NotifyWorkers:                 intEnv("BOT_NOTIFICATION_THREADS", 6),
 		QueueSize:                     intEnv("BOT_QUEUE_SIZE", 4096),
+		OutboxSentRetention:           hoursEnv("BOT_OUTBOX_SENT_RETENTION_HOURS", 72),
+		OutboxFailedRetention:         hoursEnv("BOT_OUTBOX_FAILED_RETENTION_HOURS", 24*14),
+		OutboxStatsWindow:             hoursEnv("BOT_OUTBOX_STATS_WINDOW_HOURS", 72),
 		GroupCacheTTL:                 secondsEnv("BOT_GROUP_CACHE_TTL_SECONDS", 60),
+		BillSummaryCacheTTL:           secondsEnv("BOT_BILL_SUMMARY_CACHE_TTL_SECONDS", 30),
 		UserTouchCacheTTL:             secondsEnv("BOT_USER_TOUCH_CACHE_TTL_SECONDS", 180),
 		OperatorCacheTTL:              secondsEnv("BOT_OPERATOR_CACHE_TTL_SECONDS", 10),
 		WatchCacheTTL:                 secondsEnv("BOT_WATCH_CACHE_TTL_SECONDS", 3),
@@ -153,6 +161,15 @@ func Load() (Config, error) {
 	if cfg.QueueSize < 128 {
 		cfg.QueueSize = 128
 	}
+	if cfg.OutboxSentRetention <= 0 {
+		cfg.OutboxSentRetention = 72 * time.Hour
+	}
+	if cfg.OutboxFailedRetention <= 0 {
+		cfg.OutboxFailedRetention = 14 * 24 * time.Hour
+	}
+	if cfg.OutboxStatsWindow <= 0 {
+		cfg.OutboxStatsWindow = 72 * time.Hour
+	}
 	if cfg.TronAddressPages < 1 {
 		cfg.TronAddressPages = 1
 	}
@@ -179,6 +196,9 @@ func Load() (Config, error) {
 	}
 	if cfg.SlowUpdateThreshold <= 0 {
 		cfg.SlowUpdateThreshold = 800 * time.Millisecond
+	}
+	if cfg.BillSummaryCacheTTL <= 0 {
+		cfg.BillSummaryCacheTTL = 30 * time.Second
 	}
 	if cfg.AddressWatchFreeLimit < 0 {
 		cfg.AddressWatchFreeLimit = 0
@@ -334,6 +354,10 @@ func secondsEnv(key string, fallback int) time.Duration {
 
 func millisEnv(key string, fallback int) time.Duration {
 	return time.Duration(intEnv(key, fallback)) * time.Millisecond
+}
+
+func hoursEnv(key string, fallback int) time.Duration {
+	return time.Duration(intEnv(key, fallback)) * time.Hour
 }
 
 func parseIDs(raw string) map[int64]struct{} {

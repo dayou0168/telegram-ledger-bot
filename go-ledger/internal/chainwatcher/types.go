@@ -60,21 +60,47 @@ type StatusResponse struct {
 }
 
 type ScanStatusResponse struct {
-	LastStartedAt      *time.Time `json:"last_started_at,omitempty"`
-	LastSuccessAt      *time.Time `json:"last_success_at,omitempty"`
-	LastErrorAt        *time.Time `json:"last_error_at,omitempty"`
-	LastError          string     `json:"last_error,omitempty"`
-	LastDurationMS     int64      `json:"last_duration_ms"`
-	BackoffUntil       *time.Time `json:"backoff_until,omitempty"`
-	BackoffRemainingMS int64      `json:"backoff_remaining_ms"`
-	LastBlockTimestamp int64      `json:"last_block_timestamp"`
-	LagMS              int64      `json:"lag_ms"`
-	ScanCount          int64      `json:"scan_count"`
-	ErrorCount         int64      `json:"error_count"`
-	TransferCount      int        `json:"transfer_count"`
-	MatchCount         int        `json:"match_count"`
-	SubscriptionCount  int        `json:"subscription_count"`
-	AddressCount       int        `json:"address_count"`
+	LastStartedAt      *time.Time          `json:"last_started_at,omitempty"`
+	LastSuccessAt      *time.Time          `json:"last_success_at,omitempty"`
+	LastErrorAt        *time.Time          `json:"last_error_at,omitempty"`
+	LastError          string              `json:"last_error,omitempty"`
+	LastDurationMS     int64               `json:"last_duration_ms"`
+	APIWaitMS          int64               `json:"api_wait_ms"`
+	APIFetchMS         int64               `json:"api_fetch_ms"`
+	ParseMS            int64               `json:"parse_ms"`
+	MatchMS            int64               `json:"match_ms"`
+	WriteMS            int64               `json:"write_ms"`
+	BackoffUntil       *time.Time          `json:"backoff_until,omitempty"`
+	BackoffRemainingMS int64               `json:"backoff_remaining_ms"`
+	LastBlockTimestamp int64               `json:"last_block_timestamp"`
+	LagMS              int64               `json:"lag_ms"`
+	ScanCount          int64               `json:"scan_count"`
+	ErrorCount         int64               `json:"error_count"`
+	OverlapSkipped     int64               `json:"overlap_skipped"`
+	TransferCount      int                 `json:"transfer_count"`
+	MatchCount         int                 `json:"match_count"`
+	SubscriptionCount  int                 `json:"subscription_count"`
+	AddressCount       int                 `json:"address_count"`
+	APICallCount       int                 `json:"api_call_count"`
+	PageCount          int                 `json:"page_count"`
+	Recent             []ScanRoundResponse `json:"recent,omitempty"`
+}
+
+type ScanRoundResponse struct {
+	StartedAt     *time.Time `json:"started_at,omitempty"`
+	Success       bool       `json:"success"`
+	Error         string     `json:"error,omitempty"`
+	DurationMS    int64      `json:"duration_ms"`
+	APIWaitMS     int64      `json:"api_wait_ms"`
+	APIFetchMS    int64      `json:"api_fetch_ms"`
+	ParseMS       int64      `json:"parse_ms"`
+	MatchMS       int64      `json:"match_ms"`
+	WriteMS       int64      `json:"write_ms"`
+	TransferCount int        `json:"transfer_count"`
+	MatchCount    int        `json:"match_count"`
+	AddressCount  int        `json:"address_count"`
+	APICallCount  int        `json:"api_call_count"`
+	PageCount     int        `json:"page_count"`
 }
 
 type DeliveryStatusResponse struct {

@@ -61,7 +61,7 @@ func (b *Bot) handleZRateSetting(ctx context.Context, msg telegram.Message, user
 	if ok, err := b.canUseLedger(ctx, msg.Chat.ID, user.ID); err != nil {
 		return err
 	} else if !ok {
-		return b.enqueueReplyText(ctx, sendPriorityNormal, "zrate_denied", msg.Chat.ID, msg.MessageID, ledgerPermissionDeniedText, nil, now)
+		return b.enqueueLedgerText(ctx, sendPriorityNormal, "zrate_denied", msg.Chat.ID, msg.MessageID, ledgerPermissionDeniedText, nil, now)
 	}
 	chatID := msg.Chat.ID
 	b.ratePool.Submit(func(jobCtx context.Context) {

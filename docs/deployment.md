@@ -1,11 +1,11 @@
-# Telegram 记账机器人 Go v2.3.6 部署运维
+﻿# Telegram 记账机器人 Go v2.3.7 部署运维
 
-当前发布目标是 Go v2.3.6。生产部署使用 GHCR 预构建镜像、PostgreSQL 和共享链上监听服务 `ledger-chain-watcher`。服务器上不需要源码构建作为默认路径。
+当前发布目标是 Go v2.3.7。生产部署使用 GHCR 预构建镜像、PostgreSQL 和共享链上监听服务 `ledger-chain-watcher`。服务器上不需要源码构建作为默认路径。
 
 ## 部署基线
 
-- 机器人镜像：`ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.6`
-- watcher 镜像：`ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.6`
+- 机器人镜像：`ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.7`
+- watcher 镜像：`ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.7`
 - 数据库：每个机器人实例独立 PostgreSQL 16
 - 链上监听：多个机器人共享 `ledger-chain-watcher`，watcher 使用独立 PostgreSQL 保存订阅、匹配事件和投递游标
 - 推荐入口：宝塔 Docker Compose
@@ -82,7 +82,7 @@ CHAIN_WATCHER_LOOKBACK_SECONDS: "600"
 
 watcher 是链上监听中心：全局主通道按 `CHAIN_WATCHER_SOURCE_POLL_SECONDS=1` 秒级快扫并写 watcher DB，地址补偿由 watcher 内部按 `CHAIN_WATCHER_ADDRESS_SCAN_INTERVAL_SECONDS=30` 低频执行，并受 `CHAIN_WATCHER_ADDRESS_SCAN_MAX_PER_TICK=1` 限制为低优先级补偿，也写同一套 subscriptions/events/matched_events。
 
-`/healthz` 只表示进程存活，Docker/systemd 健康检查继续用它；`/readyz` 表示链源是否可用，`/status` 用于排障，包含最近全局扫描成功时间、最近错误、429 backoff、pending/delivering、最老 pending 和 retention 清理统计。bot 自动 fallback 读取 ready 状态，不把“没有新交易”当成故障。
+`/healthz` 只表示进程存活，Docker/systemd 健康检查继续用它；`/readyz` 表示链源是否可用，`/status` 用于排障，包含最近全局扫描成功时间、最近错误、429 backoff、pending/delivering、最老 pending 和 retention 清理统计。`global`/`address` 会显示 `api_wait_ms`、`api_fetch_ms`、`parse_ms`、`match_ms`、`write_ms`、`api_call_count`、`page_count`、`overlap_skipped` 和最近 5 轮摘要。bot 自动 fallback 读取 ready 状态，不把“没有新交易”当成故障。
 
 `CHAIN_WATCHER_EMERGENCY_FALLBACK` 是机器人侧常驻应急兜底开关，默认保持 `false`。正常模式下 bot 只消费 watcher；watcher ready/claim 连续失败时，bot 会短时自动启用无 Key 公开 API fallback，只扫描本 bot 自己的监听地址并用本地 `chain_notifications/outbox` 去重。fallback 仍依赖 Tronscan/TronGrid 公开 API，不是真正事件源；真正不依赖官方 API 的方案是 Lite FullNode + Event Plugin V2 + Kafka 或第三方 Webhook/Streams。
 
@@ -244,14 +244,14 @@ BOT_TIMEZONE=Asia/Shanghai
 BOT_REQUEST_TIMEOUT=70
 ```
 
-下载 v2.3.6 发布包并安装二进制到固定路径：
+下载 v2.3.7 发布包并安装二进制到固定路径：
 
 ```bash
 cd /tmp
-wget -O ledger-chain-watcher-v2.3.6-linux-amd64.tar.gz \
-  https://github.com/dayou0168/telegram-ledger-bot/releases/download/v2.3.6/ledger-chain-watcher-v2.3.6-linux-amd64.tar.gz
-tar -xzf ledger-chain-watcher-v2.3.6-linux-amd64.tar.gz
-install -m 0755 ledger-chain-watcher-v2.3.6-linux-amd64/ledger-chain-watcher /usr/local/bin/ledger-chain-watcher
+wget -O ledger-chain-watcher-v2.3.7-linux-amd64.tar.gz \
+  https://github.com/dayou0168/telegram-ledger-bot/releases/download/v2.3.7/ledger-chain-watcher-v2.3.7-linux-amd64.tar.gz
+tar -xzf ledger-chain-watcher-v2.3.7-linux-amd64.tar.gz
+install -m 0755 ledger-chain-watcher-v2.3.7-linux-amd64/ledger-chain-watcher /usr/local/bin/ledger-chain-watcher
 /usr/local/bin/ledger-chain-watcher --help
 ```
 
@@ -338,7 +338,7 @@ journalctl -u ledger-chain-watcher -f
 ```text
 ledger-chain-watcher        共享链上监听服务和 watcher PostgreSQL
 ledger-main                 当前记账机器人实例
-ledger-ops                  第二个独立 Go v2.3.6 机器人实例
+ledger-ops                  第二个独立 Go v2.3.7 机器人实例
 ```
 
 先创建共享 Docker 网络：
@@ -453,7 +453,7 @@ ports:
 
 ## 未来接 TRON Lite FullNode + Kafka
 
-v2.3.6 第一版 watcher 统一请求 Tronscan/TronGrid。未来切换自建节点时，机器人配置不变，只调整 watcher：
+v2.3.7 第一版 watcher 统一请求 Tronscan/TronGrid。未来切换自建节点时，机器人配置不变，只调整 watcher：
 
 ```yaml
 CHAIN_WATCHER_SOURCE: "kafka"

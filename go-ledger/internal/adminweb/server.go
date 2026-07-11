@@ -27,8 +27,14 @@ const adminCookieName = "ledger_admin_token"
 type adminContextKey struct{}
 
 type Server struct {
-	cfg   config.Config
-	store *storage.Store
+	cfg         config.Config
+	store       *storage.Store
+	invalidator PermissionCacheInvalidator
+}
+
+type PermissionCacheInvalidator interface {
+	InvalidateBroadcastPermission(userID int64)
+	InvalidateWatchTargets()
 }
 
 type pageData struct {
@@ -37,7 +43,7 @@ type pageData struct {
 	Message         string
 	Groups          []storage.Group
 	BGroups         []storage.BroadcastGroup
-	BOperators      []storage.BroadcastOperator
+	BOperators      []storage.GlobalOperator
 	Permissions     []storage.BroadcastPermission
 	Replace         storage.BroadcastReplaceSetting
 	WatchTargets    []storage.WatchTarget
@@ -47,6 +53,15 @@ type pageData struct {
 	CanManageGlobal bool
 	ChatNames       map[int64]string
 	OpLabels        map[int64]string
+}
+
+type outboxStatusResponse struct {
+	storage.NotificationOutboxStats
+	QueueLength          int64  `json:"queue_length"`
+	LastErrorHint        string `json:"last_error_hint"`
+	StatsWindowHours     int64  `json:"stats_window_hours"`
+	SentRetentionHours   int64  `json:"sent_retention_hours"`
+	FailedRetentionHours int64  `json:"failed_retention_hours"`
 }
 
 type billData struct {
@@ -110,8 +125,12 @@ type billRateStat struct {
 	AmountUSDT string
 }
 
-func New(cfg config.Config, store *storage.Store) *Server {
-	return &Server{cfg: cfg, store: store}
+func New(cfg config.Config, store *storage.Store, invalidator ...PermissionCacheInvalidator) *Server {
+	s := &Server{cfg: cfg, store: store}
+	if len(invalidator) > 0 {
+		s.invalidator = invalidator[0]
+	}
+	return s
 }
 
 func (s *Server) Run(ctx context.Context) error {
@@ -161,13 +180,34 @@ func (s *Server) outboxStatus(w http.ResponseWriter, r *http.Request) {
 	if !requireGlobalAdmin(w, r) {
 		return
 	}
-	stats, err := s.store.NotificationOutboxStats(r.Context())
+	statsWindow := s.cfg.OutboxStatsWindow
+	if statsWindow <= 0 {
+		statsWindow = 72 * time.Hour
+	}
+	sentRetention := s.cfg.OutboxSentRetention
+	if sentRetention <= 0 {
+		sentRetention = 72 * time.Hour
+	}
+	failedRetention := s.cfg.OutboxFailedRetention
+	if failedRetention <= 0 {
+		failedRetention = 14 * 24 * time.Hour
+	}
+	statsSince := time.Now().Add(-statsWindow)
+	stats, err := s.store.NotificationOutboxStats(r.Context(), statsSince)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	response := outboxStatusResponse{
+		NotificationOutboxStats: stats,
+		QueueLength:             stats.Pending + stats.Sending,
+		LastErrorHint:           outboxErrorHint(stats.LastError),
+		StatsWindowHours:        int64(statsWindow / time.Hour),
+		SentRetentionHours:      int64(sentRetention / time.Hour),
+		FailedRetentionHours:    int64(failedRetention / time.Hour),
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	if err := json.NewEncoder(w).Encode(stats); err != nil {
+	if err := json.NewEncoder(w).Encode(response); err != nil {
 		log.Printf("encode outbox status: %v", err)
 	}
 }
@@ -418,14 +458,7 @@ func (s *Server) adminSessionAllowed(ctx context.Context, session adminauth.Sess
 		if session.UserID <= 0 {
 			return false, nil
 		}
-		broadcastOperator, err := s.store.IsBroadcastOperator(ctx, session.UserID)
-		if err != nil {
-			return false, err
-		}
-		if broadcastOperator {
-			return true, nil
-		}
-		return s.store.IsAnyOperator(ctx, session.UserID)
+		return s.store.IsGlobalOperator(ctx, session.UserID)
 	default:
 		return false, nil
 	}
@@ -472,6 +505,18 @@ func requirePost(w http.ResponseWriter, r *http.Request) bool {
 	}
 	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	return false
+}
+
+func (s *Server) invalidateBroadcastPermission(userID int64) {
+	if s.invalidator != nil {
+		s.invalidator.InvalidateBroadcastPermission(userID)
+	}
+}
+
+func (s *Server) invalidateWatchTargets() {
+	if s.invalidator != nil {
+		s.invalidator.InvalidateWatchTargets()
+	}
 }
 
 func parsePositiveFormID(r *http.Request, name string) (int64, bool) {
@@ -624,15 +669,25 @@ func (s *Server) saveOperator(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	userID, err := strconv.ParseInt(strings.TrimSpace(r.FormValue("user_id")), 10, 64)
-	if err != nil || userID <= 0 {
+	userID, ok := parsePositiveFormID(r, "user_id")
+	if !ok {
 		redirectMsg(w, r, "操作人 UID 不正确")
 		return
 	}
-	if err := s.store.UpsertBroadcastOperator(r.Context(), userID, 0, r.FormValue("remark"), time.Now()); err != nil {
+	level := strings.TrimSpace(r.FormValue("level"))
+	if level == "" {
+		level = "primary"
+	}
+	if level != "primary" && level != "secondary" {
+		redirectMsg(w, r, "操作人级别不正确")
+		return
+	}
+	session := adminSessionFromContext(r.Context())
+	if err := s.store.UpsertGlobalOperator(r.Context(), userID, level, 0, session.UserID, r.FormValue("remark"), time.Now()); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.invalidateBroadcastPermission(userID)
 	redirectMsg(w, r, "操作人已保存")
 }
 
@@ -652,11 +707,13 @@ func (s *Server) disableOperator(w http.ResponseWriter, r *http.Request) {
 		redirectMsg(w, r, "操作人 UID 不正确")
 		return
 	}
-	_, err := s.store.DisableBroadcastOperator(r.Context(), userID, time.Now())
+	session := adminSessionFromContext(r.Context())
+	_, err := s.store.DisableGlobalOperator(r.Context(), userID, session.UserID, time.Now())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.invalidateBroadcastPermission(userID)
 	redirectMsg(w, r, "操作人已禁用")
 }
 
@@ -674,6 +731,13 @@ func (s *Server) saveOperatorCleanup(w http.ResponseWriter, r *http.Request) {
 	userID, err := strconv.ParseInt(strings.TrimSpace(r.FormValue("user_id")), 10, 64)
 	if err != nil || userID <= 0 {
 		redirectMsg(w, r, "操作人 UID 不正确")
+		return
+	}
+	if ok, err := s.store.IsGlobalOperator(r.Context(), userID); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	} else if !ok {
+		redirectMsg(w, r, "操作人不存在或已禁用")
 		return
 	}
 	enabled := r.FormValue("enabled") == "1"
@@ -759,10 +823,18 @@ func (s *Server) grantPermission(w http.ResponseWriter, r *http.Request) {
 		redirectMsg(w, r, message)
 		return
 	}
+	if ok, err := s.store.IsGlobalOperator(r.Context(), userID); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	} else if !ok {
+		redirectMsg(w, r, "操作人不存在或已禁用")
+		return
+	}
 	if err := s.store.AddBroadcastPermission(r.Context(), userID, target, chatID, groupName, 0, time.Now()); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.invalidateBroadcastPermission(userID)
 	redirectMsg(w, r, "权限已授权")
 }
 
@@ -787,6 +859,7 @@ func (s *Server) revokePermission(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.invalidateBroadcastPermission(userID)
 	redirectMsg(w, r, "权限已取消")
 }
 
@@ -821,6 +894,7 @@ func (s *Server) saveWatchTarget(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.invalidateWatchTargets()
 	redirectMsg(w, r, "监听地址已保存")
 }
 
@@ -846,6 +920,7 @@ func (s *Server) removeWatchTarget(w http.ResponseWriter, r *http.Request) {
 		redirectMsg(w, r, "监听地址不存在")
 		return
 	}
+	s.invalidateWatchTargets()
 	redirectMsg(w, r, "监听地址已删除")
 }
 
@@ -911,7 +986,7 @@ func (s *Server) loadPageData(ctx context.Context, message string, session admin
 	var (
 		groups      []storage.Group
 		bgroups     []storage.BroadcastGroup
-		operators   []storage.BroadcastOperator
+		operators   []storage.GlobalOperator
 		permissions []storage.BroadcastPermission
 		replace     storage.BroadcastReplaceSetting
 		err         error
@@ -925,7 +1000,7 @@ func (s *Server) loadPageData(ctx context.Context, message string, session admin
 		if err != nil {
 			return pageData{}, err
 		}
-		operators, err = s.store.ListBroadcastOperators(ctx)
+		operators, err = s.store.ListGlobalOperators(ctx)
 		if err != nil {
 			return pageData{}, err
 		}
@@ -1089,7 +1164,7 @@ func permissionTarget(p storage.BroadcastPermission, names map[int64]string) str
 	return "单群：" + name
 }
 
-func operatorLabel(op storage.BroadcastOperator) string {
+func operatorLabel(op storage.GlobalOperator) string {
 	remark := strings.TrimSpace(op.Remark)
 	if remark != "" {
 		return remark
@@ -1097,7 +1172,18 @@ func operatorLabel(op storage.BroadcastOperator) string {
 	return "未备注操作人 " + maskedUserID(op.UserID)
 }
 
-func operatorSourceLabel(op storage.BroadcastOperator, labels map[int64]string) string {
+func operatorLevelLabel(level string) string {
+	switch level {
+	case "primary":
+		return "一级操作人"
+	case "secondary":
+		return "下级操作人"
+	default:
+		return level
+	}
+}
+
+func operatorSourceLabel(op storage.GlobalOperator, labels map[int64]string) string {
 	if op.CreatedBy == 0 {
 		return "后台管理"
 	}
@@ -1921,7 +2007,7 @@ func cleanupDelayCustomUnit(seconds int) string {
 	return "seconds"
 }
 
-func cleanupSummary(op storage.BroadcastOperator) string {
+func cleanupSummary(op storage.GlobalOperator) string {
 	if !op.PrivateCleanupEnabled {
 		return "关闭"
 	}
@@ -1969,6 +2055,24 @@ func cleanupDelayLabel(seconds int) string {
 	}
 }
 
+func outboxErrorHint(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	switch {
+	case value == "":
+		return "无错误"
+	case strings.Contains(value, "retry_after") || strings.Contains(value, " 429 "):
+		return "Telegram 限流 429，按 retry_after 延后重试"
+	case strings.Contains(value, " 500 ") || strings.Contains(value, " 502 ") || strings.Contains(value, " 503 ") || strings.Contains(value, " 504 "):
+		return "Telegram 5xx/网关错误，有限重试后仍失败会保留 failed"
+	case strings.Contains(value, "timeout") || strings.Contains(value, "deadline exceeded") || strings.Contains(value, "connection") || strings.Contains(value, "network"):
+		return "网络超时或连接抖动，有限重试后仍失败会保留 failed"
+	case strings.Contains(value, "queue is full"):
+		return "本地通知队列已满，稍后重试"
+	default:
+		return "普通发送失败，查看最近错误原文"
+	}
+}
+
 func privateCleanupLocation() *time.Location {
 	loc, err := time.LoadLocation("Asia/Shanghai")
 	if err != nil {
@@ -1983,6 +2087,7 @@ var adminTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
 	"permissionGroupUsers":    permissionGroupUsers,
 	"permissionChatUsers":     permissionChatUsers,
 	"operatorLabel":           operatorLabel,
+	"operatorLevelLabel":      operatorLevelLabel,
 	"operatorSourceLabel":     operatorSourceLabel,
 	"adminTime":               adminTime,
 	"permissionTarget":        permissionTarget,
@@ -2103,15 +2208,16 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 </div>
 
 <div class="card tab-card" data-admin-tab="permissions">
-<h2>一级操作人 / 操作人</h2>
-<p class="hint">宿主和默认操作人拥有全部广播权限；这里添加的是普通广播操作人，需要再授权分组或单群。页面不直接显示 UID，保存时仍按 UID 精确处理。</p>
+<h2>一级 / 下级操作人</h2>
+<p class="hint">宿主和默认操作人来自环境配置；这里添加的是全局一级/下级操作人，可邀请机器人、进入后台和使用授权广播范围。页面不直接显示 UID，保存时仍按 UID 精确处理。</p>
 <form method="post" action="/admin/operator/save" class="row">
 <input name="user_id" placeholder="操作人 UID">
+<select name="level"><option value="primary">一级操作人</option><option value="secondary">下级操作人</option></select>
 <input name="remark" placeholder="备注，可选">
 <button class="btn" type="submit">保存</button>
 </form>
-<div class="scroll"><table><thead><tr><th>操作人</th><th>授权来源</th><th>授权时间</th><th>私聊清空</th><th>状态</th><th>操作</th></tr></thead><tbody>
-{{range .BOperators}}<tr><td>{{operatorLabel .}}</td><td>{{operatorSourceLabel . $.OpLabels}}</td><td>{{adminTime .CreatedAt}}</td><td><div class="cleanup-box"><details><summary>私聊自动清理</summary><form method="post" action="/admin/operator/cleanup" class="cleanup-form"><input type="hidden" name="user_id" value="{{.UserID}}"><label><span class="field-label">总开关</span><select name="enabled"><option value="0" {{if not .PrivateCleanupEnabled}}selected{{end}}>关闭</option><option value="1" {{if .PrivateCleanupEnabled}}selected{{end}}>开启</option></select></label><label><span class="field-label">bot 提示消息</span><select name="bot_delete_after"><option value="0" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "0"}}selected{{end}}>不自动删</option><option value="30" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "30"}}selected{{end}}>30 秒后</option><option value="60" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "60"}}selected{{end}}>1 分钟后</option><option value="300" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "300"}}selected{{end}}>5 分钟后</option><option value="600" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "600"}}selected{{end}}>10 分钟后</option><option value="1800" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "1800"}}selected{{end}}>30 分钟后</option><option value="3600" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "3600"}}selected{{end}}>1 小时后</option><option value="custom" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "custom"}}selected{{end}}>自定义</option></select></label><label><span class="field-label">自定义</span><input name="bot_delete_after_custom" value="{{cleanupDelayCustomValue .PrivateCleanupBotDeleteAfterSeconds}}" placeholder="数值"></label><label><span class="field-label">单位</span><select name="bot_delete_after_unit"><option value="minutes" {{if eq (cleanupDelayCustomUnit .PrivateCleanupBotDeleteAfterSeconds) "minutes"}}selected{{end}}>分钟</option><option value="seconds" {{if eq (cleanupDelayCustomUnit .PrivateCleanupBotDeleteAfterSeconds) "seconds"}}selected{{end}}>秒</option></select></label><label><span class="field-label">用户临时消息</span><select name="incoming_enabled"><option value="0" {{if not .PrivateCleanupIncomingEnabled}}selected{{end}}>不清理</option><option value="1" {{if .PrivateCleanupIncomingEnabled}}selected{{end}}>尝试清理</option></select></label><label><span class="field-label">用户消息多久删</span><select name="incoming_delete_after"><option value="0" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "0"}}selected{{end}}>仅每日兜底</option><option value="30" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "30"}}selected{{end}}>30 秒后</option><option value="60" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "60"}}selected{{end}}>1 分钟后</option><option value="300" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "300"}}selected{{end}}>5 分钟后</option><option value="600" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "600"}}selected{{end}}>10 分钟后</option><option value="1800" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "1800"}}selected{{end}}>30 分钟后</option><option value="3600" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "3600"}}selected{{end}}>1 小时后</option><option value="custom" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "custom"}}selected{{end}}>自定义</option></select></label><label><span class="field-label">自定义</span><input name="incoming_delete_after_custom" value="{{cleanupDelayCustomValue .PrivateCleanupIncomingAfterSeconds}}" placeholder="数值"></label><label><span class="field-label">单位</span><select name="incoming_delete_after_unit"><option value="minutes" {{if eq (cleanupDelayCustomUnit .PrivateCleanupIncomingAfterSeconds) "minutes"}}selected{{end}}>分钟</option><option value="seconds" {{if eq (cleanupDelayCustomUnit .PrivateCleanupIncomingAfterSeconds) "seconds"}}selected{{end}}>秒</option></select></label><label class="wide"><span class="field-label">每日兜底清空（北京时间，可留空）</span><input name="cleanup_time" value="{{.PrivateCleanupTime}}" placeholder="HH:MM"></label><div class="cleanup-note">只处理该操作人与机器人私聊里的广播菜单、单群发送、快速回复、后台入口等提示记录；不删除目标群投递，也不删除 broadcast_deliveries。用户发来的素材/临时指令仅在开启后尝试清理，仍受 Telegram 删除限制。</div><button class="btn mini wide" type="submit">保存私聊清理</button></form></details><span class="cleanup-summary">{{cleanupSummary .}}</span></div></td><td><span class="pill">{{.Status}}</span></td><td><form method="post" action="/admin/operator/disable"><input type="hidden" name="user_id" value="{{.UserID}}"><button class="btn mini" type="submit">禁用</button></form></td></tr>{{else}}<tr><td colspan="6">暂无广播操作人</td></tr>{{end}}
+<div class="scroll"><table><thead><tr><th>操作人</th><th>级别</th><th>授权来源</th><th>授权时间</th><th>私聊清空</th><th>状态</th><th>操作</th></tr></thead><tbody>
+{{range .BOperators}}<tr><td>{{operatorLabel .}}</td><td>{{operatorLevelLabel .Level}}</td><td>{{operatorSourceLabel . $.OpLabels}}</td><td>{{adminTime .CreatedAt}}</td><td><div class="cleanup-box"><details><summary>私聊自动清理</summary><form method="post" action="/admin/operator/cleanup" class="cleanup-form"><input type="hidden" name="user_id" value="{{.UserID}}"><label><span class="field-label">总开关</span><select name="enabled"><option value="0" {{if not .PrivateCleanupEnabled}}selected{{end}}>关闭</option><option value="1" {{if .PrivateCleanupEnabled}}selected{{end}}>开启</option></select></label><label><span class="field-label">bot 提示消息</span><select name="bot_delete_after"><option value="0" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "0"}}selected{{end}}>不自动删</option><option value="30" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "30"}}selected{{end}}>30 秒后</option><option value="60" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "60"}}selected{{end}}>1 分钟后</option><option value="300" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "300"}}selected{{end}}>5 分钟后</option><option value="600" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "600"}}selected{{end}}>10 分钟后</option><option value="1800" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "1800"}}selected{{end}}>30 分钟后</option><option value="3600" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "3600"}}selected{{end}}>1 小时后</option><option value="custom" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "custom"}}selected{{end}}>自定义</option></select></label><label><span class="field-label">自定义</span><input name="bot_delete_after_custom" value="{{cleanupDelayCustomValue .PrivateCleanupBotDeleteAfterSeconds}}" placeholder="数值"></label><label><span class="field-label">单位</span><select name="bot_delete_after_unit"><option value="minutes" {{if eq (cleanupDelayCustomUnit .PrivateCleanupBotDeleteAfterSeconds) "minutes"}}selected{{end}}>分钟</option><option value="seconds" {{if eq (cleanupDelayCustomUnit .PrivateCleanupBotDeleteAfterSeconds) "seconds"}}selected{{end}}>秒</option></select></label><label><span class="field-label">用户临时消息</span><select name="incoming_enabled"><option value="0" {{if not .PrivateCleanupIncomingEnabled}}selected{{end}}>不清理</option><option value="1" {{if .PrivateCleanupIncomingEnabled}}selected{{end}}>尝试清理</option></select></label><label><span class="field-label">用户消息多久删</span><select name="incoming_delete_after"><option value="0" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "0"}}selected{{end}}>仅每日兜底</option><option value="30" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "30"}}selected{{end}}>30 秒后</option><option value="60" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "60"}}selected{{end}}>1 分钟后</option><option value="300" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "300"}}selected{{end}}>5 分钟后</option><option value="600" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "600"}}selected{{end}}>10 分钟后</option><option value="1800" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "1800"}}selected{{end}}>30 分钟后</option><option value="3600" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "3600"}}selected{{end}}>1 小时后</option><option value="custom" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "custom"}}selected{{end}}>自定义</option></select></label><label><span class="field-label">自定义</span><input name="incoming_delete_after_custom" value="{{cleanupDelayCustomValue .PrivateCleanupIncomingAfterSeconds}}" placeholder="数值"></label><label><span class="field-label">单位</span><select name="incoming_delete_after_unit"><option value="minutes" {{if eq (cleanupDelayCustomUnit .PrivateCleanupIncomingAfterSeconds) "minutes"}}selected{{end}}>分钟</option><option value="seconds" {{if eq (cleanupDelayCustomUnit .PrivateCleanupIncomingAfterSeconds) "seconds"}}selected{{end}}>秒</option></select></label><label class="wide"><span class="field-label">每日兜底清空（北京时间，可留空）</span><input name="cleanup_time" value="{{.PrivateCleanupTime}}" placeholder="HH:MM"></label><div class="cleanup-note">只处理该操作人与机器人私聊里的广播菜单、单群发送、快速回复、后台入口等提示记录；不删除目标群投递，也不删除 broadcast_deliveries。用户发来的素材/临时指令仅在开启后尝试清理，仍受 Telegram 删除限制。</div><button class="btn mini wide" type="submit">保存私聊清理</button></form></details><span class="cleanup-summary">{{cleanupSummary .}}</span></div></td><td><span class="pill">{{.Status}}</span></td><td><form method="post" action="/admin/operator/disable"><input type="hidden" name="user_id" value="{{.UserID}}"><button class="btn mini" type="submit">禁用</button></form></td></tr>{{else}}<tr><td colspan="7">暂无全局操作人</td></tr>{{end}}
 </tbody></table></div>
 </div>
 
@@ -2178,6 +2284,7 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 {{range .Permissions}}<tr><td>{{permissionUserLabel . $.OpLabels}}</td><td>{{permissionTarget . $.ChatNames}}</td><td>{{grantorLabel . $.OpLabels}}</td></tr>{{else}}<tr><td colspan="3">暂无权限</td></tr>{{end}}
 </tbody></table></div>
 </div>
+
 {{end}}
 
 <div class="card wide tab-card {{if not .CanManageGlobal}}active{{end}}" data-admin-tab="watch">

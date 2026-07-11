@@ -26,10 +26,15 @@ type Server struct {
 	status         watcherStatus
 	addressMu      sync.Mutex
 	addressCursor  int
+	scanMu         sync.Mutex
+	globalRunning  bool
+	addressRunning bool
+	watermarkMu    sync.Mutex
+	watermarks     map[string]int64
 }
 
 func NewServer(cfg config.ChainWatcherConfig, store *storage.Store, tronClient *tron.Client) *Server {
-	s := &Server{cfg: cfg, store: store, tron: tronClient}
+	s := &Server{cfg: cfg, store: store, tron: tronClient, watermarks: make(map[string]int64)}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/readyz", s.handleReady)
@@ -80,7 +85,7 @@ func (s *Server) globalLoop(ctx context.Context) {
 	ticker := time.NewTicker(s.cfg.PollInterval)
 	defer ticker.Stop()
 	for {
-		s.pollGlobalSafely(ctx)
+		s.startGlobalScan(ctx)
 		select {
 		case <-ctx.Done():
 			return
@@ -97,7 +102,7 @@ func (s *Server) addressLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.pollAddressSafely(ctx)
+			s.startAddressScan(ctx)
 		}
 	}
 }
@@ -121,21 +126,32 @@ func (s *Server) cleanupLoop(ctx context.Context) {
 	}
 }
 
-func (s *Server) pollGlobalSafely(ctx context.Context) {
+func (s *Server) startGlobalScan(ctx context.Context) {
 	now := time.Now()
 	if !s.globalBackoff.ready(now) {
 		return
 	}
+	if !s.tryStartScan("global") {
+		s.status.recordScanOverlap("global")
+		return
+	}
+	go func() {
+		defer s.finishScan("global")
+		s.pollGlobalSafely(ctx)
+	}()
+}
+
+func (s *Server) pollGlobalSafely(ctx context.Context) {
 	started := time.Now()
 	result, err := s.pollGlobalOnce(ctx)
 	duration := time.Since(started)
 	if err != nil && !errors.Is(err, context.Canceled) {
 		if s.globalBackoff.record(err, time.Now()) {
-			s.status.recordScanError("global", err, s.globalBackoff.untilTime(), duration, time.Now())
+			s.status.recordScanError("global", err, s.globalBackoff.untilTime(), result, duration, time.Now())
 			log.Printf("chain watcher global scan rate limited: %v", err)
 			return
 		}
-		s.status.recordScanError("global", err, time.Time{}, duration, time.Now())
+		s.status.recordScanError("global", err, time.Time{}, result, duration, time.Now())
 		log.Printf("chain watcher global scan: %v", err)
 		return
 	}
@@ -143,7 +159,7 @@ func (s *Server) pollGlobalSafely(ctx context.Context) {
 	s.status.recordScanSuccess("global", result, duration, time.Now())
 }
 
-func (s *Server) pollAddressSafely(ctx context.Context) {
+func (s *Server) startAddressScan(ctx context.Context) {
 	now := time.Now()
 	if !s.addressBackoff.ready(now) {
 		return
@@ -152,16 +168,27 @@ func (s *Server) pollAddressSafely(ctx context.Context) {
 		s.status.recordAddressSkippedNearGlobal()
 		return
 	}
+	if !s.tryStartScan("address") {
+		s.status.recordScanOverlap("address")
+		return
+	}
+	go func() {
+		defer s.finishScan("address")
+		s.pollAddressSafely(ctx)
+	}()
+}
+
+func (s *Server) pollAddressSafely(ctx context.Context) {
 	started := time.Now()
 	result, err := s.pollAddressOnce(ctx)
 	duration := time.Since(started)
 	if err != nil && !errors.Is(err, context.Canceled) {
 		if s.addressBackoff.record(err, time.Now()) {
-			s.status.recordScanError("address", err, s.addressBackoff.untilTime(), duration, time.Now())
+			s.status.recordScanError("address", err, s.addressBackoff.untilTime(), result, duration, time.Now())
 			log.Printf("chain watcher address scan rate limited: %v", err)
 			return
 		}
-		s.status.recordScanError("address", err, time.Time{}, duration, time.Now())
+		s.status.recordScanError("address", err, time.Time{}, result, duration, time.Now())
 		log.Printf("chain watcher address scan: %v", err)
 		return
 	}
@@ -185,18 +212,22 @@ func (s *Server) pollGlobalOnce(ctx context.Context) (scanResult, error) {
 	}
 	result.AddressCount = len(byAddress)
 	minTimestamp := time.Now().Add(-s.cfg.Lookback).UnixMilli()
-	transfers, err := s.tron.FetchGlobalUSDTTransfers(ctx, s.cfg.USDTContract, minTimestamp, s.cfg.GlobalPages)
+	fetch, err := s.tron.FetchGlobalUSDTTransfersWithMetrics(ctx, s.cfg.USDTContract, minTimestamp, s.cfg.GlobalPages)
 	if err != nil {
 		return result, err
 	}
+	result.observeFetch(fetch.Metrics)
+	transfers := fetch.Transfers
 	result.TransferCount = len(transfers)
 	for _, transfer := range transfers {
 		result.observeTransfer(transfer)
-		matches, err := s.recordTransferMatches(ctx, transfer, byAddress)
+		matches, timings, err := s.recordTransferMatches(ctx, transfer, byAddress)
 		if err != nil {
 			return result, err
 		}
 		result.MatchCount += matches
+		result.MatchDuration += timings.MatchDuration
+		result.WriteDuration += timings.WriteDuration
 	}
 	return result, nil
 }
@@ -216,10 +247,10 @@ func (s *Server) pollAddressOnce(ctx context.Context) (scanResult, error) {
 		byAddress[sub.Address] = append(byAddress[sub.Address], sub)
 	}
 	result.AddressCount = len(byAddress)
-	minTimestamp := time.Now().Add(-s.cfg.Lookback).UnixMilli()
+	defaultMinTimestamp := time.Now().Add(-s.cfg.Lookback).UnixMilli()
 	addresses := s.selectAddressBatch(byAddress)
 	result.AddressCount = len(addresses)
-	addressResult, err := s.pollAddressTransfers(ctx, byAddress, addresses, minTimestamp)
+	addressResult, err := s.pollAddressTransfers(ctx, byAddress, addresses, defaultMinTimestamp)
 	result.merge(addressResult)
 	return result, err
 }
@@ -249,7 +280,8 @@ func (s *Server) pollAddressTransfers(ctx context.Context, byAddress map[string]
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			transfers, err := s.tron.FetchAddressUSDTTransfersSincePages(ctx, address, s.cfg.USDTContract, 50, s.cfg.AddressPages, minTimestamp)
+			addressMinTimestamp := s.addressMinTimestamp(address, minTimestamp)
+			fetch, err := s.tron.FetchAddressUSDTTransfersSincePagesWithMetrics(ctx, address, s.cfg.USDTContract, 50, s.cfg.AddressPages, addressMinTimestamp)
 			if err != nil {
 				select {
 				case errCh <- err:
@@ -257,10 +289,12 @@ func (s *Server) pollAddressTransfers(ctx context.Context, byAddress map[string]
 				}
 				return
 			}
+			transfers := fetch.Transfers
 			local := scanResult{TransferCount: len(transfers)}
+			local.observeFetch(fetch.Metrics)
 			for _, transfer := range transfers {
 				local.observeTransfer(transfer)
-				matches, err := s.recordTransferMatches(ctx, transfer, byAddress)
+				matches, timings, err := s.recordTransferMatches(ctx, transfer, byAddress)
 				if err != nil {
 					select {
 					case errCh <- err:
@@ -269,7 +303,10 @@ func (s *Server) pollAddressTransfers(ctx context.Context, byAddress map[string]
 					return
 				}
 				local.MatchCount += matches
+				local.MatchDuration += timings.MatchDuration
+				local.WriteDuration += timings.WriteDuration
 			}
+			s.updateAddressWatermark(address, local.MaxBlockTimestamp)
 			mu.Lock()
 			result.merge(local)
 			mu.Unlock()
@@ -284,18 +321,22 @@ func (s *Server) pollAddressTransfers(ctx context.Context, byAddress map[string]
 	}
 }
 
-func (s *Server) recordTransferMatches(ctx context.Context, transfer tron.Transfer, byAddress map[string][]storage.ChainWatcherSubscription) (int, error) {
+func (s *Server) recordTransferMatches(ctx context.Context, transfer tron.Transfer, byAddress map[string][]storage.ChainWatcherSubscription) (int, recordTimings, error) {
+	started := time.Now()
 	candidates := append([]storage.ChainWatcherSubscription{}, byAddress[transfer.From]...)
 	candidates = append(candidates, byAddress[transfer.To]...)
 	if len(candidates) == 0 {
-		return 0, nil
+		return 0, recordTimings{MatchDuration: time.Since(started)}, nil
 	}
 	event := TransferEvent(transfer, "tronscan")
 	deliveries := MatchTransfer(transfer, candidates)
+	matchDuration := time.Since(started)
 	if len(deliveries) == 0 {
-		return 0, nil
+		return 0, recordTimings{MatchDuration: matchDuration}, nil
 	}
-	return s.store.RecordChainWatcherMatches(ctx, event, deliveries, time.Now())
+	writeStarted := time.Now()
+	inserted, err := s.store.RecordChainWatcherMatches(ctx, event, deliveries, time.Now())
+	return inserted, recordTimings{MatchDuration: matchDuration, WriteDuration: time.Since(writeStarted)}, err
 }
 
 type scanResult struct {
@@ -304,6 +345,18 @@ type scanResult struct {
 	SubscriptionCount int
 	AddressCount      int
 	MaxBlockTimestamp int64
+	APICallCount      int
+	PageCount         int
+	APIWaitDuration   time.Duration
+	APIFetchDuration  time.Duration
+	ParseDuration     time.Duration
+	MatchDuration     time.Duration
+	WriteDuration     time.Duration
+}
+
+type recordTimings struct {
+	MatchDuration time.Duration
+	WriteDuration time.Duration
 }
 
 func (r *scanResult) observeTransfer(transfer tron.Transfer) {
@@ -324,6 +377,21 @@ func (r *scanResult) merge(other scanResult) {
 	if other.MaxBlockTimestamp > r.MaxBlockTimestamp {
 		r.MaxBlockTimestamp = other.MaxBlockTimestamp
 	}
+	r.APICallCount += other.APICallCount
+	r.PageCount += other.PageCount
+	r.APIWaitDuration += other.APIWaitDuration
+	r.APIFetchDuration += other.APIFetchDuration
+	r.ParseDuration += other.ParseDuration
+	r.MatchDuration += other.MatchDuration
+	r.WriteDuration += other.WriteDuration
+}
+
+func (r *scanResult) observeFetch(metrics tron.FetchMetrics) {
+	r.APICallCount += metrics.Calls
+	r.PageCount += metrics.Pages
+	r.APIWaitDuration += metrics.WaitDuration
+	r.APIFetchDuration += metrics.APIDuration
+	r.ParseDuration += metrics.ParseDuration
 }
 
 func (s *Server) selectAddressBatch(byAddress map[string][]storage.ChainWatcherSubscription) []string {
@@ -374,6 +442,58 @@ func (s *Server) shouldSkipAddressScan(now time.Time) bool {
 		guard = s.cfg.PollInterval / 2
 	}
 	return now.Add(guard).After(nextGlobal)
+}
+
+func (s *Server) addressMinTimestamp(address string, defaultMinTimestamp int64) int64 {
+	s.watermarkMu.Lock()
+	defer s.watermarkMu.Unlock()
+	watermark := s.watermarks[address]
+	if watermark <= 0 {
+		return defaultMinTimestamp
+	}
+	minTimestamp := watermark - 30000
+	if minTimestamp < defaultMinTimestamp {
+		return defaultMinTimestamp
+	}
+	return minTimestamp
+}
+
+func (s *Server) updateAddressWatermark(address string, timestamp int64) {
+	if timestamp <= 0 {
+		return
+	}
+	s.watermarkMu.Lock()
+	defer s.watermarkMu.Unlock()
+	if timestamp > s.watermarks[address] {
+		s.watermarks[address] = timestamp
+	}
+}
+
+func (s *Server) tryStartScan(kind string) bool {
+	s.scanMu.Lock()
+	defer s.scanMu.Unlock()
+	if kind == "address" {
+		if s.addressRunning {
+			return false
+		}
+		s.addressRunning = true
+		return true
+	}
+	if s.globalRunning {
+		return false
+	}
+	s.globalRunning = true
+	return true
+}
+
+func (s *Server) finishScan(kind string) {
+	s.scanMu.Lock()
+	defer s.scanMu.Unlock()
+	if kind == "address" {
+		s.addressRunning = false
+		return
+	}
+	s.globalRunning = false
 }
 
 type apiBackoff struct {
@@ -454,10 +574,36 @@ type scanStatus struct {
 	lag                time.Duration
 	scanCount          int64
 	errorCount         int64
+	overlapSkipped     int64
 	transferCount      int
 	matchCount         int
 	subscriptionCount  int
 	addressCount       int
+	apiCallCount       int
+	pageCount          int
+	apiWaitDuration    time.Duration
+	apiFetchDuration   time.Duration
+	parseDuration      time.Duration
+	matchDuration      time.Duration
+	writeDuration      time.Duration
+	recent             []scanRound
+}
+
+type scanRound struct {
+	startedAt        time.Time
+	success          bool
+	err              string
+	duration         time.Duration
+	apiWaitDuration  time.Duration
+	apiFetchDuration time.Duration
+	parseDuration    time.Duration
+	matchDuration    time.Duration
+	writeDuration    time.Duration
+	transferCount    int
+	matchCount       int
+	addressCount     int
+	apiCallCount     int
+	pageCount        int
 }
 
 type cleanupStatus struct {
@@ -481,6 +627,13 @@ func (s *watcherStatus) recordScanSuccess(kind string, result scanResult, durati
 	target.matchCount = result.MatchCount
 	target.subscriptionCount = result.SubscriptionCount
 	target.addressCount = result.AddressCount
+	target.apiCallCount = result.APICallCount
+	target.pageCount = result.PageCount
+	target.apiWaitDuration = result.APIWaitDuration
+	target.apiFetchDuration = result.APIFetchDuration
+	target.parseDuration = result.ParseDuration
+	target.matchDuration = result.MatchDuration
+	target.writeDuration = result.WriteDuration
 	target.lastBlockTimestamp = result.MaxBlockTimestamp
 	if result.MaxBlockTimestamp > 0 {
 		lag := now.Sub(time.UnixMilli(result.MaxBlockTimestamp))
@@ -489,9 +642,24 @@ func (s *watcherStatus) recordScanSuccess(kind string, result scanResult, durati
 		}
 		target.lag = lag
 	}
+	target.appendRound(scanRound{
+		startedAt:        target.lastStartedAt,
+		success:          true,
+		duration:         duration,
+		apiWaitDuration:  result.APIWaitDuration,
+		apiFetchDuration: result.APIFetchDuration,
+		parseDuration:    result.ParseDuration,
+		matchDuration:    result.MatchDuration,
+		writeDuration:    result.WriteDuration,
+		transferCount:    result.TransferCount,
+		matchCount:       result.MatchCount,
+		addressCount:     result.AddressCount,
+		apiCallCount:     result.APICallCount,
+		pageCount:        result.PageCount,
+	})
 }
 
-func (s *watcherStatus) recordScanError(kind string, err error, backoffUntil time.Time, duration time.Duration, now time.Time) {
+func (s *watcherStatus) recordScanError(kind string, err error, backoffUntil time.Time, result scanResult, duration time.Duration, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	target := s.scan(kind)
@@ -501,6 +669,35 @@ func (s *watcherStatus) recordScanError(kind string, err error, backoffUntil tim
 	target.lastDuration = duration
 	target.backoffUntil = backoffUntil
 	target.errorCount++
+	target.apiCallCount = result.APICallCount
+	target.pageCount = result.PageCount
+	target.apiWaitDuration = result.APIWaitDuration
+	target.apiFetchDuration = result.APIFetchDuration
+	target.parseDuration = result.ParseDuration
+	target.matchDuration = result.MatchDuration
+	target.writeDuration = result.WriteDuration
+	target.appendRound(scanRound{
+		startedAt:        target.lastStartedAt,
+		success:          false,
+		err:              err.Error(),
+		duration:         duration,
+		apiWaitDuration:  result.APIWaitDuration,
+		apiFetchDuration: result.APIFetchDuration,
+		parseDuration:    result.ParseDuration,
+		matchDuration:    result.MatchDuration,
+		writeDuration:    result.WriteDuration,
+		transferCount:    result.TransferCount,
+		matchCount:       result.MatchCount,
+		addressCount:     result.AddressCount,
+		apiCallCount:     result.APICallCount,
+		pageCount:        result.PageCount,
+	})
+}
+
+func (s *watcherStatus) recordScanOverlap(kind string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.scan(kind).overlapSkipped++
 }
 
 func (s *watcherStatus) recordCleanup(stats storage.ChainWatcherCleanupStats, now time.Time) {
@@ -580,11 +777,55 @@ func (s scanStatus) response(now time.Time) ScanStatusResponse {
 		LagMS:              s.lag.Milliseconds(),
 		ScanCount:          s.scanCount,
 		ErrorCount:         s.errorCount,
+		OverlapSkipped:     s.overlapSkipped,
 		TransferCount:      s.transferCount,
 		MatchCount:         s.matchCount,
 		SubscriptionCount:  s.subscriptionCount,
 		AddressCount:       s.addressCount,
+		APICallCount:       s.apiCallCount,
+		PageCount:          s.pageCount,
+		APIWaitMS:          s.apiWaitDuration.Milliseconds(),
+		APIFetchMS:         s.apiFetchDuration.Milliseconds(),
+		ParseMS:            s.parseDuration.Milliseconds(),
+		MatchMS:            s.matchDuration.Milliseconds(),
+		WriteMS:            s.writeDuration.Milliseconds(),
+		Recent:             scanRoundResponses(s.recent),
 	}
+}
+
+func (s *scanStatus) appendRound(round scanRound) {
+	s.recent = append(s.recent, round)
+	if len(s.recent) > 5 {
+		copy(s.recent, s.recent[len(s.recent)-5:])
+		s.recent = s.recent[:5]
+	}
+}
+
+func scanRoundResponses(rounds []scanRound) []ScanRoundResponse {
+	if len(rounds) == 0 {
+		return nil
+	}
+	out := make([]ScanRoundResponse, 0, len(rounds))
+	for i := len(rounds) - 1; i >= 0; i-- {
+		round := rounds[i]
+		out = append(out, ScanRoundResponse{
+			StartedAt:     timePtr(round.startedAt),
+			Success:       round.success,
+			Error:         round.err,
+			DurationMS:    round.duration.Milliseconds(),
+			APIWaitMS:     round.apiWaitDuration.Milliseconds(),
+			APIFetchMS:    round.apiFetchDuration.Milliseconds(),
+			ParseMS:       round.parseDuration.Milliseconds(),
+			MatchMS:       round.matchDuration.Milliseconds(),
+			WriteMS:       round.writeDuration.Milliseconds(),
+			TransferCount: round.transferCount,
+			MatchCount:    round.matchCount,
+			AddressCount:  round.addressCount,
+			APICallCount:  round.apiCallCount,
+			PageCount:     round.pageCount,
+		})
+	}
+	return out
 }
 
 func (s cleanupStatus) response() CleanupStatusResponse {

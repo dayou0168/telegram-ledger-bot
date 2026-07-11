@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/permissions"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/telegram"
 )
@@ -226,6 +227,10 @@ func (b *Bot) toggleBroadcastNotifyAll(ctx context.Context, cb telegram.Callback
 }
 
 func (b *Bot) handleBroadcastMaterial(ctx context.Context, msg telegram.Message, user storage.User, state privateState, now time.Time) error {
+	if !b.canUseBroadcast(ctx, user.ID) {
+		b.privateStates.Delete(formatID(user.ID))
+		return b.enqueueReplyText(ctx, sendPriorityNormal, "broadcast_denied", msg.Chat.ID, msg.MessageID, "没有广播权限。", nil, now)
+	}
 	if len(state.ChatIDs) == 0 {
 		b.privateStates.Delete(formatID(user.ID))
 		return b.enqueueReplyText(ctx, sendPriorityNormal, "broadcast_target_lost", msg.Chat.ID, msg.MessageID, "广播目标已失效，请重新选择。", nil, now)
@@ -253,7 +258,14 @@ func (b *Bot) handleBroadcastMaterial(ctx context.Context, msg telegram.Message,
 		b.privateStates.Set(formatID(user.ID), state)
 		return b.refreshBroadcastSessionKeyboard(ctx, msg, state)
 	}
-	targets := append([]int64(nil), state.ChatIDs...)
+	targets, err := b.currentBroadcastTargets(ctx, user.ID, state)
+	if err != nil {
+		return err
+	}
+	if len(targets) == 0 {
+		b.privateStates.Delete(formatID(user.ID))
+		return b.enqueueReplyText(ctx, sendPriorityNormal, "broadcast_target_lost", msg.Chat.ID, msg.MessageID, "广播目标已失效，请重新选择。", nil, now)
+	}
 	sourceChatID := msg.Chat.ID
 	sourceMessageID := msg.MessageID
 	targetName := state.TargetName
@@ -279,6 +291,37 @@ func (b *Bot) handleBroadcastMaterial(ctx context.Context, msg telegram.Message,
 		}
 	})
 	return nil
+}
+
+func (b *Bot) currentBroadcastTargets(ctx context.Context, userID int64, state privateState) ([]int64, error) {
+	if b.perms.HasGlobalBroadcastAccess(userID) {
+		return append([]int64(nil), state.ChatIDs...), nil
+	}
+	var allowed []storage.Group
+	var err error
+	if state.Mode == "group" {
+		allowed, err = b.allowedChatsForBroadcastGroup(ctx, userID, state.TargetName)
+	} else {
+		allowed, err = b.store.ListAllowedBroadcastChats(ctx, userID, false)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return intersectChatIDs(state.ChatIDs, groupsToIDs(allowed)), nil
+}
+
+func intersectChatIDs(original []int64, allowed []int64) []int64 {
+	allowedSet := make(map[int64]struct{}, len(allowed))
+	for _, chatID := range allowed {
+		allowedSet[chatID] = struct{}{}
+	}
+	filtered := make([]int64, 0, len(original))
+	for _, chatID := range original {
+		if _, ok := allowedSet[chatID]; ok {
+			filtered = append(filtered, chatID)
+		}
+	}
+	return filtered
 }
 
 func (b *Bot) copyBroadcast(ctx context.Context, operatorID, fromChatID, messageID int64, targetChatIDs []int64, mode, targetName string, notifyAll bool) (int, int) {
@@ -447,15 +490,16 @@ func (b *Bot) canUseBroadcast(ctx context.Context, userID int64) bool {
 	if b.perms.HasGlobalBroadcastAccess(userID) {
 		return true
 	}
-	key := "broadcast:" + formatID(userID)
+	key := broadcastPermissionCacheKey(userID)
 	if value, ok := b.operatorCache.Get(key); ok {
 		return value
 	}
-	value, err := b.store.IsBroadcastOperator(ctx, userID)
+	level, ok, err := b.store.GetGlobalOperatorLevel(ctx, userID)
 	if err != nil {
-		log.Printf("check broadcast operator %d: %v", userID, err)
+		log.Printf("check global operator for broadcast %d: %v", userID, err)
 		return false
 	}
+	value := ok && b.perms.CanUsePrivateGlobalFeatures(userID, permissions.UserCapabilities{GlobalOperatorLevel: level})
 	b.operatorCache.Set(key, value)
 	return value
 }

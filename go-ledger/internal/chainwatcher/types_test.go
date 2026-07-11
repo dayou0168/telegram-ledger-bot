@@ -60,3 +60,21 @@ func TestIDsAreStableAndTenantScoped(t *testing.T) {
 		t.Fatalf("delivery id should be stable and bot scoped: %q %q", deliveryA, deliveryB)
 	}
 }
+
+func TestDeliveryIDDedupesSameTransferAcrossCompensationPages(t *testing.T) {
+	transfer := tron.Transfer{
+		Hash:           "ABCDEF",
+		From:           "TFrom",
+		To:             "TTo",
+		Value:          "10000000",
+		TokenAddress:   "TR7",
+		BlockTimestamp: 1720000000000,
+	}
+	sub := storage.ChainWatcherSubscription{BotID: "bot-a", ChatID: 1, OwnerUserID: 1, Address: "TTo"}
+
+	firstPage := DeliveryID(sub, transfer, "income")
+	secondPage := DeliveryID(sub, transfer, "income")
+	if firstPage == "" || firstPage != secondPage {
+		t.Fatalf("same transfer should produce same delivery id: %q %q", firstPage, secondPage)
+	}
+}

@@ -47,6 +47,44 @@ type Account struct {
 	LatestOperationAt     int64
 }
 
+type FetchMetrics struct {
+	Calls         int
+	Pages         int
+	WaitDuration  time.Duration
+	APIDuration   time.Duration
+	ParseDuration time.Duration
+	LastPageRows  int
+	ReachedWindow bool
+}
+
+type TransferFetchResult struct {
+	Transfers []Transfer
+	Metrics   FetchMetrics
+}
+
+type RequestMetrics struct {
+	WaitDuration  time.Duration
+	APIDuration   time.Duration
+	ParseDuration time.Duration
+}
+
+func (m *FetchMetrics) addRequest(req RequestMetrics) {
+	m.Calls++
+	m.WaitDuration += req.WaitDuration
+	m.APIDuration += req.APIDuration
+	m.ParseDuration += req.ParseDuration
+}
+
+func (m *FetchMetrics) merge(other FetchMetrics) {
+	m.Calls += other.Calls
+	m.Pages += other.Pages
+	m.WaitDuration += other.WaitDuration
+	m.APIDuration += other.APIDuration
+	m.ParseDuration += other.ParseDuration
+	m.LastPageRows = other.LastPageRows
+	m.ReachedWindow = m.ReachedWindow || other.ReachedWindow
+}
+
 func NewClient(baseURL, apiKey string, timeout time.Duration) *Client {
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
@@ -85,10 +123,15 @@ func (c *Client) SetMinRequestInterval(interval time.Duration) {
 }
 
 func (c *Client) FetchGlobalUSDTTransfers(ctx context.Context, contract string, minTimestamp int64, pages int) ([]Transfer, error) {
+	result, err := c.FetchGlobalUSDTTransfersWithMetrics(ctx, contract, minTimestamp, pages)
+	return result.Transfers, err
+}
+
+func (c *Client) FetchGlobalUSDTTransfersWithMetrics(ctx context.Context, contract string, minTimestamp int64, pages int) (TransferFetchResult, error) {
 	if pages < 1 {
 		pages = 1
 	}
-	var all []Transfer
+	var result TransferFetchResult
 	for page := 0; page < pages; page++ {
 		values := url.Values{}
 		values.Set("contract_address", contract)
@@ -98,18 +141,24 @@ func (c *Client) FetchGlobalUSDTTransfers(ctx context.Context, contract string, 
 		if minTimestamp > 0 {
 			values.Set("start_timestamp", strconv.FormatInt(minTimestamp, 10))
 		}
-		var result tronscanTransferResponse
-		if err := c.get(ctx, "/token_trc20/transfers", values, &result); err != nil {
-			return nil, err
+		var pageResult tronscanTransferResponse
+		reqMetrics, err := c.getTimed(ctx, "/token_trc20/transfers", values, &pageResult)
+		if err != nil {
+			result.Metrics.addRequest(reqMetrics)
+			result.Metrics.Pages++
+			return result, err
 		}
-		for _, row := range result.TokenTransfers {
-			all = append(all, row.toTransfer())
+		result.Metrics.addRequest(reqMetrics)
+		result.Metrics.Pages++
+		result.Metrics.LastPageRows = len(pageResult.TokenTransfers)
+		for _, row := range pageResult.TokenTransfers {
+			result.Transfers = append(result.Transfers, row.toTransfer())
 		}
-		if len(result.TokenTransfers) < 50 {
+		if len(pageResult.TokenTransfers) < 50 {
 			break
 		}
 	}
-	return all, nil
+	return result, nil
 }
 
 func (c *Client) FetchAddressUSDTTransfers(ctx context.Context, address, contract string, limit int) ([]Transfer, error) {
@@ -124,27 +173,38 @@ func (c *Client) FetchAddressUSDTTransfersSince(ctx context.Context, address, co
 }
 
 func (c *Client) FetchAddressUSDTTransfersSincePages(ctx context.Context, address, contract string, limit int, pages int, minTimestamp int64) ([]Transfer, error) {
+	result, err := c.FetchAddressUSDTTransfersSincePagesWithMetrics(ctx, address, contract, limit, pages, minTimestamp)
+	return result.Transfers, err
+}
+
+func (c *Client) FetchAddressUSDTTransfersSincePagesWithMetrics(ctx context.Context, address, contract string, limit int, pages int, minTimestamp int64) (TransferFetchResult, error) {
 	if limit < 1 {
 		limit = 20
 	}
 	if pages < 1 {
 		pages = 1
 	}
-	var all []Transfer
+	var result TransferFetchResult
 	for page := 0; page < pages; page++ {
-		transfers, err := c.fetchAddressUSDTTransfersPage(ctx, address, contract, limit, page*limit, minTimestamp)
+		transfers, metrics, err := c.fetchAddressUSDTTransfersPage(ctx, address, contract, limit, page*limit, minTimestamp)
 		if err != nil {
-			return nil, err
+			result.Metrics.addRequest(metrics)
+			result.Metrics.Pages++
+			return result, err
 		}
-		all = append(all, transfers...)
+		result.Metrics.addRequest(metrics)
+		result.Metrics.Pages++
+		result.Metrics.LastPageRows = len(transfers)
+		result.Transfers = append(result.Transfers, transfers...)
 		if len(transfers) < limit || reachedTransferWindow(transfers, minTimestamp) {
+			result.Metrics.ReachedWindow = reachedTransferWindow(transfers, minTimestamp)
 			break
 		}
 	}
-	return all, nil
+	return result, nil
 }
 
-func (c *Client) fetchAddressUSDTTransfersPage(ctx context.Context, address, contract string, limit int, start int, minTimestamp int64) ([]Transfer, error) {
+func (c *Client) fetchAddressUSDTTransfersPage(ctx context.Context, address, contract string, limit int, start int, minTimestamp int64) ([]Transfer, RequestMetrics, error) {
 	values := url.Values{}
 	values.Set("address", address)
 	values.Set("trc20Id", contract)
@@ -156,8 +216,9 @@ func (c *Client) fetchAddressUSDTTransfersPage(ctx context.Context, address, con
 		values.Set("start_timestamp", strconv.FormatInt(minTimestamp, 10))
 	}
 	var result tronscanTransferResponse
-	if err := c.get(ctx, "/transfer/trc20", values, &result); err != nil {
-		return nil, err
+	metrics, err := c.getTimed(ctx, "/transfer/trc20", values, &result)
+	if err != nil {
+		return nil, metrics, err
 	}
 	transfers := make([]Transfer, 0, len(result.TokenTransfers))
 	for _, row := range result.TokenTransfers {
@@ -167,7 +228,7 @@ func (c *Client) fetchAddressUSDTTransfersPage(ctx context.Context, address, con
 		}
 		transfers = append(transfers, transfer)
 	}
-	return transfers, nil
+	return transfers, metrics, nil
 }
 
 func reachedTransferWindow(transfers []Transfer, minTimestamp int64) bool {
@@ -205,16 +266,26 @@ func (c *Client) FetchAccount(ctx context.Context, address, usdtContract string)
 }
 
 func (c *Client) get(ctx context.Context, path string, values url.Values, out any) error {
+	_, err := c.getTimed(ctx, path, values, out)
+	return err
+}
+
+func (c *Client) getTimed(ctx context.Context, path string, values url.Values, out any) (RequestMetrics, error) {
+	var metrics RequestMetrics
+	waitStarted := time.Now()
 	if err := c.waitThrottle(ctx); err != nil {
-		return err
+		metrics.WaitDuration = time.Since(waitStarted)
+		return metrics, err
 	}
+	metrics.WaitDuration = time.Since(waitStarted)
+	apiStarted := time.Now()
 	apiURL := c.baseURL + path
 	if len(values) > 0 {
 		apiURL += "?" + values.Encode()
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 	if err != nil {
-		return err
+		return metrics, err
 	}
 	req.Header.Set("Accept", "application/json")
 	if c.apiKey != "" {
@@ -222,24 +293,29 @@ func (c *Client) get(ctx context.Context, path string, values url.Values, out an
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return err
+		metrics.APIDuration = time.Since(apiStarted)
+		return metrics, err
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(resp.Body)
+	metrics.APIDuration = time.Since(apiStarted)
 	if err != nil {
-		return err
+		return metrics, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return &HTTPError{
+		return metrics, &HTTPError{
 			StatusCode: resp.StatusCode,
 			Body:       string(raw),
 			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
 		}
 	}
+	parseStarted := time.Now()
 	if err := json.Unmarshal(raw, out); err != nil {
-		return err
+		metrics.ParseDuration = time.Since(parseStarted)
+		return metrics, err
 	}
-	return nil
+	metrics.ParseDuration = time.Since(parseStarted)
+	return metrics, nil
 }
 
 func (c *Client) waitThrottle(ctx context.Context) error {

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/adminauth"
+	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/permissions"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/telegram"
 )
@@ -61,7 +62,7 @@ func (b *Bot) sendAdminEntry(ctx context.Context, chatID, replyTo, userID int64)
 		return err
 	}
 	if !allowed {
-		return b.enqueueReliableText(ctx, sendPriorityNormal, "admin_entry_denied", messageScopedDedupe("admin_entry_denied", chatID, replyTo), chatID, "没有后台权限。只有宿主、一级操作人和操作人可以进入后台。", map[string]any{
+		return b.enqueueReliableText(ctx, sendPriorityNormal, "admin_entry_denied", messageScopedDedupe("admin_entry_denied", chatID, replyTo), chatID, "没有后台权限。只有宿主、一级操作人和下级操作人可以进入后台。", map[string]any{
 			"reply_to_message_id": replyTo,
 		}, reliableMessageRef{}, time.Now().In(b.loc))
 	}
@@ -95,18 +96,11 @@ func (b *Bot) adminRoleForUser(ctx context.Context, userID int64) (string, bool,
 	if b.perms.IsDefaultOperator(userID) {
 		return adminauth.RoleDefaultOperator, true, nil
 	}
-	ok, err := b.store.IsBroadcastOperator(ctx, userID)
+	level, ok, err := b.store.GetGlobalOperatorLevel(ctx, userID)
 	if err != nil {
 		return "", false, err
 	}
-	if ok {
-		return adminauth.RoleOperator, true, nil
-	}
-	ok, err = b.store.IsAnyOperator(ctx, userID)
-	if err != nil {
-		return "", false, err
-	}
-	if ok {
+	if b.perms.CanUsePrivateGlobalFeatures(userID, permissions.UserCapabilities{GlobalOperatorLevel: level}) && ok {
 		return adminauth.RoleOperator, true, nil
 	}
 	return "", false, nil

@@ -6,8 +6,7 @@ type Policy struct {
 }
 
 type UserCapabilities struct {
-	LedgerOperator    bool
-	BroadcastOperator bool
+	GlobalOperatorLevel string
 }
 
 func NewPolicy(hostUserID int64, defaultOperatorIDs map[int64]struct{}) Policy {
@@ -53,7 +52,15 @@ func (p Policy) PrivilegedUserIDs() []int64 {
 }
 
 func (p Policy) CanInviteBot(userID int64, caps UserCapabilities) bool {
-	return p.IsPrivileged(userID) || caps.LedgerOperator || caps.BroadcastOperator
+	return p.IsPrivileged(userID) || caps.IsGlobalOperator()
+}
+
+func (p Policy) CanUsePrivateGlobalFeatures(userID int64, caps UserCapabilities) bool {
+	return p.IsPrivileged(userID) || caps.IsGlobalOperator()
+}
+
+func (caps UserCapabilities) IsGlobalOperator() bool {
+	return caps.GlobalOperatorLevel == "primary" || caps.GlobalOperatorLevel == "secondary"
 }
 
 func (p Policy) HasGlobalLedgerAccess(userID int64) bool {

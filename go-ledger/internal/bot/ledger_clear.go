@@ -14,7 +14,7 @@ func (b *Bot) handleClearLedgerRequest(ctx context.Context, msg telegram.Message
 	if ok, err := b.canUseLedger(ctx, msg.Chat.ID, user.ID); err != nil {
 		return err
 	} else if !ok {
-		return b.enqueueReplyText(ctx, sendPriorityNormal, "clear_ledger_denied", msg.Chat.ID, msg.MessageID, "没有清除账单权限。", nil, time.Now().In(b.loc))
+		return b.enqueueLedgerText(ctx, sendPriorityNormal, "clear_ledger_denied", msg.Chat.ID, msg.MessageID, "没有清除账单权限。", nil, time.Now().In(b.loc))
 	}
 	title := "确认清除今日账单？"
 	desc := "只会清除当前群当前业务日的账单，群配置、汇率、费率不变。"
@@ -25,10 +25,9 @@ func (b *Bot) handleClearLedgerRequest(ctx context.Context, msg telegram.Message
 	keyboard := telegram.InlineKeyboardMarkup{InlineKeyboard: [][]telegram.InlineKeyboardButton{
 		{{Text: "确认清除", CallbackData: "clear:" + scope}, {Text: "取消", CallbackData: "clear:cancel"}},
 	}}
-	return b.enqueueReliableText(ctx, sendPriorityNormal, "clear_ledger_confirm", messageScopedDedupe("clear_ledger_confirm", msg.Chat.ID, msg.MessageID), msg.Chat.ID, title+"\n"+desc, map[string]any{
-		"reply_to_message_id": msg.MessageID,
-		"reply_markup":        keyboard,
-	}, reliableMessageRef{}, time.Now().In(b.loc))
+	return b.enqueueLedgerText(ctx, sendPriorityNormal, "clear_ledger_confirm", msg.Chat.ID, msg.MessageID, title+"\n"+desc, map[string]any{
+		"reply_markup": keyboard,
+	}, time.Now().In(b.loc))
 }
 
 func (b *Bot) handleClearLedgerCallback(ctx context.Context, cb telegram.CallbackQuery) error {
@@ -39,7 +38,7 @@ func (b *Bot) handleClearLedgerCallback(ctx context.Context, cb telegram.Callbac
 		if err := b.tg.AnswerCallback(ctx, cb.ID, "已取消"); err != nil {
 			return err
 		}
-		return b.enqueueReplyText(ctx, sendPriorityNormal, "clear_ledger_cancel", cb.Message.Chat.ID, cb.Message.MessageID, "已取消清除账单。", nil, time.Now().In(b.loc))
+		return b.enqueueLedgerText(ctx, sendPriorityNormal, "clear_ledger_cancel", cb.Message.Chat.ID, cb.Message.MessageID, "已取消清除账单。", nil, time.Now().In(b.loc))
 	}
 	scope := strings.TrimPrefix(cb.Data, "clear:")
 	if scope != "today" && scope != "all" {
@@ -53,13 +52,15 @@ func (b *Bot) handleClearLedgerCallback(ctx context.Context, cb telegram.Callbac
 	now := time.Now().In(b.loc)
 	var count int64
 	var err error
+	var clearedDayKey string
 	if scope == "today" {
 		group, getErr := b.getGroupCached(ctx, cb.Message.Chat.ID)
 		if getErr != nil {
 			return getErr
 		}
+		clearedDayKey = businessDayKey(now, group.CutoffHour)
 		doneDelete := measurePerfStage(ctx, "db_record_delete")
-		count, err = b.store.SoftDeleteRecordsForDay(ctx, cb.Message.Chat.ID, businessDayKey(now, group.CutoffHour), now)
+		count, err = b.store.SoftDeleteRecordsForDay(ctx, cb.Message.Chat.ID, clearedDayKey, now)
 		doneDelete()
 	} else {
 		doneDelete := measurePerfStage(ctx, "db_record_delete")
@@ -69,6 +70,11 @@ func (b *Bot) handleClearLedgerCallback(ctx context.Context, cb telegram.Callbac
 	if err != nil {
 		return err
 	}
+	if scope == "today" {
+		b.invalidateBillSummaryCache(cb.Message.Chat.ID, clearedDayKey)
+	} else {
+		b.clearBillSummaryCache()
+	}
 	if err := b.tg.AnswerCallback(ctx, cb.ID, "已清除"); err != nil {
 		return err
 	}
@@ -76,5 +82,5 @@ func (b *Bot) handleClearLedgerCallback(ctx context.Context, cb telegram.Callbac
 	if scope == "today" {
 		return b.sendBill(ctx, cb.Message.Chat.ID, cb.Message.MessageID, now, text)
 	}
-	return b.enqueueReplyText(ctx, sendPriorityNormal, "clear_ledger_done", cb.Message.Chat.ID, cb.Message.MessageID, text, nil, now)
+	return b.enqueueLedgerText(ctx, sendPriorityNormal, "clear_ledger_done", cb.Message.Chat.ID, cb.Message.MessageID, text, nil, now)
 }

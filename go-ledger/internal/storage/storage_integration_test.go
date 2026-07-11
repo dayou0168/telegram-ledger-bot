@@ -66,6 +66,13 @@ func TestPostgresStoreBasicFlow(t *testing.T) {
 	if !ok {
 		t.Fatalf("owner should be found by any-operator lookup")
 	}
+	ok, err = store.IsGlobalOperator(ctx, userID)
+	if err != nil {
+		t.Fatalf("is global operator before grant: %v", err)
+	}
+	if ok {
+		t.Fatal("single-group operator should not be a global operator")
+	}
 
 	group, err := store.GetGroup(ctx, chatID)
 	if err != nil {
@@ -167,8 +174,35 @@ func TestPostgresStoreBasicFlow(t *testing.T) {
 		t.Fatal("expired admin login ticket should not be valid")
 	}
 
-	if err := store.UpsertBroadcastOperator(ctx, userID, 0, "cleanup operator", now); err != nil {
-		t.Fatalf("upsert broadcast operator: %v", err)
+	if err := store.AddBroadcastPermission(ctx, userID, "chat", chatID, "", 0, now); err == nil {
+		t.Fatal("non-global operator should not receive broadcast permission")
+	}
+	if err := store.UpsertGlobalOperator(ctx, userID, "primary", 0, 0, "cleanup operator", now); err != nil {
+		t.Fatalf("upsert global operator: %v", err)
+	}
+	if err := store.AddBroadcastPermission(ctx, userID, "chat", chatID, "", 0, now); err != nil {
+		t.Fatalf("global operator should receive broadcast permission: %v", err)
+	}
+	level, ok, err := store.GetGlobalOperatorLevel(ctx, userID)
+	if err != nil {
+		t.Fatalf("get global operator level: %v", err)
+	}
+	if !ok || level != "primary" {
+		t.Fatalf("global operator level = %q, %v; want primary, true", level, ok)
+	}
+	globalOperators, err := store.ListGlobalOperators(ctx)
+	if err != nil {
+		t.Fatalf("list global operators: %v", err)
+	}
+	foundGlobalOperator := false
+	for _, op := range globalOperators {
+		if op.UserID == userID && op.Level == "primary" && op.Status == "active" {
+			foundGlobalOperator = true
+			break
+		}
+	}
+	if !foundGlobalOperator {
+		t.Fatal("global operator should be listed")
 	}
 	cleanupMinutes := now.In(time.FixedZone("Asia/Shanghai", 8*3600)).Hour()*60 + now.In(time.FixedZone("Asia/Shanghai", 8*3600)).Minute()
 	cleanupTime := time.Date(2000, 1, 1, cleanupMinutes/60, cleanupMinutes%60, 0, 0, time.UTC).Format("15:04")
@@ -256,6 +290,20 @@ func TestPostgresStoreBasicFlow(t *testing.T) {
 		t.Fatalf("get broadcast delivery after private cleanup: %v", err)
 	} else if !ok {
 		t.Fatal("private cleanup should not delete broadcast deliveries")
+	}
+	disabled, err := store.DisableGlobalOperator(ctx, userID, 0, now)
+	if err != nil {
+		t.Fatalf("disable global operator: %v", err)
+	}
+	if !disabled {
+		t.Fatal("global operator should disable")
+	}
+	ok, err = store.IsGlobalOperator(ctx, userID)
+	if err != nil {
+		t.Fatalf("is global operator after disable: %v", err)
+	}
+	if ok {
+		t.Fatal("disabled global operator should not be active")
 	}
 
 	inserted, err := store.RecordChainNotification(ctx, userID, address, "txhash-"+time.Now().Format("150405.000000000"), "income", now.UnixMilli(), now)

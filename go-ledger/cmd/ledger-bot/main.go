@@ -37,7 +37,7 @@ func main() {
 
 	app := bot.New(cfg, db, tg, tronClient, p2pClient)
 	if cfg.AdminWebEnabled {
-		web := adminweb.New(cfg, db)
+		web := adminweb.New(cfg, db, app)
 		go func() {
 			if err := web.Run(ctx); err != nil && err != context.Canceled {
 				log.Printf("admin web stopped: %v", err)

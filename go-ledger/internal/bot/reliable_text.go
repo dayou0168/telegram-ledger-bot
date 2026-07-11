@@ -44,6 +44,24 @@ func (b *Bot) enqueueReplyText(ctx context.Context, priority sendPriority, kind 
 	return b.enqueueReliableText(ctx, priority, kind, messageScopedDedupe(kind, chatID, replyTo), chatID, text, opts, reliableMessageRef{}, now)
 }
 
+func (b *Bot) enqueueLedgerText(ctx context.Context, priority sendPriority, kind string, chatID, sourceMessageID int64, text string, opts map[string]any, now time.Time) error {
+	return b.enqueueReliableText(ctx, priority, kind, messageScopedDedupe(kind, chatID, sourceMessageID), chatID, text, withoutReplyOptions(opts), reliableMessageRef{}, now)
+}
+
+func withoutReplyOptions(opts map[string]any) map[string]any {
+	if len(opts) == 0 {
+		return nil
+	}
+	cleaned := make(map[string]any, len(opts))
+	for key, value := range opts {
+		if key == "reply_to_message_id" || key == "reply_parameters" {
+			continue
+		}
+		cleaned[key] = value
+	}
+	return cleaned
+}
+
 func (b *Bot) sendReliableTextAsync(ctx context.Context, priority sendPriority, kind, dedupeKey string, chatID int64, text string, opts map[string]any, ref reliableMessageRef) {
 	now := time.Now().In(b.loc)
 	key := "outbox:" + strconv.FormatInt(chatID, 10)

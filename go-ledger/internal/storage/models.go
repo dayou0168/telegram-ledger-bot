@@ -54,6 +54,26 @@ type BroadcastOperator struct {
 	UpdatedAt                           time.Time
 }
 
+type GlobalOperator struct {
+	UserID                              int64
+	Level                               string
+	Status                              string
+	ParentUserID                        int64
+	Remark                              string
+	CreatedBy                           int64
+	CreatedAt                           time.Time
+	DisabledBy                          int64
+	DisabledAt                          *time.Time
+	PrivateCleanupEnabled               bool
+	PrivateCleanupTime                  string
+	PrivateCleanupLastRunDate           string
+	PrivateCleanupBotDeleteAfterSeconds int
+	PrivateCleanupIncomingEnabled       bool
+	PrivateCleanupIncomingAfterSeconds  int
+	PrivateCleanupScope                 string
+	UpdatedAt                           time.Time
+}
+
 type BroadcastPermission struct {
 	UserID    int64
 	Target    string
@@ -305,6 +325,11 @@ type NotificationOutboxStats struct {
 	OldestPending *time.Time                  `json:"oldest_pending,omitempty"`
 	LastError     string                      `json:"last_error,omitempty"`
 	ByPriority    []NotificationPriorityCount `json:"by_priority"`
+}
+
+type NotificationOutboxCleanupStats struct {
+	SentDeleted   int64 `json:"sent_deleted"`
+	FailedDeleted int64 `json:"failed_deleted"`
 }
 
 type NotificationPriorityCount struct {

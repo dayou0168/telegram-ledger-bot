@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/permissions"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/telegram"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/tron"
@@ -20,24 +21,16 @@ func (b *Bot) hasUnlimitedAddressWatch(ctx context.Context, userID int64) bool {
 	if b.perms.HasGlobalAddressWatchAccess(userID) {
 		return true
 	}
-	key := "address_watch_unlimited:" + formatID(userID)
+	key := addressWatchPrivilegeCacheKey(userID)
 	if value, ok := b.operatorCache.Get(key); ok {
 		return value
 	}
-	broadcastOperator, err := b.store.IsBroadcastOperator(ctx, userID)
+	level, ok, err := b.store.GetGlobalOperatorLevel(ctx, userID)
 	if err != nil {
-		log.Printf("check address watch operator %d: %v", userID, err)
+		log.Printf("check address watch global operator %d: %v", userID, err)
 		return false
 	}
-	if broadcastOperator {
-		b.operatorCache.Set(key, true)
-		return true
-	}
-	value, err := b.store.IsAnyOperator(ctx, userID)
-	if err != nil {
-		log.Printf("check ledger operator for address watch %d: %v", userID, err)
-		return false
-	}
+	value := ok && b.perms.CanUsePrivateGlobalFeatures(userID, permissions.UserCapabilities{GlobalOperatorLevel: level})
 	b.operatorCache.Set(key, value)
 	return value
 }
@@ -103,7 +96,7 @@ func (b *Bot) handleAddressWatchCallback(ctx context.Context, cb telegram.Callba
 			return err
 		}
 		if removed {
-			b.watchTargetCache.Clear()
+			b.InvalidateWatchTargets()
 			b.deleteChainWatcherSubscriptionAsync(ctx, cb.From.ID, address)
 			if err := b.tg.AnswerCallback(ctx, cb.ID, "已删除"); err != nil {
 				return err
@@ -151,7 +144,7 @@ func (b *Bot) handleAddressWatchState(ctx context.Context, msg telegram.Message,
 		if err := b.store.SaveWatchSettings(ctx, settings, now); err != nil {
 			return err
 		}
-		b.watchTargetCache.Clear()
+		b.InvalidateWatchTargets()
 		_ = b.enqueueReplyText(ctx, sendPriorityNormal, "watch_min_ok", msg.Chat.ID, msg.MessageID, "最小提醒金额已设置为 "+minAmount+" USDT。", nil, now)
 		return b.sendAddressWatchMenu(ctx, msg.Chat.ID, user.ID, msg.MessageID)
 	case "watch_target_min":
@@ -170,7 +163,7 @@ func (b *Bot) handleAddressWatchState(ctx context.Context, msg telegram.Message,
 		if _, err := b.store.UpdateWatchTarget(ctx, target, now); err != nil {
 			return err
 		}
-		b.watchTargetCache.Clear()
+		b.InvalidateWatchTargets()
 		b.syncChainWatcherTargetAsync(ctx, target)
 		_ = b.enqueueReplyText(ctx, sendPriorityNormal, "watch_target_min_ok", msg.Chat.ID, msg.MessageID, "最小提醒金额已设置为 "+minAmount+" USDT。", nil, now)
 		return b.sendAddressWatchDetail(ctx, msg.Chat.ID, user.ID, target.Address)
@@ -186,7 +179,7 @@ func (b *Bot) handleAddressWatchState(ctx context.Context, msg telegram.Message,
 		if _, err := b.store.UpdateWatchTarget(ctx, target, now); err != nil {
 			return err
 		}
-		b.watchTargetCache.Clear()
+		b.InvalidateWatchTargets()
 		b.syncChainWatcherTargetAsync(ctx, target)
 		_ = b.enqueueReplyText(ctx, sendPriorityNormal, "watch_target_label_ok", msg.Chat.ID, msg.MessageID, "备注已保存。", nil, now)
 		return b.sendAddressWatchDetail(ctx, msg.Chat.ID, user.ID, target.Address)
@@ -255,7 +248,7 @@ func (b *Bot) handleAddressWatchTargetCallback(ctx context.Context, cb telegram.
 		if err != nil {
 			return err
 		}
-		b.watchTargetCache.Clear()
+		b.InvalidateWatchTargets()
 		if removed {
 			b.deleteChainWatcherSubscriptionAsync(ctx, cb.From.ID, address)
 		}
@@ -273,7 +266,7 @@ func (b *Bot) handleAddressWatchTargetCallback(ctx context.Context, cb telegram.
 	if _, err := b.store.UpdateWatchTarget(ctx, target, now); err != nil {
 		return err
 	}
-	b.watchTargetCache.Clear()
+	b.InvalidateWatchTargets()
 	b.syncChainWatcherTargetAsync(ctx, target)
 	if err := b.tg.AnswerCallback(ctx, cb.ID, "已更新"); err != nil {
 		return err
@@ -301,7 +294,7 @@ func (b *Bot) toggleAddressWatchSetting(ctx context.Context, cb telegram.Callbac
 	if err := b.store.SaveWatchSettings(ctx, settings, now); err != nil {
 		return err
 	}
-	b.watchTargetCache.Clear()
+	b.InvalidateWatchTargets()
 	if err := b.tg.AnswerCallback(ctx, cb.ID, label+"已切换"); err != nil {
 		return err
 	}
@@ -318,7 +311,7 @@ func (b *Bot) addWatchFromPrivate(ctx context.Context, msg telegram.Message, use
 	if err := b.store.AddWatch(ctx, user.ID, address, strings.TrimSpace(label), now); err != nil {
 		return err
 	}
-	b.watchTargetCache.Clear()
+	b.InvalidateWatchTargets()
 	if target, ok, err := b.store.GetWatchTarget(ctx, user.ID, address); err == nil && ok {
 		b.syncChainWatcherTargetAsync(ctx, target)
 	}
@@ -511,7 +504,7 @@ func (b *Bot) removeWatchFromPrivate(ctx context.Context, msg telegram.Message, 
 		return err
 	}
 	if removed {
-		b.watchTargetCache.Clear()
+		b.InvalidateWatchTargets()
 		b.deleteChainWatcherSubscriptionAsync(ctx, user.ID, address)
 	}
 	text := "监听地址已删除。"

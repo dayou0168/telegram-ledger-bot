@@ -41,6 +41,7 @@ type Bot struct {
 
 	groupTouchCache  *ttlCache[string]
 	groupCache       *ttlCache[storage.Group]
+	billSummaryCache *ttlCache[storage.BillSummaryData]
 	userTouchCache   *ttlCache[string]
 	operatorCache    *ttlCache[bool]
 	watchTargetCache *ttlCache[[]storage.WatchTarget]
@@ -51,6 +52,7 @@ type Bot struct {
 	sendGateway      *telegramSendGateway
 	watchRunning     atomic.Bool
 	watcherFallback  *watcherFallbackController
+	watcherTiming    chainWatcherTimingStatus
 }
 
 func New(cfg config.Config, store *storage.Store, tg *telegram.Client, tronClient *tron.Client, p2pClient *p2p.Client) *Bot {
@@ -78,6 +80,7 @@ func New(cfg config.Config, store *storage.Store, tg *telegram.Client, tronClien
 		notifyPool:       worker.NewPool("notify", cfg.NotifyWorkers, cfg.QueueSize),
 		groupTouchCache:  newTTLCache[string](cfg.GroupCacheTTL),
 		groupCache:       newTTLCache[storage.Group](cfg.GroupCacheTTL),
+		billSummaryCache: newTTLCache[storage.BillSummaryData](cfg.BillSummaryCacheTTL),
 		userTouchCache:   newTTLCache[string](cfg.UserTouchCacheTTL),
 		operatorCache:    newTTLCache[bool](cfg.OperatorCacheTTL),
 		watchTargetCache: newTTLCache[[]storage.WatchTarget](cfg.WatchCacheTTL),
@@ -575,6 +578,40 @@ func (b *Bot) invalidateGroupCache(chatID int64) {
 	}
 }
 
+func (b *Bot) getBillSummaryCached(ctx context.Context, chatID int64, dayKey string, limit int) (storage.BillSummaryData, error) {
+	if b.billSummaryCache == nil {
+		return b.store.GetBillSummaryForDay(ctx, chatID, dayKey, limit)
+	}
+	key := billSummaryCacheKey(chatID, dayKey, limit)
+	if data, ok := b.billSummaryCache.Get(key); ok {
+		markPerfCache(ctx, "bill_summary", true)
+		return data, nil
+	}
+	markPerfCache(ctx, "bill_summary", false)
+	data, err := b.store.GetBillSummaryForDay(ctx, chatID, dayKey, limit)
+	if err != nil {
+		return storage.BillSummaryData{}, err
+	}
+	b.billSummaryCache.Set(key, data)
+	return data, nil
+}
+
+func (b *Bot) invalidateBillSummaryCache(chatID int64, dayKey string) {
+	if b.billSummaryCache != nil {
+		b.billSummaryCache.Delete(billSummaryCacheKey(chatID, dayKey, groupBillDefaultRecordLimit))
+	}
+}
+
+func (b *Bot) clearBillSummaryCache() {
+	if b.billSummaryCache != nil {
+		b.billSummaryCache.Clear()
+	}
+}
+
+func billSummaryCacheKey(chatID int64, dayKey string, limit int) string {
+	return strconv.FormatInt(chatID, 10) + ":" + dayKey + ":" + strconv.Itoa(limit)
+}
+
 func (b *Bot) canInvite(ctx context.Context, userID int64) (bool, error) {
 	if userID == 0 {
 		return false, nil
@@ -582,17 +619,15 @@ func (b *Bot) canInvite(ctx context.Context, userID int64) (bool, error) {
 	if b.perms.CanInviteBot(userID, permissions.UserCapabilities{}) {
 		return true, nil
 	}
-	ledgerOperator, err := b.store.IsAnyOperator(ctx, userID)
+	level, ok, err := b.store.GetGlobalOperatorLevel(ctx, userID)
 	if err != nil {
 		return false, err
 	}
-	broadcastOperator, err := b.store.IsBroadcastOperator(ctx, userID)
-	if err != nil {
-		return false, err
+	if !ok {
+		return false, nil
 	}
 	return b.perms.CanInviteBot(userID, permissions.UserCapabilities{
-		LedgerOperator:    ledgerOperator,
-		BroadcastOperator: broadcastOperator,
+		GlobalOperatorLevel: level,
 	}), nil
 }
 

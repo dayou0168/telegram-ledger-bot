@@ -12,14 +12,18 @@ import (
 )
 
 const (
-	notificationOutboxBatchSize  = 50
-	notificationOutboxMaxAttempt = 8
+	notificationOutboxBatchSize    = 50
+	notificationOutboxMaxAttempt   = 8
+	notificationOutboxCleanupEvery = time.Hour
 )
 
 func (b *Bot) notificationOutboxScheduler(ctx context.Context) {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
+	cleanupTicker := time.NewTicker(notificationOutboxCleanupEvery)
+	defer cleanupTicker.Stop()
 	b.drainNotificationOutbox(ctx)
+	b.cleanupNotificationOutbox(ctx)
 	for {
 		select {
 		case <-ctx.Done():
@@ -28,6 +32,8 @@ func (b *Bot) notificationOutboxScheduler(ctx context.Context) {
 			b.drainNotificationOutbox(ctx)
 		case <-ticker.C:
 			b.drainNotificationOutbox(ctx)
+		case <-cleanupTicker.C:
+			b.cleanupNotificationOutbox(ctx)
 		}
 	}
 }
@@ -36,6 +42,29 @@ func (b *Bot) kickNotificationOutbox() {
 	select {
 	case b.notificationWake <- struct{}{}:
 	default:
+	}
+}
+
+func (b *Bot) cleanupNotificationOutbox(ctx context.Context) {
+	if b == nil || b.store == nil {
+		return
+	}
+	now := time.Now().In(b.loc)
+	sentRetention := b.cfg.OutboxSentRetention
+	if sentRetention <= 0 {
+		sentRetention = 72 * time.Hour
+	}
+	failedRetention := b.cfg.OutboxFailedRetention
+	if failedRetention <= 0 {
+		failedRetention = 14 * 24 * time.Hour
+	}
+	stats, err := b.store.CleanupNotificationOutbox(ctx, now.Add(-sentRetention), now.Add(-failedRetention))
+	if err != nil {
+		log.Printf("cleanup notification outbox: %v", err)
+		return
+	}
+	if stats.SentDeleted > 0 || stats.FailedDeleted > 0 {
+		log.Printf("cleanup notification outbox: sent=%d failed=%d", stats.SentDeleted, stats.FailedDeleted)
 	}
 }
 
@@ -99,7 +128,7 @@ func (b *Bot) renderOutboxMessage(ctx context.Context, item storage.Notification
 		if !ok {
 			return "", nil, fmt.Errorf("ledger record %d not found", item.ReferenceID)
 		}
-		return b.renderBillMessage(ctx, record.ChatID, record.DayKey, item.ReplyToMessageID, "")
+		return b.renderBillMessage(ctx, record.ChatID, record.DayKey, "")
 	}
 	opts := notificationOptions(item)
 	return item.Text, opts, nil
