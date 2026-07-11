@@ -47,7 +47,7 @@ type Bot struct {
 	privateStates    *ttlCache[privateState]
 	notificationWake chan struct{}
 	telegramLimiter  *telegramRateLimiter
-	textGateway      *telegramTextGateway
+	sendGateway      *telegramSendGateway
 	watchRunning     atomic.Bool
 	watcherFallback  *watcherFallbackController
 }
@@ -85,7 +85,7 @@ func New(cfg config.Config, store *storage.Store, tg *telegram.Client, tronClien
 		telegramLimiter:  newTelegramRateLimiter(),
 		watcherFallback:  newWatcherFallbackController(cfg.BotWatcherFailThreshold, cfg.BotFallbackMaxActive),
 	}
-	bot.textGateway = newTelegramTextGateway(tg, bot.telegramLimiter, cfg.NotifyWorkers, cfg.QueueSize)
+	bot.sendGateway = newTelegramSendGateway(tg, bot.telegramLimiter, cfg.NotifyWorkers, cfg.QueueSize)
 	return bot
 }
 
@@ -97,7 +97,7 @@ func (b *Bot) Run(ctx context.Context) error {
 	b.broadcastPool.StartN(ctx, b.cfg.BroadcastWorkers)
 	b.queryPool.StartN(ctx, b.cfg.QueryWorkers)
 	b.notifyPool.StartN(ctx, b.cfg.NotifyWorkers)
-	b.textGateway.Start(ctx)
+	b.sendGateway.Start(ctx)
 
 	if b.cfg.ChainWatcherEnabled() {
 		go b.chainWatcherSyncScheduler(ctx)

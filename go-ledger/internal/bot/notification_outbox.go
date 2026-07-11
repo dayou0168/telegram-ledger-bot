@@ -11,7 +11,10 @@ import (
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/telegram"
 )
 
-const notificationOutboxBatchSize = 50
+const (
+	notificationOutboxBatchSize  = 50
+	notificationOutboxMaxAttempt = 8
+)
 
 func (b *Bot) notificationOutboxScheduler(ctx context.Context) {
 	ticker := time.NewTicker(500 * time.Millisecond)
@@ -39,7 +42,7 @@ func (b *Bot) kickNotificationOutbox() {
 func (b *Bot) drainNotificationOutbox(ctx context.Context) {
 	for i := 0; i < 3; i++ {
 		now := time.Now().In(b.loc)
-		items, err := b.store.ClaimDueNotifications(ctx, notificationOutboxBatchSize, now)
+		items, err := b.store.ClaimDueNotifications(ctx, notificationOutboxBatchSize, notificationOutboxMaxAttempt, now)
 		if err != nil {
 			log.Printf("claim notification outbox: %v", err)
 			return

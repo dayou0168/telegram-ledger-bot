@@ -286,7 +286,7 @@ func (b *Bot) copyBroadcast(ctx context.Context, operatorID, fromChatID, message
 	failed := 0
 	now := time.Now().In(b.loc)
 	for _, targetChatID := range targetChatIDs {
-		targetMsg, err := b.copyMessage(ctx, targetChatID, fromChatID, messageID, nil)
+		targetMsg, err := b.copyMessageWithPriority(ctx, sendPriorityBulk, targetChatID, fromChatID, messageID, nil)
 		if err != nil {
 			failed++
 			log.Printf("copy broadcast to %d: %v", targetChatID, err)

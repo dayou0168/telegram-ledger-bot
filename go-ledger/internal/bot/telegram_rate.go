@@ -23,18 +23,17 @@ func newTelegramRateLimiter() *telegramRateLimiter {
 }
 
 func (l *telegramRateLimiter) Wait(ctx context.Context, chatID int64) error {
-	for {
-		wait := l.reserveWait(chatID)
-		if wait <= 0 {
-			return nil
-		}
-		timer := time.NewTimer(wait)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
-		}
+	wait := l.reserveWait(chatID)
+	if wait <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 
@@ -46,10 +45,11 @@ func (l *telegramRateLimiter) reserveWait(chatID int64) time.Duration {
 	if chatReadyAt := l.nextByChat[chatID]; chatReadyAt.After(readyAt) {
 		readyAt = chatReadyAt
 	}
+	slotAt := now
 	if readyAt.After(now) {
-		return readyAt.Sub(now)
+		slotAt = readyAt
 	}
-	l.nextGlobal = now.Add(l.globalInterval)
-	l.nextByChat[chatID] = now.Add(l.chatInterval)
-	return 0
+	l.nextGlobal = slotAt.Add(l.globalInterval)
+	l.nextByChat[chatID] = slotAt.Add(l.chatInterval)
+	return slotAt.Sub(now)
 }

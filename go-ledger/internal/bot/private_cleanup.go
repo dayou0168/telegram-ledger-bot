@@ -131,19 +131,13 @@ func (b *Bot) runPrivateCleanupForOperator(ctx context.Context, operatorUserID i
 }
 
 func (b *Bot) deletePrivateCleanupMessage(ctx context.Context, chatID, messageID int64) error {
-	if err := b.waitTelegramSlot(ctx, chatID); err != nil {
+	if b.sendGateway != nil {
+		_, err := b.sendGateway.Do(ctx, sendPriorityBulk, chatID, func(opCtx context.Context) (telegram.Message, error) {
+			return telegram.Message{}, b.tg.DeleteMessage(opCtx, chatID, messageID)
+		})
 		return err
 	}
-	err := b.tg.DeleteMessage(ctx, chatID, messageID)
-	if retry, waitErr := waitTelegramRetry(ctx, err); waitErr != nil {
-		return waitErr
-	} else if retry {
-		if err := b.waitTelegramSlot(ctx, chatID); err != nil {
-			return err
-		}
-		return b.tg.DeleteMessage(ctx, chatID, messageID)
-	}
-	return err
+	return errTelegramSendGatewayNotConfigured
 }
 
 func privateCleanupLocation() *time.Location {

@@ -266,3 +266,19 @@ type NotificationOutbox struct {
 	UpdatedAt        time.Time
 	SentAt           *time.Time
 }
+
+type NotificationOutboxStats struct {
+	Pending       int64                       `json:"pending"`
+	Sending       int64                       `json:"sending"`
+	Sent          int64                       `json:"sent"`
+	Failed        int64                       `json:"failed"`
+	OldestPending *time.Time                  `json:"oldest_pending,omitempty"`
+	LastError     string                      `json:"last_error,omitempty"`
+	ByPriority    []NotificationPriorityCount `json:"by_priority"`
+}
+
+type NotificationPriorityCount struct {
+	Priority int    `json:"priority"`
+	Status   string `json:"status"`
+	Count    int64  `json:"count"`
+}

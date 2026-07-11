@@ -1,4 +1,4 @@
-# Telegram 记账机器人 Go v2.3.4 + PostgreSQL + shared chain watcher
+# Telegram 记账机器人 Go v2.3.5 + PostgreSQL + shared chain watcher
 #
 # 单机器人一体部署模板。多机器人共享 watcher 时，请使用仓库根目录
 # docker-compose.chain-watcher.yml 单独部署 watcher，再让每个机器人加入 ledger-chain-net。
@@ -39,7 +39,7 @@ services:
       retries: 10
 
   ledger-chain-watcher:
-    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.4
+    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.5
     container_name: ledger-chain-watcher
     restart: unless-stopped
     depends_on:
@@ -73,7 +73,7 @@ services:
       retries: 10
 
   ledger-bot:
-    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.4
+    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.5
     container_name: ledger-bot-go
     restart: unless-stopped
     depends_on:

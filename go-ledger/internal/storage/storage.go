@@ -438,6 +438,8 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_notification_outbox_reference
 			ON notification_outbox(reference_kind, reference_id)
 			WHERE reference_kind <> ''`,
+		`CREATE INDEX IF NOT EXISTS idx_notification_outbox_status_priority
+			ON notification_outbox(status, priority, updated_at DESC)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.pool.Exec(ctx, statement); err != nil {
@@ -1708,16 +1710,29 @@ func (s *Store) EnqueueNotification(ctx context.Context, item NotificationOutbox
 	return tag.RowsAffected() == 1, err
 }
 
-func (s *Store) ClaimDueNotifications(ctx context.Context, limit int, now time.Time) ([]NotificationOutbox, error) {
+func (s *Store) ClaimDueNotifications(ctx context.Context, limit int, maxAttempts int, now time.Time) ([]NotificationOutbox, error) {
 	if limit < 1 {
 		limit = 1
 	}
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
 	staleBefore := now.Add(-2 * time.Minute)
+	if _, err := s.pool.Exec(ctx, `UPDATE notification_outbox
+		SET status='failed',
+			last_error='notification send attempt expired after reaching retry limit',
+			updated_at=$1
+		WHERE status='sending'
+			AND updated_at <= $2
+			AND attempts >= $3`, now, staleBefore, maxAttempts); err != nil {
+		return nil, err
+	}
 	rows, err := s.pool.Query(ctx, `WITH next AS (
 			SELECT id
 			FROM notification_outbox
-			WHERE (status IN ('pending', 'failed') AND next_attempt_at <= $1)
-				OR (status = 'sending' AND updated_at <= $3)
+			WHERE ((status IN ('pending', 'failed') AND next_attempt_at <= $1)
+				OR (status = 'sending' AND updated_at <= $3))
+				AND attempts < $4
 			ORDER BY priority ASC, next_attempt_at ASC, id ASC
 			LIMIT $2
 			FOR UPDATE SKIP LOCKED
@@ -1731,7 +1746,7 @@ func (s *Store) ClaimDueNotifications(ctx context.Context, limit int, now time.T
 		RETURNING n.id, n.kind, n.dedupe_key, n.chat_id, n.text, n.parse_mode,
 			n.disable_preview, n.reply_to_message_id, n.reply_markup_json,
 			n.reference_kind, n.reference_id, n.priority, n.status, n.attempts, n.next_attempt_at, n.last_error,
-			n.created_at, n.updated_at, n.sent_at`, now, limit, staleBefore)
+			n.created_at, n.updated_at, n.sent_at`, now, limit, staleBefore, maxAttempts)
 	if err != nil {
 		return nil, err
 	}
@@ -1765,6 +1780,77 @@ func (s *Store) ClaimDueNotifications(ctx context.Context, limit int, now time.T
 		out = append(out, item)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) NotificationOutboxStats(ctx context.Context) (NotificationOutboxStats, error) {
+	var stats NotificationOutboxStats
+	rows, err := s.pool.Query(ctx, `SELECT status, COUNT(*)
+		FROM notification_outbox
+		GROUP BY status`)
+	if err != nil {
+		return stats, err
+	}
+	for rows.Next() {
+		var status string
+		var count int64
+		if err := rows.Scan(&status, &count); err != nil {
+			rows.Close()
+			return stats, err
+		}
+		switch status {
+		case "pending":
+			stats.Pending = count
+		case "sending":
+			stats.Sending = count
+		case "sent":
+			stats.Sent = count
+		case "failed":
+			stats.Failed = count
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return stats, err
+	}
+	rows.Close()
+
+	var oldest pgtype.Timestamptz
+	row := s.pool.QueryRow(ctx, `SELECT MIN(created_at)
+		FROM notification_outbox
+		WHERE status IN ('pending', 'failed', 'sending')`)
+	if err := row.Scan(&oldest); err != nil {
+		return stats, err
+	}
+	if oldest.Valid {
+		value := oldest.Time
+		stats.OldestPending = &value
+	}
+
+	row = s.pool.QueryRow(ctx, `SELECT COALESCE(last_error, '')
+		FROM notification_outbox
+		WHERE last_error <> ''
+		ORDER BY updated_at DESC, id DESC
+		LIMIT 1`)
+	if err := row.Scan(&stats.LastError); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return stats, err
+	}
+
+	rows, err = s.pool.Query(ctx, `SELECT priority, status, COUNT(*)
+		FROM notification_outbox
+		GROUP BY priority, status
+		ORDER BY priority ASC, status ASC`)
+	if err != nil {
+		return stats, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var item NotificationPriorityCount
+		if err := rows.Scan(&item.Priority, &item.Status, &item.Count); err != nil {
+			return stats, err
+		}
+		stats.ByPriority = append(stats.ByPriority, item)
+	}
+	return stats, rows.Err()
 }
 
 func (s *Store) MarkNotificationSent(ctx context.Context, id int64, messageID int64, now time.Time) error {

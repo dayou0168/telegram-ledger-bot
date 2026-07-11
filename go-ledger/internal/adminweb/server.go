@@ -134,6 +134,7 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("/admin/watch/save", s.withAuth(s.saveWatchTarget))
 	mux.HandleFunc("/admin/watch/remove", s.withAuth(s.removeWatchTarget))
 	mux.HandleFunc("/admin/replace/save", s.withAuth(s.saveReplace))
+	mux.HandleFunc("/admin/outbox/status", s.withAuth(s.outboxStatus))
 
 	addr := fmt.Sprintf("%s:%d", s.cfg.AdminWebHost, s.cfg.AdminWebPort)
 	server := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
@@ -154,6 +155,21 @@ func (s *Server) Run(ctx context.Context) error {
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = w.Write([]byte("ok"))
+}
+
+func (s *Server) outboxStatus(w http.ResponseWriter, r *http.Request) {
+	if !requireGlobalAdmin(w, r) {
+		return
+	}
+	stats, err := s.store.NotificationOutboxStats(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if err := json.NewEncoder(w).Encode(stats); err != nil {
+		log.Printf("encode outbox status: %v", err)
+	}
 }
 
 func (s *Server) bill(w http.ResponseWriter, r *http.Request) {
