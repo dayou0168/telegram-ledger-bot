@@ -14,15 +14,20 @@ import (
 )
 
 type privateState struct {
-	Mode                 string
-	TargetName           string
-	ChatIDs              []int64
-	NotifyAll            bool
-	ControlMessageID     int64
-	WatchAddress         string
-	QuickReplyTargetChat int64
-	QuickReplyMessageID  int64
-	CreatedAt            time.Time
+	Mode                   string
+	TargetName             string
+	ChatIDs                []int64
+	NotifyAll              bool
+	ControlMessageID       int64
+	WatchAddress           string
+	QuickReplyTargetChat   int64
+	QuickReplyMessageID    int64
+	ReturnMode             string
+	ReturnTargetName       string
+	ReturnChatIDs          []int64
+	ReturnNotifyAll        bool
+	ReturnControlMessageID int64
+	CreatedAt              time.Time
 }
 
 func isBroadcastMenuText(text string) bool {

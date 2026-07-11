@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -116,15 +117,40 @@ func (s *Store) migrate(ctx context.Context) error {
 			status TEXT NOT NULL DEFAULT 'active',
 			created_by BIGINT NOT NULL DEFAULT 0,
 			remark TEXT NOT NULL DEFAULT '',
+			private_cleanup_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+			private_cleanup_time TEXT NOT NULL DEFAULT '',
+			private_cleanup_last_run_date TEXT NOT NULL DEFAULT '',
 			created_at TIMESTAMPTZ NOT NULL,
 			updated_at TIMESTAMPTZ NOT NULL
 		)`,
+		`ALTER TABLE broadcast_operators ADD COLUMN IF NOT EXISTS private_cleanup_enabled BOOLEAN NOT NULL DEFAULT FALSE`,
+		`ALTER TABLE broadcast_operators ADD COLUMN IF NOT EXISTS private_cleanup_time TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE broadcast_operators ADD COLUMN IF NOT EXISTS private_cleanup_last_run_date TEXT NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_broadcast_operators_status
 			ON broadcast_operators(status, user_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_broadcast_operators_list
 			ON broadcast_operators(status, updated_at DESC, user_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_broadcast_operators_created_by
 			ON broadcast_operators(created_by, status, created_at, user_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_broadcast_operators_cleanup
+			ON broadcast_operators(private_cleanup_enabled, private_cleanup_time, user_id)
+			WHERE status='active'`,
+		`CREATE TABLE IF NOT EXISTS private_chat_messages (
+			id BIGSERIAL PRIMARY KEY,
+			operator_user_id BIGINT NOT NULL,
+			chat_id BIGINT NOT NULL,
+			message_id BIGINT NOT NULL,
+			direction TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL,
+			deleted_at TIMESTAMPTZ,
+			last_error TEXT NOT NULL DEFAULT '',
+			UNIQUE(chat_id, message_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_private_chat_messages_operator_pending
+			ON private_chat_messages(operator_user_id, id)
+			WHERE deleted_at IS NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_private_chat_messages_created
+			ON private_chat_messages(created_at)`,
 		`CREATE TABLE IF NOT EXISTS broadcast_groups (
 			name TEXT PRIMARY KEY,
 			created_by BIGINT NOT NULL DEFAULT 0,
@@ -720,7 +746,9 @@ func (s *Store) DisableBroadcastOperator(ctx context.Context, userID int64, now 
 }
 
 func (s *Store) ListBroadcastOperators(ctx context.Context) ([]BroadcastOperator, error) {
-	rows, err := s.pool.Query(ctx, `SELECT user_id, status, remark, created_by, created_at, updated_at
+	rows, err := s.pool.Query(ctx, `SELECT user_id, status, remark, created_by,
+			private_cleanup_enabled, private_cleanup_time, private_cleanup_last_run_date,
+			created_at, updated_at
 		FROM broadcast_operators
 		ORDER BY status ASC, updated_at DESC, user_id ASC`)
 	if err != nil {
@@ -730,12 +758,186 @@ func (s *Store) ListBroadcastOperators(ctx context.Context) ([]BroadcastOperator
 	var operators []BroadcastOperator
 	for rows.Next() {
 		var op BroadcastOperator
-		if err := rows.Scan(&op.UserID, &op.Status, &op.Remark, &op.CreatedBy, &op.CreatedAt, &op.UpdatedAt); err != nil {
+		if err := rows.Scan(
+			&op.UserID,
+			&op.Status,
+			&op.Remark,
+			&op.CreatedBy,
+			&op.PrivateCleanupEnabled,
+			&op.PrivateCleanupTime,
+			&op.PrivateCleanupLastRunDate,
+			&op.CreatedAt,
+			&op.UpdatedAt,
+		); err != nil {
 			return nil, err
 		}
 		operators = append(operators, op)
 	}
 	return operators, rows.Err()
+}
+
+func (s *Store) SetBroadcastOperatorPrivateCleanup(ctx context.Context, userID int64, enabled bool, cleanupTime string, lastRunDate string, now time.Time) (bool, error) {
+	cleanupTime = strings.TrimSpace(cleanupTime)
+	if !enabled {
+		cleanupTime = ""
+		lastRunDate = ""
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer rollback(ctx, tx)
+	tag, err := tx.Exec(ctx, `UPDATE broadcast_operators
+		SET private_cleanup_enabled=$1,
+			private_cleanup_time=$2,
+			private_cleanup_last_run_date=$3,
+			updated_at=$4
+		WHERE user_id=$5`,
+		enabled, cleanupTime, strings.TrimSpace(lastRunDate), now, userID)
+	if err != nil {
+		return false, err
+	}
+	if tag.RowsAffected() == 0 {
+		return false, tx.Commit(ctx)
+	}
+	if !enabled {
+		if _, err := tx.Exec(ctx, `UPDATE private_chat_messages
+			SET deleted_at=$1, last_error=''
+			WHERE operator_user_id=$2 AND deleted_at IS NULL`, now, userID); err != nil {
+			return false, err
+		}
+	}
+	return true, tx.Commit(ctx)
+}
+
+func (s *Store) IsPrivateCleanupEnabled(ctx context.Context, userID int64) (bool, error) {
+	row := s.pool.QueryRow(ctx, `SELECT 1
+		FROM broadcast_operators
+		WHERE user_id=$1
+		  AND status='active'
+		  AND private_cleanup_enabled=TRUE
+		  AND private_cleanup_time <> ''
+		LIMIT 1`, userID)
+	var one int
+	err := row.Scan(&one)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func (s *Store) RecordPrivateChatMessage(ctx context.Context, msg PrivateChatMessage) error {
+	if msg.OperatorUserID <= 0 || msg.ChatID <= 0 || msg.MessageID <= 0 {
+		return nil
+	}
+	direction := strings.TrimSpace(msg.Direction)
+	if direction == "" {
+		direction = "unknown"
+	}
+	createdAt := msg.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
+	_, err := s.pool.Exec(ctx, `INSERT INTO private_chat_messages(
+			operator_user_id, chat_id, message_id, direction, created_at
+		) VALUES($1, $2, $3, $4, $5)
+		ON CONFLICT(chat_id, message_id) DO NOTHING`,
+		msg.OperatorUserID, msg.ChatID, msg.MessageID, direction, createdAt)
+	return err
+}
+
+func (s *Store) PurgePrivateChatMessages(ctx context.Context, cutoff time.Time) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM private_chat_messages WHERE deleted_at IS NOT NULL AND deleted_at < $1`, cutoff)
+	return tag.RowsAffected(), err
+}
+
+func (s *Store) ListDuePrivateCleanupTargets(ctx context.Context, nowMinutes int, today string) ([]PrivateCleanupTarget, error) {
+	rows, err := s.pool.Query(ctx, `SELECT user_id, private_cleanup_time
+		FROM broadcast_operators
+		WHERE status='active'
+		  AND private_cleanup_enabled=TRUE
+		  AND private_cleanup_time <> ''
+		  AND private_cleanup_last_run_date <> $1
+		ORDER BY user_id ASC`, strings.TrimSpace(today))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var targets []PrivateCleanupTarget
+	for rows.Next() {
+		var target PrivateCleanupTarget
+		if err := rows.Scan(&target.UserID, &target.CleanupTime); err != nil {
+			return nil, err
+		}
+		minutes, ok := CleanupTimeMinutes(target.CleanupTime)
+		if ok && minutes <= nowMinutes {
+			targets = append(targets, target)
+		}
+	}
+	return targets, rows.Err()
+}
+
+func (s *Store) ListPrivateChatMessagesForCleanup(ctx context.Context, operatorUserID int64, limit int) ([]PrivateChatMessage, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	rows, err := s.pool.Query(ctx, `SELECT id, operator_user_id, chat_id, message_id, direction, created_at, deleted_at, last_error
+		FROM private_chat_messages
+		WHERE operator_user_id=$1 AND deleted_at IS NULL
+		ORDER BY id ASC
+		LIMIT $2`, operatorUserID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var messages []PrivateChatMessage
+	for rows.Next() {
+		var msg PrivateChatMessage
+		if err := rows.Scan(&msg.ID, &msg.OperatorUserID, &msg.ChatID, &msg.MessageID, &msg.Direction, &msg.CreatedAt, &msg.DeletedAt, &msg.LastError); err != nil {
+			return nil, err
+		}
+		messages = append(messages, msg)
+	}
+	return messages, rows.Err()
+}
+
+func (s *Store) MarkPrivateChatMessageCleanup(ctx context.Context, id int64, lastError string, now time.Time) error {
+	_, err := s.pool.Exec(ctx, `UPDATE private_chat_messages
+		SET deleted_at=$1, last_error=$2
+		WHERE id=$3 AND deleted_at IS NULL`, now, trimError(lastError, 500), id)
+	return err
+}
+
+func (s *Store) MarkPrivateCleanupRun(ctx context.Context, userID int64, runDate string, now time.Time) error {
+	_, err := s.pool.Exec(ctx, `UPDATE broadcast_operators
+		SET private_cleanup_last_run_date=$1, updated_at=$2
+		WHERE user_id=$3`, strings.TrimSpace(runDate), now, userID)
+	return err
+}
+
+func CleanupTimeMinutes(value string) (int, bool) {
+	value = strings.TrimSpace(strings.ReplaceAll(value, ".", ":"))
+	parts := strings.Split(value, ":")
+	if len(parts) != 2 {
+		return 0, false
+	}
+	hour, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil || hour < 0 || hour > 23 {
+		return 0, false
+	}
+	minute, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil || minute < 0 || minute > 59 {
+		return 0, false
+	}
+	return hour*60 + minute, true
+}
+
+func trimError(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	if limit <= 0 || len(value) <= limit {
+		return value
+	}
+	return value[:limit]
 }
 
 func (s *Store) CreateAdminLoginTicket(ctx context.Context, tokenHash string, userID int64, role string, expiresAt, now time.Time) error {

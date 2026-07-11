@@ -54,3 +54,51 @@ func TestBroadcastSessionControls(t *testing.T) {
 		t.Fatalf("unexpected keyboard labels: %#v", keyboard.Keyboard[1])
 	}
 }
+
+func TestQuickReplyControlsAndExitState(t *testing.T) {
+	keyboard := quickReplyKeyboard("出款群", true)
+	if len(keyboard.Keyboard) != 2 || len(keyboard.Keyboard[1]) != 3 {
+		t.Fatalf("unexpected quick reply keyboard shape: %#v", keyboard.Keyboard)
+	}
+	if keyboard.Keyboard[0][0].Text != "当前快速回复：出款群" {
+		t.Fatalf("unexpected quick reply target label: %#v", keyboard.Keyboard[0])
+	}
+	if keyboard.Keyboard[1][0].Text != "结束快速回复" || keyboard.Keyboard[1][1].Text != "返回广播" || keyboard.Keyboard[1][2].Text != "取消" {
+		t.Fatalf("unexpected quick reply exit controls: %#v", keyboard.Keyboard[1])
+	}
+	if !keyboard.IsPersistent {
+		t.Fatal("quick reply keyboard should be persistent")
+	}
+	if !isQuickReplyEndText("结束快速回复") || !isQuickReplyEndText("返回广播") || !isQuickReplyEndText("取消") {
+		t.Fatal("quick reply exit text was not recognized")
+	}
+	if !isQuickReplyStatusText("当前快速回复：出款群") {
+		t.Fatal("quick reply status label was not recognized")
+	}
+
+	restored, ok := quickReplyReturnState(privateState{
+		Mode:                   "quick_reply",
+		ReturnMode:             "broadcast",
+		ReturnTargetName:       "出款",
+		ReturnChatIDs:          []int64{-1001, -1002},
+		ReturnNotifyAll:        true,
+		ReturnControlMessageID: 42,
+	})
+	if !ok {
+		t.Fatal("quick reply should restore the previous broadcast state")
+	}
+	if restored.Mode == "quick_reply" || restored.Mode != "broadcast" {
+		t.Fatalf("quick reply exit should leave quick_reply mode, got %q", restored.Mode)
+	}
+	if restored.TargetName != "出款" || len(restored.ChatIDs) != 2 || !restored.NotifyAll || restored.ControlMessageID != 42 {
+		t.Fatalf("unexpected restored state: %+v", restored)
+	}
+	restored.ChatIDs[0] = 999
+	if restored.ReturnChatIDs != nil {
+		t.Fatalf("restored broadcast state should not keep quick reply return fields: %+v", restored)
+	}
+
+	if _, ok := quickReplyReturnState(privateState{Mode: "quick_reply"}); ok {
+		t.Fatal("quick reply without return state should fall back to menu")
+	}
+}

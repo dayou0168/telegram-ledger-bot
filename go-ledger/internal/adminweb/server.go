@@ -128,6 +128,7 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("/admin/group/remove", s.withAuth(s.removeGroupChats))
 	mux.HandleFunc("/admin/operator/save", s.withAuth(s.saveOperator))
 	mux.HandleFunc("/admin/operator/disable", s.withAuth(s.disableOperator))
+	mux.HandleFunc("/admin/operator/cleanup", s.withAuth(s.saveOperatorCleanup))
 	mux.HandleFunc("/admin/permission/grant", s.withAuth(s.grantPermission))
 	mux.HandleFunc("/admin/permission/revoke", s.withAuth(s.revokePermission))
 	mux.HandleFunc("/admin/watch/save", s.withAuth(s.saveWatchTarget))
@@ -550,6 +551,49 @@ func (s *Server) disableOperator(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	redirectMsg(w, r, "操作人已禁用")
+}
+
+func (s *Server) saveOperatorCleanup(w http.ResponseWriter, r *http.Request) {
+	if !requireGlobalAdmin(w, r) {
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	userID, err := strconv.ParseInt(strings.TrimSpace(r.FormValue("user_id")), 10, 64)
+	if err != nil || userID <= 0 {
+		redirectMsg(w, r, "操作人 UID 不正确")
+		return
+	}
+	enabled := r.FormValue("enabled") == "1"
+	cleanupTime, ok := normalizeCleanupTime(r.FormValue("cleanup_time"))
+	if enabled && !ok {
+		redirectMsg(w, r, "清空时间格式不正确，请填写 HH:MM")
+		return
+	}
+	now := time.Now()
+	runDate := ""
+	if enabled {
+		localNow := now.In(privateCleanupLocation())
+		if minutes, _ := storage.CleanupTimeMinutes(cleanupTime); minutes <= localNow.Hour()*60+localNow.Minute() {
+			runDate = localNow.Format("2006-01-02")
+		}
+	}
+	saved, err := s.store.SetBroadcastOperatorPrivateCleanup(r.Context(), userID, enabled, cleanupTime, runDate, now)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !saved {
+		redirectMsg(w, r, "操作人不存在")
+		return
+	}
+	if enabled {
+		redirectMsg(w, r, "私聊自动清空已设置")
+		return
+	}
+	redirectMsg(w, r, "私聊自动清空已关闭")
 }
 
 func (s *Server) grantPermission(w http.ResponseWriter, r *http.Request) {
@@ -1633,6 +1677,22 @@ func normalizeAdminMinAmount(raw string) string {
 	return formatBillRat(value, 2)
 }
 
+func normalizeCleanupTime(raw string) (string, bool) {
+	minutes, ok := storage.CleanupTimeMinutes(raw)
+	if !ok {
+		return "", false
+	}
+	return fmt.Sprintf("%02d:%02d", minutes/60, minutes%60), true
+}
+
+func privateCleanupLocation() *time.Location {
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		return time.FixedZone("Asia/Shanghai", 8*3600)
+	}
+	return loc
+}
+
 var adminTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
 	"chatLabel":            chatLabel,
 	"chatBroadcastGroups":  chatBroadcastGroups,
@@ -1714,9 +1774,9 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 .table-tools{display:flex;gap:8px;align-items:center;margin:8px 0 10px}.table-tools input{flex:1;width:100%}.scroll{max-height:280px;overflow:auto;border:1px solid #dce5ef;border-radius:6px}.scroll.tall{max-height:520px}.scroll table{margin:0;border:0}.scroll th:first-child,.scroll td:first-child{border-left:0}.scroll th:last-child,.scroll td:last-child{border-right:0}.scroll th{position:sticky;top:0;z-index:1}
 .pill{display:inline-block;border:1px solid #d5e1ec;background:#f7fafc;border-radius:999px;padding:3px 9px;color:#40566f}
 .actions{display:flex;gap:8px;flex-wrap:wrap}.mini{height:32px;padding:0 10px}
-.toolbar-forms{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,.45fr);gap:12px;margin-bottom:14px}.inline-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px}.section-title{margin:4px 0 8px;font-size:15px;font-weight:800;color:#243852}.member-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:14px}.member-form{border:1px solid #dce5ef;background:var(--soft);border-radius:8px;padding:12px;min-width:0}.member-form select{width:100%;margin-bottom:8px}.member-form select[multiple]{height:220px;min-height:220px;background:#fff}.group-name-list{max-width:760px;text-align:left;line-height:1.65}.permission-panels{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:14px}.permission-panel{border:1px solid #dce5ef;background:var(--soft);border-radius:8px;padding:12px;min-width:0}.permission-panel form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;align-items:end}.permission-panel .btn{grid-column:1/-1;justify-self:start;min-width:180px}.permission-table td:first-child,.operator-name{text-align:left}.field-label{display:block;margin:0 0 5px;color:var(--muted);font-size:12px;font-weight:700}.field-stack{min-width:0}.field-stack select{width:100%}.field-stack.disabled{opacity:.45}
+.toolbar-forms{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,.45fr);gap:12px;margin-bottom:14px}.inline-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px}.cleanup-form{display:grid;grid-template-columns:82px 82px auto;gap:6px;align-items:center}.cleanup-form select,.cleanup-form input{min-height:32px;height:32px;padding:4px 7px}.section-title{margin:4px 0 8px;font-size:15px;font-weight:800;color:#243852}.member-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:14px}.member-form{border:1px solid #dce5ef;background:var(--soft);border-radius:8px;padding:12px;min-width:0}.member-form select{width:100%;margin-bottom:8px}.member-form select[multiple]{height:220px;min-height:220px;background:#fff}.group-name-list{max-width:760px;text-align:left;line-height:1.65}.permission-panels{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:14px}.permission-panel{border:1px solid #dce5ef;background:var(--soft);border-radius:8px;padding:12px;min-width:0}.permission-panel form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;align-items:end}.permission-panel .btn{grid-column:1/-1;justify-self:start;min-width:180px}.permission-table td:first-child,.operator-name{text-align:left}.field-label{display:block;margin:0 0 5px;color:var(--muted);font-size:12px;font-weight:700}.field-stack{min-width:0}.field-stack select{width:100%}.field-stack.disabled{opacity:.45}
 .watch-panel{max-height:620px;overflow:auto;border:1px solid #dce5ef;border-radius:8px;background:#fff}.watch-panel form{margin:0}.watch-head,.watch-row{display:grid;grid-template-columns:minmax(130px,.7fr) minmax(330px,1.6fr) minmax(150px,.7fr) repeat(3,88px) minmax(110px,.5fr) auto auto;gap:8px;align-items:center}.watch-head{position:sticky;top:0;z-index:1;background:#f4f7fb;font-weight:800;padding:10px;border-bottom:1px solid #dce5ef;text-align:center}.watch-row{padding:10px;border-bottom:1px solid #e7eef6}.watch-row:last-child{border-bottom:0}.watch-row code{word-break:break-all;color:#173f82}.watch-row .owner{font-weight:700}.watch-row .latest{color:var(--muted);font-size:12px}.watch-check{display:flex;gap:5px;align-items:center;justify-content:center}.watch-check input{min-height:auto}.watch-row .btn{height:34px;min-width:64px;padding:0 10px}.watch-empty{border:1px dashed #cbd8e8;border-radius:8px;padding:22px;text-align:center;color:var(--muted);background:var(--soft)}
-@media(max-width:900px){.top{align-items:flex-start;flex-direction:column}.row,.row.two,.toolbar-forms,.member-grid,.permission-panels,.permission-panel form{grid-template-columns:1fr}.watch-head{display:none}.watch-row{grid-template-columns:1fr}.btn{width:100%}}
+@media(max-width:900px){.top{align-items:flex-start;flex-direction:column}.row,.row.two,.toolbar-forms,.member-grid,.permission-panels,.permission-panel form,.cleanup-form{grid-template-columns:1fr}.watch-head{display:none}.watch-row{grid-template-columns:1fr}.btn{width:100%}}
 </style>
 </head>
 <body><main class="wrap">
@@ -1757,8 +1817,8 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 <input name="remark" placeholder="备注，可选">
 <button class="btn" type="submit">保存</button>
 </form>
-<div class="scroll"><table><thead><tr><th>操作人</th><th>授权来源</th><th>授权时间</th><th>状态</th><th>操作</th></tr></thead><tbody>
-{{range .BOperators}}<tr><td>{{operatorLabel .}}</td><td>{{operatorSourceLabel . $.OpLabels}}</td><td>{{adminTime .CreatedAt}}</td><td><span class="pill">{{.Status}}</span></td><td><form method="post" action="/admin/operator/disable"><input type="hidden" name="user_id" value="{{.UserID}}"><button class="btn mini" type="submit">禁用</button></form></td></tr>{{else}}<tr><td colspan="5">暂无广播操作人</td></tr>{{end}}
+<div class="scroll"><table><thead><tr><th>操作人</th><th>授权来源</th><th>授权时间</th><th>私聊清空</th><th>状态</th><th>操作</th></tr></thead><tbody>
+{{range .BOperators}}<tr><td>{{operatorLabel .}}</td><td>{{operatorSourceLabel . $.OpLabels}}</td><td>{{adminTime .CreatedAt}}</td><td><form method="post" action="/admin/operator/cleanup" class="cleanup-form"><input type="hidden" name="user_id" value="{{.UserID}}"><select name="enabled"><option value="0" {{if not .PrivateCleanupEnabled}}selected{{end}}>关闭</option><option value="1" {{if .PrivateCleanupEnabled}}selected{{end}}>开启</option></select><input name="cleanup_time" value="{{.PrivateCleanupTime}}" placeholder="HH:MM"><button class="btn mini" type="submit">保存</button></form></td><td><span class="pill">{{.Status}}</span></td><td><form method="post" action="/admin/operator/disable"><input type="hidden" name="user_id" value="{{.UserID}}"><button class="btn mini" type="submit">禁用</button></form></td></tr>{{else}}<tr><td colspan="6">暂无广播操作人</td></tr>{{end}}
 </tbody></table></div>
 </div>
 

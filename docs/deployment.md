@@ -1,11 +1,11 @@
-# Telegram 记账机器人 Go v2.3.2 部署运维
+# Telegram 记账机器人 Go v2.3.3 部署运维
 
-当前发布目标是 Go v2.3.2。生产部署使用 GHCR 预构建镜像、PostgreSQL 和共享链上监听服务 `ledger-chain-watcher`。服务器上不需要源码构建作为默认路径。
+当前发布目标是 Go v2.3.3。生产部署使用 GHCR 预构建镜像、PostgreSQL 和共享链上监听服务 `ledger-chain-watcher`。服务器上不需要源码构建作为默认路径。
 
 ## 部署基线
 
-- 机器人镜像：`ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.2`
-- watcher 镜像：`ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.2`
+- 机器人镜像：`ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.3`
+- watcher 镜像：`ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.3`
 - 数据库：每个机器人实例独立 PostgreSQL 16
 - 链上监听：多个机器人共享 `ledger-chain-watcher`，watcher 使用独立 PostgreSQL 保存订阅、匹配事件和投递游标
 - 推荐入口：宝塔 Docker Compose
@@ -240,14 +240,14 @@ BOT_TIMEZONE=Asia/Shanghai
 BOT_REQUEST_TIMEOUT=70
 ```
 
-下载 v2.3.2 发布包并安装二进制到固定路径：
+下载 v2.3.3 发布包并安装二进制到固定路径：
 
 ```bash
 cd /tmp
-wget -O ledger-chain-watcher-v2.3.2-linux-amd64.tar.gz \
-  https://github.com/dayou0168/telegram-ledger-bot/releases/download/v2.3.2/ledger-chain-watcher-v2.3.2-linux-amd64.tar.gz
-tar -xzf ledger-chain-watcher-v2.3.2-linux-amd64.tar.gz
-install -m 0755 ledger-chain-watcher-v2.3.2-linux-amd64/ledger-chain-watcher /usr/local/bin/ledger-chain-watcher
+wget -O ledger-chain-watcher-v2.3.3-linux-amd64.tar.gz \
+  https://github.com/dayou0168/telegram-ledger-bot/releases/download/v2.3.3/ledger-chain-watcher-v2.3.3-linux-amd64.tar.gz
+tar -xzf ledger-chain-watcher-v2.3.3-linux-amd64.tar.gz
+install -m 0755 ledger-chain-watcher-v2.3.3-linux-amd64/ledger-chain-watcher /usr/local/bin/ledger-chain-watcher
 /usr/local/bin/ledger-chain-watcher --help
 ```
 
@@ -334,7 +334,7 @@ journalctl -u ledger-chain-watcher -f
 ```text
 ledger-chain-watcher        共享链上监听服务和 watcher PostgreSQL
 ledger-main                 当前记账机器人实例
-ledger-ops                  第二个独立 Go v2.3.2 机器人实例
+ledger-ops                  第二个独立 Go v2.3.3 机器人实例
 ```
 
 先创建共享 Docker 网络：
@@ -447,7 +447,7 @@ ports:
 
 ## 未来接 TRON Lite FullNode + Kafka
 
-v2.3.2 第一版 watcher 统一请求 Tronscan/TronGrid。未来切换自建节点时，机器人配置不变，只调整 watcher：
+v2.3.3 第一版 watcher 统一请求 Tronscan/TronGrid。未来切换自建节点时，机器人配置不变，只调整 watcher：
 
 ```yaml
 CHAIN_WATCHER_SOURCE: "kafka"

@@ -140,6 +140,24 @@ func TestLoginTemplateExplainsInvalidShortcutCanUsePassword(t *testing.T) {
 	}
 }
 
+func TestNormalizeCleanupTime(t *testing.T) {
+	for raw, want := range map[string]string{
+		"8:05":  "08:05",
+		"08.05": "08:05",
+		"23:59": "23:59",
+	} {
+		got, ok := normalizeCleanupTime(raw)
+		if !ok || got != want {
+			t.Fatalf("normalizeCleanupTime(%q) = %q, %v; want %q, true", raw, got, ok, want)
+		}
+	}
+	for _, raw := range []string{"24:00", "12:60", "1200", "abc"} {
+		if got, ok := normalizeCleanupTime(raw); ok {
+			t.Fatalf("normalizeCleanupTime(%q) = %q, true; want invalid", raw, got)
+		}
+	}
+}
+
 func TestAdminTemplateRendersSearchableTallSavedGroups(t *testing.T) {
 	var buf bytes.Buffer
 	err := adminTemplate.Execute(&buf, pageData{
@@ -184,10 +202,12 @@ func TestAdminTemplateRendersReadableBroadcastManagement(t *testing.T) {
 		},
 		BGroups: []storage.BroadcastGroup{{Name: "出款", ChatIDs: []int64{-1001}, ChatNames: []string{"出款群"}}},
 		BOperators: []storage.BroadcastOperator{{
-			UserID:    7611260151,
-			Status:    "active",
-			Remark:    "柚子",
-			CreatedAt: time.Date(2026, 7, 6, 15, 0, 0, 0, time.UTC),
+			UserID:                7611260151,
+			Status:                "active",
+			Remark:                "柚子",
+			PrivateCleanupEnabled: true,
+			PrivateCleanupTime:    "08:30",
+			CreatedAt:             time.Date(2026, 7, 6, 15, 0, 0, 0, time.UTC),
 		}, {
 			UserID:    8453656635,
 			Status:    "active",
@@ -233,6 +253,10 @@ func TestAdminTemplateRendersReadableBroadcastManagement(t *testing.T) {
 		`class="permission-panels"`,
 		`授权广播目标`,
 		`取消广播权限`,
+		`私聊清空`,
+		`action="/admin/operator/cleanup"`,
+		`class="cleanup-form"`,
+		`value="08:30"`,
 		`data-mode="add"`,
 		`data-mode="remove"`,
 		`class="member-group-select"`,

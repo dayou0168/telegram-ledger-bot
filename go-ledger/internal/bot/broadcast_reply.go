@@ -60,26 +60,39 @@ func (b *Bot) handleBroadcastReplyCallback(ctx context.Context, cb telegram.Call
 	if !ok || delivery.OperatorUserID != cb.From.ID {
 		return b.tg.AnswerCallback(ctx, cb.ID, "通知已失效")
 	}
-	b.privateStates.Set(formatID(cb.From.ID), privateState{
+	quickState := privateState{
 		Mode:                 "quick_reply",
 		TargetName:           delivery.TargetTitle,
 		QuickReplyTargetChat: delivery.TargetChatID,
 		QuickReplyMessageID:  delivery.TargetMessageID,
 		CreatedAt:            time.Now().In(b.loc),
-	})
+	}
+	if current, ok := b.privateStates.Get(formatID(cb.From.ID)); ok && current.Mode != "quick_reply" && len(current.ChatIDs) > 0 {
+		quickState.ReturnMode = current.Mode
+		quickState.ReturnTargetName = current.TargetName
+		quickState.ReturnChatIDs = append([]int64(nil), current.ChatIDs...)
+		quickState.ReturnNotifyAll = current.NotifyAll
+		quickState.ReturnControlMessageID = current.ControlMessageID
+	}
+	b.privateStates.Set(formatID(cb.From.ID), quickState)
 	if err := b.tg.AnswerCallback(ctx, cb.ID, "请发送回复内容"); err != nil {
 		return err
 	}
 	if cb.Message == nil {
 		return nil
 	}
-	return b.enqueueReplyText(ctx, sendPriorityNormal, "quick_reply_prompt", cb.Message.Chat.ID, cb.Message.MessageID, "请直接发送要回复的内容；文字、图片或文件都会复制到目标群。发“返回”结束快速回复。", nil, time.Now().In(b.loc))
+	return b.enqueueReplyText(ctx, sendPriorityNormal, "quick_reply_prompt", cb.Message.Chat.ID, cb.Message.MessageID, "快速回复已开启。请直接发送要回复的内容；文字、图片或文件都会复制到目标群。底部按钮可结束快速回复。", map[string]any{
+		"reply_markup": quickReplyKeyboard(delivery.TargetTitle, quickState.ReturnMode != ""),
+	}, time.Now().In(b.loc))
 }
 
 func (b *Bot) handleQuickReplyMaterial(ctx context.Context, msg telegram.Message, user storage.User, state privateState) error {
-	if msg.Text == "菜单" || msg.Text == "/start" || msg.Text == "返回" || msg.Text == "取消" {
-		b.privateStates.Delete(formatID(user.ID))
-		return b.sendPrivateMenu(ctx, msg.Chat.ID, msg.MessageID)
+	if isQuickReplyStatusText(msg.Text) {
+		b.deleteMessageBestEffort(ctx, msg.Chat.ID, msg.MessageID)
+		return nil
+	}
+	if isQuickReplyEndText(msg.Text) || msg.Text == "菜单" || msg.Text == "/start" {
+		return b.exitQuickReply(ctx, msg, user, state)
 	}
 	targetChatID := state.QuickReplyTargetChat
 	replyTo := state.QuickReplyMessageID
@@ -95,6 +108,65 @@ func (b *Bot) handleQuickReplyMaterial(ctx context.Context, msg telegram.Message
 		}
 	})
 	return nil
+}
+
+func (b *Bot) exitQuickReply(ctx context.Context, msg telegram.Message, user storage.User, state privateState) error {
+	b.deleteMessageBestEffort(ctx, msg.Chat.ID, msg.MessageID)
+	if restored, ok := quickReplyReturnState(state); ok {
+		b.privateStates.Set(formatID(user.ID), restored)
+		_, err := b.sendText(ctx, sendPriorityNormal, msg.Chat.ID, formatBroadcastReadyText(restored.TargetName, len(restored.ChatIDs), restored.NotifyAll), map[string]any{
+			"reply_markup": broadcastSessionKeyboard(restored.TargetName, restored.NotifyAll),
+		})
+		return err
+	}
+	b.privateStates.Delete(formatID(user.ID))
+	return b.sendPrivateMenu(ctx, msg.Chat.ID, msg.MessageID)
+}
+
+func quickReplyReturnState(state privateState) (privateState, bool) {
+	if state.ReturnMode == "" || len(state.ReturnChatIDs) == 0 {
+		return privateState{}, false
+	}
+	return privateState{
+		Mode:             state.ReturnMode,
+		TargetName:       state.ReturnTargetName,
+		ChatIDs:          append([]int64(nil), state.ReturnChatIDs...),
+		NotifyAll:        state.ReturnNotifyAll,
+		ControlMessageID: state.ReturnControlMessageID,
+		CreatedAt:        time.Now(),
+	}, true
+}
+
+func quickReplyKeyboard(targetName string, canReturnBroadcast bool) telegram.ReplyKeyboardMarkup {
+	targetLabel := "当前快速回复：" + strings.TrimSpace(targetName)
+	if strings.TrimSpace(targetName) == "" {
+		targetLabel = "当前快速回复：未命名群"
+	}
+	second := []telegram.KeyboardButton{{Text: "结束快速回复"}, {Text: "取消"}}
+	if canReturnBroadcast {
+		second = []telegram.KeyboardButton{{Text: "结束快速回复"}, {Text: "返回广播"}, {Text: "取消"}}
+	}
+	return telegram.ReplyKeyboardMarkup{
+		Keyboard: [][]telegram.KeyboardButton{
+			{{Text: targetLabel}},
+			second,
+		},
+		IsPersistent:   true,
+		ResizeKeyboard: true,
+	}
+}
+
+func isQuickReplyStatusText(text string) bool {
+	return strings.HasPrefix(strings.TrimSpace(text), "当前快速回复：")
+}
+
+func isQuickReplyEndText(text string) bool {
+	switch strings.TrimSpace(text) {
+	case "结束快速回复", "取消快速回复", "退出快速回复", "返回广播", "取消", "返回":
+		return true
+	default:
+		return false
+	}
 }
 
 func (b *Bot) findBroadcastDeliveryByID(ctx context.Context, id int64) (storage.BroadcastDelivery, bool, error) {

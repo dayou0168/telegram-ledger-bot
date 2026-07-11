@@ -39,12 +39,15 @@ type BroadcastGroup struct {
 }
 
 type BroadcastOperator struct {
-	UserID    int64
-	Status    string
-	Remark    string
-	CreatedBy int64
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	UserID                    int64
+	Status                    string
+	Remark                    string
+	CreatedBy                 int64
+	PrivateCleanupEnabled     bool
+	PrivateCleanupTime        string
+	PrivateCleanupLastRunDate string
+	CreatedAt                 time.Time
+	UpdatedAt                 time.Time
 }
 
 type BroadcastPermission struct {
@@ -76,6 +79,22 @@ type BroadcastReplaceSetting struct {
 	ImageName string
 	ImageData []byte
 	UpdatedAt time.Time
+}
+
+type PrivateChatMessage struct {
+	ID             int64
+	OperatorUserID int64
+	ChatID         int64
+	MessageID      int64
+	Direction      string
+	CreatedAt      time.Time
+	DeletedAt      *time.Time
+	LastError      string
+}
+
+type PrivateCleanupTarget struct {
+	UserID      int64
+	CleanupTime string
 }
 
 type Record struct {

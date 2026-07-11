@@ -152,15 +152,22 @@ func cloneSendOptions(opts map[string]any) map[string]any {
 }
 
 func (b *Bot) sendText(ctx context.Context, priority sendPriority, chatID int64, text string, opts map[string]any) (telegram.Message, error) {
+	var msg telegram.Message
+	var err error
 	if b.textGateway != nil {
-		return b.textGateway.Send(ctx, priority, chatID, text, opts)
-	}
-	if b.telegramLimiter != nil {
-		if err := b.telegramLimiter.Wait(ctx, chatID); err != nil {
-			return telegram.Message{}, err
+		msg, err = b.textGateway.Send(ctx, priority, chatID, text, opts)
+	} else {
+		if b.telegramLimiter != nil {
+			if err := b.telegramLimiter.Wait(ctx, chatID); err != nil {
+				return telegram.Message{}, err
+			}
 		}
+		msg, err = b.tg.SendMessage(ctx, chatID, text, opts)
 	}
-	return b.tg.SendMessage(ctx, chatID, text, opts)
+	if err == nil {
+		b.recordOutgoingPrivateChatMessage(ctx, msg, "outgoing")
+	}
+	return msg, err
 }
 
 func (b *Bot) copyMessage(ctx context.Context, chatID, fromChatID, messageID int64, opts map[string]any) (telegram.Message, error) {
@@ -174,7 +181,10 @@ func (b *Bot) copyMessage(ctx context.Context, chatID, fromChatID, messageID int
 		if err := b.waitTelegramSlot(ctx, chatID); err != nil {
 			return telegram.Message{}, err
 		}
-		return b.tg.CopyMessage(ctx, chatID, fromChatID, messageID, cloneSendOptions(opts))
+		msg, err = b.tg.CopyMessage(ctx, chatID, fromChatID, messageID, cloneSendOptions(opts))
+	}
+	if err == nil {
+		b.recordOutgoingPrivateChatMessage(ctx, msg, "outgoing_copy")
 	}
 	return msg, err
 }
@@ -222,7 +232,10 @@ func (b *Bot) sendPhotoBytes(ctx context.Context, chatID int64, filename string,
 		if err := b.waitTelegramSlot(ctx, chatID); err != nil {
 			return telegram.Message{}, err
 		}
-		return b.tg.SendPhotoBytes(ctx, chatID, filename, data, caption, cloneSendOptions(opts))
+		msg, err = b.tg.SendPhotoBytes(ctx, chatID, filename, data, caption, cloneSendOptions(opts))
+	}
+	if err == nil {
+		b.recordOutgoingPrivateChatMessage(ctx, msg, "outgoing_photo")
 	}
 	return msg, err
 }

@@ -153,6 +153,97 @@ func TestPostgresStoreBasicFlow(t *testing.T) {
 		t.Fatal("expired admin login ticket should not be valid")
 	}
 
+	if err := store.UpsertBroadcastOperator(ctx, userID, 0, "cleanup operator", now); err != nil {
+		t.Fatalf("upsert broadcast operator: %v", err)
+	}
+	cleanupMinutes := now.In(time.FixedZone("Asia/Shanghai", 8*3600)).Hour()*60 + now.In(time.FixedZone("Asia/Shanghai", 8*3600)).Minute()
+	cleanupTime := time.Date(2000, 1, 1, cleanupMinutes/60, cleanupMinutes%60, 0, 0, time.UTC).Format("15:04")
+	saved, err := store.SetBroadcastOperatorPrivateCleanup(ctx, userID, true, cleanupTime, "", now)
+	if err != nil {
+		t.Fatalf("set private cleanup: %v", err)
+	}
+	if !saved {
+		t.Fatal("private cleanup setting should save")
+	}
+	if err := store.RecordPrivateChatMessage(ctx, PrivateChatMessage{
+		OperatorUserID: userID,
+		ChatID:         userID,
+		MessageID:      81001,
+		Direction:      "incoming",
+		CreatedAt:      now,
+	}); err != nil {
+		t.Fatalf("record incoming private chat message: %v", err)
+	}
+	if err := store.RecordPrivateChatMessage(ctx, PrivateChatMessage{
+		OperatorUserID: userID,
+		ChatID:         userID,
+		MessageID:      81002,
+		Direction:      "outgoing",
+		CreatedAt:      now,
+	}); err != nil {
+		t.Fatalf("record outgoing private chat message: %v", err)
+	}
+	privateMessages, err := store.ListPrivateChatMessagesForCleanup(ctx, userID, 10)
+	if err != nil {
+		t.Fatalf("list private cleanup messages: %v", err)
+	}
+	if len(privateMessages) != 2 {
+		t.Fatalf("private cleanup message count = %d, want 2", len(privateMessages))
+	}
+	for _, privateMessage := range privateMessages {
+		if privateMessage.Direction == "" || privateMessage.LastError != "" {
+			t.Fatalf("unexpected private message metadata: %+v", privateMessage)
+		}
+	}
+	cleanupTargets, err := store.ListDuePrivateCleanupTargets(ctx, cleanupMinutes, "1999-01-01")
+	if err != nil {
+		t.Fatalf("list due private cleanup targets: %v", err)
+	}
+	foundCleanupTarget := false
+	for _, target := range cleanupTargets {
+		if target.UserID == userID {
+			foundCleanupTarget = true
+		}
+	}
+	if !foundCleanupTarget {
+		t.Fatal("private cleanup target should be due")
+	}
+	deliveryID, err := store.InsertBroadcastDelivery(ctx, BroadcastDelivery{
+		OperatorUserID:  userID,
+		SourceChatID:    userID,
+		SourceMessageID: 91001,
+		TargetChatID:    chatID,
+		TargetTitle:     "Go v2.3 test group",
+		TargetMessageID: 91002,
+		Mode:            "chat",
+		TargetName:      "Go v2.3 test group",
+		CreatedAt:       now,
+	})
+	if err != nil {
+		t.Fatalf("insert broadcast delivery before cleanup: %v", err)
+	}
+	if err := store.MarkPrivateChatMessageCleanup(ctx, privateMessages[0].ID, "", now); err != nil {
+		t.Fatalf("mark private cleanup success: %v", err)
+	}
+	if err := store.MarkPrivateChatMessageCleanup(ctx, privateMessages[1].ID, "delete failed", now); err != nil {
+		t.Fatalf("mark private cleanup failure: %v", err)
+	}
+	if err := store.MarkPrivateCleanupRun(ctx, userID, "1999-01-01", now); err != nil {
+		t.Fatalf("mark private cleanup run: %v", err)
+	}
+	privateMessages, err = store.ListPrivateChatMessagesForCleanup(ctx, userID, 10)
+	if err != nil {
+		t.Fatalf("list private cleanup messages after mark: %v", err)
+	}
+	if len(privateMessages) != 0 {
+		t.Fatalf("private cleanup messages should not be retried, got %d", len(privateMessages))
+	}
+	if _, ok, err := store.GetBroadcastDelivery(ctx, deliveryID); err != nil {
+		t.Fatalf("get broadcast delivery after private cleanup: %v", err)
+	} else if !ok {
+		t.Fatal("private cleanup should not delete broadcast deliveries")
+	}
+
 	inserted, err := store.RecordChainNotification(ctx, userID, address, "txhash-"+time.Now().Format("150405.000000000"), "income", now.UnixMilli(), now)
 	if err != nil {
 		t.Fatalf("record chain notification: %v", err)

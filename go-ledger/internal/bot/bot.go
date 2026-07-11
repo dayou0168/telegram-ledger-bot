@@ -109,6 +109,7 @@ func (b *Bot) Run(ctx context.Context) error {
 		go b.addressWatchScheduler(ctx)
 	}
 	go b.notificationOutboxScheduler(ctx)
+	go b.privateCleanupScheduler(ctx)
 	go b.rateScheduler(ctx)
 
 	var offset int64
@@ -285,6 +286,7 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg telegram.Message, us
 	if err := b.store.TouchUser(ctx, msg.Chat.ID, user, now); err != nil {
 		return err
 	}
+	b.recordIncomingPrivateChatMessage(ctx, msg, user, now)
 	if msg.UsersShared != nil {
 		return b.handleUsersShared(ctx, msg)
 	}
