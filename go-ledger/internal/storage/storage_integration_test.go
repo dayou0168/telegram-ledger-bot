@@ -59,6 +59,13 @@ func TestPostgresStoreBasicFlow(t *testing.T) {
 	if !ok {
 		t.Fatalf("owner should also be operator")
 	}
+	ok, err = store.IsAnyOperator(ctx, userID)
+	if err != nil {
+		t.Fatalf("is any operator: %v", err)
+	}
+	if !ok {
+		t.Fatalf("owner should be found by any-operator lookup")
+	}
 
 	group, err := store.GetGroup(ctx, chatID)
 	if err != nil {
@@ -120,19 +127,30 @@ func TestPostgresStoreBasicFlow(t *testing.T) {
 	if err := store.CreateAdminLoginTicket(ctx, tokenHash, userID, "operator", now.Add(time.Minute), now); err != nil {
 		t.Fatalf("create admin login ticket: %v", err)
 	}
-	ticket, ok, err := store.ConsumeAdminLoginTicket(ctx, tokenHash, now)
+	ticket, ok, err := store.GetAdminLoginTicket(ctx, tokenHash, now)
 	if err != nil {
-		t.Fatalf("consume admin login ticket: %v", err)
+		t.Fatalf("get admin login ticket: %v", err)
 	}
 	if !ok || ticket.UserID != userID || ticket.Role != "operator" {
 		t.Fatalf("unexpected admin ticket: ok=%v ticket=%+v", ok, ticket)
 	}
-	_, ok, err = store.ConsumeAdminLoginTicket(ctx, tokenHash, now)
+	_, ok, err = store.GetAdminLoginTicket(ctx, tokenHash, now)
 	if err != nil {
-		t.Fatalf("consume used admin login ticket: %v", err)
+		t.Fatalf("get admin login ticket again: %v", err)
+	}
+	if !ok {
+		t.Fatal("admin login ticket should remain valid during its short TTL")
+	}
+	expiredTokenHash := tokenHash + "-expired"
+	if err := store.CreateAdminLoginTicket(ctx, expiredTokenHash, userID, "operator", now.Add(-time.Minute), now.Add(-2*time.Minute)); err != nil {
+		t.Fatalf("create expired admin login ticket: %v", err)
+	}
+	_, ok, err = store.GetAdminLoginTicket(ctx, expiredTokenHash, now)
+	if err != nil {
+		t.Fatalf("get expired admin login ticket: %v", err)
 	}
 	if ok {
-		t.Fatal("admin login ticket should be single use")
+		t.Fatal("expired admin login ticket should not be valid")
 	}
 
 	inserted, err := store.RecordChainNotification(ctx, userID, address, "txhash-"+time.Now().Format("150405.000000000"), "income", now.UnixMilli(), now)

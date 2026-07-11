@@ -377,7 +377,11 @@ func (b *Bot) handleMyChatMember(ctx context.Context, upd telegram.ChatMemberUpd
 	}
 	switch upd.NewChatMember.Status {
 	case "member", "administrator", "restricted":
-		if !b.canInvite(upd.From.ID) {
+		canInvite, err := b.canInvite(ctx, upd.From.ID)
+		if err != nil {
+			return err
+		}
+		if !canInvite {
 			_, _ = b.sendText(ctx, sendPriorityNormal, upd.Chat.ID, "邀请人没有授权，机器人将自动退出。", nil)
 			return b.tg.LeaveChat(ctx, upd.Chat.ID)
 		}
@@ -457,8 +461,25 @@ func (b *Bot) touchUserCached(ctx context.Context, chatID int64, user storage.Us
 	return nil
 }
 
-func (b *Bot) canInvite(userID int64) bool {
-	return b.perms.CanInviteBot(userID)
+func (b *Bot) canInvite(ctx context.Context, userID int64) (bool, error) {
+	if userID == 0 {
+		return false, nil
+	}
+	if b.perms.CanInviteBot(userID, permissions.UserCapabilities{}) {
+		return true, nil
+	}
+	ledgerOperator, err := b.store.IsAnyOperator(ctx, userID)
+	if err != nil {
+		return false, err
+	}
+	broadcastOperator, err := b.store.IsBroadcastOperator(ctx, userID)
+	if err != nil {
+		return false, err
+	}
+	return b.perms.CanInviteBot(userID, permissions.UserCapabilities{
+		LedgerOperator:    ledgerOperator,
+		BroadcastOperator: broadcastOperator,
+	}), nil
 }
 
 func (b *Bot) isHost(userID int64) bool {

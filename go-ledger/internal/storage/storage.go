@@ -756,6 +756,18 @@ func (s *Store) CreateAdminLoginTicket(ctx context.Context, tokenHash string, us
 	return err
 }
 
+func (s *Store) GetAdminLoginTicket(ctx context.Context, tokenHash string, now time.Time) (AdminLoginTicket, bool, error) {
+	row := s.pool.QueryRow(ctx, `SELECT token_hash, user_id, role, expires_at, used_at, created_at
+		FROM admin_login_tickets
+		WHERE token_hash=$1 AND expires_at > $2`, strings.TrimSpace(tokenHash), now)
+	var ticket AdminLoginTicket
+	err := row.Scan(&ticket.TokenHash, &ticket.UserID, &ticket.Role, &ticket.ExpiresAt, &ticket.UsedAt, &ticket.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return AdminLoginTicket{}, false, nil
+	}
+	return ticket, err == nil, err
+}
+
 func (s *Store) ConsumeAdminLoginTicket(ctx context.Context, tokenHash string, now time.Time) (AdminLoginTicket, bool, error) {
 	row := s.pool.QueryRow(ctx, `UPDATE admin_login_tickets
 		SET used_at=$2

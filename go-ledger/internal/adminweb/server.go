@@ -300,13 +300,13 @@ func (s *Server) loginWithTicket(w http.ResponseWriter, r *http.Request, ticket 
 		renderLogin(w, true, "未配置 ADMIN_WEB_TOKEN，无法创建后台会话")
 		return
 	}
-	item, ok, err := s.store.ConsumeAdminLoginTicket(r.Context(), adminauth.HashToken(ticket), now)
+	item, ok, err := s.store.GetAdminLoginTicket(r.Context(), adminauth.HashToken(ticket), now)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	if !ok || !adminauth.IsAllowedRole(item.Role) {
-		renderLogin(w, s.cfg.AdminWebToken == "", "后台登录链接无效或已过期")
+		renderLogin(w, s.cfg.AdminWebToken == "", "快捷登录链接无效或已过期，请输入后台密码登录")
 		return
 	}
 	if ok, err := s.adminSessionAllowed(r.Context(), adminauth.Session{UserID: item.UserID, Role: item.Role, ExpiresAt: item.ExpiresAt}); err != nil {

@@ -24,11 +24,12 @@ func TestPolicyPrivilegedUsers(t *testing.T) {
 		t.Fatal("zero user id should never be a default operator")
 	}
 }
+
 func TestPolicyGlobalCapabilitiesUsePrivilegedUsers(t *testing.T) {
 	p := NewPolicy(1001, map[int64]struct{}{2002: {}})
 
 	for _, userID := range []int64{1001, 2002} {
-		if !p.CanInviteBot(userID) {
+		if !p.CanInviteBot(userID, UserCapabilities{}) {
 			t.Fatalf("%d should be allowed to invite bot", userID)
 		}
 		if !p.HasGlobalLedgerAccess(userID) {
@@ -45,9 +46,29 @@ func TestPolicyGlobalCapabilitiesUsePrivilegedUsers(t *testing.T) {
 		}
 	}
 
-	if p.CanInviteBot(3003) || p.HasGlobalLedgerAccess(3003) ||
+	if p.CanInviteBot(3003, UserCapabilities{}) || p.HasGlobalLedgerAccess(3003) ||
 		p.HasGlobalBroadcastAccess(3003) || p.HasGlobalAddressWatchAccess(3003) ||
 		p.CanManageAnyGroup(3003) {
 		t.Fatal("ordinary user should not receive global capabilities")
+	}
+}
+
+func TestPolicyCanInviteBotUsesLocalOperatorCapabilities(t *testing.T) {
+	p := NewPolicy(1001, map[int64]struct{}{2002: {}})
+
+	if !p.CanInviteBot(3003, UserCapabilities{LedgerOperator: true}) {
+		t.Fatal("ledger operator should be allowed to invite bot")
+	}
+	if !p.CanInviteBot(4004, UserCapabilities{BroadcastOperator: true}) {
+		t.Fatal("broadcast operator should be allowed to invite bot")
+	}
+	if !p.CanInviteBot(1001, UserCapabilities{}) {
+		t.Fatal("host should be allowed to invite bot")
+	}
+	if !p.CanInviteBot(2002, UserCapabilities{}) {
+		t.Fatal("default operator should be allowed to invite bot")
+	}
+	if p.CanInviteBot(5005, UserCapabilities{}) {
+		t.Fatal("ordinary user without local capabilities should not invite bot")
 	}
 }

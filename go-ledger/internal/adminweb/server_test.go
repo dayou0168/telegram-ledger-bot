@@ -2,6 +2,7 @@ package adminweb
 
 import (
 	"bytes"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -124,6 +125,18 @@ func TestAdminSessionSecretRequiresAdminWebToken(t *testing.T) {
 	withToken := &Server{cfg: config.Config{AdminWebToken: " admin-secret "}}
 	if got := withToken.adminSessionSecret(); got != "admin-secret" {
 		t.Fatalf("admin session secret = %q, want trimmed ADMIN_WEB_TOKEN", got)
+	}
+}
+
+func TestLoginTemplateExplainsInvalidShortcutCanUsePassword(t *testing.T) {
+	rec := httptest.NewRecorder()
+	renderLogin(rec, false, "快捷登录链接无效或已过期，请输入后台密码登录")
+	html := rec.Body.String()
+	if !strings.Contains(html, "快捷登录链接无效或已过期，请输入后台密码登录") {
+		t.Fatal("login page should explain invalid shortcut login can fall back to password")
+	}
+	if !strings.Contains(html, `name="password"`) || !strings.Contains(html, "进入后台") {
+		t.Fatal("login page should keep password login available")
 	}
 }
 

@@ -5,6 +5,11 @@ type Policy struct {
 	DefaultOperatorIDs map[int64]struct{}
 }
 
+type UserCapabilities struct {
+	LedgerOperator    bool
+	BroadcastOperator bool
+}
+
 func NewPolicy(hostUserID int64, defaultOperatorIDs map[int64]struct{}) Policy {
 	ids := make(map[int64]struct{}, len(defaultOperatorIDs))
 	for id := range defaultOperatorIDs {
@@ -47,8 +52,8 @@ func (p Policy) PrivilegedUserIDs() []int64 {
 	return ids
 }
 
-func (p Policy) CanInviteBot(userID int64) bool {
-	return p.IsPrivileged(userID)
+func (p Policy) CanInviteBot(userID int64, caps UserCapabilities) bool {
+	return p.IsPrivileged(userID) || caps.LedgerOperator || caps.BroadcastOperator
 }
 
 func (p Policy) HasGlobalLedgerAccess(userID int64) bool {
