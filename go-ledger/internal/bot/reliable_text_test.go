@@ -22,3 +22,15 @@ func TestWithoutReplyOptionsStripsReplyFields(t *testing.T) {
 		t.Fatal("withoutReplyOptions should not mutate original opts")
 	}
 }
+
+func TestReliableTextOutboxItemKeepsReplyForTraceMessages(t *testing.T) {
+	item, err := reliableTextOutboxItem(sendPriorityNormal, "ledger_error", "ledger_error:-100:99", -100, "错误", map[string]any{
+		"reply_to_message_id": 99,
+	}, reliableMessageRef{})
+	if err != nil {
+		t.Fatalf("reliableTextOutboxItem() error = %v", err)
+	}
+	if item.ReplyToMessageID != 99 {
+		t.Fatalf("ReplyToMessageID = %d, want 99", item.ReplyToMessageID)
+	}
+}

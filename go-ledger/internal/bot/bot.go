@@ -46,6 +46,7 @@ type Bot struct {
 	operatorCache    *ttlCache[bool]
 	watchTargetCache *ttlCache[[]storage.WatchTarget]
 	rateBookCache    *ttlCache[[]p2p.OrderBookEntry]
+	rateBookState    rateBookState
 	privateStates    *ttlCache[privateState]
 	notificationWake chan struct{}
 	telegramLimiter  *telegramRateLimiter

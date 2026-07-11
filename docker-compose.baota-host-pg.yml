@@ -1,9 +1,11 @@
-﻿# Telegram 记账机器人 Go v2.3.7 + 宝塔宿主机 PostgreSQL
+﻿# Telegram 记账机器人 Go v2.3.8 + 宝塔宿主机 PostgreSQL
 #
 # 适用场景：
 # - PostgreSQL 已经在宿主机/宝塔里安装好。
 # - Docker Compose 里只运行 ledger-chain-watcher 和 ledger-bot。
 # - 不创建 PostgreSQL 容器，也不创建数据库 volume。
+# - 默认使用 Docker json-file 日志上限 max-size=20m/max-file=5，单容器约 100MB。
+#   Docker json-file 不能严格按时间保留 72 小时；这里用大小上限近似最近日志并防止撑爆硬盘。
 #
 # 宝塔 PostgreSQL 数据库名建议：
 # - watcher 数据库：ledgerchainwatcher
@@ -13,9 +15,14 @@
 
 services:
   ledger-chain-watcher:
-    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.7
+    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.8
     container_name: ledger-chain-watcher
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
@@ -65,9 +72,14 @@ services:
       retries: 10
 
   ledger-bot:
-    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.7
+    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.8
     container_name: ledger-bot-go
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
     depends_on:
       ledger-chain-watcher:
         condition: service_healthy

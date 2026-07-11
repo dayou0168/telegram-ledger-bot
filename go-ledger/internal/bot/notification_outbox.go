@@ -97,7 +97,9 @@ func (b *Bot) drainNotificationOutbox(ctx context.Context) {
 }
 
 func (b *Bot) sendOutboxNotification(ctx context.Context, item storage.NotificationOutbox) {
+	renderStarted := time.Now()
 	text, opts, err := b.renderOutboxMessage(ctx, item)
+	renderDuration := time.Since(renderStarted)
 	if err != nil {
 		now := time.Now().In(b.loc)
 		if markErr := b.store.MarkNotificationFailed(ctx, item.ID, err.Error(), now.Add(notificationRetryDelay(item.Attempts, err)), now); markErr != nil {
@@ -105,7 +107,11 @@ func (b *Bot) sendOutboxNotification(ctx context.Context, item storage.Notificat
 		}
 		return
 	}
-	message, err := b.sendText(ctx, outboxSendPriority(item.Priority), item.ChatID, text, opts)
+	priority := outboxSendPriority(item.Priority)
+	message, err, sendMetrics := b.sendOutboxText(ctx, priority, item.ChatID, text, opts)
+	if item.Kind == "chain" {
+		logChainOutboxSendTiming(item, priority, renderDuration, sendMetrics, err)
+	}
 	now := time.Now().In(b.loc)
 	if err == nil {
 		if err := b.store.MarkNotificationSent(ctx, item.ID, message.MessageID, now); err != nil {
@@ -117,6 +123,43 @@ func (b *Bot) sendOutboxNotification(ctx context.Context, item storage.Notificat
 	if err := b.store.MarkNotificationFailed(ctx, item.ID, err.Error(), now.Add(delay), now); err != nil {
 		log.Printf("mark notification failed %d: %v", item.ID, err)
 	}
+}
+
+func (b *Bot) sendOutboxText(ctx context.Context, priority sendPriority, chatID int64, text string, opts map[string]any) (telegram.Message, error, telegramSendMetrics) {
+	done := measurePerfStage(ctx, "send_enqueue")
+	defer done()
+	var msg telegram.Message
+	var err error
+	var metrics telegramSendMetrics
+	if b.sendGateway != nil {
+		msg, err, metrics = b.sendGateway.SendMessageWithMetrics(ctx, priority, chatID, text, opts)
+	} else {
+		err = errTelegramSendGatewayNotConfigured
+	}
+	if err == nil {
+		b.recordOutgoingPrivateChatMessage(ctx, msg, "outgoing")
+	}
+	return msg, err, metrics
+}
+
+func logChainOutboxSendTiming(item storage.NotificationOutbox, priority sendPriority, renderDuration time.Duration, metrics telegramSendMetrics, err error) {
+	status := "sent"
+	if err != nil {
+		status = "failed"
+	}
+	log.Printf(
+		"chain outbox send timing: id=%d status=%s priority=%s render_ms=%d queue_wait_ms=%d rate_limit_ms=%d telegram_ms=%d retry_delay_ms=%d total_send_ms=%d attempts=%d",
+		item.ID,
+		status,
+		priority.String(),
+		renderDuration.Milliseconds(),
+		metrics.QueueWaitDuration.Milliseconds(),
+		metrics.RateLimitDuration.Milliseconds(),
+		metrics.OperationDuration.Milliseconds(),
+		metrics.RetryDelayDuration.Milliseconds(),
+		metrics.TotalDuration.Milliseconds(),
+		metrics.Attempts,
+	)
 }
 
 func (b *Bot) renderOutboxMessage(ctx context.Context, item storage.NotificationOutbox) (string, map[string]any, error) {

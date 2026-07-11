@@ -111,6 +111,106 @@ func TestSendGatewayRetries5xxAndSucceeds(t *testing.T) {
 	}
 }
 
+func TestSendGatewayReportsMetrics(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	gateway := newTelegramSendGateway(nil, nil, 3, 8)
+	gateway.Start(ctx)
+
+	msg, err, metrics := gateway.DoWithMetrics(ctx, sendPriorityCritical, -1001, func(context.Context) (telegram.Message, error) {
+		time.Sleep(time.Millisecond)
+		return telegram.Message{MessageID: 12}, nil
+	})
+	if err != nil {
+		t.Fatalf("gateway send failed: %v", err)
+	}
+	if msg.MessageID != 12 {
+		t.Fatalf("message id = %d, want 12", msg.MessageID)
+	}
+	if metrics.Priority != sendPriorityCritical {
+		t.Fatalf("priority = %s, want critical", metrics.Priority)
+	}
+	if metrics.Attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", metrics.Attempts)
+	}
+	if metrics.OperationDuration <= 0 {
+		t.Fatalf("operation duration = %v, want >0", metrics.OperationDuration)
+	}
+	if metrics.TotalDuration <= 0 {
+		t.Fatalf("total duration = %v, want >0", metrics.TotalDuration)
+	}
+	if metrics.CompletedAt.Before(metrics.StartedAt) {
+		t.Fatalf("completed_at %v before started_at %v", metrics.CompletedAt, metrics.StartedAt)
+	}
+}
+
+func TestSendGatewayStatsTracksQueuedBulk(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	gateway := newTelegramSendGateway(nil, nil, 3, 8)
+	gateway.Start(ctx)
+
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan struct{})
+	go func() {
+		_, _ = gateway.Do(ctx, sendPriorityBulk, -1001, func(context.Context) (telegram.Message, error) {
+			close(firstStarted)
+			<-releaseFirst
+			return telegram.Message{MessageID: 1}, nil
+		})
+		close(firstDone)
+	}()
+	select {
+	case <-firstStarted:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("first bulk request did not start")
+	}
+
+	secondStarted := make(chan struct{})
+	secondDone := make(chan struct{})
+	go func() {
+		_, _ = gateway.Do(ctx, sendPriorityBulk, -1002, func(context.Context) (telegram.Message, error) {
+			close(secondStarted)
+			return telegram.Message{MessageID: 2}, nil
+		})
+		close(secondDone)
+	}()
+
+	deadline := time.After(100 * time.Millisecond)
+	for {
+		stats := gateway.Stats(time.Now().Add(10 * time.Millisecond))
+		if stats.Bulk.Queued == 1 && stats.Bulk.OldestQueuedAgeMS > 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("bulk stats did not show queued request: %+v", gateway.Stats(time.Now()))
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	close(releaseFirst)
+	select {
+	case <-secondStarted:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("second bulk request did not start after first release")
+	}
+	select {
+	case <-firstDone:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("first bulk request did not finish")
+	}
+	select {
+	case <-secondDone:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("second bulk request did not finish")
+	}
+}
+
 func TestSendGatewayRetries5xxAndFailsAfterLimit(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -8,12 +8,27 @@ import (
 	"math/big"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/p2p"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/telegram"
 )
+
+type rateBookState struct {
+	mu        sync.RWMutex
+	entries   []p2p.OrderBookEntry
+	updatedAt time.Time
+	lastError string
+}
+
+type cachedRateBook struct {
+	Entries   []p2p.OrderBookEntry
+	UpdatedAt time.Time
+	LastError string
+	Stale     bool
+}
 
 func (b *Bot) rateScheduler(ctx context.Context) {
 	if b.cfg.P2PRefreshEvery <= 0 {
@@ -42,68 +57,62 @@ func (b *Bot) rateScheduler(ctx context.Context) {
 
 func (b *Bot) handleZ0(ctx context.Context, msg telegram.Message) error {
 	chatID := msg.Chat.ID
-	b.ratePool.Submit(func(jobCtx context.Context) {
-		entries, err := b.rateBook(jobCtx)
-		text := ""
-		if err != nil {
-			text = "Z0 查询失败：" + err.Error()
-		} else {
-			text = formatZ0(entries)
-		}
-		if err := b.enqueueReliableText(jobCtx, sendPriorityNormal, "z0_result", messageScopedDedupe("z0_result", chatID, msg.MessageID), chatID, text, map[string]any{"parse_mode": "HTML"}, reliableMessageRef{}, time.Now().In(b.loc)); err != nil {
-			log.Printf("enqueue z0 result: %v", err)
-		}
-	})
-	return nil
+	now := time.Now().In(b.loc)
+	book, err := b.rateBook(now)
+	text := ""
+	if err != nil {
+		text = "Z0 查询失败：" + err.Error()
+	} else {
+		text = formatZ0Book(book, b.loc)
+	}
+	return b.enqueueReliableText(ctx, sendPriorityNormal, "z0_result", messageScopedDedupe("z0_result", chatID, msg.MessageID), chatID, text, map[string]any{"parse_mode": "HTML"}, reliableMessageRef{}, now)
 }
 
 func (b *Bot) handleZRateSetting(ctx context.Context, msg telegram.Message, user storage.User, cmd zRateCommand, now time.Time) error {
 	if ok, err := b.canUseLedger(ctx, msg.Chat.ID, user.ID); err != nil {
 		return err
 	} else if !ok {
-		return b.enqueueLedgerText(ctx, sendPriorityNormal, "zrate_denied", msg.Chat.ID, msg.MessageID, ledgerPermissionDeniedText, nil, now)
+		return b.enqueueLedgerTraceText(ctx, sendPriorityNormal, "zrate_denied", msg.Chat.ID, msg.MessageID, ledgerPermissionDeniedText, nil, now)
 	}
 	chatID := msg.Chat.ID
-	b.ratePool.Submit(func(jobCtx context.Context) {
-		entries, err := b.rateBook(jobCtx)
-		if err != nil {
-			_ = b.enqueueReliableText(jobCtx, sendPriorityNormal, "zrate_result", messageScopedDedupe("zrate_result", chatID, msg.MessageID), chatID, "设置失败：实时汇率暂不可用："+err.Error(), nil, reliableMessageRef{}, time.Now().In(b.loc))
-			return
-		}
-		if cmd.Rank < 1 || cmd.Rank > len(entries) {
-			_ = b.enqueueReliableText(jobCtx, sendPriorityNormal, "zrate_result", messageScopedDedupe("zrate_result", chatID, msg.MessageID), chatID, "设置失败：没有这个 Z 档位。", nil, reliableMessageRef{}, time.Now().In(b.loc))
-			return
-		}
-		base := parseRat(entries[cmd.Rank-1].Price)
-		if base == nil {
-			_ = b.enqueueReliableText(jobCtx, sendPriorityNormal, "zrate_result", messageScopedDedupe("zrate_result", chatID, msg.MessageID), chatID, "设置失败：档位价格格式异常。", nil, reliableMessageRef{}, time.Now().In(b.loc))
-			return
-		}
-		rate := new(big.Rat).Add(base, cmd.Offset)
-		if rate.Sign() <= 0 {
-			_ = b.enqueueReliableText(jobCtx, sendPriorityNormal, "zrate_result", messageScopedDedupe("zrate_result", chatID, msg.MessageID), chatID, "设置失败：偏移后的汇率必须大于0。", nil, reliableMessageRef{}, time.Now().In(b.loc))
-			return
-		}
-		rateText := formatRat(rate, 8)
-		source := p2pMethodLabel(b.cfg.P2PTradeMethods)
-		offset := formatSigned(cmd.Offset)
-		if err := b.store.SetGroupRealtimeExchangeRate(jobCtx, chatID, rateText, source, cmd.Rank, offset, now); err != nil {
-			log.Printf("set z rate: %v", err)
-			_ = b.enqueueReliableText(jobCtx, sendPriorityNormal, "zrate_result", messageScopedDedupe("zrate_result", chatID, msg.MessageID), chatID, "设置失败：数据库写入失败。", nil, reliableMessageRef{}, time.Now().In(b.loc))
-			return
-		}
-		b.invalidateGroupCache(chatID)
-		text := fmt.Sprintf("操作成功：Z%d 基准%s，偏移%s，当前汇率%s",
-			cmd.Rank,
-			formatRat(base, 8),
-			formatSigned(cmd.Offset),
-			rateText,
-		)
-		if err := b.enqueueReliableText(jobCtx, sendPriorityNormal, "zrate_result", messageScopedDedupe("zrate_result", chatID, msg.MessageID), chatID, text, nil, reliableMessageRef{}, time.Now().In(b.loc)); err != nil {
-			log.Printf("enqueue z rate result: %v", err)
-		}
-	})
-	return nil
+	book, err := b.rateBook(now)
+	if err != nil {
+		return b.enqueueReplyText(ctx, sendPriorityNormal, "zrate_result", chatID, msg.MessageID, "设置失败：实时汇率暂不可用："+err.Error(), nil, now)
+	}
+	if cmd.Rank < 1 || cmd.Rank > len(book.Entries) {
+		return b.enqueueReplyText(ctx, sendPriorityNormal, "zrate_result", chatID, msg.MessageID, "设置失败：没有这个 Z 档位。", nil, now)
+	}
+	base := parseRat(book.Entries[cmd.Rank-1].Price)
+	if base == nil {
+		return b.enqueueReplyText(ctx, sendPriorityNormal, "zrate_result", chatID, msg.MessageID, "设置失败：档位价格格式异常。", nil, now)
+	}
+	rate := new(big.Rat).Add(base, cmd.Offset)
+	if rate.Sign() <= 0 {
+		return b.enqueueReplyText(ctx, sendPriorityNormal, "zrate_result", chatID, msg.MessageID, "设置失败：偏移后的汇率必须大于0。", nil, now)
+	}
+	rateText := formatRat(rate, 8)
+	source := p2pMethodLabel(b.cfg.P2PTradeMethods)
+	offset := formatSigned(cmd.Offset)
+	if err := b.store.SetGroupRealtimeExchangeRate(ctx, chatID, rateText, source, cmd.Rank, offset, now); err != nil {
+		log.Printf("set z rate: %v", err)
+		return b.enqueueReplyText(ctx, sendPriorityNormal, "zrate_result", chatID, msg.MessageID, "设置失败：数据库写入失败。", nil, now)
+	}
+	b.invalidateGroupCache(chatID)
+	text := fmt.Sprintf("操作成功：Z%d 基准%s，偏移%s，当前汇率%s",
+		cmd.Rank,
+		formatRat(base, 8),
+		formatSigned(cmd.Offset),
+		rateText,
+	)
+	if book.UpdatedAt.IsZero() {
+		text += "\n实时汇率缓存：尚未记录更新时间"
+	} else {
+		text += "\n实时汇率缓存：" + rateBookUpdatedLabel(book.UpdatedAt, b.loc)
+	}
+	if book.Stale {
+		text += "，数据可能陈旧"
+	}
+	return b.enqueueReliableText(ctx, sendPriorityNormal, "zrate_result", messageScopedDedupe("zrate_result", chatID, msg.MessageID), chatID, text, nil, reliableMessageRef{}, now)
 }
 
 func p2pMethodLabel(methods []string) string {
@@ -126,20 +135,86 @@ func p2pMethodLabel(methods []string) string {
 	}
 }
 
-func (b *Bot) rateBook(ctx context.Context) ([]p2p.OrderBookEntry, error) {
-	if cached, ok := b.rateBookCache.Get("top10"); ok {
-		return cached, nil
+func (b *Bot) rateBook(now time.Time) (cachedRateBook, error) {
+	b.rateBookState.mu.RLock()
+	entries := cloneOrderBookEntries(b.rateBookState.entries)
+	updatedAt := b.rateBookState.updatedAt
+	lastError := b.rateBookState.lastError
+	b.rateBookState.mu.RUnlock()
+	if len(entries) == 0 {
+		return cachedRateBook{}, fmt.Errorf("实时汇率缓存尚未就绪，请稍后再试")
 	}
-	return b.refreshRateBook(ctx)
+	return cachedRateBook{
+		Entries:   entries,
+		UpdatedAt: updatedAt,
+		LastError: lastError,
+		Stale:     rateBookStale(now, updatedAt, lastError, b.cfg.P2PRefreshEvery),
+	}, nil
 }
 
 func (b *Bot) refreshRateBook(ctx context.Context) ([]p2p.OrderBookEntry, error) {
 	entries, err := b.p2p.FetchOrderBookTop(ctx, b.cfg.P2PMarket, b.cfg.P2PFiatUnit, b.cfg.P2PAsset, b.cfg.P2PTradeMethods, 10)
 	if err != nil {
+		b.setRateBookError(err)
 		return nil, err
 	}
+	b.setRateBookEntries(entries, time.Now().In(b.loc))
 	b.rateBookCache.Set("top10", entries)
 	return entries, nil
+}
+
+func (b *Bot) setRateBookEntries(entries []p2p.OrderBookEntry, now time.Time) {
+	b.rateBookState.mu.Lock()
+	b.rateBookState.entries = cloneOrderBookEntries(entries)
+	b.rateBookState.updatedAt = now
+	b.rateBookState.lastError = ""
+	b.rateBookState.mu.Unlock()
+}
+
+func (b *Bot) setRateBookError(err error) {
+	if err == nil {
+		return
+	}
+	b.rateBookState.mu.Lock()
+	b.rateBookState.lastError = err.Error()
+	b.rateBookState.mu.Unlock()
+}
+
+func cloneOrderBookEntries(entries []p2p.OrderBookEntry) []p2p.OrderBookEntry {
+	if len(entries) == 0 {
+		return nil
+	}
+	clone := make([]p2p.OrderBookEntry, len(entries))
+	copy(clone, entries)
+	return clone
+}
+
+func rateBookStale(now, updatedAt time.Time, lastError string, refreshEvery time.Duration) bool {
+	if !updatedAt.IsZero() && refreshEvery > 0 && now.Sub(updatedAt) > refreshEvery*2 {
+		return true
+	}
+	return strings.TrimSpace(lastError) != ""
+}
+
+func formatZ0Book(book cachedRateBook, loc *time.Location) string {
+	text := formatZ0(book.Entries)
+	if !book.UpdatedAt.IsZero() {
+		text += "\n\n缓存更新时间：" + rateBookUpdatedLabel(book.UpdatedAt, loc)
+	}
+	if book.Stale {
+		text += "\n状态：使用上一版缓存，数据可能陈旧"
+		if book.LastError != "" {
+			text += "（最近刷新失败：" + html.EscapeString(book.LastError) + "）"
+		}
+	}
+	return strings.TrimSpace(text)
+}
+
+func rateBookUpdatedLabel(updatedAt time.Time, loc *time.Location) string {
+	if loc != nil {
+		updatedAt = updatedAt.In(loc)
+	}
+	return updatedAt.Format("2006-01-02 15:04:05")
 }
 
 func formatZ0(entries []p2p.OrderBookEntry) string {

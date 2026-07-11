@@ -14,7 +14,7 @@ func (b *Bot) handleClearLedgerRequest(ctx context.Context, msg telegram.Message
 	if ok, err := b.canUseLedger(ctx, msg.Chat.ID, user.ID); err != nil {
 		return err
 	} else if !ok {
-		return b.enqueueLedgerText(ctx, sendPriorityNormal, "clear_ledger_denied", msg.Chat.ID, msg.MessageID, "没有清除账单权限。", nil, time.Now().In(b.loc))
+		return b.enqueueLedgerTraceText(ctx, sendPriorityNormal, "clear_ledger_denied", msg.Chat.ID, msg.MessageID, "没有清除账单权限。", nil, time.Now().In(b.loc))
 	}
 	title := "确认清除今日账单？"
 	desc := "只会清除当前群当前业务日的账单，群配置、汇率、费率不变。"
@@ -25,7 +25,7 @@ func (b *Bot) handleClearLedgerRequest(ctx context.Context, msg telegram.Message
 	keyboard := telegram.InlineKeyboardMarkup{InlineKeyboard: [][]telegram.InlineKeyboardButton{
 		{{Text: "确认清除", CallbackData: "clear:" + scope}, {Text: "取消", CallbackData: "clear:cancel"}},
 	}}
-	return b.enqueueLedgerText(ctx, sendPriorityNormal, "clear_ledger_confirm", msg.Chat.ID, msg.MessageID, title+"\n"+desc, map[string]any{
+	return b.enqueueLedgerSuccessText(ctx, sendPriorityNormal, "clear_ledger_confirm", msg.Chat.ID, msg.MessageID, title+"\n"+desc, map[string]any{
 		"reply_markup": keyboard,
 	}, time.Now().In(b.loc))
 }
@@ -38,7 +38,7 @@ func (b *Bot) handleClearLedgerCallback(ctx context.Context, cb telegram.Callbac
 		if err := b.tg.AnswerCallback(ctx, cb.ID, "已取消"); err != nil {
 			return err
 		}
-		return b.enqueueLedgerText(ctx, sendPriorityNormal, "clear_ledger_cancel", cb.Message.Chat.ID, cb.Message.MessageID, "已取消清除账单。", nil, time.Now().In(b.loc))
+		return b.enqueueLedgerSuccessText(ctx, sendPriorityNormal, "clear_ledger_cancel", cb.Message.Chat.ID, cb.Message.MessageID, "已取消清除账单。", nil, time.Now().In(b.loc))
 	}
 	scope := strings.TrimPrefix(cb.Data, "clear:")
 	if scope != "today" && scope != "all" {
@@ -82,5 +82,5 @@ func (b *Bot) handleClearLedgerCallback(ctx context.Context, cb telegram.Callbac
 	if scope == "today" {
 		return b.sendBill(ctx, cb.Message.Chat.ID, cb.Message.MessageID, now, text)
 	}
-	return b.enqueueLedgerText(ctx, sendPriorityNormal, "clear_ledger_done", cb.Message.Chat.ID, cb.Message.MessageID, text, nil, now)
+	return b.enqueueLedgerSuccessText(ctx, sendPriorityNormal, "clear_ledger_done", cb.Message.Chat.ID, cb.Message.MessageID, text, nil, now)
 }

@@ -8,6 +8,7 @@ import (
 
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/config"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
+	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/tron"
 )
 
 func TestReadyzReflectsSourceFailureAndEmptySuccess(t *testing.T) {
@@ -107,6 +108,34 @@ func TestStatusIncludesSegmentTimingsAndAPICounts(t *testing.T) {
 	}
 	if len(status.Global.Recent) != 1 || status.Global.Recent[0].APICallCount != 3 {
 		t.Fatalf("recent status missing metrics: %#v", status.Global.Recent)
+	}
+}
+
+func TestStatusIncludesPageLimitReached(t *testing.T) {
+	server := NewServer(config.ChainWatcherConfig{PollInterval: time.Second, AddressMaxPerTick: 1}, nil, nil)
+	result := scanResult{}
+	result.observeFetch(tron.FetchMetrics{Calls: 2, Pages: 2, LastPageRows: 50, ReachedWindow: false})
+	result.observePageLimit(tron.FetchMetrics{Pages: 2, LastPageRows: 50, ReachedWindow: false}, 2, 50)
+	server.status.recordScanSuccess("address", result, 20*time.Millisecond, time.Now())
+
+	status := server.statusResponse(contextWithoutCancel{}, time.Now())
+	if !status.Address.PageLimitReached {
+		t.Fatal("address page limit should be marked reached")
+	}
+	if len(status.Address.Recent) != 1 || !status.Address.Recent[0].PageLimitReached {
+		t.Fatalf("recent page limit flag missing: %#v", status.Address.Recent)
+	}
+}
+
+func TestPageLimitReachedIgnoresWindowReached(t *testing.T) {
+	var result scanResult
+	result.observePageLimit(tron.FetchMetrics{Pages: 2, LastPageRows: 50, ReachedWindow: true}, 2, 50)
+	if result.PageLimitReached {
+		t.Fatal("page limit should not be marked when scan reached the time window")
+	}
+	result.observePageLimit(tron.FetchMetrics{Pages: 1, LastPageRows: 10, ReachedWindow: false}, 2, 50)
+	if result.PageLimitReached {
+		t.Fatal("page limit should not be marked when configured pages were not exhausted")
 	}
 }
 

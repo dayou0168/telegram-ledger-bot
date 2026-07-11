@@ -20,6 +20,12 @@ func TestNotificationRetryDelayBackoff(t *testing.T) {
 	}
 }
 
+func TestChainOutboxPriorityUsesCriticalLane(t *testing.T) {
+	if priority := outboxSendPriority(0); priority != sendPriorityCritical {
+		t.Fatalf("priority = %s, want critical", priority)
+	}
+}
+
 type errTest string
 
 func (e errTest) Error() string { return string(e) }

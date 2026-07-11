@@ -217,6 +217,7 @@ func (s *Server) pollGlobalOnce(ctx context.Context) (scanResult, error) {
 		return result, err
 	}
 	result.observeFetch(fetch.Metrics)
+	result.observePageLimit(fetch.Metrics, s.cfg.GlobalPages, 50)
 	transfers := fetch.Transfers
 	result.TransferCount = len(transfers)
 	for _, transfer := range transfers {
@@ -292,6 +293,7 @@ func (s *Server) pollAddressTransfers(ctx context.Context, byAddress map[string]
 			transfers := fetch.Transfers
 			local := scanResult{TransferCount: len(transfers)}
 			local.observeFetch(fetch.Metrics)
+			local.observePageLimit(fetch.Metrics, s.cfg.AddressPages, 50)
 			for _, transfer := range transfers {
 				local.observeTransfer(transfer)
 				matches, timings, err := s.recordTransferMatches(ctx, transfer, byAddress)
@@ -347,6 +349,7 @@ type scanResult struct {
 	MaxBlockTimestamp int64
 	APICallCount      int
 	PageCount         int
+	PageLimitReached  bool
 	APIWaitDuration   time.Duration
 	APIFetchDuration  time.Duration
 	ParseDuration     time.Duration
@@ -379,6 +382,7 @@ func (r *scanResult) merge(other scanResult) {
 	}
 	r.APICallCount += other.APICallCount
 	r.PageCount += other.PageCount
+	r.PageLimitReached = r.PageLimitReached || other.PageLimitReached
 	r.APIWaitDuration += other.APIWaitDuration
 	r.APIFetchDuration += other.APIFetchDuration
 	r.ParseDuration += other.ParseDuration
@@ -392,6 +396,15 @@ func (r *scanResult) observeFetch(metrics tron.FetchMetrics) {
 	r.APIWaitDuration += metrics.WaitDuration
 	r.APIFetchDuration += metrics.APIDuration
 	r.ParseDuration += metrics.ParseDuration
+}
+
+func (r *scanResult) observePageLimit(metrics tron.FetchMetrics, configuredPages int, pageLimit int) {
+	if configuredPages < 1 || pageLimit < 1 {
+		return
+	}
+	if metrics.Pages >= configuredPages && !metrics.ReachedWindow && metrics.LastPageRows >= pageLimit {
+		r.PageLimitReached = true
+	}
 }
 
 func (s *Server) selectAddressBatch(byAddress map[string][]storage.ChainWatcherSubscription) []string {
@@ -581,6 +594,7 @@ type scanStatus struct {
 	addressCount       int
 	apiCallCount       int
 	pageCount          int
+	pageLimitReached   bool
 	apiWaitDuration    time.Duration
 	apiFetchDuration   time.Duration
 	parseDuration      time.Duration
@@ -604,6 +618,7 @@ type scanRound struct {
 	addressCount     int
 	apiCallCount     int
 	pageCount        int
+	pageLimitReached bool
 }
 
 type cleanupStatus struct {
@@ -629,6 +644,7 @@ func (s *watcherStatus) recordScanSuccess(kind string, result scanResult, durati
 	target.addressCount = result.AddressCount
 	target.apiCallCount = result.APICallCount
 	target.pageCount = result.PageCount
+	target.pageLimitReached = result.PageLimitReached
 	target.apiWaitDuration = result.APIWaitDuration
 	target.apiFetchDuration = result.APIFetchDuration
 	target.parseDuration = result.ParseDuration
@@ -656,6 +672,7 @@ func (s *watcherStatus) recordScanSuccess(kind string, result scanResult, durati
 		addressCount:     result.AddressCount,
 		apiCallCount:     result.APICallCount,
 		pageCount:        result.PageCount,
+		pageLimitReached: result.PageLimitReached,
 	})
 }
 
@@ -671,6 +688,7 @@ func (s *watcherStatus) recordScanError(kind string, err error, backoffUntil tim
 	target.errorCount++
 	target.apiCallCount = result.APICallCount
 	target.pageCount = result.PageCount
+	target.pageLimitReached = result.PageLimitReached
 	target.apiWaitDuration = result.APIWaitDuration
 	target.apiFetchDuration = result.APIFetchDuration
 	target.parseDuration = result.ParseDuration
@@ -691,6 +709,7 @@ func (s *watcherStatus) recordScanError(kind string, err error, backoffUntil tim
 		addressCount:     result.AddressCount,
 		apiCallCount:     result.APICallCount,
 		pageCount:        result.PageCount,
+		pageLimitReached: result.PageLimitReached,
 	})
 }
 
@@ -784,6 +803,7 @@ func (s scanStatus) response(now time.Time) ScanStatusResponse {
 		AddressCount:       s.addressCount,
 		APICallCount:       s.apiCallCount,
 		PageCount:          s.pageCount,
+		PageLimitReached:   s.pageLimitReached,
 		APIWaitMS:          s.apiWaitDuration.Milliseconds(),
 		APIFetchMS:         s.apiFetchDuration.Milliseconds(),
 		ParseMS:            s.parseDuration.Milliseconds(),
@@ -809,20 +829,21 @@ func scanRoundResponses(rounds []scanRound) []ScanRoundResponse {
 	for i := len(rounds) - 1; i >= 0; i-- {
 		round := rounds[i]
 		out = append(out, ScanRoundResponse{
-			StartedAt:     timePtr(round.startedAt),
-			Success:       round.success,
-			Error:         round.err,
-			DurationMS:    round.duration.Milliseconds(),
-			APIWaitMS:     round.apiWaitDuration.Milliseconds(),
-			APIFetchMS:    round.apiFetchDuration.Milliseconds(),
-			ParseMS:       round.parseDuration.Milliseconds(),
-			MatchMS:       round.matchDuration.Milliseconds(),
-			WriteMS:       round.writeDuration.Milliseconds(),
-			TransferCount: round.transferCount,
-			MatchCount:    round.matchCount,
-			AddressCount:  round.addressCount,
-			APICallCount:  round.apiCallCount,
-			PageCount:     round.pageCount,
+			StartedAt:        timePtr(round.startedAt),
+			Success:          round.success,
+			Error:            round.err,
+			DurationMS:       round.duration.Milliseconds(),
+			APIWaitMS:        round.apiWaitDuration.Milliseconds(),
+			APIFetchMS:       round.apiFetchDuration.Milliseconds(),
+			ParseMS:          round.parseDuration.Milliseconds(),
+			MatchMS:          round.matchDuration.Milliseconds(),
+			WriteMS:          round.writeDuration.Milliseconds(),
+			TransferCount:    round.transferCount,
+			MatchCount:       round.matchCount,
+			AddressCount:     round.addressCount,
+			APICallCount:     round.apiCallCount,
+			PageCount:        round.pageCount,
+			PageLimitReached: round.pageLimitReached,
 		})
 	}
 	return out

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/telegram"
@@ -45,9 +46,38 @@ func (p sendPriority) String() string {
 type telegramSendResult struct {
 	message telegram.Message
 	err     error
+	metrics telegramSendMetrics
 }
 
 type telegramSendOperation func(context.Context) (telegram.Message, error)
+
+type telegramSendMetrics struct {
+	EnqueuedAt         time.Time
+	StartedAt          time.Time
+	CompletedAt        time.Time
+	QueueWaitDuration  time.Duration
+	RateLimitDuration  time.Duration
+	OperationDuration  time.Duration
+	RetryDelayDuration time.Duration
+	TotalDuration      time.Duration
+	Attempts           int
+	Priority           sendPriority
+}
+
+type TelegramSendGatewayStats struct {
+	Workers     int                          `json:"workers"`
+	MaxAttempts int                          `json:"max_attempts"`
+	Critical    TelegramSendGatewayLaneStats `json:"critical"`
+	Normal      TelegramSendGatewayLaneStats `json:"normal"`
+	Bulk        TelegramSendGatewayLaneStats `json:"bulk"`
+}
+
+type TelegramSendGatewayLaneStats struct {
+	Queued            int        `json:"queued"`
+	Capacity          int        `json:"capacity"`
+	OldestQueuedAt    *time.Time `json:"oldest_queued_at,omitempty"`
+	OldestQueuedAgeMS int64      `json:"oldest_queued_age_ms"`
+}
 
 type telegramSendRequest struct {
 	ctx         context.Context
@@ -55,6 +85,8 @@ type telegramSendRequest struct {
 	operation   telegramSendOperation
 	result      chan telegramSendResult
 	maxAttempts int
+	enqueuedAt  time.Time
+	priority    sendPriority
 }
 
 type telegramSendGateway struct {
@@ -69,6 +101,9 @@ type telegramSendGateway struct {
 	maxAttempts    int
 	retryBaseDelay time.Duration
 	retryMaxDelay  time.Duration
+
+	metricsMu sync.Mutex
+	queuedAt  map[sendPriority][]time.Time
 }
 
 func newTelegramSendGateway(tg *telegram.Client, limiter *telegramRateLimiter, workers int, queueSize int) *telegramSendGateway {
@@ -88,6 +123,11 @@ func newTelegramSendGateway(tg *telegram.Client, limiter *telegramRateLimiter, w
 		maxAttempts:    3,
 		retryBaseDelay: 200 * time.Millisecond,
 		retryMaxDelay:  2 * time.Second,
+		queuedAt: map[sendPriority][]time.Time{
+			sendPriorityCritical: {},
+			sendPriorityNormal:   {},
+			sendPriorityBulk:     {},
+		},
 	}
 }
 
@@ -127,34 +167,54 @@ func splitGatewayWorkers(workers int) (int, int, int) {
 }
 
 func (g *telegramSendGateway) Do(ctx context.Context, priority sendPriority, chatID int64, operation telegramSendOperation) (telegram.Message, error) {
+	message, err, _ := g.DoWithMetrics(ctx, priority, chatID, operation)
+	return message, err
+}
+
+func (g *telegramSendGateway) DoWithMetrics(ctx context.Context, priority sendPriority, chatID int64, operation telegramSendOperation) (telegram.Message, error, telegramSendMetrics) {
 	if g == nil {
-		return telegram.Message{}, errTelegramSendGatewayNotConfigured
+		return telegram.Message{}, errTelegramSendGatewayNotConfigured, telegramSendMetrics{}
 	}
 	if operation == nil {
-		return telegram.Message{}, errors.New("telegram send operation is nil")
+		return telegram.Message{}, errors.New("telegram send operation is nil"), telegramSendMetrics{}
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	priority = priority.normalized()
 	req := telegramSendRequest{
 		ctx:         ctx,
 		chatID:      chatID,
 		operation:   operation,
 		result:      make(chan telegramSendResult, 1),
 		maxAttempts: g.maxAttempts,
+		enqueuedAt:  time.Now(),
+		priority:    priority,
 	}
+	g.noteQueued(priority, req.enqueuedAt)
 	queue := g.queue(priority)
 	select {
 	case queue <- req:
 	case <-ctx.Done():
-		return telegram.Message{}, ctx.Err()
+		g.noteDequeued(priority)
+		return telegram.Message{}, ctx.Err(), telegramSendMetrics{}
 	}
 	select {
 	case result := <-req.result:
-		return result.message, result.err
+		return result.message, result.err, result.metrics
 	case <-ctx.Done():
-		return telegram.Message{}, ctx.Err()
+		return telegram.Message{}, ctx.Err(), telegramSendMetrics{}
 	}
+}
+
+func (g *telegramSendGateway) SendMessageWithMetrics(ctx context.Context, priority sendPriority, chatID int64, text string, opts map[string]any) (telegram.Message, error, telegramSendMetrics) {
+	if g == nil || g.tg == nil {
+		return telegram.Message{}, errTelegramSendGatewayNotConfigured, telegramSendMetrics{}
+	}
+	cloned := cloneSendOptions(opts)
+	return g.DoWithMetrics(ctx, priority, chatID, func(opCtx context.Context) (telegram.Message, error) {
+		return g.tg.SendMessage(opCtx, chatID, text, cloned)
+	})
 }
 
 func (g *telegramSendGateway) SendMessage(ctx context.Context, priority sendPriority, chatID int64, text string, opts map[string]any) (telegram.Message, error) {
@@ -236,9 +296,68 @@ func (g *telegramSendGateway) loop(ctx context.Context, lane sendPriority) {
 		if !ok {
 			return
 		}
-		message, err := g.execute(ctx, req)
-		req.result <- telegramSendResult{message: message, err: err}
+		g.noteDequeued(req.priority)
+		message, err, metrics := g.execute(ctx, req)
+		req.result <- telegramSendResult{message: message, err: err, metrics: metrics}
 	}
+}
+
+func (g *telegramSendGateway) Stats(now time.Time) TelegramSendGatewayStats {
+	if g == nil {
+		return TelegramSendGatewayStats{}
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	g.metricsMu.Lock()
+	defer g.metricsMu.Unlock()
+	return TelegramSendGatewayStats{
+		Workers:     g.workers,
+		MaxAttempts: g.maxAttempts,
+		Critical:    g.laneStatsLocked(sendPriorityCritical, cap(g.critical), now),
+		Normal:      g.laneStatsLocked(sendPriorityNormal, cap(g.normal), now),
+		Bulk:        g.laneStatsLocked(sendPriorityBulk, cap(g.bulk), now),
+	}
+}
+
+func (g *telegramSendGateway) noteQueued(priority sendPriority, queuedAt time.Time) {
+	if g == nil {
+		return
+	}
+	priority = priority.normalized()
+	g.metricsMu.Lock()
+	g.queuedAt[priority] = append(g.queuedAt[priority], queuedAt)
+	g.metricsMu.Unlock()
+}
+
+func (g *telegramSendGateway) noteDequeued(priority sendPriority) {
+	if g == nil {
+		return
+	}
+	priority = priority.normalized()
+	g.metricsMu.Lock()
+	queue := g.queuedAt[priority]
+	if len(queue) > 0 {
+		copy(queue, queue[1:])
+		g.queuedAt[priority] = queue[:len(queue)-1]
+	}
+	g.metricsMu.Unlock()
+}
+
+func (g *telegramSendGateway) laneStatsLocked(priority sendPriority, capacity int, now time.Time) TelegramSendGatewayLaneStats {
+	queue := g.queuedAt[priority.normalized()]
+	stats := TelegramSendGatewayLaneStats{
+		Queued:   len(queue),
+		Capacity: capacity,
+	}
+	if len(queue) > 0 {
+		oldest := queue[0]
+		stats.OldestQueuedAt = &oldest
+		if age := now.Sub(oldest); age > 0 {
+			stats.OldestQueuedAgeMS = age.Milliseconds()
+		}
+	}
+	return stats
 }
 
 func (g *telegramSendGateway) next(ctx context.Context, lane sendPriority) (telegramSendRequest, bool) {
@@ -274,30 +393,56 @@ func (g *telegramSendGateway) next(ctx context.Context, lane sendPriority) (tele
 	}
 }
 
-func (g *telegramSendGateway) execute(workerCtx context.Context, req telegramSendRequest) (telegram.Message, error) {
+func (g *telegramSendGateway) execute(workerCtx context.Context, req telegramSendRequest) (telegram.Message, error, telegramSendMetrics) {
+	metrics := telegramSendMetrics{
+		EnqueuedAt: req.enqueuedAt,
+		StartedAt:  time.Now(),
+		Priority:   req.priority,
+	}
+	if metrics.EnqueuedAt.IsZero() {
+		metrics.EnqueuedAt = metrics.StartedAt
+	}
+	metrics.QueueWaitDuration = metrics.StartedAt.Sub(metrics.EnqueuedAt)
 	maxAttempts := req.maxAttempts
 	if maxAttempts < 1 {
 		maxAttempts = 1
 	}
 	for attempt := 1; ; attempt++ {
+		metrics.Attempts = attempt
 		if err := contextDone(workerCtx, req.ctx); err != nil {
-			return telegram.Message{}, err
+			metrics.CompletedAt = time.Now()
+			metrics.TotalDuration = metrics.CompletedAt.Sub(metrics.EnqueuedAt)
+			return telegram.Message{}, err, metrics
 		}
 		if g.limiter != nil {
+			rateStarted := time.Now()
 			if err := g.limiter.Wait(req.ctx, req.chatID); err != nil {
-				return telegram.Message{}, err
+				metrics.RateLimitDuration += time.Since(rateStarted)
+				metrics.CompletedAt = time.Now()
+				metrics.TotalDuration = metrics.CompletedAt.Sub(metrics.EnqueuedAt)
+				return telegram.Message{}, err, metrics
 			}
+			metrics.RateLimitDuration += time.Since(rateStarted)
 		}
+		operationStarted := time.Now()
 		message, err := req.operation(req.ctx)
+		metrics.OperationDuration += time.Since(operationStarted)
 		if err == nil {
-			return message, nil
+			metrics.CompletedAt = time.Now()
+			metrics.TotalDuration = metrics.CompletedAt.Sub(metrics.EnqueuedAt)
+			return message, nil, metrics
 		}
 		if attempt >= maxAttempts || !telegramGatewayRetryable(err) {
-			return telegram.Message{}, err
+			metrics.CompletedAt = time.Now()
+			metrics.TotalDuration = metrics.CompletedAt.Sub(metrics.EnqueuedAt)
+			return telegram.Message{}, err, metrics
 		}
 		delay := telegramGatewayRetryDelay(attempt, err, g.retryBaseDelay, g.retryMaxDelay)
+		metrics.RetryDelayDuration += delay
 		if err := waitGatewayDelay(workerCtx, req.ctx, delay); err != nil {
-			return telegram.Message{}, err
+			metrics.CompletedAt = time.Now()
+			metrics.TotalDuration = metrics.CompletedAt.Sub(metrics.EnqueuedAt)
+			return telegram.Message{}, err, metrics
 		}
 	}
 }
@@ -463,4 +608,11 @@ func (b *Bot) editPhotoBytes(ctx context.Context, chatID, messageID int64, filen
 		return b.sendGateway.EditMessagePhotoBytes(ctx, sendPriorityNormal, chatID, messageID, filename, data, caption, opts)
 	}
 	return telegram.Message{}, errTelegramSendGatewayNotConfigured
+}
+
+func (b *Bot) TelegramSendGatewayStats() any {
+	if b == nil || b.sendGateway == nil {
+		return nil
+	}
+	return b.sendGateway.Stats(time.Now())
 }

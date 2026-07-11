@@ -1,13 +1,20 @@
-﻿# Telegram 记账机器人 Go v2.3.7 + PostgreSQL + shared chain watcher
+﻿# Telegram 记账机器人 Go v2.3.8 + PostgreSQL + shared chain watcher
 #
 # 单机器人一体部署模板。多机器人共享 watcher 时，请使用仓库根目录
 # docker-compose.chain-watcher.yml 单独部署 watcher，再让每个机器人加入 ledger-chain-net。
+# 默认使用 Docker json-file 日志上限 max-size=20m/max-file=5，单容器约 100MB。
+# Docker json-file 不能严格按时间保留 72 小时；这里用大小上限近似最近日志并防止撑爆硬盘。
 
 services:
   postgres:
     image: postgres:16-alpine
     container_name: ledger-postgres
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
     environment:
       POSTGRES_DB: "ledger_bot"
       POSTGRES_USER: "ledger"
@@ -25,6 +32,11 @@ services:
     image: postgres:16-alpine
     container_name: ledger-chain-postgres
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
     environment:
       POSTGRES_DB: "ledger_chain_watcher"
       POSTGRES_USER: "chainwatcher"
@@ -39,9 +51,14 @@ services:
       retries: 10
 
   ledger-chain-watcher:
-    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.7
+    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.8
     container_name: ledger-chain-watcher
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
     depends_on:
       chain-postgres:
         condition: service_healthy
@@ -73,9 +90,14 @@ services:
       retries: 10
 
   ledger-bot:
-    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.7
+    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.8
     container_name: ledger-bot-go
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
     depends_on:
       postgres:
         condition: service_healthy

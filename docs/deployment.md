@@ -1,11 +1,11 @@
-﻿# Telegram 记账机器人 Go v2.3.7 部署运维
+﻿# Telegram 记账机器人 Go v2.3.8 部署运维
 
-当前发布目标是 Go v2.3.7。生产部署使用 GHCR 预构建镜像、PostgreSQL 和共享链上监听服务 `ledger-chain-watcher`。服务器上不需要源码构建作为默认路径。
+当前发布目标是 Go v2.3.8。生产部署使用 GHCR 预构建镜像、PostgreSQL 和共享链上监听服务 `ledger-chain-watcher`。服务器上不需要源码构建作为默认路径。
 
 ## 部署基线
 
-- 机器人镜像：`ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.7`
-- watcher 镜像：`ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.7`
+- 机器人镜像：`ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.8`
+- watcher 镜像：`ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.8`
 - 数据库：每个机器人实例独立 PostgreSQL 16
 - 链上监听：多个机器人共享 `ledger-chain-watcher`，watcher 使用独立 PostgreSQL 保存订阅、匹配事件和投递游标
 - 推荐入口：宝塔 Docker Compose
@@ -114,6 +114,18 @@ BOT_QUEUE_SIZE: "4096"
 docker compose logs -f ledger-bot
 docker compose logs -f ledger-chain-watcher
 ```
+
+Compose 模板默认给 bot、watcher 和 PostgreSQL 容器配置 Docker `json-file` 日志上限：
+
+```yaml
+logging:
+  driver: "json-file"
+  options:
+    max-size: "20m"
+    max-file: "5"
+```
+
+这个配置的目标是防止长期运行时 stdout/stderr 日志撑爆硬盘，单容器最多约 100MB。Docker `json-file` 不能严格按时间保留最近 72 小时；这里用大小上限近似保留近期日志。如果异常刷屏，系统会优先保护磁盘空间，日志时间跨度可能短于 72 小时。修改已有容器的 `logging` 配置后，需要下次 `docker compose up -d` 重新创建对应容器才会生效。
 
 ## 场景 A1：宝塔宿主机 PostgreSQL
 
@@ -244,14 +256,14 @@ BOT_TIMEZONE=Asia/Shanghai
 BOT_REQUEST_TIMEOUT=70
 ```
 
-下载 v2.3.7 发布包并安装二进制到固定路径：
+下载 v2.3.8 发布包并安装二进制到固定路径：
 
 ```bash
 cd /tmp
-wget -O ledger-chain-watcher-v2.3.7-linux-amd64.tar.gz \
-  https://github.com/dayou0168/telegram-ledger-bot/releases/download/v2.3.7/ledger-chain-watcher-v2.3.7-linux-amd64.tar.gz
-tar -xzf ledger-chain-watcher-v2.3.7-linux-amd64.tar.gz
-install -m 0755 ledger-chain-watcher-v2.3.7-linux-amd64/ledger-chain-watcher /usr/local/bin/ledger-chain-watcher
+wget -O ledger-chain-watcher-v2.3.8-linux-amd64.tar.gz \
+  https://github.com/dayou0168/telegram-ledger-bot/releases/download/v2.3.8/ledger-chain-watcher-v2.3.8-linux-amd64.tar.gz
+tar -xzf ledger-chain-watcher-v2.3.8-linux-amd64.tar.gz
+install -m 0755 ledger-chain-watcher-v2.3.8-linux-amd64/ledger-chain-watcher /usr/local/bin/ledger-chain-watcher
 /usr/local/bin/ledger-chain-watcher --help
 ```
 
@@ -267,6 +279,28 @@ journalctl -u ledger-chain-watcher -f
 ```
 
 模板默认不写死 `User=`。如果要用非 root 用户运行，请先创建用户，再确认该用户能读取 `/etc/ledger-chain-watcher/env` 和执行 `/usr/local/bin/ledger-chain-watcher`，然后在 service 里启用 `User=` / `Group=`。
+
+宿主机 systemd 版 watcher 的日志进入 journald。建议给 journald 设置 72 小时保留和总量上限，防止 watcher 或其他 systemd 服务长期刷日志占满磁盘：
+
+```bash
+mkdir -p /etc/systemd/journald.conf.d
+cat >/etc/systemd/journald.conf.d/ledger-retention.conf <<'EOF'
+[Journal]
+MaxRetentionSec=3day
+SystemMaxUse=500M
+SystemKeepFree=1G
+SystemMaxFileSize=50M
+RuntimeMaxUse=128M
+MaxFileSec=1day
+EOF
+
+systemctl restart systemd-journald
+journalctl --vacuum-time=3d
+journalctl --vacuum-size=500M
+journalctl -u ledger-chain-watcher --since "10 minutes ago" --no-pager
+```
+
+`MaxRetentionSec=3day` 是 journald 全局策略，不只作用于 `ledger-chain-watcher`。它不会重启 watcher 进程，但会影响本机所有 systemd journal 的保留窗口。
 
 机器人 Compose 接入宿主机 watcher 时，机器人自己的数据库仍然写自己的 bot 库，不要改成 `ledgerchainwatcher`：
 
@@ -338,7 +372,7 @@ journalctl -u ledger-chain-watcher -f
 ```text
 ledger-chain-watcher        共享链上监听服务和 watcher PostgreSQL
 ledger-main                 当前记账机器人实例
-ledger-ops                  第二个独立 Go v2.3.7 机器人实例
+ledger-ops                  第二个独立 Go v2.3.8 机器人实例
 ```
 
 先创建共享 Docker 网络：
@@ -453,7 +487,7 @@ ports:
 
 ## 未来接 TRON Lite FullNode + Kafka
 
-v2.3.7 第一版 watcher 统一请求 Tronscan/TronGrid。未来切换自建节点时，机器人配置不变，只调整 watcher：
+v2.3.8 第一版 watcher 统一请求 Tronscan/TronGrid。未来切换自建节点时，机器人配置不变，只调整 watcher：
 
 ```yaml
 CHAIN_WATCHER_SOURCE: "kafka"
@@ -541,6 +575,38 @@ gzip backups/*.sql
 ```
 
 建议把 `backups/` 同步到服务器外部位置，例如另一台机器、对象存储或网盘。
+
+## 日志保留和磁盘保护
+
+长期运行建议同时限制 Docker、journald 和 PostgreSQL 日志：
+
+```text
+Docker Compose 容器日志: json-file max-size=20m, max-file=5，单容器约 100MB
+host systemd watcher 日志: journald MaxRetentionSec=3day, SystemMaxUse=500M, SystemMaxFileSize=50M
+PostgreSQL 日志: 优先使用宝塔或系统 logrotate，避免单个 postgresql 日志长期增长
+```
+
+Docker 的 `json-file` 驱动不能严格按时间保留 72 小时，只能按大小和文件数轮转。要严格按时间保留，需要切换到 journald 或额外 logrotate，但会改变 Docker/宝塔查看容器日志的方式。默认模板选择 `json-file` 大小上限，是为了兼容宝塔 Compose 并优先保护磁盘。
+
+检查当前容器日志配置：
+
+```bash
+docker inspect ledger-bot-go --format '{{.HostConfig.LogConfig.Type}} {{json .HostConfig.LogConfig.Config}}'
+docker inspect ledger-bot-go --format '{{.LogPath}}' | xargs du -h
+```
+
+如果容器已经创建，修改 Compose 里的 `logging` 后不会热生效，需要下次更新窗口执行：
+
+```bash
+docker compose up -d
+```
+
+host watcher 日志检查：
+
+```bash
+journalctl --disk-usage
+journalctl -u ledger-chain-watcher --since "72 hours ago" --no-pager
+```
 
 ## 常见检查
 

@@ -318,13 +318,14 @@ type NotificationOutbox struct {
 }
 
 type NotificationOutboxStats struct {
-	Pending       int64                       `json:"pending"`
-	Sending       int64                       `json:"sending"`
-	Sent          int64                       `json:"sent"`
-	Failed        int64                       `json:"failed"`
-	OldestPending *time.Time                  `json:"oldest_pending,omitempty"`
-	LastError     string                      `json:"last_error,omitempty"`
-	ByPriority    []NotificationPriorityCount `json:"by_priority"`
+	Pending        int64                           `json:"pending"`
+	Sending        int64                           `json:"sending"`
+	Sent           int64                           `json:"sent"`
+	Failed         int64                           `json:"failed"`
+	OldestPending  *time.Time                      `json:"oldest_pending,omitempty"`
+	LastError      string                          `json:"last_error,omitempty"`
+	ByPriority     []NotificationPriorityCount     `json:"by_priority"`
+	FailureClasses []NotificationFailureClassCount `json:"failure_classes"`
 }
 
 type NotificationOutboxCleanupStats struct {
@@ -336,4 +337,9 @@ type NotificationPriorityCount struct {
 	Priority int    `json:"priority"`
 	Status   string `json:"status"`
 	Count    int64  `json:"count"`
+}
+
+type NotificationFailureClassCount struct {
+	Class string `json:"class"`
+	Count int64  `json:"count"`
 }

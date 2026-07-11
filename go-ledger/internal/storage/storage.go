@@ -1718,17 +1718,27 @@ func (s *Store) GetBillSummaryForDay(ctx context.Context, chatID int64, dayKey s
 	); err != nil {
 		return BillSummaryData{}, err
 	}
-	rows, err := s.pool.Query(ctx, `WITH ranked AS (
+	rows, err := s.pool.Query(ctx, `SELECT id, chat_id, day_key, kind, currency, amount, rate, fee_rate, result_usdt,
+			subject_user_id, subject_name, actor_user_id, actor_name, source_message_id, bot_message_id, remark, created_at, deleted_at
+		FROM (
 			SELECT id, chat_id, day_key, kind, currency, amount, rate, fee_rate, result_usdt,
-				subject_user_id, subject_name, actor_user_id, actor_name, source_message_id, bot_message_id, remark, created_at, deleted_at,
-				ROW_NUMBER() OVER (PARTITION BY kind ORDER BY id DESC) AS rn
+				subject_user_id, subject_name, actor_user_id, actor_name, source_message_id, bot_message_id, remark, created_at, deleted_at
 			FROM records
-			WHERE chat_id=$1 AND day_key=$2 AND deleted_at IS NULL AND kind IN ('deposit', 'payout')
-		)
+			WHERE chat_id=$1 AND day_key=$2 AND deleted_at IS NULL AND kind='deposit'
+			ORDER BY id DESC
+			LIMIT $3
+		) deposits
+		UNION ALL
 		SELECT id, chat_id, day_key, kind, currency, amount, rate, fee_rate, result_usdt,
 			subject_user_id, subject_name, actor_user_id, actor_name, source_message_id, bot_message_id, remark, created_at, deleted_at
-		FROM ranked
-		WHERE rn <= $3
+		FROM (
+			SELECT id, chat_id, day_key, kind, currency, amount, rate, fee_rate, result_usdt,
+				subject_user_id, subject_name, actor_user_id, actor_name, source_message_id, bot_message_id, remark, created_at, deleted_at
+			FROM records
+			WHERE chat_id=$1 AND day_key=$2 AND deleted_at IS NULL AND kind='payout'
+			ORDER BY id DESC
+			LIMIT $3
+		) payouts
 		ORDER BY id ASC`,
 		chatID, dayKey, recentLimit)
 	if err != nil {
@@ -2246,13 +2256,43 @@ func (s *Store) NotificationOutboxStats(ctx context.Context, since time.Time) (N
 	if err != nil {
 		return stats, err
 	}
-	defer rows.Close()
 	for rows.Next() {
 		var item NotificationPriorityCount
 		if err := rows.Scan(&item.Priority, &item.Status, &item.Count); err != nil {
+			rows.Close()
 			return stats, err
 		}
 		stats.ByPriority = append(stats.ByPriority, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return stats, err
+	}
+	rows.Close()
+
+	rows, err = s.pool.Query(ctx, `SELECT CASE
+			WHEN lower(last_error) LIKE '%retry_after%' OR last_error LIKE '% 429 %' THEN '429'
+			WHEN last_error LIKE '% 500 %' OR last_error LIKE '% 502 %' OR last_error LIKE '% 503 %' OR last_error LIKE '% 504 %' THEN '5xx'
+			WHEN lower(last_error) LIKE '%timeout%' OR lower(last_error) LIKE '%deadline exceeded%' OR lower(last_error) LIKE '%connection%' OR lower(last_error) LIKE '%network%' THEN 'network'
+			WHEN lower(last_error) LIKE '%queue is full%' THEN 'queue_full'
+			ELSE 'other'
+		END AS failure_class,
+		COUNT(*)
+		FROM notification_outbox
+		WHERE status='failed'
+		  AND updated_at >= $1
+		GROUP BY failure_class
+		ORDER BY failure_class ASC`, since)
+	if err != nil {
+		return stats, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var item NotificationFailureClassCount
+		if err := rows.Scan(&item.Class, &item.Count); err != nil {
+			return stats, err
+		}
+		stats.FailureClasses = append(stats.FailureClasses, item)
 	}
 	return stats, rows.Err()
 }

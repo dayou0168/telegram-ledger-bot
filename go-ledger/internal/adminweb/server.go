@@ -30,11 +30,16 @@ type Server struct {
 	cfg         config.Config
 	store       *storage.Store
 	invalidator PermissionCacheInvalidator
+	stats       SendGatewayStatsProvider
 }
 
 type PermissionCacheInvalidator interface {
 	InvalidateBroadcastPermission(userID int64)
 	InvalidateWatchTargets()
+}
+
+type SendGatewayStatsProvider interface {
+	TelegramSendGatewayStats() any
 }
 
 type pageData struct {
@@ -62,6 +67,7 @@ type outboxStatusResponse struct {
 	StatsWindowHours     int64  `json:"stats_window_hours"`
 	SentRetentionHours   int64  `json:"sent_retention_hours"`
 	FailedRetentionHours int64  `json:"failed_retention_hours"`
+	SendGateway          any    `json:"send_gateway,omitempty"`
 }
 
 type billData struct {
@@ -129,6 +135,9 @@ func New(cfg config.Config, store *storage.Store, invalidator ...PermissionCache
 	s := &Server{cfg: cfg, store: store}
 	if len(invalidator) > 0 {
 		s.invalidator = invalidator[0]
+		if stats, ok := any(invalidator[0]).(SendGatewayStatsProvider); ok {
+			s.stats = stats
+		}
 	}
 	return s
 }
@@ -205,6 +214,9 @@ func (s *Server) outboxStatus(w http.ResponseWriter, r *http.Request) {
 		StatsWindowHours:        int64(statsWindow / time.Hour),
 		SentRetentionHours:      int64(sentRetention / time.Hour),
 		FailedRetentionHours:    int64(failedRetention / time.Hour),
+	}
+	if s.stats != nil {
+		response.SendGateway = s.stats.TelegramSendGatewayStats()
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if err := json.NewEncoder(w).Encode(response); err != nil {

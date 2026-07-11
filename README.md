@@ -1,6 +1,6 @@
 ﻿# Telegram 群组记账机器人
 
-这是 Telegram 记账机器人 Go v2.3.7 主线，按群组使用，生产部署使用 PostgreSQL、GHCR 镜像和共享 `ledger-chain-watcher` 链上监听服务。
+这是 Telegram 记账机器人 Go v2.3.8 主线，按群组使用，生产部署使用 PostgreSQL、GHCR 镜像和共享 `ledger-chain-watcher` 链上监听服务。
 
 重装系统或换机器前后的当前状态交接见 [docs/reinstall-handoff.md](docs/reinstall-handoff.md)。
 
@@ -46,20 +46,22 @@
 - `开启记账置顶` / `关闭记账置顶`。
 - 每个群的 `🌐 完整账单` 按钮会按 `chat_id` 生成独立链接。
 
-## 运行 Go v2.3.7
+## 运行 Go v2.3.8
 
-推荐优先使用 Go v2.3.7 镜像、PostgreSQL 和共享 watcher：
+推荐优先使用 Go v2.3.8 镜像、PostgreSQL 和共享 watcher：
 
 ```powershell
-docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.7
-docker pull ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.7
+docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.8
+docker pull ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.8
 ```
 
-宝塔 Docker Compose 可以直接使用仓库里的 [docker-compose.ghcr.yml](docker-compose.ghcr.yml)。这个文件默认拉取 `ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.7` 和 `ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.7`，在同一个 Compose 项目里用独立 PostgreSQL 容器和独立 watcher 容器组成全家桶，适合快速部署。
+宝塔 Docker Compose 可以直接使用仓库里的 [docker-compose.ghcr.yml](docker-compose.ghcr.yml)。这个文件默认拉取 `ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.8` 和 `ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.8`，在同一个 Compose 项目里用独立 PostgreSQL 容器和独立 watcher 容器组成全家桶，适合快速部署。
 
 如果 PostgreSQL 已经安装在宿主机/宝塔里，使用 [docker-compose.baota-host-pg.yml](docker-compose.baota-host-pg.yml)。这个文件只运行 `ledger-chain-watcher` 和 `ledger-bot`，通过 `host.docker.internal` 连接宿主机 PostgreSQL。
 
-如果希望 `ledger-chain-watcher` 直接跑在宿主机 systemd 里，GitHub Release `v2.3.7` 会同时发布 `ledger-chain-watcher-v2.3.7-linux-amd64.tar.gz` 宿主机包，里面包含二进制、[deploy/ledger-chain-watcher.env.example](deploy/ledger-chain-watcher.env.example) 和 [deploy/ledger-chain-watcher.service](deploy/ledger-chain-watcher.service)。机器人 Compose 保留自己的 `DATABASE_URL`，并把 `CHAIN_WATCHER_URL` 配成 `http://host.docker.internal:8090` 或 Docker 网桥 IP。
+如果希望 `ledger-chain-watcher` 直接跑在宿主机 systemd 里，GitHub Release `v2.3.8` 会同时发布 `ledger-chain-watcher-v2.3.8-linux-amd64.tar.gz` 宿主机包，里面包含二进制、[deploy/ledger-chain-watcher.env.example](deploy/ledger-chain-watcher.env.example) 和 [deploy/ledger-chain-watcher.service](deploy/ledger-chain-watcher.service)。机器人 Compose 保留自己的 `DATABASE_URL`，并把 `CHAIN_WATCHER_URL` 配成 `http://host.docker.internal:8090` 或 Docker 网桥 IP。
+
+部署模板默认限制 Docker `json-file` 日志为 `max-size=20m`、`max-file=5`，单容器约 100MB。host systemd 版 watcher 建议用 journald `MaxRetentionSec=3day` 和 `SystemMaxUse=500M` 控制最近约 72 小时日志，详见 [docs/deployment.md](docs/deployment.md)。
 
 广播和记账是一体能力，不需要为“广播群”单独关闭机器人记账模块。群默认未开始记账；需要记账的群由宿主、默认操作人或本群操作员发送 `开始` 即可开启。
 
@@ -150,7 +152,7 @@ https://bot.your-domain.example/day_xxb.php?chat_id=-100xxx&created_at=2026-07-0
 
 ### TRC20 链上监听
 
-Go v2.3.7 通过共享 `ledger-chain-watcher` 获取链上数据。多个机器人实例只配置内网 URL 和内部密钥，不再各自配置官网 API Key：
+Go v2.3.8 通过共享 `ledger-chain-watcher` 获取链上数据。多个机器人实例只配置内网 URL 和内部密钥，不再各自配置官网 API Key：
 
 ```env
 CHAIN_WATCHER_URL=http://ledger-chain-watcher:8090
@@ -228,4 +230,4 @@ P2P_RATE_CACHE_TTL_SECONDS=180
 docker compose -f docker-compose.ghcr.yml up -d
 ```
 
-服务器部署见 [docs/deployment.md](docs/deployment.md)，当前发布目标优先用 Go v2.3.7 镜像、PostgreSQL、共享 `ledger-chain-watcher` 和 Docker Compose。
+服务器部署见 [docs/deployment.md](docs/deployment.md)，当前发布目标优先用 Go v2.3.8 镜像、PostgreSQL、共享 `ledger-chain-watcher` 和 Docker Compose。

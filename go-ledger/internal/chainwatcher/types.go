@@ -83,24 +83,26 @@ type ScanStatusResponse struct {
 	AddressCount       int                 `json:"address_count"`
 	APICallCount       int                 `json:"api_call_count"`
 	PageCount          int                 `json:"page_count"`
+	PageLimitReached   bool                `json:"page_limit_reached"`
 	Recent             []ScanRoundResponse `json:"recent,omitempty"`
 }
 
 type ScanRoundResponse struct {
-	StartedAt     *time.Time `json:"started_at,omitempty"`
-	Success       bool       `json:"success"`
-	Error         string     `json:"error,omitempty"`
-	DurationMS    int64      `json:"duration_ms"`
-	APIWaitMS     int64      `json:"api_wait_ms"`
-	APIFetchMS    int64      `json:"api_fetch_ms"`
-	ParseMS       int64      `json:"parse_ms"`
-	MatchMS       int64      `json:"match_ms"`
-	WriteMS       int64      `json:"write_ms"`
-	TransferCount int        `json:"transfer_count"`
-	MatchCount    int        `json:"match_count"`
-	AddressCount  int        `json:"address_count"`
-	APICallCount  int        `json:"api_call_count"`
-	PageCount     int        `json:"page_count"`
+	StartedAt        *time.Time `json:"started_at,omitempty"`
+	Success          bool       `json:"success"`
+	Error            string     `json:"error,omitempty"`
+	DurationMS       int64      `json:"duration_ms"`
+	APIWaitMS        int64      `json:"api_wait_ms"`
+	APIFetchMS       int64      `json:"api_fetch_ms"`
+	ParseMS          int64      `json:"parse_ms"`
+	MatchMS          int64      `json:"match_ms"`
+	WriteMS          int64      `json:"write_ms"`
+	TransferCount    int        `json:"transfer_count"`
+	MatchCount       int        `json:"match_count"`
+	AddressCount     int        `json:"address_count"`
+	APICallCount     int        `json:"api_call_count"`
+	PageCount        int        `json:"page_count"`
+	PageLimitReached bool       `json:"page_limit_reached"`
 }
 
 type DeliveryStatusResponse struct {

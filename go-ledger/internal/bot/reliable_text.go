@@ -44,8 +44,12 @@ func (b *Bot) enqueueReplyText(ctx context.Context, priority sendPriority, kind 
 	return b.enqueueReliableText(ctx, priority, kind, messageScopedDedupe(kind, chatID, replyTo), chatID, text, opts, reliableMessageRef{}, now)
 }
 
-func (b *Bot) enqueueLedgerText(ctx context.Context, priority sendPriority, kind string, chatID, sourceMessageID int64, text string, opts map[string]any, now time.Time) error {
+func (b *Bot) enqueueLedgerSuccessText(ctx context.Context, priority sendPriority, kind string, chatID, sourceMessageID int64, text string, opts map[string]any, now time.Time) error {
 	return b.enqueueReliableText(ctx, priority, kind, messageScopedDedupe(kind, chatID, sourceMessageID), chatID, text, withoutReplyOptions(opts), reliableMessageRef{}, now)
+}
+
+func (b *Bot) enqueueLedgerTraceText(ctx context.Context, priority sendPriority, kind string, chatID, sourceMessageID int64, text string, opts map[string]any, now time.Time) error {
+	return b.enqueueReplyText(ctx, priority, kind, chatID, sourceMessageID, text, opts, now)
 }
 
 func withoutReplyOptions(opts map[string]any) map[string]any {
