@@ -1,11 +1,11 @@
-# Telegram 记账机器人 Go v2.3.3 部署运维
+# Telegram 记账机器人 Go v2.3.4 部署运维
 
-当前发布目标是 Go v2.3.3。生产部署使用 GHCR 预构建镜像、PostgreSQL 和共享链上监听服务 `ledger-chain-watcher`。服务器上不需要源码构建作为默认路径。
+当前发布目标是 Go v2.3.4。生产部署使用 GHCR 预构建镜像、PostgreSQL 和共享链上监听服务 `ledger-chain-watcher`。服务器上不需要源码构建作为默认路径。
 
 ## 部署基线
 
-- 机器人镜像：`ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.3`
-- watcher 镜像：`ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.3`
+- 机器人镜像：`ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.4`
+- watcher 镜像：`ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.4`
 - 数据库：每个机器人实例独立 PostgreSQL 16
 - 链上监听：多个机器人共享 `ledger-chain-watcher`，watcher 使用独立 PostgreSQL 保存订阅、匹配事件和投递游标
 - 推荐入口：宝塔 Docker Compose
@@ -73,15 +73,18 @@ CHAIN_WATCHER_GLOBAL_SCAN_PAGES: "3"
 CHAIN_WATCHER_ADDRESS_SCAN_INTERVAL_SECONDS: "30"
 CHAIN_WATCHER_ADDRESS_SCAN_PAGES: "1"
 CHAIN_WATCHER_ADDRESS_SCAN_CONCURRENCY: "1"
+CHAIN_WATCHER_ADDRESS_SCAN_MAX_PER_TICK: "1"
 CHAIN_WATCHER_TRON_REQUEST_INTERVAL_MS: "250"
 CHAIN_WATCHER_LOOKBACK_SECONDS: "600"
 ```
 
 `CHAIN_WATCHER_TRON_API_KEY` 只放在 watcher 里，机器人实例不再各自配置官网 API Key。
 
-watcher 是链上监听中心：全局主通道按 `CHAIN_WATCHER_SOURCE_POLL_SECONDS=1` 秒级快扫并写 watcher DB，地址补偿由 watcher 内部按 `CHAIN_WATCHER_ADDRESS_SCAN_INTERVAL_SECONDS=30` 低频执行，也写同一套 subscriptions/events/matched_events。
+watcher 是链上监听中心：全局主通道按 `CHAIN_WATCHER_SOURCE_POLL_SECONDS=1` 秒级快扫并写 watcher DB，地址补偿由 watcher 内部按 `CHAIN_WATCHER_ADDRESS_SCAN_INTERVAL_SECONDS=30` 低频执行，并受 `CHAIN_WATCHER_ADDRESS_SCAN_MAX_PER_TICK=1` 限制为低优先级补偿，也写同一套 subscriptions/events/matched_events。
 
-`CHAIN_WATCHER_EMERGENCY_FALLBACK` 是机器人侧常驻应急兜底开关，默认保持 `false`。正常模式下 bot 只消费 watcher；watcher health/claim 连续失败时，bot 会短时自动启用无 Key 公开 API fallback，只扫描本 bot 自己的监听地址并用本地 `chain_notifications/outbox` 去重。fallback 仍依赖 Tronscan/TronGrid 公开 API，不是真正事件源；真正不依赖官方 API 的方案是 Lite FullNode + Event Plugin V2 + Kafka 或第三方 Webhook/Streams。
+`/healthz` 只表示进程存活，Docker/systemd 健康检查继续用它；`/readyz` 表示链源是否可用，`/status` 用于排障，包含最近全局扫描成功时间、最近错误、429 backoff、pending/delivering、最老 pending 和 retention 清理统计。bot 自动 fallback 读取 ready 状态，不把“没有新交易”当成故障。
+
+`CHAIN_WATCHER_EMERGENCY_FALLBACK` 是机器人侧常驻应急兜底开关，默认保持 `false`。正常模式下 bot 只消费 watcher；watcher ready/claim 连续失败时，bot 会短时自动启用无 Key 公开 API fallback，只扫描本 bot 自己的监听地址并用本地 `chain_notifications/outbox` 去重。fallback 仍依赖 Tronscan/TronGrid 公开 API，不是真正事件源；真正不依赖官方 API 的方案是 Lite FullNode + Event Plugin V2 + Kafka 或第三方 Webhook/Streams。
 
 常用选填：
 
@@ -232,6 +235,7 @@ CHAIN_WATCHER_GLOBAL_SCAN_PAGES=3
 CHAIN_WATCHER_ADDRESS_SCAN_INTERVAL_SECONDS=30
 CHAIN_WATCHER_ADDRESS_SCAN_PAGES=1
 CHAIN_WATCHER_ADDRESS_SCAN_CONCURRENCY=1
+CHAIN_WATCHER_ADDRESS_SCAN_MAX_PER_TICK=1
 CHAIN_WATCHER_TRON_REQUEST_INTERVAL_MS=250
 CHAIN_WATCHER_LOOKBACK_SECONDS=600
 CHAIN_WATCHER_CLAIM_LEASE_SECONDS=30
@@ -240,14 +244,14 @@ BOT_TIMEZONE=Asia/Shanghai
 BOT_REQUEST_TIMEOUT=70
 ```
 
-下载 v2.3.3 发布包并安装二进制到固定路径：
+下载 v2.3.4 发布包并安装二进制到固定路径：
 
 ```bash
 cd /tmp
-wget -O ledger-chain-watcher-v2.3.3-linux-amd64.tar.gz \
-  https://github.com/dayou0168/telegram-ledger-bot/releases/download/v2.3.3/ledger-chain-watcher-v2.3.3-linux-amd64.tar.gz
-tar -xzf ledger-chain-watcher-v2.3.3-linux-amd64.tar.gz
-install -m 0755 ledger-chain-watcher-v2.3.3-linux-amd64/ledger-chain-watcher /usr/local/bin/ledger-chain-watcher
+wget -O ledger-chain-watcher-v2.3.4-linux-amd64.tar.gz \
+  https://github.com/dayou0168/telegram-ledger-bot/releases/download/v2.3.4/ledger-chain-watcher-v2.3.4-linux-amd64.tar.gz
+tar -xzf ledger-chain-watcher-v2.3.4-linux-amd64.tar.gz
+install -m 0755 ledger-chain-watcher-v2.3.4-linux-amd64/ledger-chain-watcher /usr/local/bin/ledger-chain-watcher
 /usr/local/bin/ledger-chain-watcher --help
 ```
 
@@ -334,7 +338,7 @@ journalctl -u ledger-chain-watcher -f
 ```text
 ledger-chain-watcher        共享链上监听服务和 watcher PostgreSQL
 ledger-main                 当前记账机器人实例
-ledger-ops                  第二个独立 Go v2.3.3 机器人实例
+ledger-ops                  第二个独立 Go v2.3.4 机器人实例
 ```
 
 先创建共享 Docker 网络：
@@ -423,7 +427,9 @@ ADMIN_WEB_TOKEN
 ```text
 容器端口: 8090
 机器人内网访问: http://ledger-chain-watcher:8090
-健康检查: /healthz
+进程健康检查: /healthz
+链源就绪检查: /readyz
+排障状态: /status
 公网端口: 不开放
 ```
 
@@ -447,7 +453,7 @@ ports:
 
 ## 未来接 TRON Lite FullNode + Kafka
 
-v2.3.3 第一版 watcher 统一请求 Tronscan/TronGrid。未来切换自建节点时，机器人配置不变，只调整 watcher：
+v2.3.4 第一版 watcher 统一请求 Tronscan/TronGrid。未来切换自建节点时，机器人配置不变，只调整 watcher：
 
 ```yaml
 CHAIN_WATCHER_SOURCE: "kafka"
@@ -567,6 +573,8 @@ curl -I https://bot.example.com/admin
 
 ```bash
 docker exec ledger-bot-go wget -qO- http://ledger-chain-watcher:8090/healthz
+docker exec ledger-bot-go wget -qO- http://ledger-chain-watcher:8090/readyz
+docker exec ledger-bot-go wget -qO- http://ledger-chain-watcher:8090/status
 ```
 
 如果网页打不开，优先检查 `PUBLIC_BILL_BASE_URL` 是否带 `https://`，宝塔反代目标端口是否正确，以及 Cloudflare SSL 模式是否正确。

@@ -77,3 +77,39 @@ func TestClaimEventsParsesResponse(t *testing.T) {
 		t.Fatalf("unexpected events: %#v", events)
 	}
 }
+
+func TestReadyReturnsDegradedError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/readyz" {
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(chainwatcher.StatusResponse{Status: "degraded", Ready: false})
+	}))
+	defer server.Close()
+
+	client := New(server.URL, "bot-a", "secret-a", time.Second)
+	status, err := client.Ready(context.Background())
+	if err == nil {
+		t.Fatal("Ready() error = nil, want degraded error")
+	}
+	if status.Ready || status.Status != "degraded" {
+		t.Fatalf("unexpected status: %#v", status)
+	}
+}
+
+func TestReadyAcceptsSuccessfulEmptySource(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(chainwatcher.StatusResponse{Status: "ready", Ready: true})
+	}))
+	defer server.Close()
+
+	client := New(server.URL, "bot-a", "secret-a", time.Second)
+	status, err := client.Ready(context.Background())
+	if err != nil {
+		t.Fatalf("Ready() error = %v", err)
+	}
+	if !status.Ready {
+		t.Fatalf("Ready() status = %#v, want ready", status)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"time"
 
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/tron"
@@ -42,6 +43,52 @@ type ClaimRequest struct {
 
 type ClaimResponse struct {
 	Events []MatchedEvent `json:"events"`
+}
+
+type StatusResponse struct {
+	Status                 string                 `json:"status"`
+	Ready                  bool                   `json:"ready"`
+	Now                    time.Time              `json:"now"`
+	StaleAfterMS           int64                  `json:"stale_after_ms"`
+	Global                 ScanStatusResponse     `json:"global"`
+	Address                ScanStatusResponse     `json:"address"`
+	Deliveries             DeliveryStatusResponse `json:"deliveries"`
+	RetentionCleanup       CleanupStatusResponse  `json:"retention_cleanup"`
+	AddressCursor          int                    `json:"address_cursor"`
+	AddressScanMaxPerTick  int                    `json:"address_scan_max_per_tick"`
+	AddressScanSkippedNear int64                  `json:"address_scan_skipped_near_global"`
+}
+
+type ScanStatusResponse struct {
+	LastStartedAt      *time.Time `json:"last_started_at,omitempty"`
+	LastSuccessAt      *time.Time `json:"last_success_at,omitempty"`
+	LastErrorAt        *time.Time `json:"last_error_at,omitempty"`
+	LastError          string     `json:"last_error,omitempty"`
+	LastDurationMS     int64      `json:"last_duration_ms"`
+	BackoffUntil       *time.Time `json:"backoff_until,omitempty"`
+	BackoffRemainingMS int64      `json:"backoff_remaining_ms"`
+	LastBlockTimestamp int64      `json:"last_block_timestamp"`
+	LagMS              int64      `json:"lag_ms"`
+	ScanCount          int64      `json:"scan_count"`
+	ErrorCount         int64      `json:"error_count"`
+	TransferCount      int        `json:"transfer_count"`
+	MatchCount         int        `json:"match_count"`
+	SubscriptionCount  int        `json:"subscription_count"`
+	AddressCount       int        `json:"address_count"`
+}
+
+type DeliveryStatusResponse struct {
+	PendingCount       int64      `json:"pending_count"`
+	DeliveringCount    int64      `json:"delivering_count"`
+	OldestPendingAt    *time.Time `json:"oldest_pending_at,omitempty"`
+	OldestPendingAgeMS int64      `json:"oldest_pending_age_ms"`
+}
+
+type CleanupStatusResponse struct {
+	LastRunAt      *time.Time `json:"last_run_at,omitempty"`
+	MatchedDeleted int64      `json:"matched_deleted"`
+	EventsDeleted  int64      `json:"events_deleted"`
+	Error          string     `json:"error,omitempty"`
 }
 
 type AckRequest struct {

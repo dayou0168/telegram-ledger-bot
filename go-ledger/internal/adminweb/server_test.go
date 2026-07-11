@@ -2,6 +2,7 @@ package adminweb
 
 import (
 	"bytes"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -137,6 +138,71 @@ func TestLoginTemplateExplainsInvalidShortcutCanUsePassword(t *testing.T) {
 	}
 	if !strings.Contains(html, `name="password"`) || !strings.Contains(html, "进入后台") {
 		t.Fatal("login page should keep password login available")
+	}
+}
+
+func TestLoginTemplateRendersShortcutSubmitWithoutHidingPassword(t *testing.T) {
+	rec := httptest.NewRecorder()
+	renderLoginWithTicket(rec, false, "快捷登录链接有效，点击下方按钮进入后台。", "ticket-value")
+	html := rec.Body.String()
+	for _, want := range []string{
+		`method="post" action="/admin/login"`,
+		`name="ticket" value="ticket-value"`,
+		"使用快捷登录进入后台",
+		`name="password"`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("login page missing %q", want)
+		}
+	}
+}
+
+func TestAdminCookieSecureFlag(t *testing.T) {
+	rec := httptest.NewRecorder()
+	s := &Server{cfg: config.Config{AdminWebToken: "secret", AdminWebCookieSecure: true}}
+	s.setAdminCookie(rec, adminauth.Session{UserID: 1, Role: adminauth.RoleHost, ExpiresAt: time.Now().Add(time.Hour)})
+	cookies := rec.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("cookies len = %d, want 1", len(cookies))
+	}
+	if !cookies[0].Secure {
+		t.Fatal("admin cookie should honor AdminWebCookieSecure=true")
+	}
+}
+
+func TestRequirePostRejectsGet(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/admin/operator/disable", nil)
+	if requirePost(rec, req) {
+		t.Fatal("GET should not satisfy requirePost")
+	}
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusMethodNotAllowed)
+	}
+}
+
+func TestParseBroadcastPermissionFormValidatesInput(t *testing.T) {
+	tests := []struct {
+		name string
+		form string
+		ok   bool
+	}{
+		{name: "valid chat", form: "user_id=123&target=chat&chat_id=-1001", ok: true},
+		{name: "valid group", form: "user_id=123&target=group&group_name=alpha", ok: true},
+		{name: "zero user", form: "user_id=0&target=chat&chat_id=-1001"},
+		{name: "empty chat", form: "user_id=123&target=chat&chat_id=0"},
+		{name: "empty group", form: "user_id=123&target=group&group_name="},
+		{name: "bad target", form: "user_id=123&target=all&chat_id=-1001"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/admin/permission/grant", strings.NewReader(tt.form))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			_, _, _, _, _, ok := parseBroadcastPermissionForm(req)
+			if ok != tt.ok {
+				t.Fatalf("parseBroadcastPermissionForm ok = %v, want %v", ok, tt.ok)
+			}
+		})
 	}
 }
 

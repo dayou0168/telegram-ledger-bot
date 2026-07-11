@@ -134,12 +134,26 @@ func TestPostgresStoreBasicFlow(t *testing.T) {
 	if !ok || ticket.UserID != userID || ticket.Role != "operator" {
 		t.Fatalf("unexpected admin ticket: ok=%v ticket=%+v", ok, ticket)
 	}
+	ticket, ok, err = store.ConsumeAdminLoginTicket(ctx, tokenHash, now)
+	if err != nil {
+		t.Fatalf("consume admin login ticket: %v", err)
+	}
+	if !ok || ticket.UserID != userID || ticket.Role != "operator" {
+		t.Fatalf("unexpected consumed admin ticket: ok=%v ticket=%+v", ok, ticket)
+	}
+	_, ok, err = store.ConsumeAdminLoginTicket(ctx, tokenHash, now)
+	if err != nil {
+		t.Fatalf("consume admin login ticket again: %v", err)
+	}
+	if ok {
+		t.Fatal("admin login ticket should not be consumed twice")
+	}
 	_, ok, err = store.GetAdminLoginTicket(ctx, tokenHash, now)
 	if err != nil {
-		t.Fatalf("get admin login ticket again: %v", err)
+		t.Fatalf("get consumed admin login ticket: %v", err)
 	}
-	if !ok {
-		t.Fatal("admin login ticket should remain valid during its short TTL")
+	if ok {
+		t.Fatal("consumed admin login ticket should not be valid")
 	}
 	expiredTokenHash := tokenHash + "-expired"
 	if err := store.CreateAdminLoginTicket(ctx, expiredTokenHash, userID, "operator", now.Add(-time.Minute), now.Add(-2*time.Minute)); err != nil {

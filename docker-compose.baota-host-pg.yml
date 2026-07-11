@@ -1,4 +1,4 @@
-# Telegram 记账机器人 Go v2.3.3 + 宝塔宿主机 PostgreSQL
+# Telegram 记账机器人 Go v2.3.4 + 宝塔宿主机 PostgreSQL
 #
 # 适用场景：
 # - PostgreSQL 已经在宿主机/宝塔里安装好。
@@ -13,7 +13,7 @@
 
 services:
   ledger-chain-watcher:
-    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.3
+    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.4
     container_name: ledger-chain-watcher
     restart: unless-stopped
     extra_hosts:
@@ -45,6 +45,7 @@ services:
       CHAIN_WATCHER_ADDRESS_SCAN_INTERVAL_SECONDS: "30"
       CHAIN_WATCHER_ADDRESS_SCAN_PAGES: "1"
       CHAIN_WATCHER_ADDRESS_SCAN_CONCURRENCY: "1"
+      CHAIN_WATCHER_ADDRESS_SCAN_MAX_PER_TICK: "1"
       CHAIN_WATCHER_TRON_REQUEST_INTERVAL_MS: "250"
       CHAIN_WATCHER_LOOKBACK_SECONDS: "600"
       CHAIN_WATCHER_CLAIM_LEASE_SECONDS: "30"
@@ -64,7 +65,7 @@ services:
       retries: 10
 
   ledger-bot:
-    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.3
+    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.4
     container_name: ledger-bot-go
     restart: unless-stopped
     depends_on:

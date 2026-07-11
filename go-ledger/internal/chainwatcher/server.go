@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -22,12 +23,17 @@ type Server struct {
 	http           *http.Server
 	globalBackoff  apiBackoff
 	addressBackoff apiBackoff
+	status         watcherStatus
+	addressMu      sync.Mutex
+	addressCursor  int
 }
 
 func NewServer(cfg config.ChainWatcherConfig, store *storage.Store, tronClient *tron.Client) *Server {
 	s := &Server{cfg: cfg, store: store, tron: tronClient}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealth)
+	mux.HandleFunc("/readyz", s.handleReady)
+	mux.HandleFunc("/status", s.handleStatus)
 	mux.HandleFunc("/v1/subscriptions/upsert", s.handleUpsertSubscription)
 	mux.HandleFunc("/v1/subscriptions/delete", s.handleDeleteSubscription)
 	mux.HandleFunc("/v1/subscriptions/sync", s.handleSyncSubscriptions)
@@ -100,8 +106,12 @@ func (s *Server) cleanupLoop(ctx context.Context) {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 	for {
-		if err := s.store.CleanupChainWatcherRetention(ctx, s.cfg.Lookback, time.Now()); err != nil && !errors.Is(err, context.Canceled) {
+		stats, err := s.store.CleanupChainWatcherRetention(ctx, s.cfg.Lookback, time.Now())
+		if err != nil && !errors.Is(err, context.Canceled) {
+			s.status.recordCleanupError(err, time.Now())
 			log.Printf("chain watcher cleanup: %v", err)
+		} else if err == nil {
+			s.status.recordCleanup(stats, time.Now())
 		}
 		select {
 		case <-ctx.Done():
@@ -112,79 +122,112 @@ func (s *Server) cleanupLoop(ctx context.Context) {
 }
 
 func (s *Server) pollGlobalSafely(ctx context.Context) {
-	if !s.globalBackoff.ready(time.Now()) {
+	now := time.Now()
+	if !s.globalBackoff.ready(now) {
 		return
 	}
-	if err := s.pollGlobalOnce(ctx); err != nil && !errors.Is(err, context.Canceled) {
+	started := time.Now()
+	result, err := s.pollGlobalOnce(ctx)
+	duration := time.Since(started)
+	if err != nil && !errors.Is(err, context.Canceled) {
 		if s.globalBackoff.record(err, time.Now()) {
+			s.status.recordScanError("global", err, s.globalBackoff.untilTime(), duration, time.Now())
 			log.Printf("chain watcher global scan rate limited: %v", err)
 			return
 		}
+		s.status.recordScanError("global", err, time.Time{}, duration, time.Now())
 		log.Printf("chain watcher global scan: %v", err)
 		return
 	}
 	s.globalBackoff.reset()
+	s.status.recordScanSuccess("global", result, duration, time.Now())
 }
 
 func (s *Server) pollAddressSafely(ctx context.Context) {
-	if !s.addressBackoff.ready(time.Now()) {
+	now := time.Now()
+	if !s.addressBackoff.ready(now) {
 		return
 	}
-	if err := s.pollAddressOnce(ctx); err != nil && !errors.Is(err, context.Canceled) {
+	if s.shouldSkipAddressScan(now) {
+		s.status.recordAddressSkippedNearGlobal()
+		return
+	}
+	started := time.Now()
+	result, err := s.pollAddressOnce(ctx)
+	duration := time.Since(started)
+	if err != nil && !errors.Is(err, context.Canceled) {
 		if s.addressBackoff.record(err, time.Now()) {
+			s.status.recordScanError("address", err, s.addressBackoff.untilTime(), duration, time.Now())
 			log.Printf("chain watcher address scan rate limited: %v", err)
 			return
 		}
+		s.status.recordScanError("address", err, time.Time{}, duration, time.Now())
 		log.Printf("chain watcher address scan: %v", err)
 		return
 	}
 	s.addressBackoff.reset()
+	s.status.recordScanSuccess("address", result, duration, time.Now())
 }
 
-func (s *Server) pollGlobalOnce(ctx context.Context) error {
+func (s *Server) pollGlobalOnce(ctx context.Context) (scanResult, error) {
+	var result scanResult
 	subs, err := s.store.ListChainWatcherSubscriptions(ctx)
 	if err != nil {
-		return err
+		return result, err
 	}
+	result.SubscriptionCount = len(subs)
 	if len(subs) == 0 {
-		return nil
+		return result, nil
 	}
 	byAddress := make(map[string][]storage.ChainWatcherSubscription)
 	for _, sub := range subs {
 		byAddress[sub.Address] = append(byAddress[sub.Address], sub)
 	}
+	result.AddressCount = len(byAddress)
 	minTimestamp := time.Now().Add(-s.cfg.Lookback).UnixMilli()
 	transfers, err := s.tron.FetchGlobalUSDTTransfers(ctx, s.cfg.USDTContract, minTimestamp, s.cfg.GlobalPages)
 	if err != nil {
-		return err
+		return result, err
 	}
+	result.TransferCount = len(transfers)
 	for _, transfer := range transfers {
-		if err := s.recordTransferMatches(ctx, transfer, byAddress); err != nil {
-			return err
+		result.observeTransfer(transfer)
+		matches, err := s.recordTransferMatches(ctx, transfer, byAddress)
+		if err != nil {
+			return result, err
 		}
+		result.MatchCount += matches
 	}
-	return nil
+	return result, nil
 }
 
-func (s *Server) pollAddressOnce(ctx context.Context) error {
+func (s *Server) pollAddressOnce(ctx context.Context) (scanResult, error) {
+	var result scanResult
 	subs, err := s.store.ListChainWatcherSubscriptions(ctx)
 	if err != nil {
-		return err
+		return result, err
 	}
+	result.SubscriptionCount = len(subs)
 	if len(subs) == 0 {
-		return nil
+		return result, nil
 	}
 	byAddress := make(map[string][]storage.ChainWatcherSubscription)
 	for _, sub := range subs {
 		byAddress[sub.Address] = append(byAddress[sub.Address], sub)
 	}
+	result.AddressCount = len(byAddress)
 	minTimestamp := time.Now().Add(-s.cfg.Lookback).UnixMilli()
-	return s.pollAddressTransfers(ctx, byAddress, minTimestamp)
+	addresses := s.selectAddressBatch(byAddress)
+	result.AddressCount = len(addresses)
+	addressResult, err := s.pollAddressTransfers(ctx, byAddress, addresses, minTimestamp)
+	result.merge(addressResult)
+	return result, err
 }
 
-func (s *Server) pollAddressTransfers(ctx context.Context, byAddress map[string][]storage.ChainWatcherSubscription, minTimestamp int64) error {
-	if len(byAddress) == 0 {
-		return nil
+func (s *Server) pollAddressTransfers(ctx context.Context, byAddress map[string][]storage.ChainWatcherSubscription, addresses []string, minTimestamp int64) (scanResult, error) {
+	var result scanResult
+	if len(byAddress) == 0 || len(addresses) == 0 {
+		return result, nil
 	}
 	concurrency := s.cfg.AddressConcurrency
 	if concurrency < 1 {
@@ -193,12 +236,13 @@ func (s *Server) pollAddressTransfers(ctx context.Context, byAddress map[string]
 	sem := make(chan struct{}, concurrency)
 	errCh := make(chan error, 1)
 	var wg sync.WaitGroup
-	for address := range byAddress {
+	var mu sync.Mutex
+	for _, address := range addresses {
 		address := address
 		select {
 		case <-ctx.Done():
 			wg.Wait()
-			return ctx.Err()
+			return result, ctx.Err()
 		case sem <- struct{}{}:
 		}
 		wg.Add(1)
@@ -213,39 +257,123 @@ func (s *Server) pollAddressTransfers(ctx context.Context, byAddress map[string]
 				}
 				return
 			}
+			local := scanResult{TransferCount: len(transfers)}
 			for _, transfer := range transfers {
-				if err := s.recordTransferMatches(ctx, transfer, byAddress); err != nil {
+				local.observeTransfer(transfer)
+				matches, err := s.recordTransferMatches(ctx, transfer, byAddress)
+				if err != nil {
 					select {
 					case errCh <- err:
 					default:
 					}
 					return
 				}
+				local.MatchCount += matches
 			}
+			mu.Lock()
+			result.merge(local)
+			mu.Unlock()
 		}()
 	}
 	wg.Wait()
 	select {
 	case err := <-errCh:
-		return err
+		return result, err
 	default:
-		return nil
+		return result, nil
 	}
 }
 
-func (s *Server) recordTransferMatches(ctx context.Context, transfer tron.Transfer, byAddress map[string][]storage.ChainWatcherSubscription) error {
+func (s *Server) recordTransferMatches(ctx context.Context, transfer tron.Transfer, byAddress map[string][]storage.ChainWatcherSubscription) (int, error) {
 	candidates := append([]storage.ChainWatcherSubscription{}, byAddress[transfer.From]...)
 	candidates = append(candidates, byAddress[transfer.To]...)
 	if len(candidates) == 0 {
-		return nil
+		return 0, nil
 	}
 	event := TransferEvent(transfer, "tronscan")
 	deliveries := MatchTransfer(transfer, candidates)
 	if len(deliveries) == 0 {
+		return 0, nil
+	}
+	return s.store.RecordChainWatcherMatches(ctx, event, deliveries, time.Now())
+}
+
+type scanResult struct {
+	TransferCount     int
+	MatchCount        int
+	SubscriptionCount int
+	AddressCount      int
+	MaxBlockTimestamp int64
+}
+
+func (r *scanResult) observeTransfer(transfer tron.Transfer) {
+	if transfer.BlockTimestamp > r.MaxBlockTimestamp {
+		r.MaxBlockTimestamp = transfer.BlockTimestamp
+	}
+}
+
+func (r *scanResult) merge(other scanResult) {
+	r.TransferCount += other.TransferCount
+	r.MatchCount += other.MatchCount
+	if other.SubscriptionCount > r.SubscriptionCount {
+		r.SubscriptionCount = other.SubscriptionCount
+	}
+	if other.AddressCount > r.AddressCount {
+		r.AddressCount = other.AddressCount
+	}
+	if other.MaxBlockTimestamp > r.MaxBlockTimestamp {
+		r.MaxBlockTimestamp = other.MaxBlockTimestamp
+	}
+}
+
+func (s *Server) selectAddressBatch(byAddress map[string][]storage.ChainWatcherSubscription) []string {
+	if len(byAddress) == 0 {
 		return nil
 	}
-	_, err := s.store.RecordChainWatcherMatches(ctx, event, deliveries, time.Now())
-	return err
+	addresses := make([]string, 0, len(byAddress))
+	for address := range byAddress {
+		addresses = append(addresses, address)
+	}
+	sort.Strings(addresses)
+	limit := s.cfg.AddressMaxPerTick
+	if limit < 1 {
+		limit = 1
+	}
+	if limit >= len(addresses) {
+		s.addressMu.Lock()
+		s.addressCursor = 0
+		s.addressMu.Unlock()
+		return addresses
+	}
+	s.addressMu.Lock()
+	start := s.addressCursor % len(addresses)
+	batch := make([]string, 0, limit)
+	for i := 0; i < limit; i++ {
+		batch = append(batch, addresses[(start+i)%len(addresses)])
+	}
+	s.addressCursor = (start + limit) % len(addresses)
+	s.addressMu.Unlock()
+	return batch
+}
+
+func (s *Server) shouldSkipAddressScan(now time.Time) bool {
+	if s.cfg.PollInterval <= 0 {
+		return false
+	}
+	global := s.status.snapshotScan("global", now)
+	if global.LastStartedAt == nil {
+		return false
+	}
+	nextGlobal := global.LastStartedAt.Add(s.cfg.PollInterval)
+	guard := s.cfg.RequestInterval
+	if guard <= 0 {
+		guard = 250 * time.Millisecond
+	}
+	guard *= time.Duration(maxInt(1, s.cfg.AddressMaxPerTick))
+	if guard < s.cfg.PollInterval/2 {
+		guard = s.cfg.PollInterval / 2
+	}
+	return now.Add(guard).After(nextGlobal)
 }
 
 type apiBackoff struct {
@@ -287,6 +415,12 @@ func (b *apiBackoff) reset() {
 	b.failures = 0
 }
 
+func (b *apiBackoff) untilTime() time.Time {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.until
+}
+
 func minInt(a, b int) int {
 	if a < b {
 		return a
@@ -294,8 +428,249 @@ func minInt(a, b int) int {
 	return b
 }
 
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+type watcherStatus struct {
+	mu                       sync.Mutex
+	global                   scanStatus
+	address                  scanStatus
+	cleanup                  cleanupStatus
+	addressSkippedNearGlobal int64
+}
+
+type scanStatus struct {
+	lastStartedAt      time.Time
+	lastSuccessAt      time.Time
+	lastErrorAt        time.Time
+	lastError          string
+	lastDuration       time.Duration
+	backoffUntil       time.Time
+	lastBlockTimestamp int64
+	lag                time.Duration
+	scanCount          int64
+	errorCount         int64
+	transferCount      int
+	matchCount         int
+	subscriptionCount  int
+	addressCount       int
+}
+
+type cleanupStatus struct {
+	lastRunAt      time.Time
+	matchedDeleted int64
+	eventsDeleted  int64
+	err            string
+}
+
+func (s *watcherStatus) recordScanSuccess(kind string, result scanResult, duration time.Duration, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	target := s.scan(kind)
+	target.lastStartedAt = now.Add(-duration)
+	target.lastSuccessAt = now
+	target.lastError = ""
+	target.lastDuration = duration
+	target.backoffUntil = time.Time{}
+	target.scanCount++
+	target.transferCount = result.TransferCount
+	target.matchCount = result.MatchCount
+	target.subscriptionCount = result.SubscriptionCount
+	target.addressCount = result.AddressCount
+	target.lastBlockTimestamp = result.MaxBlockTimestamp
+	if result.MaxBlockTimestamp > 0 {
+		lag := now.Sub(time.UnixMilli(result.MaxBlockTimestamp))
+		if lag < 0 {
+			lag = 0
+		}
+		target.lag = lag
+	}
+}
+
+func (s *watcherStatus) recordScanError(kind string, err error, backoffUntil time.Time, duration time.Duration, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	target := s.scan(kind)
+	target.lastStartedAt = now.Add(-duration)
+	target.lastErrorAt = now
+	target.lastError = err.Error()
+	target.lastDuration = duration
+	target.backoffUntil = backoffUntil
+	target.errorCount++
+}
+
+func (s *watcherStatus) recordCleanup(stats storage.ChainWatcherCleanupStats, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanup.lastRunAt = now
+	s.cleanup.matchedDeleted = stats.MatchedDeleted
+	s.cleanup.eventsDeleted = stats.EventsDeleted
+	s.cleanup.err = ""
+}
+
+func (s *watcherStatus) recordCleanupError(err error, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanup.lastRunAt = now
+	s.cleanup.err = err.Error()
+}
+
+func (s *watcherStatus) recordAddressSkippedNearGlobal() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.addressSkippedNearGlobal++
+}
+
+func (s *watcherStatus) snapshotScan(kind string, now time.Time) ScanStatusResponse {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.scan(kind).response(now)
+}
+
+func (s *watcherStatus) response(now time.Time, staleAfter time.Duration, delivery storage.ChainWatcherDeliveryStats, addressCursor int, addressMaxPerTick int) StatusResponse {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	global := s.global.response(now)
+	address := s.address.response(now)
+	ready := scanReady(s.global, staleAfter, now)
+	status := "ready"
+	if !ready {
+		status = "degraded"
+	}
+	return StatusResponse{
+		Status:                 status,
+		Ready:                  ready,
+		Now:                    now,
+		StaleAfterMS:           staleAfter.Milliseconds(),
+		Global:                 global,
+		Address:                address,
+		Deliveries:             deliveryResponse(delivery),
+		RetentionCleanup:       s.cleanup.response(),
+		AddressCursor:          addressCursor,
+		AddressScanMaxPerTick:  addressMaxPerTick,
+		AddressScanSkippedNear: s.addressSkippedNearGlobal,
+	}
+}
+
+func (s *watcherStatus) scan(kind string) *scanStatus {
+	if kind == "address" {
+		return &s.address
+	}
+	return &s.global
+}
+
+func (s scanStatus) response(now time.Time) ScanStatusResponse {
+	backoffRemaining := int64(0)
+	if !s.backoffUntil.IsZero() && s.backoffUntil.After(now) {
+		backoffRemaining = s.backoffUntil.Sub(now).Milliseconds()
+	}
+	return ScanStatusResponse{
+		LastStartedAt:      timePtr(s.lastStartedAt),
+		LastSuccessAt:      timePtr(s.lastSuccessAt),
+		LastErrorAt:        timePtr(s.lastErrorAt),
+		LastError:          s.lastError,
+		LastDurationMS:     s.lastDuration.Milliseconds(),
+		BackoffUntil:       timePtr(s.backoffUntil),
+		BackoffRemainingMS: backoffRemaining,
+		LastBlockTimestamp: s.lastBlockTimestamp,
+		LagMS:              s.lag.Milliseconds(),
+		ScanCount:          s.scanCount,
+		ErrorCount:         s.errorCount,
+		TransferCount:      s.transferCount,
+		MatchCount:         s.matchCount,
+		SubscriptionCount:  s.subscriptionCount,
+		AddressCount:       s.addressCount,
+	}
+}
+
+func (s cleanupStatus) response() CleanupStatusResponse {
+	return CleanupStatusResponse{
+		LastRunAt:      timePtr(s.lastRunAt),
+		MatchedDeleted: s.matchedDeleted,
+		EventsDeleted:  s.eventsDeleted,
+		Error:          s.err,
+	}
+}
+
+func scanReady(status scanStatus, staleAfter time.Duration, now time.Time) bool {
+	if status.lastSuccessAt.IsZero() {
+		return false
+	}
+	if staleAfter <= 0 {
+		staleAfter = 5 * time.Second
+	}
+	if now.Sub(status.lastSuccessAt) > staleAfter {
+		return false
+	}
+	return status.backoffUntil.IsZero() || !status.backoffUntil.After(now)
+}
+
+func deliveryResponse(stats storage.ChainWatcherDeliveryStats) DeliveryStatusResponse {
+	return DeliveryStatusResponse{
+		PendingCount:       stats.PendingCount,
+		DeliveringCount:    stats.DeliveringCount,
+		OldestPendingAt:    stats.OldestPendingAt,
+		OldestPendingAgeMS: stats.OldestPendingAgeMS,
+	}
+}
+
+func timePtr(value time.Time) *time.Time {
+	if value.IsZero() {
+		return nil
+	}
+	return &value
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "process": "alive"})
+}
+
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	status := s.statusResponse(r.Context(), time.Now())
+	if !status.Ready {
+		writeJSON(w, http.StatusServiceUnavailable, status)
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.statusResponse(r.Context(), time.Now()))
+}
+
+func (s *Server) statusResponse(ctx context.Context, now time.Time) StatusResponse {
+	var delivery storage.ChainWatcherDeliveryStats
+	if s.store != nil {
+		stats, err := s.store.ChainWatcherDeliveryStats(ctx, s.cfg.Lookback, now)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("chain watcher delivery stats: %v", err)
+		} else {
+			delivery = stats
+		}
+	}
+	s.addressMu.Lock()
+	cursor := s.addressCursor
+	s.addressMu.Unlock()
+	return s.status.response(now, s.sourceStaleAfter(), delivery, cursor, s.cfg.AddressMaxPerTick)
+}
+
+func (s *Server) sourceStaleAfter() time.Duration {
+	interval := s.cfg.PollInterval
+	if interval <= 0 {
+		interval = time.Second
+	}
+	staleAfter := interval * 5
+	if staleAfter < 5*time.Second {
+		staleAfter = 5 * time.Second
+	}
+	if s.cfg.Lookback > 0 && staleAfter > s.cfg.Lookback {
+		staleAfter = s.cfg.Lookback
+	}
+	return staleAfter
 }
 
 func (s *Server) handleUpsertSubscription(w http.ResponseWriter, r *http.Request) {

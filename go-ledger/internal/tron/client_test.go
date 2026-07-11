@@ -2,6 +2,7 @@ package tron
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -54,6 +55,14 @@ func TestParseRetryAfter(t *testing.T) {
 	}
 	if got := parseRetryAfter("", now); got != 0 {
 		t.Fatalf("empty Retry-After = %s, want 0", got)
+	}
+}
+
+func TestIsRateLimitedUnwrapsHTTPError(t *testing.T) {
+	err := fmt.Errorf("wrapped: %w", &HTTPError{StatusCode: http.StatusTooManyRequests})
+	httpErr, ok := IsRateLimited(err)
+	if !ok || httpErr == nil || httpErr.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("IsRateLimited() = %#v %v, want wrapped 429", httpErr, ok)
 	}
 }
 

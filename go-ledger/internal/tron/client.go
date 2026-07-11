@@ -3,6 +3,7 @@ package tron
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -69,7 +70,8 @@ func (e *HTTPError) RateLimited() bool {
 }
 
 func IsRateLimited(err error) (*HTTPError, bool) {
-	httpErr, ok := err.(*HTTPError)
+	var httpErr *HTTPError
+	ok := errors.As(err, &httpErr)
 	return httpErr, ok && httpErr.RateLimited()
 }
 

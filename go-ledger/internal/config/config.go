@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const Version = "2.3.3"
+const Version = "2.3.4"
 
 type Config struct {
 	TelegramBotToken string
@@ -68,10 +68,12 @@ type Config struct {
 	AdminWebHost                  string
 	AdminWebPort                  int
 	AdminWebToken                 string
+	AdminWebCookieSecure          bool
 	AddressWatchFreeLimit         int
 }
 
 func Load() (Config, error) {
+	publicBillBaseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("PUBLIC_BILL_BASE_URL")), "/")
 	cfg := Config{
 		TelegramBotToken:              strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN")),
 		TelegramAPIBase:               env("TELEGRAM_API_BASE", "https://api.telegram.org"),
@@ -122,12 +124,17 @@ func Load() (Config, error) {
 		P2PFiatUnit:                   env("P2P_RATE_FIAT_UNIT", "CNY"),
 		P2PAsset:                      env("P2P_RATE_ASSET", "USDT"),
 		P2PTradeMethods:               parseCSV(env("P2P_RATE_TRADE_METHODS", "aliPay")),
-		PublicBillBaseURL:             strings.TrimRight(strings.TrimSpace(os.Getenv("PUBLIC_BILL_BASE_URL")), "/"),
+		PublicBillBaseURL:             publicBillBaseURL,
 		AdminWebEnabled:               boolEnv("ADMIN_WEB_ENABLED", true),
 		AdminWebHost:                  env("ADMIN_WEB_HOST", "0.0.0.0"),
 		AdminWebPort:                  intEnv("ADMIN_WEB_PORT", 8080),
 		AdminWebToken:                 strings.TrimSpace(os.Getenv("ADMIN_WEB_TOKEN")),
 		AddressWatchFreeLimit:         intEnv("ADDRESS_WATCH_FREE_LIMIT", 2),
+	}
+	if raw := strings.TrimSpace(os.Getenv("ADMIN_WEB_COOKIE_SECURE")); raw != "" {
+		cfg.AdminWebCookieSecure = boolEnv("ADMIN_WEB_COOKIE_SECURE", false)
+	} else {
+		cfg.AdminWebCookieSecure = strings.HasPrefix(strings.ToLower(cfg.PublicBillBaseURL), "https://")
 	}
 	if cfg.TelegramBotToken == "" {
 		return cfg, errors.New("TELEGRAM_BOT_TOKEN is required")
@@ -195,6 +202,7 @@ type ChainWatcherConfig struct {
 	AddressInterval    time.Duration
 	AddressPages       int
 	AddressConcurrency int
+	AddressMaxPerTick  int
 	RequestInterval    time.Duration
 	Lookback           time.Duration
 	BotCredentials     map[string]string
@@ -216,6 +224,7 @@ func LoadChainWatcher() (ChainWatcherConfig, error) {
 		AddressInterval:    secondsEnv("CHAIN_WATCHER_ADDRESS_SCAN_INTERVAL_SECONDS", 30),
 		AddressPages:       intEnv("CHAIN_WATCHER_ADDRESS_SCAN_PAGES", 1),
 		AddressConcurrency: intEnv("CHAIN_WATCHER_ADDRESS_SCAN_CONCURRENCY", 1),
+		AddressMaxPerTick:  intEnv("CHAIN_WATCHER_ADDRESS_SCAN_MAX_PER_TICK", 1),
 		RequestInterval:    millisEnv("CHAIN_WATCHER_TRON_REQUEST_INTERVAL_MS", 250),
 		Lookback:           secondsEnv("CHAIN_WATCHER_LOOKBACK_SECONDS", 600),
 		BotCredentials:     parseBotCredentials(os.Getenv("CHAIN_WATCHER_BOTS")),
@@ -239,6 +248,9 @@ func LoadChainWatcher() (ChainWatcherConfig, error) {
 	}
 	if cfg.AddressConcurrency < 1 {
 		cfg.AddressConcurrency = 1
+	}
+	if cfg.AddressMaxPerTick < 1 {
+		cfg.AddressMaxPerTick = 1
 	}
 	if cfg.Lookback <= 0 {
 		cfg.Lookback = 10 * time.Minute

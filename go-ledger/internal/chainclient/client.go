@@ -21,6 +21,19 @@ type Client struct {
 	http    *http.Client
 }
 
+type ReadinessError struct {
+	StatusCode int
+	Status     chainwatcher.StatusResponse
+	Body       string
+}
+
+func (e *ReadinessError) Error() string {
+	if e.Status.Status != "" {
+		return fmt.Sprintf("chain watcher ready http %d: %s", e.StatusCode, e.Status.Status)
+	}
+	return fmt.Sprintf("chain watcher ready http %d: %s", e.StatusCode, e.Body)
+}
+
 func New(baseURL, botID, secret string, timeout time.Duration) *Client {
 	return &Client{
 		baseURL: strings.TrimRight(strings.TrimSpace(baseURL), "/"),
@@ -104,6 +117,39 @@ func (c *Client) Health(ctx context.Context) error {
 		return fmt.Errorf("chain watcher health http %d: %s", resp.StatusCode, string(body))
 	}
 	return nil
+}
+
+func (c *Client) Ready(ctx context.Context) (chainwatcher.StatusResponse, error) {
+	var status chainwatcher.StatusResponse
+	if !c.Enabled() {
+		status.Ready = true
+		status.Status = "disabled"
+		return status, nil
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/readyz", nil)
+	if err != nil {
+		return status, err
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return status, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return status, err
+	}
+	if len(body) > 0 {
+		_ = json.Unmarshal(body, &status)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return status, &ReadinessError{StatusCode: resp.StatusCode, Status: status, Body: string(body)}
+	}
+	if !status.Ready {
+		return status, &ReadinessError{StatusCode: resp.StatusCode, Status: status, Body: string(body)}
+	}
+	return status, nil
 }
 
 func (c *Client) post(ctx context.Context, path string, payload any, out any) error {

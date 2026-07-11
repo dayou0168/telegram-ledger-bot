@@ -39,6 +39,7 @@ CHAIN_WATCHER_GLOBAL_SCAN_PAGES=3
 CHAIN_WATCHER_ADDRESS_SCAN_INTERVAL_SECONDS=30
 CHAIN_WATCHER_ADDRESS_SCAN_PAGES=1
 CHAIN_WATCHER_ADDRESS_SCAN_CONCURRENCY=1
+CHAIN_WATCHER_ADDRESS_SCAN_MAX_PER_TICK=1
 CHAIN_WATCHER_LOOKBACK_SECONDS=600
 CHAIN_WATCHER_TRON_REQUEST_INTERVAL_MS=250
 CHAIN_WATCHER_EMERGENCY_FALLBACK=false
@@ -72,6 +73,7 @@ Snapshot from the v2.3.1 release thread after deployment:
 - `zhuanfa-tianze-go` bot container was updated to `ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.1`.
 - `ledger-chain-watcher.service` was active.
 - watcher `/healthz` returned OK.
+- watcher `/readyz` should be used for chain-source readiness; `/status` shows latest source scan, backoff, pending, and cleanup state.
 - bot container could access watcher `/healthz`.
 - Short observation window showed no sustained `401`, `403`, `429`, or `ApiKey not exists` logs.
 - watcher DB snapshot at that time:
@@ -161,7 +163,10 @@ Recommended checks:
 ```bash
 systemctl is-active ledger-chain-watcher
 curl -fsS http://127.0.0.1:8090/healthz
+curl -fsS http://127.0.0.1:8090/readyz
+curl -fsS http://127.0.0.1:8090/status
 docker exec zhuanfa-tianze-go wget -qO- http://host.docker.internal:8090/healthz
+docker exec zhuanfa-tianze-go wget -qO- http://host.docker.internal:8090/readyz
 journalctl -u ledger-chain-watcher --since "3 minutes ago" --no-pager
 docker logs --since 3m zhuanfa-tianze-go
 ```

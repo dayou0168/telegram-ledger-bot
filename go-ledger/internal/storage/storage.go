@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -365,6 +366,8 @@ func (s *Store) migrate(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_events_tx
 			ON chain_watcher_events(tx_hash, block_timestamp DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_events_created
+			ON chain_watcher_events(created_at)`,
 		`CREATE TABLE IF NOT EXISTS chain_watcher_matched_events (
 			delivery_id TEXT PRIMARY KEY,
 			event_id TEXT NOT NULL,
@@ -396,6 +399,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			WHERE status IN ('pending', 'delivering')`,
 		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_matched_event
 			ON chain_watcher_matched_events(event_id, bot_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_matched_created
+			ON chain_watcher_matched_events(created_at)`,
 		`CREATE TABLE IF NOT EXISTS notification_outbox (
 			id BIGSERIAL PRIMARY KEY,
 			kind TEXT NOT NULL,
@@ -961,7 +966,7 @@ func (s *Store) CreateAdminLoginTicket(ctx context.Context, tokenHash string, us
 func (s *Store) GetAdminLoginTicket(ctx context.Context, tokenHash string, now time.Time) (AdminLoginTicket, bool, error) {
 	row := s.pool.QueryRow(ctx, `SELECT token_hash, user_id, role, expires_at, used_at, created_at
 		FROM admin_login_tickets
-		WHERE token_hash=$1 AND expires_at > $2`, strings.TrimSpace(tokenHash), now)
+		WHERE token_hash=$1 AND used_at IS NULL AND expires_at > $2`, strings.TrimSpace(tokenHash), now)
 	var ticket AdminLoginTicket
 	err := row.Scan(&ticket.TokenHash, &ticket.UserID, &ticket.Role, &ticket.ExpiresAt, &ticket.UsedAt, &ticket.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -2056,16 +2061,49 @@ func (s *Store) AckChainWatcherMatchedEvents(ctx context.Context, botID string, 
 	return err
 }
 
-func (s *Store) CleanupChainWatcherRetention(ctx context.Context, maxAge time.Duration, now time.Time) error {
+func (s *Store) ChainWatcherDeliveryStats(ctx context.Context, maxAge time.Duration, now time.Time) (ChainWatcherDeliveryStats, error) {
 	if maxAge <= 0 {
 		maxAge = 10 * time.Minute
 	}
-	cutoff := now.Add(-maxAge)
-	if _, err := s.pool.Exec(ctx, `DELETE FROM chain_watcher_matched_events WHERE created_at < $1`, cutoff); err != nil {
-		return err
+	keepAfter := now.Add(-maxAge)
+	var stats ChainWatcherDeliveryStats
+	var oldest pgtype.Timestamptz
+	err := s.pool.QueryRow(ctx, `SELECT
+			COUNT(*) FILTER (WHERE status='pending'),
+			COUNT(*) FILTER (WHERE status='delivering'),
+			MIN(created_at) FILTER (WHERE status IN ('pending', 'delivering'))
+		FROM chain_watcher_matched_events
+		WHERE created_at >= $1`, keepAfter).Scan(&stats.PendingCount, &stats.DeliveringCount, &oldest)
+	if err != nil {
+		return stats, err
 	}
-	_, err := s.pool.Exec(ctx, `DELETE FROM chain_watcher_events WHERE created_at < $1`, cutoff)
-	return err
+	if oldest.Valid {
+		stats.OldestPendingAt = &oldest.Time
+		stats.OldestPendingAgeMS = now.Sub(oldest.Time).Milliseconds()
+		if stats.OldestPendingAgeMS < 0 {
+			stats.OldestPendingAgeMS = 0
+		}
+	}
+	return stats, nil
+}
+
+func (s *Store) CleanupChainWatcherRetention(ctx context.Context, maxAge time.Duration, now time.Time) (ChainWatcherCleanupStats, error) {
+	if maxAge <= 0 {
+		maxAge = 10 * time.Minute
+	}
+	var stats ChainWatcherCleanupStats
+	cutoff := now.Add(-maxAge)
+	tag, err := s.pool.Exec(ctx, `DELETE FROM chain_watcher_matched_events WHERE created_at < $1`, cutoff)
+	if err != nil {
+		return stats, err
+	}
+	stats.MatchedDeleted = tag.RowsAffected()
+	tag, err = s.pool.Exec(ctx, `DELETE FROM chain_watcher_events WHERE created_at < $1`, cutoff)
+	if err != nil {
+		return stats, err
+	}
+	stats.EventsDeleted = tag.RowsAffected()
+	return stats, nil
 }
 
 func rollback(ctx context.Context, tx pgx.Tx) {

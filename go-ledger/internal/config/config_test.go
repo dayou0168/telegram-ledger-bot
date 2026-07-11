@@ -71,6 +71,7 @@ func TestLoadChainWatcherDefaults(t *testing.T) {
 	t.Setenv("CHAIN_WATCHER_ADDRESS_SCAN_INTERVAL_SECONDS", "")
 	t.Setenv("CHAIN_WATCHER_ADDRESS_SCAN_PAGES", "")
 	t.Setenv("CHAIN_WATCHER_ADDRESS_SCAN_CONCURRENCY", "")
+	t.Setenv("CHAIN_WATCHER_ADDRESS_SCAN_MAX_PER_TICK", "")
 	t.Setenv("CHAIN_WATCHER_TRON_REQUEST_INTERVAL_MS", "")
 	cfg, err := LoadChainWatcher()
 	if err != nil {
@@ -90,6 +91,9 @@ func TestLoadChainWatcherDefaults(t *testing.T) {
 	}
 	if cfg.AddressConcurrency != 1 {
 		t.Fatalf("AddressConcurrency = %d, want 1", cfg.AddressConcurrency)
+	}
+	if cfg.AddressMaxPerTick != 1 {
+		t.Fatalf("AddressMaxPerTick = %d, want 1", cfg.AddressMaxPerTick)
 	}
 	if got := cfg.RequestInterval.Milliseconds(); got != 250 {
 		t.Fatalf("RequestInterval = %d ms, want 250", got)

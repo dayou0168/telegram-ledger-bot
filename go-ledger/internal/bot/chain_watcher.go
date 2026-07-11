@@ -161,22 +161,28 @@ func (b *Bot) checkChainWatcherHealth(ctx context.Context) {
 	}
 	healthCtx, cancel := context.WithTimeout(ctx, b.cfg.BotWatcherClaimTimeout)
 	defer cancel()
-	if err := b.watcher.Health(healthCtx); err != nil {
-		log.Printf("chain watcher health: %v", err)
-		b.recordChainWatcherFailure("health")
+	status, err := b.watcher.Ready(healthCtx)
+	if err != nil {
+		log.Printf("chain watcher readiness: %v", err)
+		b.recordChainWatcherFailure("ready")
 		return
 	}
-	b.recordChainWatcherSuccess("health")
+	if !status.Ready {
+		log.Printf("chain watcher source degraded: %s", status.Status)
+		b.recordChainWatcherFailure("ready")
+		return
+	}
+	b.recordChainWatcherSuccess("ready")
 }
 
 func (b *Bot) recordChainWatcherFailure(source string) {
-	if b.watcherFallback.recordFailure(time.Now()) {
+	if b.watcherFallback.recordFailure(source, time.Now()) {
 		log.Printf("chain watcher %s failed repeatedly; enabling temporary no-key fallback", source)
 	}
 }
 
 func (b *Bot) recordChainWatcherSuccess(source string) {
-	if b.watcherFallback.recordSuccess(time.Now()) {
+	if b.watcherFallback.recordSuccess(source, time.Now()) {
 		log.Printf("chain watcher %s recovered; disabling temporary fallback", source)
 	}
 }
@@ -240,7 +246,7 @@ type watcherFallbackController struct {
 	mu            sync.Mutex
 	failThreshold int
 	maxActive     time.Duration
-	failures      int
+	failures      map[string]int
 	successes     int
 	activeNow     bool
 	exhausted     bool
@@ -254,18 +260,21 @@ func newWatcherFallbackController(failThreshold int, maxActive time.Duration) *w
 	if maxActive <= 0 {
 		maxActive = 10 * time.Minute
 	}
-	return &watcherFallbackController{failThreshold: failThreshold, maxActive: maxActive}
+	return &watcherFallbackController{failThreshold: failThreshold, maxActive: maxActive, failures: make(map[string]int)}
 }
 
-func (c *watcherFallbackController) recordFailure(now time.Time) bool {
+func (c *watcherFallbackController) recordFailure(source string, now time.Time) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if source == "" {
+		source = "watcher"
+	}
 	c.successes = 0
 	if c.exhausted {
 		return false
 	}
-	c.failures++
-	if c.activeNow || c.failures < c.failThreshold {
+	c.failures[source]++
+	if c.activeNow || c.failures[source] < c.failThreshold {
 		return false
 	}
 	c.activeNow = true
@@ -273,10 +282,17 @@ func (c *watcherFallbackController) recordFailure(now time.Time) bool {
 	return true
 }
 
-func (c *watcherFallbackController) recordSuccess(now time.Time) bool {
+func (c *watcherFallbackController) recordSuccess(source string, now time.Time) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.failures = 0
+	if source == "" {
+		source = "watcher"
+	}
+	delete(c.failures, source)
+	if len(c.failures) > 0 {
+		c.successes = 0
+		return false
+	}
 	c.successes++
 	if c.successes < watcherRecoveryThreshold {
 		return false
@@ -297,7 +313,7 @@ func (c *watcherFallbackController) active(now time.Time) bool {
 	if c.maxActive > 0 && now.Sub(c.startedAt) >= c.maxActive {
 		c.activeNow = false
 		c.exhausted = true
-		c.failures = 0
+		c.failures = make(map[string]int)
 		return false
 	}
 	return true

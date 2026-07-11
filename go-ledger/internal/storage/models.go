@@ -201,6 +201,18 @@ type ChainWatcherMatchedEvent struct {
 	DeliveredAt    *time.Time
 }
 
+type ChainWatcherDeliveryStats struct {
+	PendingCount       int64
+	DeliveringCount    int64
+	OldestPendingAt    *time.Time
+	OldestPendingAgeMS int64
+}
+
+type ChainWatcherCleanupStats struct {
+	MatchedDeleted int64
+	EventsDeleted  int64
+}
+
 type WatchSettings struct {
 	OwnerUserID     int64
 	WatchIncome     bool

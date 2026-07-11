@@ -263,16 +263,20 @@ func (s *Server) downloadBill(w http.ResponseWriter, group storage.Group, dayKey
 }
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
-	if ticket := strings.TrimSpace(r.URL.Query().Get("ticket")); ticket != "" {
-		s.loginWithTicket(w, r, ticket)
-		return
-	}
 	if r.Method == http.MethodGet {
+		if ticket := strings.TrimSpace(r.URL.Query().Get("ticket")); ticket != "" {
+			s.renderTicketLogin(w, r, ticket)
+			return
+		}
 		renderLogin(w, s.cfg.AdminWebToken == "", "")
 		return
 	}
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if ticket := strings.TrimSpace(firstNonEmpty(r.FormValue("ticket"), r.URL.Query().Get("ticket"))); ticket != "" {
+		s.loginWithTicket(w, r, ticket)
 		return
 	}
 	if strings.TrimSpace(s.cfg.AdminWebToken) == "" {
@@ -295,13 +299,34 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
 }
 
+func (s *Server) renderTicketLogin(w http.ResponseWriter, r *http.Request, ticket string) {
+	now := time.Now()
+	item, ok, err := s.store.GetAdminLoginTicket(r.Context(), adminauth.HashToken(ticket), now)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !ok || !adminauth.IsAllowedRole(item.Role) {
+		renderLogin(w, s.cfg.AdminWebToken == "", "快捷登录链接无效或已过期，请输入后台密码登录")
+		return
+	}
+	if ok, err := s.adminSessionAllowed(r.Context(), adminauth.Session{UserID: item.UserID, Role: item.Role, ExpiresAt: item.ExpiresAt}); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	} else if !ok {
+		renderLogin(w, s.cfg.AdminWebToken == "", "后台登录身份已失效，请输入后台密码登录")
+		return
+	}
+	renderLoginWithTicket(w, s.cfg.AdminWebToken == "", "快捷登录链接有效，点击下方按钮进入后台。", ticket)
+}
+
 func (s *Server) loginWithTicket(w http.ResponseWriter, r *http.Request, ticket string) {
 	now := time.Now()
 	if strings.TrimSpace(s.cfg.AdminWebToken) == "" {
 		renderLogin(w, true, "未配置 ADMIN_WEB_TOKEN，无法创建后台会话")
 		return
 	}
-	item, ok, err := s.store.GetAdminLoginTicket(r.Context(), adminauth.HashToken(ticket), now)
+	item, ok, err := s.store.ConsumeAdminLoginTicket(r.Context(), adminauth.HashToken(ticket), now)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -397,6 +422,7 @@ func (s *Server) setAdminCookie(w http.ResponseWriter, session adminauth.Session
 		Path:     "/admin",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
+		Secure:   s.cfg.AdminWebCookieSecure,
 		MaxAge:   int(time.Until(session.ExpiresAt).Seconds()),
 	})
 }
@@ -424,6 +450,43 @@ func requireGlobalAdmin(w http.ResponseWriter, r *http.Request) bool {
 	return false
 }
 
+func requirePost(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method == http.MethodPost {
+		return true
+	}
+	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	return false
+}
+
+func parsePositiveFormID(r *http.Request, name string) (int64, bool) {
+	id, err := strconv.ParseInt(strings.TrimSpace(r.FormValue(name)), 10, 64)
+	return id, err == nil && id > 0
+}
+
+func parseBroadcastPermissionForm(r *http.Request) (int64, string, int64, string, string, bool) {
+	userID, ok := parsePositiveFormID(r, "user_id")
+	if !ok {
+		return 0, "", 0, "", "操作人 UID 不正确", false
+	}
+	target := strings.TrimSpace(r.FormValue("target"))
+	switch target {
+	case "chat":
+		chatID, err := strconv.ParseInt(strings.TrimSpace(r.FormValue("chat_id")), 10, 64)
+		if err != nil || chatID == 0 {
+			return 0, "", 0, "", "单群目标不正确", false
+		}
+		return userID, target, chatID, "", "", true
+	case "group":
+		groupName := strings.TrimSpace(r.FormValue("group_name"))
+		if groupName == "" {
+			return 0, "", 0, "", "分组目标不能为空", false
+		}
+		return userID, target, 0, groupName, "", true
+	default:
+		return 0, "", 0, "", "权限类型不正确", false
+	}
+}
+
 func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 	data, err := s.loadPageData(r.Context(), r.URL.Query().Get("msg"), adminSessionFromContext(r.Context()))
 	if err != nil {
@@ -440,8 +503,7 @@ func (s *Server) saveGroup(w http.ResponseWriter, r *http.Request) {
 	if !requireGlobalAdmin(w, r) {
 		return
 	}
-	if r.Method != http.MethodPost {
-		http.Redirect(w, r, "/admin", http.StatusSeeOther)
+	if !requirePost(w, r) {
 		return
 	}
 	if err := r.ParseForm(); err != nil {
@@ -464,11 +526,19 @@ func (s *Server) deleteGroup(w http.ResponseWriter, r *http.Request) {
 	if !requireGlobalAdmin(w, r) {
 		return
 	}
+	if !requirePost(w, r) {
+		return
+	}
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	ok, err := s.store.DeleteBroadcastGroup(r.Context(), r.FormValue("name"))
+	name := strings.TrimSpace(r.FormValue("name"))
+	if name == "" {
+		redirectMsg(w, r, "分组名不能为空")
+		return
+	}
+	ok, err := s.store.DeleteBroadcastGroup(r.Context(), name)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -492,12 +562,23 @@ func (s *Server) changeGroupChats(w http.ResponseWriter, r *http.Request, add bo
 	if !requireGlobalAdmin(w, r) {
 		return
 	}
+	if !requirePost(w, r) {
+		return
+	}
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	name := r.FormValue("name")
+	name := strings.TrimSpace(r.FormValue("name"))
+	if name == "" {
+		redirectMsg(w, r, "分组名不能为空")
+		return
+	}
 	chatIDs := parseIDList(r.Form["chat_id"])
+	if len(chatIDs) == 0 {
+		redirectMsg(w, r, "请选择群")
+		return
+	}
 	var count int
 	var err error
 	if add {
@@ -520,6 +601,9 @@ func (s *Server) saveOperator(w http.ResponseWriter, r *http.Request) {
 	if !requireGlobalAdmin(w, r) {
 		return
 	}
+	if !requirePost(w, r) {
+		return
+	}
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -540,11 +624,18 @@ func (s *Server) disableOperator(w http.ResponseWriter, r *http.Request) {
 	if !requireGlobalAdmin(w, r) {
 		return
 	}
+	if !requirePost(w, r) {
+		return
+	}
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	userID, _ := strconv.ParseInt(r.FormValue("user_id"), 10, 64)
+	userID, ok := parsePositiveFormID(r, "user_id")
+	if !ok {
+		redirectMsg(w, r, "操作人 UID 不正确")
+		return
+	}
 	_, err := s.store.DisableBroadcastOperator(r.Context(), userID, time.Now())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -555,6 +646,9 @@ func (s *Server) disableOperator(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) saveOperatorCleanup(w http.ResponseWriter, r *http.Request) {
 	if !requireGlobalAdmin(w, r) {
+		return
+	}
+	if !requirePost(w, r) {
 		return
 	}
 	if err := r.ParseForm(); err != nil {
@@ -600,14 +694,18 @@ func (s *Server) grantPermission(w http.ResponseWriter, r *http.Request) {
 	if !requireGlobalAdmin(w, r) {
 		return
 	}
+	if !requirePost(w, r) {
+		return
+	}
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	userID, _ := strconv.ParseInt(r.FormValue("user_id"), 10, 64)
-	target := r.FormValue("target")
-	chatID, _ := strconv.ParseInt(r.FormValue("chat_id"), 10, 64)
-	groupName := r.FormValue("group_name")
+	userID, target, chatID, groupName, message, ok := parseBroadcastPermissionForm(r)
+	if !ok {
+		redirectMsg(w, r, message)
+		return
+	}
 	if err := s.store.AddBroadcastPermission(r.Context(), userID, target, chatID, groupName, 0, time.Now()); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -619,14 +717,18 @@ func (s *Server) revokePermission(w http.ResponseWriter, r *http.Request) {
 	if !requireGlobalAdmin(w, r) {
 		return
 	}
+	if !requirePost(w, r) {
+		return
+	}
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	userID, _ := strconv.ParseInt(r.FormValue("user_id"), 10, 64)
-	target := r.FormValue("target")
-	chatID, _ := strconv.ParseInt(r.FormValue("chat_id"), 10, 64)
-	groupName := r.FormValue("group_name")
+	userID, target, chatID, groupName, message, ok := parseBroadcastPermissionForm(r)
+	if !ok {
+		redirectMsg(w, r, message)
+		return
+	}
 	_, err := s.store.RemoveBroadcastPermission(r.Context(), userID, target, chatID, groupName)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -636,6 +738,9 @@ func (s *Server) revokePermission(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) saveWatchTarget(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r) {
+		return
+	}
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -667,6 +772,9 @@ func (s *Server) saveWatchTarget(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) removeWatchTarget(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r) {
+		return
+	}
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -704,6 +812,9 @@ func (s *Server) watchFormIdentity(w http.ResponseWriter, r *http.Request, sessi
 
 func (s *Server) saveReplace(w http.ResponseWriter, r *http.Request) {
 	if !requireGlobalAdmin(w, r) {
+		return
+	}
+	if !requirePost(w, r) {
 		return
 	}
 	if err := r.ParseMultipartForm(8 << 20); err != nil {
@@ -830,9 +941,22 @@ func parseIDList(values []string) []int64 {
 	return ids
 }
 
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
 func renderLogin(w http.ResponseWriter, tokenUnset bool, message string) {
+	renderLoginWithTicket(w, tokenUnset, message, "")
+}
+
+func renderLoginWithTicket(w http.ResponseWriter, tokenUnset bool, message, ticket string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_ = loginTemplate.Execute(w, map[string]any{"TokenUnset": tokenUnset, "Message": message})
+	_ = loginTemplate.Execute(w, map[string]any{"TokenUnset": tokenUnset, "Message": message, "Ticket": ticket})
 }
 
 func chatLabel(group storage.Group) string {
@@ -1737,8 +1861,13 @@ button{background:#12213a;color:#fff;font-weight:700;cursor:pointer}
 </head>
 <body><main class="box">
 <h1>后台管理登录</h1>
-{{if .TokenUnset}}<div class="warn">当前没有配置 ADMIN_WEB_TOKEN，测试环境可直接进入；公网部署请务必设置。</div>{{end}}
+{{if .TokenUnset}}<div class="warn">当前没有配置 ADMIN_WEB_TOKEN，无法创建后台会话；公网部署请务必设置。</div>{{end}}
 {{if .Message}}<div class="err">{{.Message}}</div>{{end}}
+{{if .Ticket}}<form method="post" action="/admin/login">
+<input type="hidden" name="ticket" value="{{.Ticket}}">
+<button type="submit">使用快捷登录进入后台</button>
+</form>
+<div class="warn">如果快捷登录失败，也可以输入后台密码登录。</div>{{end}}
 <form method="post" action="/admin/login">
 <input type="password" name="password" placeholder="输入后台密码">
 <button type="submit">进入后台</button>
