@@ -127,3 +127,15 @@ func TestLoadBotWatcherFallbackDefaults(t *testing.T) {
 		t.Fatalf("BotFallbackMaxActive = %.0f seconds, want 600", got)
 	}
 }
+
+func TestLoadSlowUpdateThreshold(t *testing.T) {
+	t.Setenv("TELEGRAM_BOT_TOKEN", "token")
+	t.Setenv("BOT_SLOW_UPDATE_THRESHOLD_MS", "1200")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got := cfg.SlowUpdateThreshold.Milliseconds(); got != 1200 {
+		t.Fatalf("SlowUpdateThreshold = %d ms, want 1200", got)
+	}
+}

@@ -18,6 +18,8 @@ type reliableMessageRef struct {
 }
 
 func (b *Bot) enqueueReliableText(ctx context.Context, priority sendPriority, kind, dedupeKey string, chatID int64, text string, opts map[string]any, ref reliableMessageRef, now time.Time) error {
+	done := measurePerfStage(ctx, "send_enqueue")
+	defer done()
 	item, err := reliableTextOutboxItem(priority, kind, dedupeKey, chatID, text, opts, ref)
 	if err != nil {
 		return err

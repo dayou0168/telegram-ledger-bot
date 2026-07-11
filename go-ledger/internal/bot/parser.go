@@ -176,6 +176,10 @@ func isBillCommand(text string) bool {
 	}
 }
 
+func isOpenBillCommand(text string) bool {
+	return strings.TrimSpace(text) == "+0"
+}
+
 func isZ0Command(text string) bool {
 	return strings.EqualFold(strings.TrimSpace(text), "Z0")
 }

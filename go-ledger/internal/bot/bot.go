@@ -40,6 +40,7 @@ type Bot struct {
 	notifyPool    *worker.Pool
 
 	groupTouchCache  *ttlCache[string]
+	groupCache       *ttlCache[storage.Group]
 	userTouchCache   *ttlCache[string]
 	operatorCache    *ttlCache[bool]
 	watchTargetCache *ttlCache[[]storage.WatchTarget]
@@ -76,6 +77,7 @@ func New(cfg config.Config, store *storage.Store, tg *telegram.Client, tronClien
 		queryPool:        worker.NewPool("query", cfg.QueryWorkers, cfg.QueueSize),
 		notifyPool:       worker.NewPool("notify", cfg.NotifyWorkers, cfg.QueueSize),
 		groupTouchCache:  newTTLCache[string](cfg.GroupCacheTTL),
+		groupCache:       newTTLCache[storage.Group](cfg.GroupCacheTTL),
 		userTouchCache:   newTTLCache[string](cfg.UserTouchCacheTTL),
 		operatorCache:    newTTLCache[bool](cfg.OperatorCacheTTL),
 		watchTargetCache: newTTLCache[[]storage.WatchTarget](cfg.WatchCacheTTL),
@@ -141,16 +143,85 @@ func (b *Bot) Run(ctx context.Context) error {
 			key, pool := b.updateRoute(update)
 			u := update
 			b.dispatcher.Submit(ctx, key, pool, func(jobCtx context.Context) {
-				start := time.Now()
-				if err := b.handleUpdate(jobCtx, u); err != nil {
+				trace := newPerfTrace(u.UpdateID, updateChatID(u))
+				traceCtx := contextWithPerfTrace(jobCtx, trace)
+				if err := b.handleUpdate(traceCtx, u); err != nil {
 					log.Printf("handle update %d: %v", u.UpdateID, err)
 				}
-				if elapsed := time.Since(start); elapsed > 2*time.Second {
-					log.Printf("slow update %d handled in %s", u.UpdateID, elapsed)
-				}
+				finishPerfTrace(trace, b.cfg.SlowUpdateThreshold)
 			})
 		}
 	}
+}
+
+func updateChatID(update telegram.Update) int64 {
+	if update.Message != nil {
+		return update.Message.Chat.ID
+	}
+	if update.CallbackQuery != nil && update.CallbackQuery.Message != nil {
+		return update.CallbackQuery.Message.Chat.ID
+	}
+	if update.MyChatMember != nil {
+		return update.MyChatMember.Chat.ID
+	}
+	return 0
+}
+
+func classifyMessageCommand(text string, chatType string) string {
+	text = strings.TrimSpace(text)
+	if chatType == "private" {
+		if text == "" || text == "/start" || text == "菜单" {
+			return "private_menu"
+		}
+		if _, ok := parseTRXAddressQuery(text); ok {
+			return "private_trx_query"
+		}
+		return "private_message"
+	}
+	switch text {
+	case "":
+		return "non_text"
+	case "开始":
+		return "ledger_start"
+	case "停止", "关闭":
+		return "ledger_stop"
+	case "上课", "下课":
+		return "business_mode"
+	}
+	if isBillCommand(text) {
+		return "ledger_bill"
+	}
+	if isZ0Command(text) {
+		return "z0"
+	}
+	if _, ok := parseZRateSetting(text); ok {
+		return "zrate_setting"
+	}
+	if _, ok := parseSetting(text); ok {
+		return "ledger_setting"
+	}
+	if _, ok := parseClearScope(text); ok {
+		return "ledger_clear"
+	}
+	if _, ok := parseUndoKind(text); ok {
+		return "ledger_undo"
+	}
+	if isNotifyAllCommand(text) {
+		return "notify_all"
+	}
+	if isOperatorWriteCommand(text) {
+		return "operator_write"
+	}
+	if isOperatorListCommand(text) {
+		return "operator_list"
+	}
+	if _, ok := parseLedger(text); ok {
+		return "ledger_record"
+	}
+	if isArithmeticExpression(text) {
+		return "calculator"
+	}
+	return "other"
 }
 
 func (b *Bot) updateRoute(update telegram.Update) (string, worker.Executor) {
@@ -199,6 +270,10 @@ func (b *Bot) handleMessage(ctx context.Context, msg telegram.Message) error {
 	user := userFromTelegram(*msg.From)
 	now := time.Now().In(b.loc)
 	text := strings.TrimSpace(msg.TextOrCaption())
+	doneParse := measurePerfStage(ctx, "command_parse")
+	command := classifyMessageCommand(text, msg.Chat.Type)
+	doneParse()
+	setPerfCommand(ctx, command)
 	if msg.Chat.Type == "private" {
 		return b.handlePrivateMessage(ctx, msg, user, text, now)
 	}
@@ -231,7 +306,10 @@ func (b *Bot) handleMessage(ctx context.Context, msg telegram.Message) error {
 		return b.handleNotifyAll(ctx, msg, user)
 	}
 	if isBillCommand(text) {
-		group, err := b.store.GetGroup(ctx, msg.Chat.ID)
+		if isOpenBillCommand(text) {
+			return b.sendBill(ctx, msg.Chat.ID, msg.MessageID, now, "")
+		}
+		group, err := b.getGroupCached(ctx, msg.Chat.ID)
 		if err != nil {
 			return err
 		}
@@ -283,9 +361,12 @@ func (b *Bot) handleMessage(ctx context.Context, msg telegram.Message) error {
 }
 
 func (b *Bot) handlePrivateMessage(ctx context.Context, msg telegram.Message, user storage.User, text string, now time.Time) error {
+	doneTouch := measurePerfStage(ctx, "db_user_touch")
 	if err := b.store.TouchUser(ctx, msg.Chat.ID, user, now); err != nil {
+		doneTouch()
 		return err
 	}
+	doneTouch()
 	b.recordIncomingPrivateChatMessage(ctx, msg, user, now)
 	if msg.UsersShared != nil {
 		return b.handleUsersShared(ctx, msg)
@@ -441,8 +522,12 @@ func userFromTelegram(u telegram.User) storage.User {
 func (b *Bot) ensureGroupCached(ctx context.Context, chatID int64, title string, now time.Time) error {
 	key := strconv.FormatInt(chatID, 10)
 	if cached, ok := b.groupTouchCache.Get(key); ok && cached == title {
+		markPerfCache(ctx, "group_touch", true)
 		return nil
 	}
+	markPerfCache(ctx, "group_touch", false)
+	done := measurePerfStage(ctx, "db_group_touch")
+	defer done()
 	if err := b.store.EnsureGroup(ctx, chatID, title, now); err != nil {
 		return err
 	}
@@ -454,13 +539,40 @@ func (b *Bot) touchUserCached(ctx context.Context, chatID int64, user storage.Us
 	key := fmt.Sprintf("%d:%d", chatID, user.ID)
 	value := user.Username + "|" + user.DisplayName
 	if cached, ok := b.userTouchCache.Get(key); ok && cached == value {
+		markPerfCache(ctx, "user_touch", true)
 		return nil
 	}
+	markPerfCache(ctx, "user_touch", false)
+	done := measurePerfStage(ctx, "db_user_touch")
+	defer done()
 	if err := b.store.TouchUser(ctx, chatID, user, now); err != nil {
 		return err
 	}
 	b.userTouchCache.Set(key, value)
 	return nil
+}
+
+func (b *Bot) getGroupCached(ctx context.Context, chatID int64) (storage.Group, error) {
+	key := strconv.FormatInt(chatID, 10)
+	if group, ok := b.groupCache.Get(key); ok {
+		markPerfCache(ctx, "group", true)
+		return group, nil
+	}
+	markPerfCache(ctx, "group", false)
+	done := measurePerfStage(ctx, "db_group_get")
+	defer done()
+	group, err := b.store.GetGroup(ctx, chatID)
+	if err != nil {
+		return storage.Group{}, err
+	}
+	b.groupCache.Set(key, group)
+	return group, nil
+}
+
+func (b *Bot) invalidateGroupCache(chatID int64) {
+	if b.groupCache != nil {
+		b.groupCache.Delete(strconv.FormatInt(chatID, 10))
+	}
 }
 
 func (b *Bot) canInvite(ctx context.Context, userID int64) (bool, error) {

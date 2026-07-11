@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const Version = "2.3.5"
+const Version = "2.3.6"
 
 type Config struct {
 	TelegramBotToken string
@@ -32,6 +32,7 @@ type Config struct {
 	UserTouchCacheTTL   time.Duration
 	OperatorCacheTTL    time.Duration
 	WatchCacheTTL       time.Duration
+	SlowUpdateThreshold time.Duration
 	PollTimeout         time.Duration
 	RequestTimeout      time.Duration
 	TronPollInterval    time.Duration
@@ -94,6 +95,7 @@ func Load() (Config, error) {
 		UserTouchCacheTTL:             secondsEnv("BOT_USER_TOUCH_CACHE_TTL_SECONDS", 180),
 		OperatorCacheTTL:              secondsEnv("BOT_OPERATOR_CACHE_TTL_SECONDS", 10),
 		WatchCacheTTL:                 secondsEnv("BOT_WATCH_CACHE_TTL_SECONDS", 3),
+		SlowUpdateThreshold:           millisEnv("BOT_SLOW_UPDATE_THRESHOLD_MS", 800),
 		PollTimeout:                   secondsEnv("BOT_POLL_TIMEOUT", 50),
 		RequestTimeout:                secondsEnv("BOT_REQUEST_TIMEOUT", 70),
 		TronPollInterval:              secondsEnv("TRON_POLL_INTERVAL_SECONDS", 1),
@@ -174,6 +176,9 @@ func Load() (Config, error) {
 	}
 	if cfg.BotFallbackMaxActive <= 0 {
 		cfg.BotFallbackMaxActive = 10 * time.Minute
+	}
+	if cfg.SlowUpdateThreshold <= 0 {
+		cfg.SlowUpdateThreshold = 800 * time.Millisecond
 	}
 	if cfg.AddressWatchFreeLimit < 0 {
 		cfg.AddressWatchFreeLimit = 0

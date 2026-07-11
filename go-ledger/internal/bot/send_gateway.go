@@ -391,6 +391,8 @@ func cloneSendOptions(opts map[string]any) map[string]any {
 }
 
 func (b *Bot) sendText(ctx context.Context, priority sendPriority, chatID int64, text string, opts map[string]any) (telegram.Message, error) {
+	done := measurePerfStage(ctx, "send_enqueue")
+	defer done()
 	var msg telegram.Message
 	var err error
 	if b.sendGateway != nil {
@@ -441,6 +443,8 @@ func (b *Bot) sendPhotoBytes(ctx context.Context, chatID int64, filename string,
 }
 
 func (b *Bot) sendPhotoBytesWithPriority(ctx context.Context, priority sendPriority, chatID int64, filename string, data []byte, caption string, opts map[string]any) (telegram.Message, error) {
+	done := measurePerfStage(ctx, "send_enqueue")
+	defer done()
 	var msg telegram.Message
 	var err error
 	if b.sendGateway != nil {

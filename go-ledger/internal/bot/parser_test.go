@@ -60,6 +60,17 @@ func TestParseLedgerPayoutRequiresUSDT(t *testing.T) {
 	}
 }
 
+func TestOpenBillCommandOnlyPlusZero(t *testing.T) {
+	if !isBillCommand("+0") || !isOpenBillCommand("+0") {
+		t.Fatal("+0 should be an open bill query command")
+	}
+	for _, text := range []string{"账单", "显示账单", "+100", "下发100U"} {
+		if isOpenBillCommand(text) {
+			t.Fatalf("%q should not bypass ledger permission checks", text)
+		}
+	}
+}
+
 func TestParseLedgerPayoutWithMultiplierAndRate(t *testing.T) {
 	cmd, ok := parseLedger("下发5000*5/7.1")
 	if !ok {

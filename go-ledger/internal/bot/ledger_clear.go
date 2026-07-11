@@ -54,13 +54,17 @@ func (b *Bot) handleClearLedgerCallback(ctx context.Context, cb telegram.Callbac
 	var count int64
 	var err error
 	if scope == "today" {
-		group, getErr := b.store.GetGroup(ctx, cb.Message.Chat.ID)
+		group, getErr := b.getGroupCached(ctx, cb.Message.Chat.ID)
 		if getErr != nil {
 			return getErr
 		}
+		doneDelete := measurePerfStage(ctx, "db_record_delete")
 		count, err = b.store.SoftDeleteRecordsForDay(ctx, cb.Message.Chat.ID, businessDayKey(now, group.CutoffHour), now)
+		doneDelete()
 	} else {
+		doneDelete := measurePerfStage(ctx, "db_record_delete")
 		count, err = b.store.SoftDeleteAllRecords(ctx, cb.Message.Chat.ID, now)
+		doneDelete()
 	}
 	if err != nil {
 		return err

@@ -176,3 +176,39 @@ func TestBuildBillTextShowsLatestFiveRecords(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildBillTextFromSummaryUsesAggregateTotals(t *testing.T) {
+	loc := time.FixedZone("Asia/Shanghai", 8*3600)
+	text := buildBillTextFromSummary(storage.Group{DepositExchangeRate: "1"}, storage.BillSummaryData{
+		Summary: storage.RecordDaySummary{
+			DepositCount:     7,
+			PayoutCount:      2,
+			TotalDepositCNY:  "28",
+			TotalDepositUSDT: "28",
+			TotalPayoutUSDT:  "6",
+		},
+		Records: []storage.Record{
+			{
+				Kind:        "deposit",
+				Currency:    "CNY",
+				Amount:      "7",
+				Rate:        "1",
+				ResultUSDT:  "7",
+				SubjectName: "阿泽",
+				CreatedAt:   time.Date(2026, 7, 6, 1, 7, 0, 0, loc),
+			},
+		},
+	}, loc, "")
+	for _, want := range []string{
+		"<b>今日入款（7笔）</b>",
+		"01:07:00 7 / 1=7U 阿泽",
+		"<b>今日下发（2笔）</b>",
+		"总入款：28（28U）",
+		"已下发：6U",
+		"余额：22U",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("bill text missing %q:\n%s", want, text)
+		}
+	}
+}

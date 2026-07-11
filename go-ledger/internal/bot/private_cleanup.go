@@ -24,6 +24,7 @@ func (b *Bot) recordIncomingPrivateChatMessage(ctx context.Context, msg telegram
 		ChatID:         msg.Chat.ID,
 		MessageID:      msg.MessageID,
 		Direction:      "incoming",
+		Category:       "operator_message",
 		CreatedAt:      now,
 	})
 }
@@ -44,6 +45,7 @@ func (b *Bot) recordOutgoingPrivateChatMessage(ctx context.Context, msg telegram
 		ChatID:         msg.Chat.ID,
 		MessageID:      msg.MessageID,
 		Direction:      direction,
+		Category:       "bot_prompt",
 		CreatedAt:      createdAt,
 	})
 }
@@ -52,17 +54,46 @@ func (b *Bot) recordPrivateChatMessage(ctx context.Context, msg storage.PrivateC
 	if b.store == nil {
 		return
 	}
-	enabled, err := b.store.IsPrivateCleanupEnabled(ctx, msg.OperatorUserID)
+	settings, ok, err := b.store.GetPrivateCleanupSettings(ctx, msg.OperatorUserID)
 	if err != nil {
 		log.Printf("check private cleanup setting %d: %v", msg.OperatorUserID, err)
 		return
 	}
-	if !enabled {
+	if !ok || !settings.Enabled {
+		return
+	}
+	msg.Category, msg.CleanupAfterSeconds, msg.DueAt = privateCleanupMessageSchedule(msg, settings)
+	if msg.Direction == "incoming" && !settings.IncomingEnabled {
+		return
+	}
+	if msg.DueAt == nil && settings.DailyTime == "" {
 		return
 	}
 	if err := b.store.RecordPrivateChatMessage(ctx, msg); err != nil {
 		log.Printf("record private chat message %d/%d: %v", msg.ChatID, msg.MessageID, err)
 	}
+}
+
+func privateCleanupMessageSchedule(msg storage.PrivateChatMessage, settings storage.PrivateCleanupSettings) (string, int, *time.Time) {
+	category := msg.Category
+	if category == "" {
+		category = "private"
+	}
+	seconds := 0
+	if msg.Direction == "incoming" {
+		seconds = settings.IncomingDeleteAfter
+	} else {
+		seconds = settings.BotDeleteAfter
+	}
+	if seconds <= 0 {
+		return category, 0, nil
+	}
+	createdAt := msg.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
+	dueAt := createdAt.Add(time.Duration(seconds) * time.Second)
+	return category, seconds, &dueAt
 }
 
 func (b *Bot) privateCleanupScheduler(ctx context.Context) {
@@ -84,6 +115,9 @@ func (b *Bot) runPrivateCleanupOnce(ctx context.Context) {
 	if _, err := b.store.PurgePrivateChatMessages(ctx, now.Add(-privateCleanupRetention)); err != nil {
 		log.Printf("purge private cleanup records: %v", err)
 	}
+	if err := b.runDuePrivateCleanup(ctx, now); err != nil {
+		log.Printf("due private cleanup: %v", err)
+	}
 	targets, err := b.store.ListDuePrivateCleanupTargets(ctx, now.Hour()*60+now.Minute(), now.Format("2006-01-02"))
 	if err != nil {
 		log.Printf("list private cleanup targets: %v", err)
@@ -92,6 +126,30 @@ func (b *Bot) runPrivateCleanupOnce(ctx context.Context) {
 	for _, target := range targets {
 		if err := b.runPrivateCleanupForOperator(ctx, target.UserID, now.Format("2006-01-02")); err != nil {
 			log.Printf("private cleanup for %d: %v", target.UserID, err)
+		}
+	}
+}
+
+func (b *Bot) runDuePrivateCleanup(ctx context.Context, now time.Time) error {
+	for {
+		messages, err := b.store.ListDuePrivateChatMessagesForCleanup(ctx, now, privateCleanupBatchSize)
+		if err != nil {
+			return err
+		}
+		if len(messages) == 0 {
+			return nil
+		}
+		for _, msg := range messages {
+			lastError := ""
+			if err := b.deletePrivateCleanupMessage(ctx, msg.ChatID, msg.MessageID); err != nil {
+				lastError = err.Error()
+			}
+			if err := b.store.MarkPrivateChatMessageCleanup(ctx, msg.ID, lastError, now); err != nil {
+				return err
+			}
+		}
+		if len(messages) < privateCleanupBatchSize {
+			return nil
 		}
 	}
 }

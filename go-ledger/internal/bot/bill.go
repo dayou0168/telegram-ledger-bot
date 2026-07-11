@@ -13,12 +13,17 @@ import (
 const groupBillDefaultRecordLimit = 5
 
 func buildBillText(group storage.Group, records []storage.Record, loc *time.Location, prefix string) string {
-	var deposits []storage.Record
-	var payouts []storage.Record
+	return buildBillTextFromSummary(group, storage.BillSummaryData{
+		Records: records,
+		Summary: summarizeRecordsForBill(records),
+	}, loc, prefix)
+}
+
+func summarizeRecordsForBill(records []storage.Record) storage.RecordDaySummary {
+	var summary storage.RecordDaySummary
 	totalDepositCNY := big.NewRat(0, 1)
 	totalDepositUSDT := big.NewRat(0, 1)
 	totalPayoutUSDT := big.NewRat(0, 1)
-
 	for _, record := range records {
 		result := parseRat(record.ResultUSDT)
 		if result == nil {
@@ -26,7 +31,7 @@ func buildBillText(group storage.Group, records []storage.Record, loc *time.Loca
 		}
 		switch record.Kind {
 		case "deposit":
-			deposits = append(deposits, record)
+			summary.DepositCount++
 			totalDepositUSDT.Add(totalDepositUSDT, result)
 			if strings.EqualFold(record.Currency, "CNY") {
 				if amount := parseRat(record.Amount); amount != nil {
@@ -34,10 +39,31 @@ func buildBillText(group storage.Group, records []storage.Record, loc *time.Loca
 				}
 			}
 		case "payout":
-			payouts = append(payouts, record)
+			summary.PayoutCount++
 			totalPayoutUSDT.Add(totalPayoutUSDT, result)
 		}
 	}
+	summary.TotalDepositCNY = formatAmount(totalDepositCNY)
+	summary.TotalDepositUSDT = formatAmount(totalDepositUSDT)
+	summary.TotalPayoutUSDT = formatAmount(totalPayoutUSDT)
+	return summary
+}
+
+func buildBillTextFromSummary(group storage.Group, data storage.BillSummaryData, loc *time.Location, prefix string) string {
+	var deposits []storage.Record
+	var payouts []storage.Record
+
+	for _, record := range data.Records {
+		switch record.Kind {
+		case "deposit":
+			deposits = append(deposits, record)
+		case "payout":
+			payouts = append(payouts, record)
+		}
+	}
+	totalDepositCNY := ratFromSummary(data.Summary.TotalDepositCNY)
+	totalDepositUSDT := ratFromSummary(data.Summary.TotalDepositUSDT)
+	totalPayoutUSDT := ratFromSummary(data.Summary.TotalPayoutUSDT)
 	balance := new(big.Rat).Sub(totalDepositUSDT, totalPayoutUSDT)
 
 	var out strings.Builder
@@ -46,14 +72,14 @@ func buildBillText(group storage.Group, records []storage.Record, loc *time.Loca
 		out.WriteString("\n\n")
 	}
 	out.WriteString("<b>今日入款（")
-	out.WriteString(formatInt(len(deposits)))
+	out.WriteString(formatInt64(data.Summary.DepositCount))
 	out.WriteString("笔）</b>\n")
 	for _, record := range latestRecords(deposits, groupBillDefaultRecordLimit) {
 		out.WriteString(recordLine(record, loc))
 		out.WriteByte('\n')
 	}
 	out.WriteString("\n<b>今日下发（")
-	out.WriteString(formatInt(len(payouts)))
+	out.WriteString(formatInt64(data.Summary.PayoutCount))
 	out.WriteString("笔）</b>\n")
 	for _, record := range latestRecords(payouts, groupBillDefaultRecordLimit) {
 		out.WriteString(recordLine(record, loc))
@@ -81,6 +107,13 @@ func buildBillText(group storage.Group, records []storage.Record, loc *time.Loca
 	out.WriteString(formatAmount(balance))
 	out.WriteString("U")
 	return out.String()
+}
+
+func ratFromSummary(raw string) *big.Rat {
+	if value := parseRat(raw); value != nil {
+		return value
+	}
+	return big.NewRat(0, 1)
 }
 
 func latestRecords(records []storage.Record, limit int) []storage.Record {
@@ -206,7 +239,11 @@ func feeFactorText(raw string) string {
 }
 
 func formatInt(value int) string {
-	return new(big.Int).SetInt64(int64(value)).String()
+	return formatInt64(int64(value))
+}
+
+func formatInt64(value int64) string {
+	return new(big.Int).SetInt64(value).String()
 }
 
 func exchangeRateDisplay(group storage.Group) string {

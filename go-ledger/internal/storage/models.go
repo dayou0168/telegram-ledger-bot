@@ -39,15 +39,19 @@ type BroadcastGroup struct {
 }
 
 type BroadcastOperator struct {
-	UserID                    int64
-	Status                    string
-	Remark                    string
-	CreatedBy                 int64
-	PrivateCleanupEnabled     bool
-	PrivateCleanupTime        string
-	PrivateCleanupLastRunDate string
-	CreatedAt                 time.Time
-	UpdatedAt                 time.Time
+	UserID                              int64
+	Status                              string
+	Remark                              string
+	CreatedBy                           int64
+	PrivateCleanupEnabled               bool
+	PrivateCleanupTime                  string
+	PrivateCleanupLastRunDate           string
+	PrivateCleanupBotDeleteAfterSeconds int
+	PrivateCleanupIncomingEnabled       bool
+	PrivateCleanupIncomingAfterSeconds  int
+	PrivateCleanupScope                 string
+	CreatedAt                           time.Time
+	UpdatedAt                           time.Time
 }
 
 type BroadcastPermission struct {
@@ -82,19 +86,32 @@ type BroadcastReplaceSetting struct {
 }
 
 type PrivateChatMessage struct {
-	ID             int64
-	OperatorUserID int64
-	ChatID         int64
-	MessageID      int64
-	Direction      string
-	CreatedAt      time.Time
-	DeletedAt      *time.Time
-	LastError      string
+	ID                  int64
+	OperatorUserID      int64
+	ChatID              int64
+	MessageID           int64
+	Direction           string
+	Category            string
+	CleanupAfterSeconds int
+	DueAt               *time.Time
+	CreatedAt           time.Time
+	DeletedAt           *time.Time
+	LastError           string
 }
 
 type PrivateCleanupTarget struct {
 	UserID      int64
 	CleanupTime string
+}
+
+type PrivateCleanupSettings struct {
+	Enabled             bool
+	DailyTime           string
+	DailyLastRunDate    string
+	BotDeleteAfter      int
+	IncomingEnabled     bool
+	IncomingDeleteAfter int
+	Scope               string
 }
 
 type Record struct {
@@ -116,6 +133,19 @@ type Record struct {
 	Remark          string
 	CreatedAt       time.Time
 	DeletedAt       *time.Time
+}
+
+type RecordDaySummary struct {
+	DepositCount     int64
+	PayoutCount      int64
+	TotalDepositCNY  string
+	TotalDepositUSDT string
+	TotalPayoutUSDT  string
+}
+
+type BillSummaryData struct {
+	Records []Record
+	Summary RecordDaySummary
 }
 
 type Operator struct {

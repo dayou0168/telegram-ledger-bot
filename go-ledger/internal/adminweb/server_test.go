@@ -224,6 +224,41 @@ func TestNormalizeCleanupTime(t *testing.T) {
 	}
 }
 
+func TestNormalizeCleanupDelay(t *testing.T) {
+	cases := []struct {
+		preset string
+		custom string
+		unit   string
+		want   int
+	}{
+		{preset: "0", want: 0},
+		{preset: "30", want: 30},
+		{preset: "3600", want: 3600},
+		{preset: "custom", custom: "45", unit: "seconds", want: 45},
+		{preset: "custom", custom: "3", unit: "minutes", want: 180},
+	}
+	for _, tc := range cases {
+		got, ok := normalizeCleanupDelay(tc.preset, tc.custom, tc.unit)
+		if !ok || got != tc.want {
+			t.Fatalf("normalizeCleanupDelay(%q,%q,%q) = %d,%v; want %d,true", tc.preset, tc.custom, tc.unit, got, ok, tc.want)
+		}
+	}
+	for _, tc := range []struct {
+		preset string
+		custom string
+		unit   string
+	}{
+		{preset: "abc"},
+		{preset: "-1"},
+		{preset: "custom", custom: "0", unit: "minutes"},
+		{preset: "custom", custom: "1441", unit: "minutes"},
+	} {
+		if got, ok := normalizeCleanupDelay(tc.preset, tc.custom, tc.unit); ok {
+			t.Fatalf("normalizeCleanupDelay(%q,%q,%q) = %d,true; want invalid", tc.preset, tc.custom, tc.unit, got)
+		}
+	}
+}
+
 func TestAdminTemplateRendersSearchableTallSavedGroups(t *testing.T) {
 	var buf bytes.Buffer
 	err := adminTemplate.Execute(&buf, pageData{
@@ -268,12 +303,15 @@ func TestAdminTemplateRendersReadableBroadcastManagement(t *testing.T) {
 		},
 		BGroups: []storage.BroadcastGroup{{Name: "出款", ChatIDs: []int64{-1001}, ChatNames: []string{"出款群"}}},
 		BOperators: []storage.BroadcastOperator{{
-			UserID:                7611260151,
-			Status:                "active",
-			Remark:                "柚子",
-			PrivateCleanupEnabled: true,
-			PrivateCleanupTime:    "08:30",
-			CreatedAt:             time.Date(2026, 7, 6, 15, 0, 0, 0, time.UTC),
+			UserID:                              7611260151,
+			Status:                              "active",
+			Remark:                              "柚子",
+			PrivateCleanupEnabled:               true,
+			PrivateCleanupTime:                  "08:30",
+			PrivateCleanupBotDeleteAfterSeconds: 300,
+			PrivateCleanupIncomingEnabled:       true,
+			PrivateCleanupIncomingAfterSeconds:  45,
+			CreatedAt:                           time.Date(2026, 7, 6, 15, 0, 0, 0, time.UTC),
 		}, {
 			UserID:    8453656635,
 			Status:    "active",
@@ -322,6 +360,12 @@ func TestAdminTemplateRendersReadableBroadcastManagement(t *testing.T) {
 		`私聊清空`,
 		`action="/admin/operator/cleanup"`,
 		`class="cleanup-form"`,
+		`name="bot_delete_after"`,
+		`name="incoming_enabled"`,
+		`name="incoming_delete_after"`,
+		`bot提示 5分钟后`,
+		`用户临时消息 45秒后`,
+		`只处理该操作人与机器人私聊`,
 		`value="08:30"`,
 		`data-mode="add"`,
 		`data-mode="remove"`,

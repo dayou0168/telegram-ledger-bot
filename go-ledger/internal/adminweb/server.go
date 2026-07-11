@@ -677,20 +677,57 @@ func (s *Server) saveOperatorCleanup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	enabled := r.FormValue("enabled") == "1"
-	cleanupTime, ok := normalizeCleanupTime(r.FormValue("cleanup_time"))
+	cleanupTime := ""
+	if strings.TrimSpace(r.FormValue("cleanup_time")) != "" {
+		var ok bool
+		cleanupTime, ok = normalizeCleanupTime(r.FormValue("cleanup_time"))
+		if !ok {
+			redirectMsg(w, r, "每日兜底清空时间格式不正确，请填写 HH:MM")
+			return
+		}
+	}
+	botAfter, ok := normalizeCleanupDelay(r.FormValue("bot_delete_after"), r.FormValue("bot_delete_after_custom"), r.FormValue("bot_delete_after_unit"))
 	if enabled && !ok {
-		redirectMsg(w, r, "清空时间格式不正确，请填写 HH:MM")
+		redirectMsg(w, r, "机器人提示消息删除时间不正确")
+		return
+	}
+	incomingEnabled := r.FormValue("incoming_enabled") == "1"
+	incomingAfter, ok := normalizeCleanupDelay(r.FormValue("incoming_delete_after"), r.FormValue("incoming_delete_after_custom"), r.FormValue("incoming_delete_after_unit"))
+	if enabled && incomingEnabled && !ok {
+		redirectMsg(w, r, "用户临时消息删除时间不正确")
+		return
+	}
+	if enabled && cleanupTime == "" && botAfter == 0 && (!incomingEnabled || incomingAfter == 0) {
+		redirectMsg(w, r, "请至少选择一种私聊清理方式")
+		return
+	}
+	if !enabled {
+		cleanupTime = ""
+		botAfter = 0
+		incomingEnabled = false
+		incomingAfter = 0
+	}
+	if incomingEnabled && incomingAfter == 0 && cleanupTime == "" {
+		redirectMsg(w, r, "清理用户临时消息时，请选择发送后删除时间或每日兜底时间")
 		return
 	}
 	now := time.Now()
 	runDate := ""
-	if enabled {
+	if enabled && cleanupTime != "" {
 		localNow := now.In(privateCleanupLocation())
 		if minutes, _ := storage.CleanupTimeMinutes(cleanupTime); minutes <= localNow.Hour()*60+localNow.Minute() {
 			runDate = localNow.Format("2006-01-02")
 		}
 	}
-	saved, err := s.store.SetBroadcastOperatorPrivateCleanup(r.Context(), userID, enabled, cleanupTime, runDate, now)
+	saved, err := s.store.SetBroadcastOperatorPrivateCleanupSettings(r.Context(), userID, storage.PrivateCleanupSettings{
+		Enabled:             enabled,
+		DailyTime:           cleanupTime,
+		DailyLastRunDate:    runDate,
+		BotDeleteAfter:      botAfter,
+		IncomingEnabled:     incomingEnabled,
+		IncomingDeleteAfter: incomingAfter,
+		Scope:               storage.DefaultPrivateCleanupScope(),
+	}, now)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1825,6 +1862,113 @@ func normalizeCleanupTime(raw string) (string, bool) {
 	return fmt.Sprintf("%02d:%02d", minutes/60, minutes%60), true
 }
 
+func normalizeCleanupDelay(preset string, custom string, unit string) (int, bool) {
+	preset = strings.TrimSpace(preset)
+	if preset == "" {
+		return 0, true
+	}
+	if preset != "custom" {
+		seconds, err := strconv.Atoi(preset)
+		if err != nil || seconds < 0 || seconds > 86400 {
+			return 0, false
+		}
+		return seconds, true
+	}
+	value, err := strconv.Atoi(strings.TrimSpace(custom))
+	if err != nil || value < 1 {
+		return 0, false
+	}
+	switch strings.TrimSpace(unit) {
+	case "seconds", "秒":
+		if value > 86400 {
+			return 0, false
+		}
+		return value, true
+	default:
+		if value > 1440 {
+			return 0, false
+		}
+		return value * 60, true
+	}
+}
+
+func cleanupDelayPreset(seconds int) string {
+	switch seconds {
+	case 0, 30, 60, 300, 600, 1800, 3600:
+		return strconv.Itoa(seconds)
+	default:
+		return "custom"
+	}
+}
+
+func cleanupDelayCustomValue(seconds int) string {
+	if cleanupDelayPreset(seconds) != "custom" {
+		return ""
+	}
+	if seconds%60 == 0 {
+		return strconv.Itoa(seconds / 60)
+	}
+	return strconv.Itoa(seconds)
+}
+
+func cleanupDelayCustomUnit(seconds int) string {
+	if cleanupDelayPreset(seconds) != "custom" {
+		return "minutes"
+	}
+	if seconds%60 == 0 {
+		return "minutes"
+	}
+	return "seconds"
+}
+
+func cleanupSummary(op storage.BroadcastOperator) string {
+	if !op.PrivateCleanupEnabled {
+		return "关闭"
+	}
+	var parts []string
+	if op.PrivateCleanupBotDeleteAfterSeconds > 0 {
+		parts = append(parts, "bot提示 "+cleanupDelayLabel(op.PrivateCleanupBotDeleteAfterSeconds))
+	}
+	if op.PrivateCleanupIncomingEnabled {
+		if op.PrivateCleanupIncomingAfterSeconds > 0 {
+			parts = append(parts, "用户临时消息 "+cleanupDelayLabel(op.PrivateCleanupIncomingAfterSeconds))
+		} else if op.PrivateCleanupTime != "" {
+			parts = append(parts, "用户临时消息 每日兜底")
+		}
+	}
+	if op.PrivateCleanupTime != "" {
+		parts = append(parts, "每日 "+op.PrivateCleanupTime)
+	}
+	if len(parts) == 0 {
+		return "已开启，未选择规则"
+	}
+	return strings.Join(parts, "；")
+}
+
+func cleanupDelayLabel(seconds int) string {
+	switch seconds {
+	case 0:
+		return "不清理"
+	case 30:
+		return "30秒后"
+	case 60:
+		return "1分钟后"
+	case 300:
+		return "5分钟后"
+	case 600:
+		return "10分钟后"
+	case 1800:
+		return "30分钟后"
+	case 3600:
+		return "1小时后"
+	default:
+		if seconds%60 == 0 {
+			return fmt.Sprintf("%d分钟后", seconds/60)
+		}
+		return fmt.Sprintf("%d秒后", seconds)
+	}
+}
+
 func privateCleanupLocation() *time.Location {
 	loc, err := time.LoadLocation("Asia/Shanghai")
 	if err != nil {
@@ -1834,18 +1978,22 @@ func privateCleanupLocation() *time.Location {
 }
 
 var adminTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
-	"chatLabel":            chatLabel,
-	"chatBroadcastGroups":  chatBroadcastGroups,
-	"permissionGroupUsers": permissionGroupUsers,
-	"permissionChatUsers":  permissionChatUsers,
-	"operatorLabel":        operatorLabel,
-	"operatorSourceLabel":  operatorSourceLabel,
-	"adminTime":            adminTime,
-	"permissionTarget":     permissionTarget,
-	"permissionUserLabel":  permissionUserLabel,
-	"grantorLabel":         grantorLabel,
-	"watchOwnerLabel":      watchOwnerLabel,
-	"watchLatestTime":      watchLatestTime,
+	"chatLabel":               chatLabel,
+	"chatBroadcastGroups":     chatBroadcastGroups,
+	"permissionGroupUsers":    permissionGroupUsers,
+	"permissionChatUsers":     permissionChatUsers,
+	"operatorLabel":           operatorLabel,
+	"operatorSourceLabel":     operatorSourceLabel,
+	"adminTime":               adminTime,
+	"permissionTarget":        permissionTarget,
+	"permissionUserLabel":     permissionUserLabel,
+	"grantorLabel":            grantorLabel,
+	"watchOwnerLabel":         watchOwnerLabel,
+	"watchLatestTime":         watchLatestTime,
+	"cleanupSummary":          cleanupSummary,
+	"cleanupDelayPreset":      cleanupDelayPreset,
+	"cleanupDelayCustomValue": cleanupDelayCustomValue,
+	"cleanupDelayCustomUnit":  cleanupDelayCustomUnit,
 }).Parse(adminHTML))
 
 var loginTemplate = template.Must(template.New("login").Parse(loginHTML))
@@ -1919,7 +2067,7 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 .table-tools{display:flex;gap:8px;align-items:center;margin:8px 0 10px}.table-tools input{flex:1;width:100%}.scroll{max-height:280px;overflow:auto;border:1px solid #dce5ef;border-radius:6px}.scroll.tall{max-height:520px}.scroll table{margin:0;border:0}.scroll th:first-child,.scroll td:first-child{border-left:0}.scroll th:last-child,.scroll td:last-child{border-right:0}.scroll th{position:sticky;top:0;z-index:1}
 .pill{display:inline-block;border:1px solid #d5e1ec;background:#f7fafc;border-radius:999px;padding:3px 9px;color:#40566f}
 .actions{display:flex;gap:8px;flex-wrap:wrap}.mini{height:32px;padding:0 10px}
-.toolbar-forms{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,.45fr);gap:12px;margin-bottom:14px}.inline-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px}.cleanup-form{display:grid;grid-template-columns:82px 82px auto;gap:6px;align-items:center}.cleanup-form select,.cleanup-form input{min-height:32px;height:32px;padding:4px 7px}.section-title{margin:4px 0 8px;font-size:15px;font-weight:800;color:#243852}.member-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:14px}.member-form{border:1px solid #dce5ef;background:var(--soft);border-radius:8px;padding:12px;min-width:0}.member-form select{width:100%;margin-bottom:8px}.member-form select[multiple]{height:220px;min-height:220px;background:#fff}.group-name-list{max-width:760px;text-align:left;line-height:1.65}.permission-panels{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:14px}.permission-panel{border:1px solid #dce5ef;background:var(--soft);border-radius:8px;padding:12px;min-width:0}.permission-panel form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;align-items:end}.permission-panel .btn{grid-column:1/-1;justify-self:start;min-width:180px}.permission-table td:first-child,.operator-name{text-align:left}.field-label{display:block;margin:0 0 5px;color:var(--muted);font-size:12px;font-weight:700}.field-stack{min-width:0}.field-stack select{width:100%}.field-stack.disabled{opacity:.45}
+.toolbar-forms{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,.45fr);gap:12px;margin-bottom:14px}.inline-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px}.cleanup-box{text-align:left;min-width:260px}.cleanup-box summary{cursor:pointer;font-weight:800;color:var(--navy)}.cleanup-summary{display:block;margin-top:4px;color:var(--muted);font-size:12px;line-height:1.35}.cleanup-form{display:grid;grid-template-columns:130px minmax(120px,1fr) minmax(84px,.5fr) minmax(84px,.5fr);gap:7px;align-items:end;margin-top:10px}.cleanup-form .wide{grid-column:1/-1}.cleanup-form select,.cleanup-form input{min-height:32px;height:32px;padding:4px 7px}.cleanup-note{grid-column:1/-1;color:var(--muted);font-size:12px;line-height:1.45}.section-title{margin:4px 0 8px;font-size:15px;font-weight:800;color:#243852}.member-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:14px}.member-form{border:1px solid #dce5ef;background:var(--soft);border-radius:8px;padding:12px;min-width:0}.member-form select{width:100%;margin-bottom:8px}.member-form select[multiple]{height:220px;min-height:220px;background:#fff}.group-name-list{max-width:760px;text-align:left;line-height:1.65}.permission-panels{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:14px}.permission-panel{border:1px solid #dce5ef;background:var(--soft);border-radius:8px;padding:12px;min-width:0}.permission-panel form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;align-items:end}.permission-panel .btn{grid-column:1/-1;justify-self:start;min-width:180px}.permission-table td:first-child,.operator-name{text-align:left}.field-label{display:block;margin:0 0 5px;color:var(--muted);font-size:12px;font-weight:700}.field-stack{min-width:0}.field-stack select{width:100%}.field-stack.disabled{opacity:.45}
 .watch-panel{max-height:620px;overflow:auto;border:1px solid #dce5ef;border-radius:8px;background:#fff}.watch-panel form{margin:0}.watch-head,.watch-row{display:grid;grid-template-columns:minmax(130px,.7fr) minmax(330px,1.6fr) minmax(150px,.7fr) repeat(3,88px) minmax(110px,.5fr) auto auto;gap:8px;align-items:center}.watch-head{position:sticky;top:0;z-index:1;background:#f4f7fb;font-weight:800;padding:10px;border-bottom:1px solid #dce5ef;text-align:center}.watch-row{padding:10px;border-bottom:1px solid #e7eef6}.watch-row:last-child{border-bottom:0}.watch-row code{word-break:break-all;color:#173f82}.watch-row .owner{font-weight:700}.watch-row .latest{color:var(--muted);font-size:12px}.watch-check{display:flex;gap:5px;align-items:center;justify-content:center}.watch-check input{min-height:auto}.watch-row .btn{height:34px;min-width:64px;padding:0 10px}.watch-empty{border:1px dashed #cbd8e8;border-radius:8px;padding:22px;text-align:center;color:var(--muted);background:var(--soft)}
 @media(max-width:900px){.top{align-items:flex-start;flex-direction:column}.row,.row.two,.toolbar-forms,.member-grid,.permission-panels,.permission-panel form,.cleanup-form{grid-template-columns:1fr}.watch-head{display:none}.watch-row{grid-template-columns:1fr}.btn{width:100%}}
 </style>
@@ -1963,7 +2111,7 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 <button class="btn" type="submit">保存</button>
 </form>
 <div class="scroll"><table><thead><tr><th>操作人</th><th>授权来源</th><th>授权时间</th><th>私聊清空</th><th>状态</th><th>操作</th></tr></thead><tbody>
-{{range .BOperators}}<tr><td>{{operatorLabel .}}</td><td>{{operatorSourceLabel . $.OpLabels}}</td><td>{{adminTime .CreatedAt}}</td><td><form method="post" action="/admin/operator/cleanup" class="cleanup-form"><input type="hidden" name="user_id" value="{{.UserID}}"><select name="enabled"><option value="0" {{if not .PrivateCleanupEnabled}}selected{{end}}>关闭</option><option value="1" {{if .PrivateCleanupEnabled}}selected{{end}}>开启</option></select><input name="cleanup_time" value="{{.PrivateCleanupTime}}" placeholder="HH:MM"><button class="btn mini" type="submit">保存</button></form></td><td><span class="pill">{{.Status}}</span></td><td><form method="post" action="/admin/operator/disable"><input type="hidden" name="user_id" value="{{.UserID}}"><button class="btn mini" type="submit">禁用</button></form></td></tr>{{else}}<tr><td colspan="6">暂无广播操作人</td></tr>{{end}}
+{{range .BOperators}}<tr><td>{{operatorLabel .}}</td><td>{{operatorSourceLabel . $.OpLabels}}</td><td>{{adminTime .CreatedAt}}</td><td><div class="cleanup-box"><details><summary>私聊自动清理</summary><form method="post" action="/admin/operator/cleanup" class="cleanup-form"><input type="hidden" name="user_id" value="{{.UserID}}"><label><span class="field-label">总开关</span><select name="enabled"><option value="0" {{if not .PrivateCleanupEnabled}}selected{{end}}>关闭</option><option value="1" {{if .PrivateCleanupEnabled}}selected{{end}}>开启</option></select></label><label><span class="field-label">bot 提示消息</span><select name="bot_delete_after"><option value="0" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "0"}}selected{{end}}>不自动删</option><option value="30" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "30"}}selected{{end}}>30 秒后</option><option value="60" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "60"}}selected{{end}}>1 分钟后</option><option value="300" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "300"}}selected{{end}}>5 分钟后</option><option value="600" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "600"}}selected{{end}}>10 分钟后</option><option value="1800" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "1800"}}selected{{end}}>30 分钟后</option><option value="3600" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "3600"}}selected{{end}}>1 小时后</option><option value="custom" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "custom"}}selected{{end}}>自定义</option></select></label><label><span class="field-label">自定义</span><input name="bot_delete_after_custom" value="{{cleanupDelayCustomValue .PrivateCleanupBotDeleteAfterSeconds}}" placeholder="数值"></label><label><span class="field-label">单位</span><select name="bot_delete_after_unit"><option value="minutes" {{if eq (cleanupDelayCustomUnit .PrivateCleanupBotDeleteAfterSeconds) "minutes"}}selected{{end}}>分钟</option><option value="seconds" {{if eq (cleanupDelayCustomUnit .PrivateCleanupBotDeleteAfterSeconds) "seconds"}}selected{{end}}>秒</option></select></label><label><span class="field-label">用户临时消息</span><select name="incoming_enabled"><option value="0" {{if not .PrivateCleanupIncomingEnabled}}selected{{end}}>不清理</option><option value="1" {{if .PrivateCleanupIncomingEnabled}}selected{{end}}>尝试清理</option></select></label><label><span class="field-label">用户消息多久删</span><select name="incoming_delete_after"><option value="0" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "0"}}selected{{end}}>仅每日兜底</option><option value="30" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "30"}}selected{{end}}>30 秒后</option><option value="60" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "60"}}selected{{end}}>1 分钟后</option><option value="300" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "300"}}selected{{end}}>5 分钟后</option><option value="600" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "600"}}selected{{end}}>10 分钟后</option><option value="1800" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "1800"}}selected{{end}}>30 分钟后</option><option value="3600" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "3600"}}selected{{end}}>1 小时后</option><option value="custom" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "custom"}}selected{{end}}>自定义</option></select></label><label><span class="field-label">自定义</span><input name="incoming_delete_after_custom" value="{{cleanupDelayCustomValue .PrivateCleanupIncomingAfterSeconds}}" placeholder="数值"></label><label><span class="field-label">单位</span><select name="incoming_delete_after_unit"><option value="minutes" {{if eq (cleanupDelayCustomUnit .PrivateCleanupIncomingAfterSeconds) "minutes"}}selected{{end}}>分钟</option><option value="seconds" {{if eq (cleanupDelayCustomUnit .PrivateCleanupIncomingAfterSeconds) "seconds"}}selected{{end}}>秒</option></select></label><label class="wide"><span class="field-label">每日兜底清空（北京时间，可留空）</span><input name="cleanup_time" value="{{.PrivateCleanupTime}}" placeholder="HH:MM"></label><div class="cleanup-note">只处理该操作人与机器人私聊里的广播菜单、单群发送、快速回复、后台入口等提示记录；不删除目标群投递，也不删除 broadcast_deliveries。用户发来的素材/临时指令仅在开启后尝试清理，仍受 Telegram 删除限制。</div><button class="btn mini wide" type="submit">保存私聊清理</button></form></details><span class="cleanup-summary">{{cleanupSummary .}}</span></div></td><td><span class="pill">{{.Status}}</span></td><td><form method="post" action="/admin/operator/disable"><input type="hidden" name="user_id" value="{{.UserID}}"><button class="btn mini" type="submit">禁用</button></form></td></tr>{{else}}<tr><td colspan="6">暂无广播操作人</td></tr>{{end}}
 </tbody></table></div>
 </div>
 

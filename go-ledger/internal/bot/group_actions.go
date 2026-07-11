@@ -21,6 +21,7 @@ func (b *Bot) handleBusinessMode(ctx context.Context, msg telegram.Message, user
 	if err := b.store.SetGroupBusinessOpen(ctx, msg.Chat.ID, open, now); err != nil {
 		return err
 	}
+	b.invalidateGroupCache(msg.Chat.ID)
 	perms := groupSendPermissions(open)
 	if err := b.tg.SetChatPermissions(ctx, msg.Chat.ID, perms); err != nil {
 		_ = b.enqueueReplyText(ctx, sendPriorityNormal, "business_mode_failed", msg.Chat.ID, msg.MessageID, "设置群发言权限失败，请确认机器人是管理员并拥有管理群权限。", nil, now)

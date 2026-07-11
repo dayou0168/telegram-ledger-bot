@@ -92,6 +92,7 @@ func (b *Bot) handleZRateSetting(ctx context.Context, msg telegram.Message, user
 			_ = b.enqueueReliableText(jobCtx, sendPriorityNormal, "zrate_result", messageScopedDedupe("zrate_result", chatID, msg.MessageID), chatID, "设置失败：数据库写入失败。", nil, reliableMessageRef{}, time.Now().In(b.loc))
 			return
 		}
+		b.invalidateGroupCache(chatID)
 		text := fmt.Sprintf("操作成功：Z%d 基准%s，偏移%s，当前汇率%s",
 			cmd.Rank,
 			formatRat(base, 8),
