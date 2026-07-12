@@ -1,11 +1,13 @@
-﻿# Telegram 记账机器人 Go v2.3.8 部署运维
+# Telegram 记账机器人 Go v2.4.0 部署运维
 
-当前发布目标是 Go v2.3.8。生产部署使用 GHCR 预构建镜像、PostgreSQL 和共享链上监听服务 `ledger-chain-watcher`。服务器上不需要源码构建作为默认路径。
+当前发布目标是 Go v2.4.0。生产部署使用 GHCR 预构建镜像、PostgreSQL 和共享链上监听服务 `ledger-chain-watcher`。服务器上不需要源码构建作为默认路径。
 
 ## 部署基线
 
-- 机器人镜像：`ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.8`
-- watcher 镜像：`ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.8`
+- 机器人镜像：`ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.0`
+- watcher 镜像：`ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.0`
+
+v2.4.0 是 watcher 架构升级。上线前必须同时备份每个 bot 数据库和 watcher 数据库，配置新的 `CHAIN_WATCHER_KEY_ENCRYPTION_KEY`，并为每个 bot 设置唯一且稳定的 `BOT_FALLBACK_INSTANCE_ID`。bot 与 watcher 必须在同一个维护窗口同步升级。
 - 数据库：每个机器人实例独立 PostgreSQL 16
 - 链上监听：多个机器人共享 `ledger-chain-watcher`，watcher 使用独立 PostgreSQL 保存订阅、匹配事件和投递游标
 - 推荐入口：宝塔 Docker Compose
@@ -48,13 +50,12 @@ DATABASE_URL: "postgres://ledger:change_this_strong_password@postgres:5432/ledge
 CHAIN_WATCHER_SECRET: "change_this_chain_watcher_secret"
 CHAIN_WATCHER_URL: "http://ledger-chain-watcher:8090"
 CHAIN_WATCHER_BOT_ID: "ledger-main"
-CHAIN_WATCHER_EMERGENCY_FALLBACK: "false"
 TRONGRID_API_KEY: ""
 BOT_WATCHER_HEALTH_INTERVAL_SECONDS: "1"
-BOT_WATCHER_FAIL_THRESHOLD: "2"
+BOT_WATCHER_FAIL_THRESHOLD: "3"
 BOT_WATCHER_CLAIM_TIMEOUT_MS: "2000"
 BOT_FALLBACK_POLL_SECONDS: "1"
-BOT_FALLBACK_MAX_ACTIVE_SECONDS: "600"
+BOT_FALLBACK_SHARED_DATABASE_URL: "postgres://chainwatcher:***@chain-postgres:5432/ledger_chain_watcher?sslmode=disable"
 ```
 
 `CHAIN_WATCHER_BOT_ID` 和 `CHAIN_WATCHER_SECRET` 必须同步写入 watcher 的 `CHAIN_WATCHER_BOTS`：
@@ -67,24 +68,35 @@ CHAIN_WATCHER_BOTS: "ledger-main:change_this_chain_watcher_secret"
 
 ```yaml
 CHAIN_WATCHER_TRONSCAN_API_BASE: "https://apilist.tronscanapi.com/api"
-CHAIN_WATCHER_TRON_API_KEY: "your_real_api_key"
+CHAIN_WATCHER_TRONSCAN_API_KEYS: "key1,key2,key3"
+CHAIN_WATCHER_TRONSCAN_API_KEY: ""
+CHAIN_WATCHER_TRON_API_KEY: ""
 CHAIN_WATCHER_SOURCE_POLL_SECONDS: "1"
 CHAIN_WATCHER_GLOBAL_SCAN_PAGES: "3"
-CHAIN_WATCHER_ADDRESS_SCAN_INTERVAL_SECONDS: "30"
-CHAIN_WATCHER_ADDRESS_SCAN_PAGES: "1"
-CHAIN_WATCHER_ADDRESS_SCAN_CONCURRENCY: "1"
-CHAIN_WATCHER_ADDRESS_SCAN_MAX_PER_TICK: "1"
-CHAIN_WATCHER_TRON_REQUEST_INTERVAL_MS: "250"
+CHAIN_WATCHER_GLOBAL_EXPAND_PAGE_LIMIT: "20"
+CHAIN_WATCHER_CATCHUP_ENABLED: "true"
+CHAIN_WATCHER_CATCHUP_STATE_INTERVAL_SECONDS: "30"
+CHAIN_WATCHER_CATCHUP_PAGE_LIMIT: "3"
+CHAIN_WATCHER_CATCHUP_MAX_REQUESTS_PER_TICK: "6"
+CHAIN_WATCHER_CATCHUP_WINDOW_SECONDS: "30"
+CHAIN_WATCHER_CATCHUP_OVERLAP_SECONDS: "2"
+CHAIN_WATCHER_CATCHUP_MAX_RPS: "8"
+CHAIN_WATCHER_TRONSCAN_KEY_INTERVAL_MS: "200"
+CHAIN_WATCHER_KEY_ENCRYPTION_KEY: "base64_encoded_32_byte_key"
 CHAIN_WATCHER_LOOKBACK_SECONDS: "600"
 ```
 
-`CHAIN_WATCHER_TRON_API_KEY` 只放在 watcher 里，机器人实例不再各自配置官网 API Key。
+`CHAIN_WATCHER_TRONSCAN_API_KEYS` 只用于首次填充 watcher Key 注册表；旧单 Key 配置继续兼容。注册表最多保存 10 个 Key，禁用项也占槽；之后可通过受 `CHAIN_WATCHER_ADMIN_TOKEN` 保护的 `/v1/admin/keys*` 接口热增删、启停和立即复检。第 11 个 Key 会明确拒绝。
 
-watcher 是链上监听中心：全局主通道按 `CHAIN_WATCHER_SOURCE_POLL_SECONDS=1` 秒级快扫并写 watcher DB，地址补偿由 watcher 内部按 `CHAIN_WATCHER_ADDRESS_SCAN_INTERVAL_SECONDS=30` 低频执行，并受 `CHAIN_WATCHER_ADDRESS_SCAN_MAX_PER_TICK=1` 限制为低优先级补偿，也写同一套 subscriptions/events/matched_events。
+watcher 是唯一主扫描中心：每秒以同一个 cutoff 并行读取 P1-P3，并以稳定 event identity 检查上一轮锚点。锚点缺失时 P4-P20 在独立 worker 扩页，不阻塞下一秒热头；仍缺失才置位持久化全局 catch-up。catch-up 只在明确缺口时从 cursor 查询封闭时间窗口，完整落库后推进，safe head 默认落后实时头部 2 秒。逐地址轮询默认关闭，地址数只影响内存 hash 匹配。
+
+每个 bot 必须设置唯一且稳定的 `BOT_FALLBACK_INSTANCE_ID`，并把 `BOT_FALLBACK_SHARED_DATABASE_URL` 指向 watcher 的共享 PostgreSQL。缺少任一项时公共 fallback 会明确进入 DEGRADED，不会退回每 bot 逐地址扫描。正常状态下公共无 Key通道完全不发请求；只有 watcher 连续异常 3 秒后，跨 bot 的共享 lease 才选出一个 leader 接管。
+
+每 Key 独立限制 5 requests/sec；UTC 日计数持久化但不设置本地软停或硬停，只用于最少用量调度和容量观测。401/403 首次 suspect、5 秒独立探测，连续两次认证失败才 invalid；invalid 每 30 分钟探测，连续两次成功恢复。429 尊重 `Retry-After`，无头按 60/120/300/900/3600 秒退避；明确 daily exhausted 在北京时间 08:00 后探测。5xx/timeout 按 1/2/4/8/15/30 秒退避。Key 密文使用 AES-256-GCM；首次部署执行 `openssl rand -base64 32`，把结果仅写入 watcher 的受限 env，丢失该密钥将无法解密已注册 Key。
 
 `/healthz` 只表示进程存活，Docker/systemd 健康检查继续用它；`/readyz` 表示链源是否可用，`/status` 用于排障，包含最近全局扫描成功时间、最近错误、429 backoff、pending/delivering、最老 pending 和 retention 清理统计。`global`/`address` 会显示 `api_wait_ms`、`api_fetch_ms`、`parse_ms`、`match_ms`、`write_ms`、`api_call_count`、`page_count`、`overlap_skipped` 和最近 5 轮摘要。bot 自动 fallback 读取 ready 状态，不把“没有新交易”当成故障。
 
-`CHAIN_WATCHER_EMERGENCY_FALLBACK` 是机器人侧常驻应急兜底开关，默认保持 `false`。正常模式下 bot 只消费 watcher；watcher ready/claim 连续失败时，bot 会短时自动启用无 Key 公开 API fallback，只扫描本 bot 自己的监听地址并用本地 `chain_notifications/outbox` 去重。fallback 仍依赖 Tronscan/TronGrid 公开 API，不是真正事件源；真正不依赖官方 API 的方案是 Lite FullNode + Event Plugin V2 + Kafka 或第三方 Webhook/Streams。
+自动热备要求所有 bot 配置同一个 `BOT_FALLBACK_SHARED_DATABASE_URL`；PostgreSQL lease 保证只有一个实例执行无 Key 全局扫描，其他 bot 只领取共享 matched events。恢复时进入 RECOVERING，私有 Key 池补齐 watermark，连续 ready/claim 成功且 lag 归零后才释放 leader lease。没有共享 DSN 时明确 DEGRADED，不启动旧本机扫描。
 
 常用选填：
 
@@ -239,16 +251,19 @@ chmod 600 /etc/ledger-chain-watcher/env
 ```env
 CHAIN_WATCHER_DATABASE_URL=postgres://ledger:你的PostgreSQL密码@127.0.0.1:5432/ledgerchainwatcher?sslmode=disable
 CHAIN_WATCHER_ADDR=0.0.0.0:8090
+CHAIN_WATCHER_KEY_ENCRYPTION_KEY=base64_encoded_32_byte_key
 CHAIN_WATCHER_BOTS=tianzezsbot:换成随机内部密钥
 CHAIN_WATCHER_TRONSCAN_API_BASE=https://apilist.tronscanapi.com/api
-CHAIN_WATCHER_TRON_API_KEY=你的Tronscan API Key
+CHAIN_WATCHER_TRONSCAN_API_KEYS=key1,key2,key3
+CHAIN_WATCHER_TRONSCAN_API_KEY=
+CHAIN_WATCHER_TRON_API_KEY=
 CHAIN_WATCHER_SOURCE_POLL_SECONDS=1
 CHAIN_WATCHER_GLOBAL_SCAN_PAGES=3
-CHAIN_WATCHER_ADDRESS_SCAN_INTERVAL_SECONDS=30
-CHAIN_WATCHER_ADDRESS_SCAN_PAGES=1
-CHAIN_WATCHER_ADDRESS_SCAN_CONCURRENCY=1
-CHAIN_WATCHER_ADDRESS_SCAN_MAX_PER_TICK=1
-CHAIN_WATCHER_TRON_REQUEST_INTERVAL_MS=250
+CHAIN_WATCHER_GLOBAL_EXPAND_PAGE_LIMIT=20
+CHAIN_WATCHER_CATCHUP_ENABLED=true
+CHAIN_WATCHER_CATCHUP_STATE_INTERVAL_SECONDS=30
+CHAIN_WATCHER_CATCHUP_OVERLAP_SECONDS=2
+CHAIN_WATCHER_TRONSCAN_KEY_INTERVAL_MS=200
 CHAIN_WATCHER_LOOKBACK_SECONDS=600
 CHAIN_WATCHER_CLAIM_LEASE_SECONDS=30
 CHAIN_WATCHER_DELIVERY_RETRY_SECONDS=2
@@ -256,14 +271,14 @@ BOT_TIMEZONE=Asia/Shanghai
 BOT_REQUEST_TIMEOUT=70
 ```
 
-下载 v2.3.8 发布包并安装二进制到固定路径：
+下载 v2.4.0 发布包并安装二进制到固定路径：
 
 ```bash
 cd /tmp
-wget -O ledger-chain-watcher-v2.3.8-linux-amd64.tar.gz \
-  https://github.com/dayou0168/telegram-ledger-bot/releases/download/v2.3.8/ledger-chain-watcher-v2.3.8-linux-amd64.tar.gz
-tar -xzf ledger-chain-watcher-v2.3.8-linux-amd64.tar.gz
-install -m 0755 ledger-chain-watcher-v2.3.8-linux-amd64/ledger-chain-watcher /usr/local/bin/ledger-chain-watcher
+wget -O ledger-chain-watcher-v2.4.0-linux-amd64.tar.gz \
+  https://github.com/dayou0168/telegram-ledger-bot/releases/download/v2.4.0/ledger-chain-watcher-v2.4.0-linux-amd64.tar.gz
+tar -xzf ledger-chain-watcher-v2.4.0-linux-amd64.tar.gz
+install -m 0755 ledger-chain-watcher-v2.4.0-linux-amd64/ledger-chain-watcher /usr/local/bin/ledger-chain-watcher
 /usr/local/bin/ledger-chain-watcher --help
 ```
 
@@ -312,13 +327,12 @@ environment:
   CHAIN_WATCHER_URL: "http://host.docker.internal:8090"
   CHAIN_WATCHER_BOT_ID: "tianzezsbot"
   CHAIN_WATCHER_SECRET: "换成随机内部密钥"
-  CHAIN_WATCHER_EMERGENCY_FALLBACK: "false"
   TRONGRID_API_KEY: ""
   BOT_WATCHER_HEALTH_INTERVAL_SECONDS: "1"
-  BOT_WATCHER_FAIL_THRESHOLD: "2"
+  BOT_WATCHER_FAIL_THRESHOLD: "3"
   BOT_WATCHER_CLAIM_TIMEOUT_MS: "2000"
   BOT_FALLBACK_POLL_SECONDS: "1"
-  BOT_FALLBACK_MAX_ACTIVE_SECONDS: "600"
+  BOT_FALLBACK_SHARED_DATABASE_URL: "postgres://ledger:你的PostgreSQL密码@127.0.0.1:5432/ledgerchainwatcher?sslmode=disable"
 ```
 
 Docker 20.10+ 推荐使用：
@@ -372,7 +386,7 @@ journalctl -u ledger-chain-watcher -f
 ```text
 ledger-chain-watcher        共享链上监听服务和 watcher PostgreSQL
 ledger-main                 当前记账机器人实例
-ledger-ops                  第二个独立 Go v2.3.8 机器人实例
+ledger-ops                  第二个独立 Go v2.4.0 机器人实例
 ```
 
 先创建共享 Docker 网络：
@@ -400,12 +414,11 @@ services:
       CHAIN_WATCHER_URL: "http://ledger-chain-watcher:8090"
       CHAIN_WATCHER_BOT_ID: "ledger-main"
       CHAIN_WATCHER_SECRET: "change_this_chain_watcher_secret"
-      CHAIN_WATCHER_EMERGENCY_FALLBACK: "false"
       BOT_WATCHER_HEALTH_INTERVAL_SECONDS: "1"
-      BOT_WATCHER_FAIL_THRESHOLD: "2"
+      BOT_WATCHER_FAIL_THRESHOLD: "3"
       BOT_WATCHER_CLAIM_TIMEOUT_MS: "2000"
       BOT_FALLBACK_POLL_SECONDS: "1"
-      BOT_FALLBACK_MAX_ACTIVE_SECONDS: "600"
+      BOT_FALLBACK_SHARED_DATABASE_URL: "postgres://chainwatcher:change_this_chain_pg_password@chain-postgres:5432/ledger_chain_watcher?sslmode=disable"
 
 networks:
   ledger-chain-net:
@@ -487,7 +500,7 @@ ports:
 
 ## 未来接 TRON Lite FullNode + Kafka
 
-v2.3.8 第一版 watcher 统一请求 Tronscan/TronGrid。未来切换自建节点时，机器人配置不变，只调整 watcher：
+v2.4.0 第一版 watcher 统一请求 Tronscan/TronGrid。未来切换自建节点时，机器人配置不变，只调整 watcher：
 
 ```yaml
 CHAIN_WATCHER_SOURCE: "kafka"
@@ -560,13 +573,16 @@ docker compose restart ledger-chain-watcher
 
 ## PostgreSQL 备份
 
-每个机器人实例都要单独备份自己的 PostgreSQL：
+每个机器人实例都要单独备份自己的 PostgreSQL，同时备份共享 watcher PostgreSQL：
 
 ```bash
 mkdir -p backups
 docker exec ledger-main-postgres pg_dump -U ledger -d ledger_bot > backups/ledger_main_$(date +%F_%H%M%S).sql
 docker exec ledger-ops-postgres pg_dump -U ledger -d ledger_bot > backups/ledger_ops_$(date +%F_%H%M%S).sql
+docker exec chain-postgres pg_dump -U chainwatcher -d ledger_chain_watcher > backups/ledger_chain_watcher_$(date +%F_%H%M%S).sql
 ```
+
+宿主机 PostgreSQL 部署请改用实际用户和数据库名，例如 `pg_dump -U ledger ledgerchainwatcher`。备份文件必须完成可读性检查后再更新服务。
 
 压缩备份：
 

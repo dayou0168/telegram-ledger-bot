@@ -1,6 +1,6 @@
-﻿# Telegram Ledger Bot Go Runtime v2.3.8
+# Telegram Ledger Bot Go Runtime v2.4.0
 
-这是机器人 Go 版 v2.3.8 主线，目标是把同步、异步、队列、并发、缓存、数据库和共享链上监听从架构层面重新设计。当前已具备：
+这是机器人 Go 版 v2.4.0 主线，目标是把同步、异步、队列、并发、缓存、数据库和共享链上监听从架构层面重新设计。当前已具备：
 
 - Telegram long polling。
 - 按 `chat_id` / `user_id` 串行分发。
@@ -31,15 +31,15 @@
 - 群内发送 TRC20 地址会自动记录验证次数；首次出现回复防篡改核对图，重复出现显示上次发送人和本次发送人。
 - `查询T...` / `查询TRX地址 T...` 查询 TRON 地址余额、创建/活跃时间和最近 USDT 流水，走独立查询池。
 - 地址监听权限：普通用户最多 2 个监听地址；宿主、默认操作人、一级/下级操作人不受数量限制。私聊按钮面板支持添加/删除地址、收入/支出/TRX 通知开关、最小提醒金额。
-- v2.3.8 链上监听通过共享 `ledger-chain-watcher` 获取链上数据；机器人侧继续保存监听地址、tx_hash 去重和 Telegram outbox。
+- v2.4.0 链上监听通过共享 `ledger-chain-watcher` 获取链上数据；机器人侧继续保存监听地址、tx_hash 去重和 Telegram outbox。
 
 ## 构建
 
 推荐直接使用 GitHub Actions 构建发布的镜像：
 
 ```bash
-docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.8
-docker pull ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.8
+docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.0
+docker pull ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.0
 ```
 
 本目录也保留独立 Dockerfile，方便本地构建：
@@ -49,7 +49,7 @@ docker build -t telegram-ledger-bot-go:dev .
 docker build --build-arg APP=chain-watcher -t telegram-ledger-chain-watcher:dev .
 ```
 
-推荐直接用仓库根目录的 `docker-compose.yml` 或 `docker-compose.ghcr.yml` 启动，同一个 Compose 项目里包含 PostgreSQL 独立容器和 `ledger-chain-watcher` 独立容器，默认拉取 `ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.8` 与 `ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.8`：
+推荐直接用仓库根目录的 `docker-compose.yml` 或 `docker-compose.ghcr.yml` 启动，同一个 Compose 项目里包含 PostgreSQL 独立容器和 `ledger-chain-watcher` 独立容器，默认拉取 `ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.0` 与 `ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.0`：
 
 ```bash
 docker compose -f ../docker-compose.yml up -d
@@ -64,7 +64,7 @@ deploy/ledger-chain-watcher.env.example
 deploy/ledger-chain-watcher.service
 ```
 
-GitHub Release `v2.3.8` 同时发布 `ledger-chain-watcher-v2.3.8-linux-amd64.tar.gz` 宿主机包，里面已经包含 Linux amd64 二进制和上述两个模板。
+GitHub Release `v2.4.0` 同时发布 `ledger-chain-watcher-v2.4.0-linux-amd64.tar.gz` 宿主机包，里面已经包含 Linux amd64 二进制和上述两个模板。
 
 机器人仍然用自己的 `DATABASE_URL` 连接自己的 PostgreSQL 数据库，并通过 `CHAIN_WATCHER_URL=http://host.docker.internal:8090` 或 Docker 网桥 IP 访问宿主机 watcher。
 
@@ -81,16 +81,19 @@ ADDRESS_WATCH_FREE_LIMIT=2
 CHAIN_WATCHER_URL=http://ledger-chain-watcher:8090
 CHAIN_WATCHER_BOT_ID=ledger-main
 CHAIN_WATCHER_SECRET=change_this_chain_watcher_secret
-CHAIN_WATCHER_EMERGENCY_FALLBACK=false
 TRONGRID_API_KEY=
 BOT_WATCHER_HEALTH_INTERVAL_SECONDS=1
-BOT_WATCHER_FAIL_THRESHOLD=2
+BOT_WATCHER_FAIL_THRESHOLD=3
 BOT_WATCHER_CLAIM_TIMEOUT_MS=2000
 BOT_FALLBACK_POLL_SECONDS=1
-BOT_FALLBACK_MAX_ACTIVE_SECONDS=600
+BOT_FALLBACK_SHARED_DATABASE_URL=postgres://chainwatcher:***@chain-postgres:5432/ledger_chain_watcher?sslmode=disable
 ```
 
-`CHAIN_WATCHER_EMERGENCY_FALLBACK` 是机器人侧常驻应急开关，默认关闭。正常模式下 bot 只消费 watcher 事件；watcher health/claim 连续失败时，bot 会短时自动启用无 Key 公开 API fallback，最多运行 `BOT_FALLBACK_MAX_ACTIVE_SECONDS`。fallback 仍依赖 Tronscan/TronGrid 公开 API，不是真正事件源；真正不依赖官方 API 的方案是 Lite FullNode + Event Plugin V2 + Kafka 或可靠 Webhook/Streams。
+正常模式下 bot 只消费 watcher 事件。watcher 连续异常 3 秒后，所有 bot 通过共享 PostgreSQL lease 只选一个无 Key fallback leader；它持续工作到 watcher 补齐 cursor 并恢复，不设 600 秒强停。未配置共享 DSN 时明确降级，不启动逐地址 fallback。
+
+每个 bot 的 `BOT_FALLBACK_INSTANCE_ID` 必须唯一且稳定，并与 `BOT_FALLBACK_SHARED_DATABASE_URL` 一起配置；缺少任一项时 fallback 只报告 DEGRADED。
+
+watcher 支持最多 10 个动态 Tronscan Key。每秒以同一 cutoff 扫 P1-P3，Key 按实际用量最少和公平轮转分配，每 Key最多 5 RPS。没有本地额度停扫线；服务端 429 才触发冷却。Key 用 AES-256-GCM 加密保存，`/status` 只显示短指纹和脱敏状态。
 
 ## 推荐默认并发
 
@@ -115,8 +118,8 @@ BOT_QUEUE_SIZE=4096
 - Telegram 更新去重、账本、权限、广播任务、链上通知都落 PostgreSQL。
 - 表设计从第一版就使用 `BIGINT` Telegram ID、`TIMESTAMPTZ` 时间、`BOOLEAN` 开关和高频组合索引。
 - 金额类字段在写库前统一格式化为两位小数，减少长尾小数导致的账单阅读问题。
-- PostgreSQL 是 v2.3.8 的唯一主库目标，避免后续再次迁移。
+- PostgreSQL 是 v2.4.0 的唯一主库目标，避免后续再次迁移。
 
 ## 启动原则
 
-Go v2.3.8 直接按 PostgreSQL 空库启动。等账单、广播、监听三块经过真实群测试后，再切换生产 Bot Token。多机器人部署时，每个机器人实例独立 PostgreSQL；只有 `ledger-chain-watcher` 共享。
+Go v2.4.0 直接按 PostgreSQL 空库启动。等账单、广播、监听三块经过真实群测试后，再切换生产 Bot Token。多机器人部署时，每个机器人实例独立 PostgreSQL；只有 `ledger-chain-watcher` 共享。

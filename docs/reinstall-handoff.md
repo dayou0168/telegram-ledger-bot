@@ -9,15 +9,15 @@ This document is the recovery handoff for reinstalling the local system and cont
 - Repository: `dayou0168/telegram-ledger-bot`
 - Main line: Go + PostgreSQL
 - Deprecated line: the old Python runtime is retired. Do not restore, test, or publish it as the active product line.
-- Current released version: `v2.3.1`
-- Release commit: `650ff642e084897a92c93890ba73744175ed3264`
-- Release URL: `https://github.com/dayou0168/telegram-ledger-bot/releases/tag/v2.3.1`
+- Current release target: `v2.4.0`
+- Release commit: the commit referenced by the `v2.4.0` tag
+- Release URL: `https://github.com/dayou0168/telegram-ledger-bot/releases/tag/v2.4.0`
 
 Current images:
 
 ```text
-ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.1
-ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.1
+ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.0
+ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.0
 ```
 
 ## Current Architecture
@@ -26,33 +26,40 @@ ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.1
 - Each bot keeps its own PostgreSQL database for ledger, broadcast, forwarding, address-watch settings, notifications, and admin data.
 - Shared `ledger-chain-watcher` is a separate service with its own PostgreSQL database.
 - In normal mode, the bot registers watched addresses with `ledger-chain-watcher` and claims watcher matched events.
-- Bot fallback is not the normal path. It only takes over briefly when watcher health or claim calls keep failing, then exits after watcher recovery or after the configured maximum active time.
-- `CHAIN_WATCHER_EMERGENCY_FALLBACK=false` should remain the default. Do not enable it during Tronscan rate-limit incidents unless explicitly doing emergency diagnosis.
+- Bot fallback is not the normal path. After sustained watcher failure, all bots compete for a PostgreSQL lease and only one shared no-key leader scans until the watcher has recovered and its watermark is caught up.
+- Shared no-key fallback requires the watcher PostgreSQL DSN and a unique stable `BOT_FALLBACK_INSTANCE_ID` per bot; there is no per-bot emergency scanner switch or fixed maximum active time.
 
-## v2.3.1 Watcher Configuration
+## v2.4.0 Watcher Configuration
 
 Expected watcher-side values:
 
 ```env
 CHAIN_WATCHER_SOURCE_POLL_SECONDS=1
 CHAIN_WATCHER_GLOBAL_SCAN_PAGES=3
-CHAIN_WATCHER_ADDRESS_SCAN_INTERVAL_SECONDS=30
-CHAIN_WATCHER_ADDRESS_SCAN_PAGES=1
-CHAIN_WATCHER_ADDRESS_SCAN_CONCURRENCY=1
-CHAIN_WATCHER_ADDRESS_SCAN_MAX_PER_TICK=1
+CHAIN_WATCHER_GLOBAL_EXPAND_PAGE_LIMIT=20
+CHAIN_WATCHER_CATCHUP_ENABLED=true
+CHAIN_WATCHER_CATCHUP_STATE_INTERVAL_SECONDS=30
+CHAIN_WATCHER_CATCHUP_PAGE_LIMIT=3
+CHAIN_WATCHER_CATCHUP_MAX_REQUESTS_PER_TICK=6
+CHAIN_WATCHER_CATCHUP_WINDOW_SECONDS=30
+CHAIN_WATCHER_CATCHUP_OVERLAP_SECONDS=2
 CHAIN_WATCHER_LOOKBACK_SECONDS=600
-CHAIN_WATCHER_TRON_REQUEST_INTERVAL_MS=250
-CHAIN_WATCHER_EMERGENCY_FALLBACK=false
+CHAIN_WATCHER_TRONSCAN_API_KEYS=key1,key2,key3
+CHAIN_WATCHER_TRONSCAN_KEY_INTERVAL_MS=200
+CHAIN_WATCHER_KEY_ENCRYPTION_KEY=base64_encoded_32_byte_key
 ```
+
+The main scan always creates three page jobs per second. It assigns those jobs across an immutable snapshot of up to ten healthy keys and rotates page-to-key mapping between rounds. Global catch-up is watermark/window based and lower priority; per-address polling is disabled by default. Key registry, usage, and cooldown state are persisted in watcher PostgreSQL; `/status` exposes fingerprints and counters only.
 
 Expected bot-side fallback values:
 
 ```env
 BOT_WATCHER_HEALTH_INTERVAL_SECONDS=1
-BOT_WATCHER_FAIL_THRESHOLD=2
+BOT_WATCHER_FAIL_THRESHOLD=3
+BOT_FALLBACK_SHARED_DATABASE_URL=postgres://chainwatcher:***@chain-postgres:5432/ledger_chain_watcher?sslmode=disable
+BOT_FALLBACK_INSTANCE_ID=unique-stable-id-for-this-bot
 BOT_WATCHER_CLAIM_TIMEOUT_MS=2000
 BOT_FALLBACK_POLL_SECONDS=1
-BOT_FALLBACK_MAX_ACTIVE_SECONDS=600
 ```
 
 Related templates:
@@ -65,9 +72,9 @@ Related templates:
 - `deploy/ledger-chain-watcher.service`
 - `docs/deployment.md`
 
-## Latest Online Snapshot
+## Historical Online Snapshot
 
-Snapshot from the v2.3.1 release thread after deployment:
+Historical snapshot from the v2.3.1 release thread. It is not evidence that v2.4.0 has been deployed:
 
 - Host `ledger-chain-watcher` was updated to `v2.3.1` from the GitHub Release linux-amd64 package.
 - `zhuanfa-tianze-go` bot container was updated to `ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.1`.
@@ -150,11 +157,11 @@ docs/reinstall-handoff.md
 6. Pull and start the current images.
 
 ```powershell
-docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.1
-docker pull ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.1
+docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.0
+docker pull ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.0
 ```
 
-For host systemd watcher, install the GitHub Release package for `v2.3.1` instead of extracting a binary from a container image.
+For host systemd watcher, install the GitHub Release package for `v2.4.0` instead of extracting a binary from a container image.
 
 7. Verify after startup.
 
@@ -197,4 +204,4 @@ Use examples such as `replace-me`, `change_this_password`, or `your_real_api_key
 2. If reminders are still slow or unreliable, evaluate a non-public-API event source:
    - TRON Lite FullNode + Event Plugin V2 + Kafka
    - reliable webhook or stream provider
-3. Keep `CHAIN_WATCHER_EMERGENCY_FALLBACK=false` by default and only enable emergency behavior with a clear reason and observation window.
+3. Verify every bot has the same shared fallback DSN; missing DSN must remain visibly degraded rather than starting a local scanner.

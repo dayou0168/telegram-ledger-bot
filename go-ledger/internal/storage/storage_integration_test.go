@@ -2,7 +2,9 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"sync"
 	"testing"
 	"time"
 )
@@ -312,5 +314,119 @@ func TestPostgresStoreBasicFlow(t *testing.T) {
 	}
 	if !inserted {
 		t.Fatalf("first chain notification should insert")
+	}
+}
+
+func TestChainWatcherConcurrentSourcesCreateOneDelivery(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	store, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	suffix := fmt.Sprint(time.Now().UnixNano())
+	event := ChainWatcherEvent{EventID: "event-" + suffix, TxHash: "tx-" + suffix, From: "A", To: "B", Value: "1", EventIndex: "0", Source: "realtime"}
+	delivery := ChainWatcherMatchedEvent{DeliveryID: "delivery-" + suffix, EventID: event.EventID, BotID: "bot", ChatID: 1, OwnerUserID: 1, WatchAddress: "B", Direction: "income"}
+	var wg sync.WaitGroup
+	results := make(chan int, 4)
+	for _, source := range []string{"realtime", "expand", "catchup", "fallback"} {
+		wg.Add(1)
+		go func(source string) {
+			defer wg.Done()
+			copyEvent := event
+			copyEvent.Source = source
+			inserted, insertErr := store.RecordChainWatcherMatches(ctx, copyEvent, []ChainWatcherMatchedEvent{delivery}, time.Now())
+			if insertErr != nil {
+				t.Errorf("source %s: %v", source, insertErr)
+				return
+			}
+			results <- inserted
+		}(source)
+	}
+	wg.Wait()
+	close(results)
+	total := 0
+	for inserted := range results {
+		total += inserted
+	}
+	if total != 1 {
+		t.Fatalf("inserted deliveries = %d, want 1", total)
+	}
+
+	second := event
+	second.EventID += "-log1"
+	second.EventIndex = "1"
+	secondDelivery := delivery
+	secondDelivery.EventID, secondDelivery.DeliveryID = second.EventID, delivery.DeliveryID+"-log1"
+	inserted, err := store.RecordChainWatcherMatches(ctx, second, []ChainWatcherMatchedEvent{secondDelivery}, time.Now())
+	if err != nil || inserted != 1 {
+		t.Fatalf("second log event = %d/%v", inserted, err)
+	}
+}
+
+func TestFallbackLeaseElectsSingleLeader(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	store, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	leaseName := fmt.Sprintf("test-fallback-%d", time.Now().UnixNano())
+	now := time.Now().UTC()
+	first, leader, err := store.AcquireChainWatcherFallbackLease(ctx, leaseName, "bot-a", "FALLBACK_ACTIVE", 10*time.Second, now)
+	if err != nil || !leader || first.HolderID != "bot-a" {
+		t.Fatalf("first lease = %+v/%v/%v", first, leader, err)
+	}
+	second, leader, err := store.AcquireChainWatcherFallbackLease(ctx, leaseName, "bot-b", "FALLBACK_ACTIVE", 10*time.Second, now.Add(time.Second))
+	if err != nil || leader || second.HolderID != "bot-a" {
+		t.Fatalf("competing lease = %+v/%v/%v", second, leader, err)
+	}
+	third, leader, err := store.AcquireChainWatcherFallbackLease(ctx, leaseName, "bot-b", "FALLBACK_ACTIVE", 10*time.Second, now.Add(11*time.Second))
+	if err != nil || !leader || third.HolderID != "bot-b" {
+		t.Fatalf("expired lease takeover = %+v/%v/%v", third, leader, err)
+	}
+}
+
+func TestChainWatcherCursorSurvivesNewStoreInstance(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	first, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	timestamp := time.Now().UTC().UnixMilli()
+	eventID := fmt.Sprintf("restart-cursor-%d", timestamp)
+	if err := first.AdvanceChainWatcherWatermark(ctx, timestamp, eventID, "catchup", time.Now().UTC()); err != nil {
+		first.Close()
+		t.Fatal(err)
+	}
+	first.Close()
+
+	second, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	watermark, err := second.GetChainWatcherWatermark(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if watermark.Timestamp != timestamp || watermark.TxHash != eventID {
+		t.Fatalf("watermark after reopen = %+v, want %d/%s", watermark, timestamp, eventID)
 	}
 }

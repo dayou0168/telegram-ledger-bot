@@ -1,11 +1,11 @@
-﻿# Telegram 记账机器人 Go v2.3.8 + PostgreSQL + shared chain watcher
+# Telegram 记账机器人 Go v2.4.0 + PostgreSQL + shared chain watcher
 #
 # 单机器人一体部署：
 # 1. 新建宝塔 Compose 项目，把本文件完整粘贴进去。
 # 2. 先填写 TELEGRAM_BOT_TOKEN、TELEGRAM_BOT_USERNAME、BOT_HOST_USER_ID。
 # 3. 分别修改机器人 PostgreSQL 和 watcher PostgreSQL 的密码。
 # 4. 填写 CHAIN_WATCHER_BOT_ID、CHAIN_WATCHER_SECRET，并同步到 watcher 的 CHAIN_WATCHER_BOTS。
-# 5. 如果使用 Tronscan/TronGrid 官方接口，在 watcher 服务里填写 CHAIN_WATCHER_TRON_API_KEY。
+# 5. 在 watcher 服务里填写 CHAIN_WATCHER_TRONSCAN_API_KEYS；1秒×3页长期运行建议至少3个Key。
 # 6. 如果要使用完整账单/后台，把 PUBLIC_BILL_BASE_URL 改成你的 HTTPS 域名，并填写 ADMIN_WEB_TOKEN。
 # 7. 默认使用 Docker json-file 日志上限 max-size=20m/max-file=5，单容器约 100MB。
 #    Docker json-file 不能严格按时间保留 72 小时；这里用大小上限近似最近日志并防止撑爆硬盘。
@@ -56,7 +56,7 @@ services:
       retries: 10
 
   ledger-chain-watcher:
-    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.3.8
+    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.0
     container_name: ledger-chain-watcher
     restart: unless-stopped
     logging:
@@ -70,6 +70,8 @@ services:
     environment:
       CHAIN_WATCHER_DATABASE_URL: "postgres://chainwatcher:change_this_chain_pg_password@chain-postgres:5432/ledger_chain_watcher?sslmode=disable"
       CHAIN_WATCHER_ADDR: ":8090"
+      CHAIN_WATCHER_ADMIN_TOKEN: "change_this_watcher_admin_token"
+      CHAIN_WATCHER_KEY_ENCRYPTION_KEY: "replace_with_base64_32_byte_key"
       BOT_TIMEZONE: "Asia/Shanghai"
       BOT_REQUEST_TIMEOUT: "70"
 
@@ -78,15 +80,21 @@ services:
 
       # 第一版：统一请求 Tronscan/TronGrid。多个机器人不再分别配置官网 API Key。
       CHAIN_WATCHER_TRONSCAN_API_BASE: "https://apilist.tronscanapi.com/api"
+      CHAIN_WATCHER_TRONSCAN_API_KEYS: "replace_key_1,replace_key_2,replace_key_3"
+      CHAIN_WATCHER_TRONSCAN_API_KEY: ""
       CHAIN_WATCHER_TRON_API_KEY: ""
       TRON_USDT_CONTRACT: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
       CHAIN_WATCHER_SOURCE_POLL_SECONDS: "1"
       CHAIN_WATCHER_GLOBAL_SCAN_PAGES: "3"
-      CHAIN_WATCHER_ADDRESS_SCAN_INTERVAL_SECONDS: "30"
-      CHAIN_WATCHER_ADDRESS_SCAN_PAGES: "1"
-      CHAIN_WATCHER_ADDRESS_SCAN_CONCURRENCY: "1"
-      CHAIN_WATCHER_ADDRESS_SCAN_MAX_PER_TICK: "1"
-      CHAIN_WATCHER_TRON_REQUEST_INTERVAL_MS: "250"
+      CHAIN_WATCHER_GLOBAL_EXPAND_PAGE_LIMIT: "20"
+      CHAIN_WATCHER_CATCHUP_ENABLED: "true"
+      CHAIN_WATCHER_CATCHUP_STATE_INTERVAL_SECONDS: "30"
+      CHAIN_WATCHER_CATCHUP_PAGE_LIMIT: "3"
+      CHAIN_WATCHER_CATCHUP_MAX_REQUESTS_PER_TICK: "6"
+      CHAIN_WATCHER_CATCHUP_WINDOW_SECONDS: "30"
+      CHAIN_WATCHER_CATCHUP_OVERLAP_SECONDS: "2"
+      CHAIN_WATCHER_CATCHUP_MAX_RPS: "8"
+      CHAIN_WATCHER_TRONSCAN_KEY_INTERVAL_MS: "200"
       CHAIN_WATCHER_LOOKBACK_SECONDS: "600"
       CHAIN_WATCHER_CLAIM_LEASE_SECONDS: "30"
       CHAIN_WATCHER_DELIVERY_RETRY_SECONDS: "2"
@@ -104,7 +112,7 @@ services:
       retries: 10
 
   ledger-bot:
-    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.8
+    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.0
     container_name: ledger-bot-go
     restart: unless-stopped
     logging:
@@ -129,7 +137,6 @@ services:
       CHAIN_WATCHER_BOT_ID: "ledger-main"
       CHAIN_WATCHER_SECRET: "change_this_chain_watcher_secret"
       # 常驻应急兜底默认关闭；正常模式下 bot 只消费 watcher 事件。
-      CHAIN_WATCHER_EMERGENCY_FALLBACK: "false"
 
       # ==================== 选填配置 ====================
       DEFAULT_OPERATOR_USER_IDS: ""
@@ -154,16 +161,23 @@ services:
       # bot 自动 fallback 默认无 Key 使用公开 API；常驻应急模式需要 Key 时才填写。
       TRONGRID_API_KEY: ""
       TRON_USDT_CONTRACT: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
-      TRON_POLL_INTERVAL_SECONDS: "1"
       TRON_ADDRESS_BACKFILL_SECONDS: "60"
       TRON_INITIAL_LOOKBACK_MINUTES: "15"
       CHAIN_WATCHER_POLL_SECONDS: "1"
       CHAIN_WATCHER_BATCH_SIZE: "50"
       BOT_WATCHER_HEALTH_INTERVAL_SECONDS: "1"
-      BOT_WATCHER_FAIL_THRESHOLD: "2"
+      BOT_WATCHER_FAIL_THRESHOLD: "3"
       BOT_WATCHER_CLAIM_TIMEOUT_MS: "2000"
       BOT_FALLBACK_POLL_SECONDS: "1"
-      BOT_FALLBACK_MAX_ACTIVE_SECONDS: "600"
+      BOT_FALLBACK_SHARED_DATABASE_URL: "postgres://chainwatcher:change_this_chain_pg_password@chain-postgres:5432/ledger_chain_watcher?sslmode=disable"
+      BOT_FALLBACK_INSTANCE_ID: ""
+      BOT_FALLBACK_LEASE_SECONDS: "15"
+      BOT_FALLBACK_GLOBAL_PAGES: "3"
+      BOT_FALLBACK_REQUEST_INTERVAL_MS: "200"
+      BOT_FALLBACK_RECOVERY_SUCCESS_ROUNDS: "3"
+      BOT_FALLBACK_RECOVERY_LAG_SECONDS: "5"
+      BOT_FALLBACK_MAX_REQUESTS_PER_TICK: "6"
+      BOT_FALLBACK_WINDOW_SECONDS: "30"
       P2P_RATE_API_BASE: "https://p2p.army/api/fapi"
       P2P_RATE_FRONT_API: "NextVOF2Ozuh36mW0TCv"
       P2P_RATE_MARKET: "okx"

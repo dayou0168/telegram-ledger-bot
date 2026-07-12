@@ -224,6 +224,7 @@ type ChainWatcherEvent struct {
 	BlockTimestamp int64
 	Confirmed      bool
 	Source         string
+	EventIndex     string
 }
 
 type ChainWatcherMatchedEvent struct {
@@ -261,6 +262,35 @@ type ChainWatcherDeliveryStats struct {
 type ChainWatcherCleanupStats struct {
 	MatchedDeleted int64
 	EventsDeleted  int64
+}
+
+type ChainWatcherWatermark struct {
+	Timestamp int64
+	TxHash    string
+	Source    string
+	UpdatedAt time.Time
+}
+
+type ChainWatcherCatchupState struct {
+	Required  bool
+	Reason    string
+	UpdatedAt time.Time
+}
+
+type ChainWatcherFallbackLease struct {
+	LeaseName          string
+	HolderID           string
+	LeaseUntil         time.Time
+	Mode               string
+	StartedAt          *time.Time
+	LastWatcherSuccess *time.Time
+	FallbackRequests   int64
+	Fallback429        int64
+	CatchupFrom        int64
+	CatchupTo          int64
+	CatchupPages       int64
+	CatchupBudgetUsed  int64
+	UpdatedAt          time.Time
 }
 
 type WatchSettings struct {

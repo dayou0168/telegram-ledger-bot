@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 )
@@ -119,5 +120,47 @@ func TestNormalizeTimestampMillis(t *testing.T) {
 				t.Fatalf("normalizeTimestampMillis(%d) = %d, want %d", tt.in, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestFetchKeepsMultipleEventsFromSameTransaction(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"token_transfers":[{"transaction_id":"same","event_index":0,"from_address":"A","to_address":"B","quant":"1","block_ts":2000000000000},{"transaction_id":"same","event_index":1,"from_address":"A","to_address":"C","quant":"2","block_ts":2000000000000}]}`)
+	}))
+	defer server.Close()
+	client := NewClient(server.URL, "", time.Second)
+	result, err := client.FetchGlobalUSDTTransfersWithMetrics(context.Background(), "TR7", 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Transfers) != 2 {
+		t.Fatalf("transfers = %d, want 2", len(result.Transfers))
+	}
+	if result.Transfers[0].EventIndex == result.Transfers[1].EventIndex {
+		t.Fatalf("event indexes collapsed: %+v", result.Transfers)
+	}
+}
+
+func TestThreeHeadPagesShareOneCutoff(t *testing.T) {
+	var mu sync.Mutex
+	var cutoffs []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		cutoffs = append(cutoffs, r.URL.Query().Get("end_timestamp"))
+		mu.Unlock()
+		fmt.Fprint(w, `{"token_transfers":[]}`)
+	}))
+	defer server.Close()
+	client := NewClientWithKeys(server.URL, []string{"k1", "k2", "k3"}, time.Second, KeyPoolOptions{})
+	if _, err := client.FetchGlobalUSDTTransfersAtWithMetrics(context.Background(), "TR7", 1, 123456, 3); err != nil {
+		t.Fatal(err)
+	}
+	if len(cutoffs) != 3 {
+		t.Fatalf("calls = %d", len(cutoffs))
+	}
+	for _, cutoff := range cutoffs {
+		if cutoff != "123456" {
+			t.Fatalf("cutoffs = %v", cutoffs)
+		}
 	}
 }

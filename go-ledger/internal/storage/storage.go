@@ -8,16 +8,47 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/tron"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type Store struct {
-	pool *pgxpool.Pool
+	pool      *pgxpool.Pool
+	keyCipher *keyCipher
 }
 
 func Open(ctx context.Context, databaseURL string) (*Store, error) {
+	return open(ctx, databaseURL, true)
+}
+
+func OpenExisting(ctx context.Context, databaseURL string) (*Store, error) {
+	return open(ctx, databaseURL, false)
+}
+
+func OpenChainWatcher(ctx context.Context, databaseURL, encryptionKey string) (*Store, error) {
+	cipher, err := newKeyCipher(encryptionKey)
+	if err != nil {
+		return nil, err
+	}
+	store, err := open(ctx, databaseURL, false)
+	if err != nil {
+		return nil, err
+	}
+	store.keyCipher = cipher
+	if err := store.migrate(ctx); err != nil {
+		store.Close()
+		return nil, err
+	}
+	if err := store.migrateTronscanKeyEncryption(ctx); err != nil {
+		store.Close()
+		return nil, err
+	}
+	return store, nil
+}
+
+func open(ctx context.Context, databaseURL string, migrate bool) (*Store, error) {
 	cfg, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
 		return nil, err
@@ -37,9 +68,11 @@ func Open(ctx context.Context, databaseURL string) (*Store, error) {
 		return nil, err
 	}
 	store := &Store{pool: pool}
-	if err := store.migrate(ctx); err != nil {
-		pool.Close()
-		return nil, err
+	if migrate {
+		if err := store.migrate(ctx); err != nil {
+			pool.Close()
+			return nil, err
+		}
 	}
 	return store, nil
 }
@@ -364,6 +397,10 @@ func (s *Store) migrate(ctx context.Context) error {
 			created_at TIMESTAMPTZ NOT NULL,
 			PRIMARY KEY(owner_user_id, address, tx_hash, direction)
 		)`,
+		`ALTER TABLE chain_notifications ADD COLUMN IF NOT EXISTS event_id TEXT NOT NULL DEFAULT ''`,
+		`UPDATE chain_notifications SET event_id=tx_hash WHERE event_id=''`,
+		`ALTER TABLE chain_notifications DROP CONSTRAINT IF EXISTS chain_notifications_pkey`,
+		`ALTER TABLE chain_notifications ADD PRIMARY KEY(owner_user_id, address, event_id, direction)`,
 		`CREATE INDEX IF NOT EXISTS idx_chain_notifications_latest
 			ON chain_notifications(owner_user_id, address, block_timestamp DESC)`,
 		`CREATE TABLE IF NOT EXISTS chain_watcher_bots (
@@ -375,6 +412,80 @@ func (s *Store) migrate(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_bots_status
 			ON chain_watcher_bots(status, bot_id)`,
+		`CREATE TABLE IF NOT EXISTS chain_watcher_key_usage (
+			fingerprint TEXT NOT NULL,
+			budget_day DATE NOT NULL,
+			request_count INTEGER NOT NULL DEFAULT 0,
+			main_request_count INTEGER NOT NULL DEFAULT 0,
+			comp_request_count INTEGER NOT NULL DEFAULT 0,
+			other_request_count INTEGER NOT NULL DEFAULT 0,
+			failover_count INTEGER NOT NULL DEFAULT 0,
+			rate_limit_count INTEGER NOT NULL DEFAULT 0,
+			auth_error_count INTEGER NOT NULL DEFAULT 0,
+			last_http_status INTEGER NOT NULL DEFAULT 0,
+			last_429_at TIMESTAMPTZ,
+			cooldown_until TIMESTAMPTZ,
+			disabled_until TIMESTAMPTZ,
+			updated_at TIMESTAMPTZ NOT NULL,
+			PRIMARY KEY(fingerprint, budget_day)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_key_usage_day
+			ON chain_watcher_key_usage(budget_day, fingerprint)`,
+		`CREATE TABLE IF NOT EXISTS chain_watcher_api_keys (
+			fingerprint TEXT PRIMARY KEY,
+			api_key TEXT NOT NULL DEFAULT '',
+			api_key_ciphertext BYTEA,
+			enabled BOOLEAN NOT NULL DEFAULT TRUE,
+			health TEXT NOT NULL DEFAULT 'suspect',
+			reason TEXT NOT NULL DEFAULT 'new_or_updated',
+			consecutive_failures INTEGER NOT NULL DEFAULT 0,
+			consecutive_auth_failures INTEGER NOT NULL DEFAULT 0,
+			consecutive_probe_successes INTEGER NOT NULL DEFAULT 0,
+			cooldown_until TIMESTAMPTZ,
+			next_probe_at TIMESTAMPTZ,
+			last_used_at TIMESTAMPTZ,
+			last_success_at TIMESTAMPTZ,
+			last_failure_at TIMESTAMPTZ,
+			last_error_class TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL,
+			updated_at TIMESTAMPTZ NOT NULL
+		)`,
+		`ALTER TABLE chain_watcher_api_keys ADD COLUMN IF NOT EXISTS api_key_ciphertext BYTEA`,
+		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_api_keys_enabled
+			ON chain_watcher_api_keys(enabled, health, updated_at)`,
+		`CREATE TABLE IF NOT EXISTS chain_watcher_runtime_state (
+			id SMALLINT PRIMARY KEY DEFAULT 1 CHECK(id=1),
+			global_watermark_timestamp BIGINT NOT NULL DEFAULT 0,
+			global_watermark_tx_hash TEXT NOT NULL DEFAULT '',
+			watermark_source TEXT NOT NULL DEFAULT '',
+			updated_at TIMESTAMPTZ NOT NULL
+		)`,
+		`ALTER TABLE chain_watcher_runtime_state ADD COLUMN IF NOT EXISTS realtime_watermark_timestamp BIGINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE chain_watcher_runtime_state ADD COLUMN IF NOT EXISTS realtime_watermark_tx_hash TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE chain_watcher_runtime_state ADD COLUMN IF NOT EXISTS realtime_updated_at TIMESTAMPTZ`,
+		`ALTER TABLE chain_watcher_runtime_state ADD COLUMN IF NOT EXISTS fallback_head_timestamp BIGINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE chain_watcher_runtime_state ADD COLUMN IF NOT EXISTS fallback_anchor_event_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE chain_watcher_runtime_state ADD COLUMN IF NOT EXISTS fallback_head_updated_at TIMESTAMPTZ`,
+		`ALTER TABLE chain_watcher_runtime_state ADD COLUMN IF NOT EXISTS catchup_required BOOLEAN NOT NULL DEFAULT FALSE`,
+		`ALTER TABLE chain_watcher_runtime_state ADD COLUMN IF NOT EXISTS catchup_reason TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE chain_watcher_runtime_state ADD COLUMN IF NOT EXISTS catchup_updated_at TIMESTAMPTZ`,
+		`CREATE TABLE IF NOT EXISTS chain_watcher_fallback_lease (
+			lease_name TEXT PRIMARY KEY,
+			holder_id TEXT NOT NULL DEFAULT '',
+			lease_until TIMESTAMPTZ NOT NULL,
+			mode TEXT NOT NULL DEFAULT 'PRIMARY',
+			started_at TIMESTAMPTZ,
+			last_watcher_success TIMESTAMPTZ,
+			fallback_requests BIGINT NOT NULL DEFAULT 0,
+			fallback_429 BIGINT NOT NULL DEFAULT 0,
+			catchup_from BIGINT NOT NULL DEFAULT 0,
+			catchup_to BIGINT NOT NULL DEFAULT 0,
+			catchup_pages BIGINT NOT NULL DEFAULT 0,
+			catchup_budget_used BIGINT NOT NULL DEFAULT 0,
+			updated_at TIMESTAMPTZ NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_fallback_lease_expiry
+			ON chain_watcher_fallback_lease(lease_until)`,
 		`CREATE TABLE IF NOT EXISTS chain_watcher_subscriptions (
 			bot_id TEXT NOT NULL,
 			chat_id BIGINT NOT NULL DEFAULT 0,
@@ -410,8 +521,10 @@ func (s *Store) migrate(ctx context.Context) error {
 			block_timestamp BIGINT NOT NULL,
 			confirmed BOOLEAN NOT NULL DEFAULT FALSE,
 			source TEXT NOT NULL DEFAULT '',
+			event_index TEXT NOT NULL DEFAULT '',
 			created_at TIMESTAMPTZ NOT NULL
 		)`,
+		`ALTER TABLE chain_watcher_events ADD COLUMN IF NOT EXISTS event_index TEXT NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_events_tx
 			ON chain_watcher_events(tx_hash, block_timestamp DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_events_created
@@ -2049,28 +2162,32 @@ func (s *Store) RecordAddressValidation(ctx context.Context, chatID int64, addre
 }
 
 func (s *Store) RecordChainNotification(ctx context.Context, owner int64, address, txHash, direction string, blockTimestamp int64, now time.Time) (bool, error) {
-	tag, err := s.pool.Exec(ctx, `INSERT INTO chain_notifications(owner_user_id, address, tx_hash, direction, block_timestamp, created_at)
-		VALUES($1, $2, $3, $4, $5, $6)
-		ON CONFLICT DO NOTHING`, owner, address, txHash, direction, blockTimestamp, now)
+	tag, err := s.pool.Exec(ctx, `INSERT INTO chain_notifications(owner_user_id, address, tx_hash, event_id, direction, block_timestamp, created_at)
+		VALUES($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT DO NOTHING`, owner, address, txHash, txHash, direction, blockTimestamp, now)
 	return tag.RowsAffected() == 1, err
 }
 
 func (s *Store) RecordChainNotificationOutbox(ctx context.Context, owner int64, address, txHash, direction string, blockTimestamp int64, chatID int64, text, parseMode string, disablePreview bool, now time.Time) (bool, error) {
+	return s.RecordChainNotificationOutboxEvent(ctx, owner, address, txHash, txHash, direction, blockTimestamp, chatID, text, parseMode, disablePreview, now)
+}
+
+func (s *Store) RecordChainNotificationOutboxEvent(ctx context.Context, owner int64, address, txHash, eventID, direction string, blockTimestamp int64, chatID int64, text, parseMode string, disablePreview bool, now time.Time) (bool, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return false, err
 	}
 	defer rollback(ctx, tx)
-	tag, err := tx.Exec(ctx, `INSERT INTO chain_notifications(owner_user_id, address, tx_hash, direction, block_timestamp, created_at)
-		VALUES($1, $2, $3, $4, $5, $6)
-		ON CONFLICT DO NOTHING`, owner, address, txHash, direction, blockTimestamp, now)
+	tag, err := tx.Exec(ctx, `INSERT INTO chain_notifications(owner_user_id, address, tx_hash, event_id, direction, block_timestamp, created_at)
+		VALUES($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT DO NOTHING`, owner, address, txHash, eventID, direction, blockTimestamp, now)
 	if err != nil {
 		return false, err
 	}
 	if tag.RowsAffected() == 0 {
 		return false, tx.Commit(ctx)
 	}
-	dedupeKey := fmt.Sprintf("chain:%d:%s:%s:%s", owner, address, txHash, direction)
+	dedupeKey := fmt.Sprintf("chain:%d:%s:%s:%s", owner, address, eventID, direction)
 	if _, err := tx.Exec(ctx, `INSERT INTO notification_outbox(
 			kind, dedupe_key, chat_id, text, parse_mode, disable_preview, priority, status,
 			attempts, next_attempt_at, created_at, updated_at
@@ -2500,14 +2617,18 @@ func (s *Store) RecordChainWatcherMatches(ctx context.Context, event ChainWatche
 		return 0, err
 	}
 	defer rollback(ctx, tx)
-	if _, err := tx.Exec(ctx, `INSERT INTO chain_watcher_events(
+	eventTag, err := tx.Exec(ctx, `INSERT INTO chain_watcher_events(
 			event_id, tx_hash, contract, from_address, to_address, value, token_symbol, token_address,
-			token_decimals, block_timestamp, confirmed, source, created_at
-		) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+			token_decimals, block_timestamp, confirmed, source, event_index, created_at
+		) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		ON CONFLICT(event_id) DO NOTHING`,
 		event.EventID, event.TxHash, event.Contract, event.From, event.To, event.Value, event.TokenSymbol, event.TokenAddress,
-		event.TokenDecimals, event.BlockTimestamp, event.Confirmed, event.Source, now); err != nil {
+		event.TokenDecimals, event.BlockTimestamp, event.Confirmed, event.Source, event.EventIndex, now)
+	if err != nil {
 		return 0, err
+	}
+	if eventTag.RowsAffected() == 0 {
+		return 0, tx.Commit(ctx)
 	}
 	inserted := 0
 	for _, d := range deliveries {
@@ -2637,6 +2758,459 @@ func (s *Store) ChainWatcherDeliveryStats(ctx context.Context, maxAge time.Durat
 	return stats, nil
 }
 
+func (s *Store) LoadTronscanKeyUsage(ctx context.Context, fingerprints []string, budgetDay string) (map[string]tron.KeyUsageRecord, error) {
+	records := make(map[string]tron.KeyUsageRecord)
+	if len(fingerprints) == 0 {
+		return records, nil
+	}
+	rows, err := s.pool.Query(ctx, `SELECT fingerprint, budget_day::text, request_count,
+		main_request_count, comp_request_count, other_request_count, failover_count,
+		rate_limit_count, auth_error_count, last_http_status, last_429_at, cooldown_until, disabled_until
+		FROM chain_watcher_key_usage
+		WHERE budget_day=$1::date AND fingerprint = ANY($2)`, budgetDay, fingerprints)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		record, err := scanTronscanKeyUsage(rows)
+		if err != nil {
+			return nil, err
+		}
+		records[record.Fingerprint] = record
+	}
+	return records, rows.Err()
+}
+
+func (s *Store) ListTronscanAPIKeys(ctx context.Context) ([]tron.KeyRegistryRecord, error) {
+	rows, err := s.pool.Query(ctx, `SELECT fingerprint, api_key_ciphertext, enabled, health, reason,
+		consecutive_failures, consecutive_auth_failures, consecutive_probe_successes,
+		cooldown_until, next_probe_at, last_used_at, last_success_at, last_failure_at,
+		last_error_class FROM chain_watcher_api_keys ORDER BY created_at, fingerprint`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var records []tron.KeyRegistryRecord
+	for rows.Next() {
+		record, err := scanTronscanAPIKey(rows, s.keyCipher)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+	}
+	return records, rows.Err()
+}
+
+func (s *Store) UpsertTronscanAPIKey(ctx context.Context, fingerprint, apiKey string, enabled bool, now time.Time) error {
+	ciphertext, err := s.keyCipher.encrypt(apiKey)
+	if err != nil {
+		return err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer rollback(ctx, tx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('chain_watcher_api_keys'))`); err != nil {
+		return err
+	}
+	var exists bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM chain_watcher_api_keys WHERE fingerprint=$1)`, fingerprint).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		var count int
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM chain_watcher_api_keys`).Scan(&count); err != nil {
+			return err
+		}
+		if count >= tron.MaxConfiguredKeys {
+			return fmt.Errorf("Tronscan API key registry supports at most %d keys; delete one before adding another", tron.MaxConfiguredKeys)
+		}
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO chain_watcher_api_keys(
+		fingerprint, api_key, api_key_ciphertext, enabled, health, reason, next_probe_at, created_at, updated_at
+	) VALUES($1,'',$2,$3,'suspect','new_or_updated',$4,$4,$4)
+	ON CONFLICT(fingerprint) DO UPDATE SET api_key='', api_key_ciphertext=excluded.api_key_ciphertext, enabled=excluded.enabled,
+		health='suspect', reason='new_or_updated', consecutive_failures=0,
+		consecutive_auth_failures=0, consecutive_probe_successes=0,
+		cooldown_until=NULL, next_probe_at=excluded.next_probe_at,
+		last_error_class='', updated_at=excluded.updated_at`, fingerprint, ciphertext, enabled, now)
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Store) DeleteTronscanAPIKey(ctx context.Context, fingerprint string) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM chain_watcher_api_keys WHERE fingerprint=$1`, fingerprint)
+	return err
+}
+
+func (s *Store) UpdateTronscanAPIKeyState(ctx context.Context, record tron.KeyRegistryRecord, now time.Time) error {
+	_, err := s.pool.Exec(ctx, `UPDATE chain_watcher_api_keys SET enabled=$2, health=$3,
+		reason=$4, consecutive_failures=$5, consecutive_auth_failures=$6,
+		consecutive_probe_successes=$7, cooldown_until=$8, next_probe_at=$9,
+		last_used_at=$10, last_success_at=$11, last_failure_at=$12,
+		last_error_class=$13, updated_at=$14 WHERE fingerprint=$1`,
+		record.Fingerprint, record.Enabled, record.Health, record.Reason,
+		record.ConsecutiveFailures, record.ConsecutiveAuthFailures, record.ConsecutiveProbeSuccesses,
+		nullableTime(record.CooldownUntil), nullableTime(record.NextProbeAt), nullableTime(record.LastUsedAt),
+		nullableTime(record.LastSuccessAt), nullableTime(record.LastFailureAt), record.LastErrorClass, now)
+	return err
+}
+
+func scanTronscanAPIKey(scanner recordScanner, cipher *keyCipher) (tron.KeyRegistryRecord, error) {
+	var record tron.KeyRegistryRecord
+	var ciphertext []byte
+	var cooldown, nextProbe, lastUsed, lastSuccess, lastFailure pgtype.Timestamptz
+	err := scanner.Scan(&record.Fingerprint, &ciphertext, &record.Enabled, &record.Health,
+		&record.Reason, &record.ConsecutiveFailures, &record.ConsecutiveAuthFailures,
+		&record.ConsecutiveProbeSuccesses, &cooldown, &nextProbe, &lastUsed,
+		&lastSuccess, &lastFailure, &record.LastErrorClass)
+	if err != nil {
+		return record, err
+	}
+	record.APIKey, err = cipher.decrypt(ciphertext)
+	if err != nil {
+		return record, fmt.Errorf("decrypt Tronscan key %s: %w", record.Fingerprint, err)
+	}
+	if cooldown.Valid {
+		record.CooldownUntil = cooldown.Time
+	}
+	if nextProbe.Valid {
+		record.NextProbeAt = nextProbe.Time
+	}
+	if lastUsed.Valid {
+		record.LastUsedAt = lastUsed.Time
+	}
+	if lastSuccess.Valid {
+		record.LastSuccessAt = lastSuccess.Time
+	}
+	if lastFailure.Valid {
+		record.LastFailureAt = lastFailure.Time
+	}
+	return record, err
+}
+
+func (s *Store) migrateTronscanKeyEncryption(ctx context.Context) error {
+	rows, err := s.pool.Query(ctx, `SELECT fingerprint, api_key FROM chain_watcher_api_keys
+		WHERE api_key <> '' AND api_key_ciphertext IS NULL`)
+	if err != nil {
+		return err
+	}
+	type legacyKey struct{ fingerprint, key string }
+	var legacy []legacyKey
+	for rows.Next() {
+		var item legacyKey
+		if err := rows.Scan(&item.fingerprint, &item.key); err != nil {
+			rows.Close()
+			return err
+		}
+		legacy = append(legacy, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for _, item := range legacy {
+		ciphertext, err := s.keyCipher.encrypt(item.key)
+		if err != nil {
+			return err
+		}
+		if _, err := s.pool.Exec(ctx, `UPDATE chain_watcher_api_keys SET api_key='', api_key_ciphertext=$2 WHERE fingerprint=$1`, item.fingerprint, ciphertext); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) GetChainWatcherWatermark(ctx context.Context) (ChainWatcherWatermark, error) {
+	var watermark ChainWatcherWatermark
+	err := s.pool.QueryRow(ctx, `SELECT global_watermark_timestamp, global_watermark_tx_hash,
+		watermark_source, updated_at FROM chain_watcher_runtime_state WHERE id=1`).Scan(
+		&watermark.Timestamp, &watermark.TxHash, &watermark.Source, &watermark.UpdatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return watermark, nil
+	}
+	return watermark, err
+}
+
+func (s *Store) AdvanceChainWatcherWatermark(ctx context.Context, timestamp int64, txHash, source string, now time.Time) error {
+	_, err := s.pool.Exec(ctx, `INSERT INTO chain_watcher_runtime_state(
+		id, global_watermark_timestamp, global_watermark_tx_hash, watermark_source, updated_at
+	) VALUES(1, $1, $2, $3, $4)
+	ON CONFLICT(id) DO UPDATE SET
+		global_watermark_timestamp=excluded.global_watermark_timestamp,
+		global_watermark_tx_hash=excluded.global_watermark_tx_hash,
+		watermark_source=excluded.watermark_source,
+		updated_at=excluded.updated_at
+	WHERE excluded.global_watermark_timestamp >= chain_watcher_runtime_state.global_watermark_timestamp`,
+		timestamp, txHash, source, now)
+	return err
+}
+
+func (s *Store) GetChainWatcherRealtimeWatermark(ctx context.Context) (ChainWatcherWatermark, error) {
+	var watermark ChainWatcherWatermark
+	var updated pgtype.Timestamptz
+	err := s.pool.QueryRow(ctx, `SELECT realtime_watermark_timestamp, realtime_watermark_tx_hash, realtime_updated_at
+		FROM chain_watcher_runtime_state WHERE id=1`).Scan(&watermark.Timestamp, &watermark.TxHash, &updated)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return watermark, nil
+	}
+	if updated.Valid {
+		watermark.UpdatedAt = updated.Time
+	}
+	watermark.Source = "realtime"
+	return watermark, err
+}
+
+func (s *Store) AdvanceChainWatcherRealtimeWatermark(ctx context.Context, timestamp int64, txHash string, now time.Time) error {
+	_, err := s.pool.Exec(ctx, `INSERT INTO chain_watcher_runtime_state(
+		id, global_watermark_timestamp, global_watermark_tx_hash, watermark_source,
+		realtime_watermark_timestamp, realtime_watermark_tx_hash, realtime_updated_at, updated_at
+	) VALUES(1, 0, '', '', $1, $2, $3, $3)
+	ON CONFLICT(id) DO UPDATE SET
+		realtime_watermark_timestamp=excluded.realtime_watermark_timestamp,
+		realtime_watermark_tx_hash=excluded.realtime_watermark_tx_hash,
+		realtime_updated_at=excluded.realtime_updated_at,
+		updated_at=excluded.updated_at
+	WHERE excluded.realtime_watermark_timestamp >= chain_watcher_runtime_state.realtime_watermark_timestamp`,
+		timestamp, txHash, now)
+	return err
+}
+
+func (s *Store) GetChainWatcherFallbackHead(ctx context.Context) (ChainWatcherWatermark, error) {
+	var head ChainWatcherWatermark
+	var updated pgtype.Timestamptz
+	err := s.pool.QueryRow(ctx, `SELECT fallback_head_timestamp, fallback_anchor_event_id, fallback_head_updated_at
+		FROM chain_watcher_runtime_state WHERE id=1`).Scan(&head.Timestamp, &head.TxHash, &updated)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return head, nil
+	}
+	if updated.Valid {
+		head.UpdatedAt = updated.Time
+	}
+	head.Source = "fallback"
+	return head, err
+}
+
+func (s *Store) AdvanceChainWatcherFallbackHead(ctx context.Context, timestamp int64, anchorID string, now time.Time) error {
+	_, err := s.pool.Exec(ctx, `INSERT INTO chain_watcher_runtime_state(
+		id, global_watermark_timestamp, global_watermark_tx_hash, watermark_source,
+		fallback_head_timestamp, fallback_anchor_event_id, fallback_head_updated_at, updated_at
+	) VALUES(1,0,'','',$1,$2,$3,$3)
+	ON CONFLICT(id) DO UPDATE SET fallback_head_timestamp=excluded.fallback_head_timestamp,
+		fallback_anchor_event_id=excluded.fallback_anchor_event_id,
+		fallback_head_updated_at=excluded.fallback_head_updated_at, updated_at=excluded.updated_at
+	WHERE excluded.fallback_head_timestamp >= chain_watcher_runtime_state.fallback_head_timestamp`, timestamp, anchorID, now)
+	return err
+}
+
+func (s *Store) GetChainWatcherCatchupState(ctx context.Context) (ChainWatcherCatchupState, error) {
+	var state ChainWatcherCatchupState
+	var updated pgtype.Timestamptz
+	err := s.pool.QueryRow(ctx, `SELECT catchup_required, catchup_reason, catchup_updated_at
+		FROM chain_watcher_runtime_state WHERE id=1`).Scan(&state.Required, &state.Reason, &updated)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return state, nil
+	}
+	if updated.Valid {
+		state.UpdatedAt = updated.Time
+	}
+	return state, err
+}
+
+func (s *Store) MarkChainWatcherCatchupRequired(ctx context.Context, reason string, now time.Time) error {
+	_, err := s.pool.Exec(ctx, `INSERT INTO chain_watcher_runtime_state(
+		id, global_watermark_timestamp, global_watermark_tx_hash, watermark_source,
+		catchup_required, catchup_reason, catchup_updated_at, updated_at
+	) VALUES(1,0,'','',TRUE,$1,$2,$2)
+	ON CONFLICT(id) DO UPDATE SET catchup_required=TRUE, catchup_reason=excluded.catchup_reason,
+		catchup_updated_at=excluded.catchup_updated_at, updated_at=excluded.updated_at`, reason, now)
+	return err
+}
+
+func (s *Store) ClearChainWatcherCatchupRequired(ctx context.Context, now time.Time) error {
+	_, err := s.pool.Exec(ctx, `UPDATE chain_watcher_runtime_state SET catchup_required=FALSE,
+		catchup_reason='', catchup_updated_at=$1, updated_at=$1 WHERE id=1`, now)
+	return err
+}
+
+func (s *Store) AcquireChainWatcherFallbackLease(ctx context.Context, leaseName, holderID, mode string, ttl time.Duration, now time.Time) (ChainWatcherFallbackLease, bool, error) {
+	if ttl <= 0 {
+		ttl = 5 * time.Second
+	}
+	leaseUntil := now.Add(ttl)
+	row := s.pool.QueryRow(ctx, `INSERT INTO chain_watcher_fallback_lease(
+		lease_name, holder_id, lease_until, mode, started_at, updated_at
+	) VALUES($1, $2, $3, $4, $5, $5)
+	ON CONFLICT(lease_name) DO UPDATE SET
+		holder_id=excluded.holder_id,
+		lease_until=excluded.lease_until,
+		mode=excluded.mode,
+		started_at=COALESCE(chain_watcher_fallback_lease.started_at, excluded.started_at),
+		fallback_requests=CASE WHEN chain_watcher_fallback_lease.updated_at < $5 - interval '72 hours' THEN 0 ELSE chain_watcher_fallback_lease.fallback_requests END,
+		fallback_429=CASE WHEN chain_watcher_fallback_lease.updated_at < $5 - interval '72 hours' THEN 0 ELSE chain_watcher_fallback_lease.fallback_429 END,
+		catchup_pages=CASE WHEN chain_watcher_fallback_lease.updated_at < $5 - interval '72 hours' THEN 0 ELSE chain_watcher_fallback_lease.catchup_pages END,
+		catchup_budget_used=CASE WHEN chain_watcher_fallback_lease.updated_at < $5 - interval '72 hours' THEN 0 ELSE chain_watcher_fallback_lease.catchup_budget_used END,
+		updated_at=excluded.updated_at
+	WHERE chain_watcher_fallback_lease.lease_until <= $5
+	   OR chain_watcher_fallback_lease.holder_id=$2
+	RETURNING lease_name, holder_id, lease_until, mode, started_at, last_watcher_success,
+		fallback_requests, fallback_429, catchup_from, catchup_to, catchup_pages,
+		catchup_budget_used, updated_at`, leaseName, holderID, leaseUntil, mode, now)
+	lease, err := scanChainWatcherFallbackLease(row)
+	if err == nil {
+		return lease, lease.HolderID == holderID, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return lease, false, err
+	}
+	lease, err = s.GetChainWatcherFallbackLease(ctx, leaseName)
+	return lease, false, err
+}
+
+func (s *Store) UpdateChainWatcherFallbackLease(ctx context.Context, leaseName, holderID, mode string, lastWatcherSuccess time.Time, requestDelta, rateLimitDelta int64, catchupFrom, catchupTo int64, catchupPages, catchupBudgetUsed int64, ttl time.Duration, now time.Time) error {
+	if ttl <= 0 {
+		ttl = 5 * time.Second
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE chain_watcher_fallback_lease SET
+		lease_until=$3, mode=$4,
+		last_watcher_success=COALESCE($5, last_watcher_success),
+		fallback_requests=fallback_requests+$6,
+		fallback_429=fallback_429+$7,
+		catchup_from=$8, catchup_to=$9,
+		catchup_pages=catchup_pages+$10,
+		catchup_budget_used=catchup_budget_used+$11,
+		updated_at=$12
+	WHERE lease_name=$1 AND holder_id=$2`, leaseName, holderID, now.Add(ttl), mode,
+		nullableTime(lastWatcherSuccess), requestDelta, rateLimitDelta, catchupFrom, catchupTo,
+		catchupPages, catchupBudgetUsed, now)
+	return err
+}
+
+func (s *Store) ReleaseChainWatcherFallbackLease(ctx context.Context, leaseName, holderID, mode string, now time.Time) error {
+	_, err := s.pool.Exec(ctx, `UPDATE chain_watcher_fallback_lease
+		SET lease_until=$3, mode=$4, holder_id='', updated_at=$3
+		WHERE lease_name=$1 AND holder_id=$2`, leaseName, holderID, now, mode)
+	return err
+}
+
+func (s *Store) GetChainWatcherFallbackLease(ctx context.Context, leaseName string) (ChainWatcherFallbackLease, error) {
+	row := s.pool.QueryRow(ctx, `SELECT lease_name, holder_id, lease_until, mode, started_at,
+		last_watcher_success, fallback_requests, fallback_429, catchup_from, catchup_to,
+		catchup_pages, catchup_budget_used, updated_at
+		FROM chain_watcher_fallback_lease WHERE lease_name=$1`, leaseName)
+	lease, err := scanChainWatcherFallbackLease(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ChainWatcherFallbackLease{LeaseName: leaseName, Mode: "PRIMARY"}, nil
+	}
+	return lease, err
+}
+
+func scanChainWatcherFallbackLease(scanner recordScanner) (ChainWatcherFallbackLease, error) {
+	var lease ChainWatcherFallbackLease
+	var startedAt, lastSuccess pgtype.Timestamptz
+	err := scanner.Scan(&lease.LeaseName, &lease.HolderID, &lease.LeaseUntil, &lease.Mode,
+		&startedAt, &lastSuccess, &lease.FallbackRequests, &lease.Fallback429,
+		&lease.CatchupFrom, &lease.CatchupTo, &lease.CatchupPages, &lease.CatchupBudgetUsed, &lease.UpdatedAt)
+	if startedAt.Valid {
+		lease.StartedAt = &startedAt.Time
+	}
+	if lastSuccess.Valid {
+		lease.LastWatcherSuccess = &lastSuccess.Time
+	}
+	return lease, err
+}
+
+func (s *Store) ReserveTronscanKeyRequest(ctx context.Context, fingerprint, budgetDay string, source tron.RequestSource, failover bool, dailyLimit int, now time.Time) (tron.KeyUsageRecord, bool, error) {
+	mainInc := source == tron.RequestSourceMain
+	compInc := source == tron.RequestSourceCompensation
+	otherInc := !mainInc && !compInc
+	row := s.pool.QueryRow(ctx, `INSERT INTO chain_watcher_key_usage(
+		fingerprint, budget_day, request_count, main_request_count, comp_request_count,
+		other_request_count, failover_count, updated_at
+	) VALUES($1, $2::date, 1, CASE WHEN $3 THEN 1 ELSE 0 END,
+		CASE WHEN $4 THEN 1 ELSE 0 END, CASE WHEN $5 THEN 1 ELSE 0 END,
+		CASE WHEN $6 THEN 1 ELSE 0 END, $7)
+	ON CONFLICT(fingerprint, budget_day) DO UPDATE SET
+		request_count=chain_watcher_key_usage.request_count+1,
+		main_request_count=chain_watcher_key_usage.main_request_count+CASE WHEN $3 THEN 1 ELSE 0 END,
+		comp_request_count=chain_watcher_key_usage.comp_request_count+CASE WHEN $4 THEN 1 ELSE 0 END,
+		other_request_count=chain_watcher_key_usage.other_request_count+CASE WHEN $5 THEN 1 ELSE 0 END,
+		failover_count=chain_watcher_key_usage.failover_count+CASE WHEN $6 THEN 1 ELSE 0 END,
+		updated_at=$7
+	WHERE $8 <= 0 OR chain_watcher_key_usage.request_count < $8
+	RETURNING fingerprint, budget_day::text, request_count, main_request_count,
+		comp_request_count, other_request_count, failover_count, rate_limit_count,
+		auth_error_count, last_http_status, last_429_at, cooldown_until, disabled_until`,
+		fingerprint, budgetDay, mainInc, compInc, otherInc, failover, now, dailyLimit)
+	record, err := scanTronscanKeyUsage(row)
+	if err == nil {
+		return record, true, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return tron.KeyUsageRecord{}, false, err
+	}
+	row = s.pool.QueryRow(ctx, `SELECT fingerprint, budget_day::text, request_count,
+		main_request_count, comp_request_count, other_request_count, failover_count,
+		rate_limit_count, auth_error_count, last_http_status, last_429_at, cooldown_until, disabled_until
+		FROM chain_watcher_key_usage WHERE fingerprint=$1 AND budget_day=$2::date`, fingerprint, budgetDay)
+	record, err = scanTronscanKeyUsage(row)
+	return record, false, err
+}
+
+func (s *Store) RecordTronscanKeyResult(ctx context.Context, fingerprint, budgetDay string, status int, last429At, cooldownUntil, disabledUntil time.Time) (tron.KeyUsageRecord, error) {
+	row := s.pool.QueryRow(ctx, `UPDATE chain_watcher_key_usage SET
+		rate_limit_count=rate_limit_count+CASE WHEN $3=429 THEN 1 ELSE 0 END,
+		auth_error_count=auth_error_count+CASE WHEN $3 IN (401,403) THEN 1 ELSE 0 END,
+		last_http_status=$3,
+		last_429_at=CASE WHEN $3=429 THEN $4 ELSE last_429_at END,
+		cooldown_until=$5,
+		disabled_until=$6,
+		updated_at=$7
+	WHERE fingerprint=$1 AND budget_day=$2::date
+	RETURNING fingerprint, budget_day::text, request_count, main_request_count,
+		comp_request_count, other_request_count, failover_count, rate_limit_count,
+		auth_error_count, last_http_status, last_429_at, cooldown_until, disabled_until`,
+		fingerprint, budgetDay, status, nullableTime(last429At), nullableTime(cooldownUntil), nullableTime(disabledUntil), time.Now())
+	return scanTronscanKeyUsage(row)
+}
+
+func scanTronscanKeyUsage(scanner recordScanner) (tron.KeyUsageRecord, error) {
+	var record tron.KeyUsageRecord
+	var last429At, cooldownUntil, disabledUntil pgtype.Timestamptz
+	err := scanner.Scan(
+		&record.Fingerprint, &record.BudgetDay, &record.RequestCount,
+		&record.MainRequestCount, &record.CompRequestCount, &record.OtherRequestCount,
+		&record.FailoverCount, &record.RateLimitCount, &record.AuthErrorCount,
+		&record.LastHTTPStatus, &last429At, &cooldownUntil, &disabledUntil,
+	)
+	if err != nil {
+		return record, err
+	}
+	if last429At.Valid {
+		record.Last429At = last429At.Time
+	}
+	if cooldownUntil.Valid {
+		record.CooldownUntil = cooldownUntil.Time
+	}
+	if disabledUntil.Valid {
+		record.DisabledUntil = disabledUntil.Time
+	}
+	return record, nil
+}
+
+func nullableTime(value time.Time) any {
+	if value.IsZero() {
+		return nil
+	}
+	return value
+}
+
 func (s *Store) CleanupChainWatcherRetention(ctx context.Context, maxAge time.Duration, now time.Time) (ChainWatcherCleanupStats, error) {
 	if maxAge <= 0 {
 		maxAge = 10 * time.Minute
@@ -2653,6 +3227,9 @@ func (s *Store) CleanupChainWatcherRetention(ctx context.Context, maxAge time.Du
 		return stats, err
 	}
 	stats.EventsDeleted = tag.RowsAffected()
+	if _, err := s.pool.Exec(ctx, `DELETE FROM chain_watcher_key_usage WHERE updated_at < $1`, now.Add(-72*time.Hour)); err != nil {
+		return stats, err
+	}
 	return stats, nil
 }
 

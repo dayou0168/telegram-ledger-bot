@@ -20,15 +20,16 @@ import (
 )
 
 type Bot struct {
-	cfg          config.Config
-	store        *storage.Store
-	tg           *telegram.Client
-	tron         *tron.Client
-	fallbackTron *tron.Client
-	p2p          *p2p.Client
-	watcher      *chainclient.Client
-	perms        permissions.Policy
-	loc          *time.Location
+	cfg           config.Config
+	store         *storage.Store
+	fallbackStore *storage.Store
+	tg            *telegram.Client
+	tron          *tron.Client
+	fallbackTron  *tron.Client
+	p2p           *p2p.Client
+	watcher       *chainclient.Client
+	perms         permissions.Policy
+	loc           *time.Location
 
 	dispatcher    *worker.Dispatcher
 	ledgerPool    *worker.Pool
@@ -39,34 +40,43 @@ type Bot struct {
 	queryPool     *worker.Pool
 	notifyPool    *worker.Pool
 
-	groupTouchCache  *ttlCache[string]
-	groupCache       *ttlCache[storage.Group]
-	billSummaryCache *ttlCache[storage.BillSummaryData]
-	userTouchCache   *ttlCache[string]
-	operatorCache    *ttlCache[bool]
-	watchTargetCache *ttlCache[[]storage.WatchTarget]
-	rateBookCache    *ttlCache[[]p2p.OrderBookEntry]
-	rateBookState    rateBookState
-	privateStates    *ttlCache[privateState]
-	notificationWake chan struct{}
-	telegramLimiter  *telegramRateLimiter
-	sendGateway      *telegramSendGateway
-	watchRunning     atomic.Bool
-	watcherFallback  *watcherFallbackController
-	watcherTiming    chainWatcherTimingStatus
+	groupTouchCache       *ttlCache[string]
+	groupCache            *ttlCache[storage.Group]
+	billSummaryCache      *ttlCache[storage.BillSummaryData]
+	userTouchCache        *ttlCache[string]
+	operatorCache         *ttlCache[bool]
+	watchTargetCache      *ttlCache[[]storage.WatchTarget]
+	fallbackSubCache      *ttlCache[[]storage.ChainWatcherSubscription]
+	rateBookCache         *ttlCache[[]p2p.OrderBookEntry]
+	rateBookState         rateBookState
+	privateStates         *ttlCache[privateState]
+	notificationWake      chan struct{}
+	telegramLimiter       *telegramRateLimiter
+	sendGateway           *telegramSendGateway
+	watchRunning          atomic.Bool
+	watcherFallback       *watcherFallbackController
+	watcherTiming         chainWatcherTimingStatus
+	fallbackNextPoll      atomic.Int64
+	fallbackBackoff       atomic.Int32
+	fallbackExpandRunning atomic.Bool
 }
 
-func New(cfg config.Config, store *storage.Store, tg *telegram.Client, tronClient *tron.Client, p2pClient *p2p.Client) *Bot {
+func New(cfg config.Config, store *storage.Store, tg *telegram.Client, tronClient *tron.Client, p2pClient *p2p.Client, fallbackStores ...*storage.Store) *Bot {
 	loc, err := time.LoadLocation(cfg.Timezone)
 	if err != nil {
 		loc = time.FixedZone("Asia/Shanghai", 8*3600)
 	}
+	var fallbackStore *storage.Store
+	if len(fallbackStores) > 0 {
+		fallbackStore = fallbackStores[0]
+	}
 	bot := &Bot{
 		cfg:              cfg,
 		store:            store,
+		fallbackStore:    fallbackStore,
 		tg:               tg,
 		tron:             tronClient,
-		fallbackTron:     tron.NewClient(cfg.TronAPIBase, "", cfg.RequestTimeout),
+		fallbackTron:     tron.NewPublicFallbackClient(cfg.TronAPIBase, cfg.RequestTimeout),
 		p2p:              p2pClient,
 		watcher:          chainclient.New(cfg.ChainWatcherURL, cfg.ChainWatcherBotID, cfg.ChainWatcherSecret, cfg.RequestTimeout),
 		perms:            permissions.NewPolicy(cfg.HostUserID, cfg.DefaultOperatorIDs),
@@ -85,12 +95,14 @@ func New(cfg config.Config, store *storage.Store, tg *telegram.Client, tronClien
 		userTouchCache:   newTTLCache[string](cfg.UserTouchCacheTTL),
 		operatorCache:    newTTLCache[bool](cfg.OperatorCacheTTL),
 		watchTargetCache: newTTLCache[[]storage.WatchTarget](cfg.WatchCacheTTL),
+		fallbackSubCache: newTTLCache[[]storage.ChainWatcherSubscription](cfg.WatchCacheTTL),
 		rateBookCache:    newTTLCache[[]p2p.OrderBookEntry](cfg.P2PCacheTTL),
 		privateStates:    newTTLCache[privateState](30 * time.Minute),
 		notificationWake: make(chan struct{}, 1),
 		telegramLimiter:  newTelegramRateLimiter(),
-		watcherFallback:  newWatcherFallbackController(cfg.BotWatcherFailThreshold, cfg.BotFallbackMaxActive),
+		watcherFallback:  newWatcherFallbackControllerWithRecovery(cfg.BotWatcherFailThreshold, cfg.BotFallbackRecoverySuccesses, cfg.BotFallbackRecoveryLag),
 	}
+	bot.fallbackTron.SetMinRequestInterval(cfg.BotFallbackRequestInterval)
 	bot.sendGateway = newTelegramSendGateway(tg, bot.telegramLimiter, cfg.NotifyWorkers, cfg.QueueSize)
 	return bot
 }
@@ -106,13 +118,13 @@ func (b *Bot) Run(ctx context.Context) error {
 	b.sendGateway.Start(ctx)
 
 	if b.cfg.ChainWatcherEnabled() {
+		if b.fallbackStore == nil {
+			log.Printf("DEGRADED: BOT_FALLBACK_SHARED_DATABASE_URL is not configured; shared public fallback is unavailable")
+		}
 		go b.chainWatcherSyncScheduler(ctx)
 		go b.chainWatcherEventScheduler(ctx)
 		go b.chainWatcherHealthScheduler(ctx)
 		go b.chainWatcherFallbackScheduler(ctx)
-	}
-	if b.cfg.LocalAddressWatcherEnabled() {
-		go b.addressWatchScheduler(ctx)
 	}
 	go b.notificationOutboxScheduler(ctx)
 	go b.privateCleanupScheduler(ctx)

@@ -78,3 +78,16 @@ func TestDeliveryIDDedupesSameTransferAcrossCompensationPages(t *testing.T) {
 		t.Fatalf("same transfer should produce same delivery id: %q %q", firstPage, secondPage)
 	}
 }
+
+func TestSameTransactionDifferentEventIndexesRemainDistinct(t *testing.T) {
+	base := tron.Transfer{Hash: "same-tx", From: "TA", To: "TB", Value: "1", TokenAddress: "TR7", BlockTimestamp: 1000}
+	first, second := base, base
+	first.EventIndex, second.EventIndex = "0", "1"
+	if EventID(first) == EventID(second) {
+		t.Fatal("different log indexes collapsed to one event")
+	}
+	sub := storage.ChainWatcherSubscription{BotID: "bot", ChatID: 1, OwnerUserID: 1, Address: "TB", WatchIncome: true, Active: true}
+	if DeliveryID(sub, first, "income") == DeliveryID(sub, second, "income") {
+		t.Fatal("different events in one tx collapsed to one delivery")
+	}
+}

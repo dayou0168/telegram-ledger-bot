@@ -46,17 +46,53 @@ type ClaimResponse struct {
 }
 
 type StatusResponse struct {
-	Status                 string                 `json:"status"`
-	Ready                  bool                   `json:"ready"`
-	Now                    time.Time              `json:"now"`
-	StaleAfterMS           int64                  `json:"stale_after_ms"`
-	Global                 ScanStatusResponse     `json:"global"`
-	Address                ScanStatusResponse     `json:"address"`
-	Deliveries             DeliveryStatusResponse `json:"deliveries"`
-	RetentionCleanup       CleanupStatusResponse  `json:"retention_cleanup"`
-	AddressCursor          int                    `json:"address_cursor"`
-	AddressScanMaxPerTick  int                    `json:"address_scan_max_per_tick"`
-	AddressScanSkippedNear int64                  `json:"address_scan_skipped_near_global"`
+	Status                string                  `json:"status"`
+	Ready                 bool                    `json:"ready"`
+	Now                   time.Time               `json:"now"`
+	StaleAfterMS          int64                   `json:"stale_after_ms"`
+	Global                ScanStatusResponse      `json:"global"`
+	Catchup               ScanStatusResponse      `json:"catchup"`
+	Expand                ScanStatusResponse      `json:"expand"`
+	Deliveries            DeliveryStatusResponse  `json:"deliveries"`
+	RetentionCleanup      CleanupStatusResponse   `json:"retention_cleanup"`
+	TronscanKeys          tron.KeyPoolStatus      `json:"tronscan_keys"`
+	GlobalWatermark       WatermarkStatusResponse `json:"global_watermark"`
+	RealtimeWatermark     WatermarkStatusResponse `json:"realtime_watermark"`
+	Fallback              FallbackStatusResponse  `json:"fallback"`
+	WatchAddressCount     int                     `json:"watch_address_count"`
+	CatchupDeferredReason string                  `json:"catchup_deferred_reason,omitempty"`
+	CatchupDeferredCount  int64                   `json:"catchup_deferred_count"`
+	CatchupLagSeconds     int64                   `json:"catchup_lag_seconds"`
+	CatchupRequired       bool                    `json:"catchup_required"`
+	CatchupReason         string                  `json:"catchup_reason,omitempty"`
+	CatchupSafeEnd        int64                   `json:"catchup_safe_end"`
+	CatchupETASeconds     int64                   `json:"catchup_eta_seconds"`
+}
+
+type WatermarkStatusResponse struct {
+	Timestamp  int64      `json:"timestamp"`
+	TxHash     string     `json:"tx_hash,omitempty"`
+	EventID    string     `json:"event_id,omitempty"`
+	Source     string     `json:"source,omitempty"`
+	UpdatedAt  *time.Time `json:"updated_at,omitempty"`
+	LagSeconds int64      `json:"lag_seconds"`
+}
+
+type FallbackStatusResponse struct {
+	Mode               string     `json:"mode"`
+	LastWatcherSuccess *time.Time `json:"last_watcher_success,omitempty"`
+	FallbackLeader     string     `json:"fallback_leader,omitempty"`
+	FallbackStartedAt  *time.Time `json:"fallback_started_at,omitempty"`
+	FallbackRequests   int64      `json:"fallback_requests"`
+	Fallback429        int64      `json:"fallback_429"`
+	CatchupFrom        int64      `json:"catchup_from"`
+	CatchupTo          int64      `json:"catchup_to"`
+	CatchupLagSeconds  int64      `json:"catchup_lag_seconds"`
+	CatchupPages       int64      `json:"catchup_pages"`
+	CatchupRequests    int64      `json:"catchup_requests"`
+	CatchupBudgetUsed  int64      `json:"catchup_budget_used"`
+	Recovering         bool       `json:"recovering"`
+	LeaseUntil         *time.Time `json:"lease_until,omitempty"`
 }
 
 type ScanStatusResponse struct {
@@ -84,6 +120,10 @@ type ScanStatusResponse struct {
 	APICallCount       int                 `json:"api_call_count"`
 	PageCount          int                 `json:"page_count"`
 	PageLimitReached   bool                `json:"page_limit_reached"`
+	CutoffTimestamp    int64               `json:"cutoff_timestamp"`
+	AnchorFound        bool                `json:"anchor_found"`
+	PreviousAnchorID   string              `json:"previous_anchor_id,omitempty"`
+	HeadEventID        string              `json:"head_event_id,omitempty"`
 	Recent             []ScanRoundResponse `json:"recent,omitempty"`
 }
 
@@ -145,13 +185,27 @@ type MatchedEvent struct {
 }
 
 func EventID(t tron.Transfer) string {
-	raw := strings.Join([]string{t.Hash, t.From, t.To, t.Value, t.TokenAddress, fmt.Sprint(t.BlockTimestamp)}, "|")
+	raw := tron.TransferIdentity(t)
 	sum := sha1.Sum([]byte(raw))
 	return "tron:trc20:" + strings.ToLower(t.Hash) + ":" + hex.EncodeToString(sum[:])[:12]
 }
 
+func AnchorCoverage(transfers []tron.Transfer, previous string) (string, bool) {
+	found := previous == ""
+	head := previous
+	if len(transfers) > 0 {
+		head = EventID(transfers[0])
+	}
+	for _, transfer := range transfers {
+		if EventID(transfer) == previous {
+			found = true
+		}
+	}
+	return head, found
+}
+
 func DeliveryID(sub storage.ChainWatcherSubscription, t tron.Transfer, direction string) string {
-	raw := strings.Join([]string{sub.BotID, fmt.Sprint(sub.ChatID), fmt.Sprint(sub.OwnerUserID), sub.Address, strings.ToLower(t.Hash), direction}, "|")
+	raw := strings.Join([]string{sub.BotID, fmt.Sprint(sub.ChatID), fmt.Sprint(sub.OwnerUserID), sub.Address, EventID(t), direction}, "|")
 	sum := sha1.Sum([]byte(raw))
 	return "cw:" + hex.EncodeToString(sum[:])
 }
@@ -170,6 +224,7 @@ func TransferEvent(t tron.Transfer, source string) storage.ChainWatcherEvent {
 		BlockTimestamp: t.BlockTimestamp,
 		Confirmed:      t.Confirmed,
 		Source:         source,
+		EventIndex:     t.EventIndex,
 	}
 }
 

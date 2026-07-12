@@ -30,12 +30,24 @@ func main() {
 		log.Fatalf("open storage: %v", err)
 	}
 	defer db.Close()
+	var fallbackDB *storage.Store
+	if cfg.SharedFallbackEnabled() {
+		fallbackDB, err = storage.OpenExisting(ctx, cfg.BotFallbackSharedDatabaseURL)
+		if err != nil {
+			log.Fatalf("open shared fallback storage: %v", err)
+		}
+		defer fallbackDB.Close()
+		if cfg.BotFallbackInstanceID == "" {
+			hostname, _ := os.Hostname()
+			cfg.BotFallbackInstanceID = cfg.ChainWatcherBotID + ":" + hostname
+		}
+	}
 
 	tg := telegram.NewClient(cfg.TelegramAPIBase, cfg.TelegramBotToken, cfg.RequestTimeout)
 	tronClient := tron.NewClient(cfg.TronAPIBase, cfg.TronAPIKey, cfg.RequestTimeout)
 	p2pClient := p2p.NewClient(cfg.P2PAPIBase, cfg.P2PFrontAPI, cfg.RequestTimeout)
 
-	app := bot.New(cfg, db, tg, tronClient, p2pClient)
+	app := bot.New(cfg, db, tg, tronClient, p2pClient, fallbackDB)
 	if cfg.AdminWebEnabled {
 		web := adminweb.New(cfg, db, app)
 		go func() {

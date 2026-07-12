@@ -30,23 +30,3 @@ func TestFormatTransferNoticeUsesConfiguredTimezone(t *testing.T) {
 		t.Fatalf("notice should keep hash link:\n%s", text)
 	}
 }
-
-func TestWatchAddressMinTimestampsDeduplicatesByAddress(t *testing.T) {
-	now := time.Date(2026, 7, 6, 23, 50, 0, 0, time.FixedZone("Asia/Shanghai", 8*3600))
-	mins := watchAddressMinTimestamps([]storage.WatchTarget{
-		{Address: "TA", LatestTimestamp: now.Add(-time.Minute).UnixMilli()},
-		{Address: "TA", LatestTimestamp: now.Add(-2 * time.Minute).UnixMilli()},
-		{Address: "TB"},
-	}, now, 15)
-	wantA := now.Add(-2*time.Minute).UnixMilli() - 30000
-	if mins["TA"] != wantA {
-		t.Fatalf("TA min = %d, want %d", mins["TA"], wantA)
-	}
-	wantB := now.Add(-15 * time.Minute).UnixMilli()
-	if mins["TB"] != wantB {
-		t.Fatalf("TB min = %d, want %d", mins["TB"], wantB)
-	}
-	if len(mins) != 2 {
-		t.Fatalf("mins = %#v", mins)
-	}
-}

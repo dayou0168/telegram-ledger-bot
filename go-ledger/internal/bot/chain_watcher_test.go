@@ -1,53 +1,75 @@
 package bot
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
 
-func TestWatcherFallbackControllerFailureRecoveryAndMaxActive(t *testing.T) {
+func TestWatcherFallbackControllerStateMachineAndRecovery(t *testing.T) {
 	now := time.Unix(1000, 0)
-	controller := newWatcherFallbackController(2, 10*time.Second)
+	controller := newWatcherFallbackControllerWithRecovery(3, 2, 5*time.Second)
 
-	if controller.recordFailure("ready", now) {
-		t.Fatal("first failure enabled fallback")
+	controller.recordFailure("ready", now)
+	if mode := controller.snapshot(now).Mode; mode != fallbackModePending {
+		t.Fatalf("first failure mode = %s, want pending", mode)
 	}
-	if !controller.recordFailure("ready", now.Add(time.Second)) {
-		t.Fatal("second failure did not enable fallback")
+	controller.recordFailure("claim", now.Add(time.Second))
+	if mode := controller.snapshot(now.Add(time.Second)).Mode; mode != fallbackModePending {
+		t.Fatalf("second failure mode = %s, want pending", mode)
 	}
-	if !controller.active(now.Add(2 * time.Second)) {
-		t.Fatal("fallback should be active before max active duration")
+	controller.recordFailure("ready", now.Add(3*time.Second))
+	if mode := controller.snapshot(now.Add(time.Hour)).Mode; mode != fallbackModeActive {
+		t.Fatalf("long-running fallback mode = %s, want active", mode)
 	}
-	if controller.active(now.Add(11 * time.Second)) {
-		t.Fatal("fallback should stop after max active duration")
+
+	controller.recordSuccess("ready", now.Add(time.Hour+time.Second), time.Second)
+	if mode := controller.snapshot(now.Add(12 * time.Second)).Mode; mode != fallbackModeRecovery {
+		t.Fatalf("first recovery mode = %s, want recovering", mode)
 	}
-	if controller.recordFailure("ready", now.Add(12*time.Second)) {
-		t.Fatal("fallback re-enabled before watcher recovery")
+	controller.recordSuccess("ready", now.Add(time.Hour+2*time.Second), time.Second)
+	controller.recordSuccess("claim", now.Add(time.Hour+3*time.Second), time.Second)
+	controller.recordSuccess("ready", now.Add(time.Hour+4*time.Second), 10*time.Second)
+	if controller.recordSuccess("claim", now.Add(time.Hour+4*time.Second), 0) {
+		t.Fatal("high watcher lag completed recovery")
 	}
-	if controller.recordSuccess("ready", now.Add(13*time.Second)) {
-		t.Fatal("first success should not reset exhausted fallback")
+	if !controller.recordSuccess("ready", now.Add(time.Hour+5*time.Second), time.Second) {
+		t.Fatal("ready/claim successes with low lag did not complete recovery")
 	}
-	if controller.recordSuccess("ready", now.Add(14*time.Second)) {
-		t.Fatal("second success should not reset exhausted fallback")
-	}
-	if !controller.recordSuccess("ready", now.Add(15*time.Second)) {
-		t.Fatal("third success should reset exhausted fallback")
-	}
-	if controller.recordFailure("ready", now.Add(16*time.Second)) {
-		t.Fatal("first failure after recovery enabled fallback")
-	}
-	if !controller.recordFailure("ready", now.Add(17*time.Second)) {
-		t.Fatal("second failure after recovery did not enable fallback")
+	if mode := controller.snapshot(now.Add(time.Hour + 5*time.Second)).Mode; mode != fallbackModePrimary {
+		t.Fatalf("recovered mode = %s, want primary", mode)
 	}
 }
 
-func TestWatcherFallbackControllerKeepsFailureSourcesSeparate(t *testing.T) {
-	now := time.Unix(2000, 0)
-	controller := newWatcherFallbackController(2, time.Minute)
+func TestFallbackPollBackoffStepsAndRecovers(t *testing.T) {
+	bot := &Bot{}
+	var previous time.Duration
+	for i, want := range []time.Duration{time.Second, 2 * time.Second, 3 * time.Second, 5 * time.Second, 10 * time.Second} {
+		before := time.Now()
+		bot.recordFallbackPollResult(errors.New("429"))
+		delay := time.Until(time.Unix(0, bot.fallbackNextPoll.Load()))
+		if delay < want-100*time.Millisecond || delay > want+100*time.Millisecond {
+			t.Fatalf("step %d delay = %v, want %v", i, delay, want)
+		}
+		if time.Since(before) > 100*time.Millisecond {
+			t.Fatal("backoff calculation blocked")
+		}
+		previous = delay
+	}
+	bot.recordFallbackPollResult(nil)
+	delay := time.Until(time.Unix(0, bot.fallbackNextPoll.Load()))
+	if delay >= previous {
+		t.Fatalf("successful fallback poll did not reduce backoff: %v >= %v", delay, previous)
+	}
+}
 
-	controller.recordFailure("ready", now)
-	controller.recordSuccess("claim", now.Add(time.Second))
-	if !controller.recordFailure("ready", now.Add(2*time.Second)) {
-		t.Fatal("claim success cleared ready failure streak")
+func TestWatcherFallbackControllerEmptySuccessfulClaimsDoNotFail(t *testing.T) {
+	now := time.Unix(2000, 0)
+	controller := newWatcherFallbackControllerWithRecovery(3, 2, 5*time.Second)
+	for i := 0; i < 10; i++ {
+		controller.recordSuccess("claim", now.Add(time.Duration(i)*time.Second), 0)
+	}
+	if mode := controller.snapshot(now.Add(10 * time.Second)).Mode; mode != fallbackModePrimary {
+		t.Fatalf("empty successful claims mode = %s, want primary", mode)
 	}
 }
