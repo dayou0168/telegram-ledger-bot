@@ -96,6 +96,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			title TEXT NOT NULL DEFAULT '',
 			active BOOLEAN NOT NULL DEFAULT FALSE,
 			active_day_key TEXT NOT NULL DEFAULT '',
+			active_expires_day_key TEXT NOT NULL DEFAULT '',
 			business_open BOOLEAN NOT NULL DEFAULT TRUE,
 			owner_user_id BIGINT NOT NULL DEFAULT 0,
 			deposit_rate TEXT NOT NULL DEFAULT '0',
@@ -118,6 +119,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			ON groups(title ASC, chat_id ASC)
 			WHERE chat_id < 0`,
 		`ALTER TABLE groups ADD COLUMN IF NOT EXISTS active_day_key TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE groups ADD COLUMN IF NOT EXISTS active_expires_day_key TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE groups ADD COLUMN IF NOT EXISTS exchange_rate_source TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE groups ADD COLUMN IF NOT EXISTS exchange_rate_rank INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE groups ADD COLUMN IF NOT EXISTS exchange_rate_offset TEXT NOT NULL DEFAULT ''`,
@@ -633,6 +635,11 @@ func (s *Store) migrate(ctx context.Context) error {
 		ON CONFLICT(version) DO NOTHING`); err != nil {
 		return fmt.Errorf("record schema migration: %w", err)
 	}
+	if _, err := s.pool.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
+		VALUES('2.4.1', NOW())
+		ON CONFLICT(version) DO NOTHING`); err != nil {
+		return fmt.Errorf("record schema migration: %w", err)
+	}
 	return nil
 }
 
@@ -697,7 +704,7 @@ func (s *Store) GetUser(ctx context.Context, chatID, userID int64) (User, bool, 
 }
 
 func (s *Store) GetGroup(ctx context.Context, chatID int64) (Group, error) {
-	row := s.pool.QueryRow(ctx, `SELECT chat_id, title, active, active_day_key, business_open, owner_user_id,
+	row := s.pool.QueryRow(ctx, `SELECT chat_id, title, active, active_day_key, active_expires_day_key, business_open, owner_user_id,
 		deposit_rate, payout_rate, deposit_exchange_rate, payout_exchange_rate,
 		exchange_rate_source, exchange_rate_rank, exchange_rate_offset, fee_rate,
 		cutoff_hour, all_members_can_record, created_at, updated_at
@@ -706,7 +713,7 @@ func (s *Store) GetGroup(ctx context.Context, chatID int64) (Group, error) {
 }
 
 func (s *Store) ListGroups(ctx context.Context) ([]Group, error) {
-	rows, err := s.pool.Query(ctx, `SELECT chat_id, title, active, active_day_key, business_open, owner_user_id,
+	rows, err := s.pool.Query(ctx, `SELECT chat_id, title, active, active_day_key, active_expires_day_key, business_open, owner_user_id,
 		deposit_rate, payout_rate, deposit_exchange_rate, payout_exchange_rate,
 		exchange_rate_source, exchange_rate_rank, exchange_rate_offset, fee_rate,
 		cutoff_hour, all_members_can_record, created_at, updated_at
@@ -730,7 +737,7 @@ func (s *Store) ListGroups(ctx context.Context) ([]Group, error) {
 
 func scanGroup(scanner recordScanner) (Group, error) {
 	var g Group
-	err := scanner.Scan(&g.ChatID, &g.Title, &g.Active, &g.ActiveDayKey, &g.BusinessOpen, &g.OwnerUserID,
+	err := scanner.Scan(&g.ChatID, &g.Title, &g.Active, &g.ActiveDayKey, &g.ActiveExpiresDayKey, &g.BusinessOpen, &g.OwnerUserID,
 		&g.DepositRate, &g.PayoutRate, &g.DepositExchangeRate, &g.PayoutExchangeRate,
 		&g.ExchangeRateSource, &g.ExchangeRateRank, &g.ExchangeRateOffset, &g.FeeRate,
 		&g.CutoffHour, &g.AllMembersCanRecord, &g.CreatedAt, &g.UpdatedAt)
@@ -738,11 +745,30 @@ func scanGroup(scanner recordScanner) (Group, error) {
 }
 
 func (s *Store) SetGroupActive(ctx context.Context, chatID int64, active bool, activeDayKey string, now time.Time) error {
+	activeExpiresDayKey := activeDayKey
+	if !active {
+		activeExpiresDayKey = ""
+	}
+	return s.SetGroupActivePeriod(ctx, chatID, active, activeDayKey, activeExpiresDayKey, now)
+}
+
+func (s *Store) SetGroupActivePeriod(ctx context.Context, chatID int64, active bool, activeDayKey, activeExpiresDayKey string, now time.Time) error {
 	if !active {
 		activeDayKey = ""
+		activeExpiresDayKey = ""
 	}
-	_, err := s.pool.Exec(ctx, `UPDATE groups SET active=$1, active_day_key=$2, updated_at=$3 WHERE chat_id=$4`,
-		active, activeDayKey, now, chatID)
+	_, err := s.pool.Exec(ctx, `UPDATE groups SET active=$1, active_day_key=$2, active_expires_day_key=$3, updated_at=$4 WHERE chat_id=$5`,
+		active, activeDayKey, activeExpiresDayKey, now, chatID)
+	return err
+}
+
+func (s *Store) SetGroupCutoffState(ctx context.Context, chatID int64, cutoffHour int, active bool, activeDayKey, activeExpiresDayKey string, now time.Time) error {
+	if !active {
+		activeDayKey = ""
+		activeExpiresDayKey = ""
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE groups SET cutoff_hour=$1, active=$2, active_day_key=$3, active_expires_day_key=$4, updated_at=$5 WHERE chat_id=$6`,
+		cutoffHour, active, activeDayKey, activeExpiresDayKey, now, chatID)
 	return err
 }
 
@@ -1549,7 +1575,7 @@ func (s *Store) ListBroadcastGroups(ctx context.Context) ([]BroadcastGroup, erro
 }
 
 func (s *Store) ListBroadcastGroupChats(ctx context.Context, name string) ([]Group, error) {
-	rows, err := s.pool.Query(ctx, `SELECT g.chat_id, g.title, g.active, g.active_day_key, g.business_open, g.owner_user_id,
+	rows, err := s.pool.Query(ctx, `SELECT g.chat_id, g.title, g.active, g.active_day_key, g.active_expires_day_key, g.business_open, g.owner_user_id,
 		g.deposit_rate, g.payout_rate, g.deposit_exchange_rate, g.payout_exchange_rate,
 		g.exchange_rate_source, g.exchange_rate_rank, g.exchange_rate_offset, g.fee_rate,
 		g.cutoff_hour, g.all_members_can_record, g.created_at, g.updated_at
@@ -1632,7 +1658,7 @@ func (s *Store) ListAllowedBroadcastChats(ctx context.Context, userID int64, all
 	if all {
 		return s.ListGroups(ctx)
 	}
-	rows, err := s.pool.Query(ctx, `SELECT DISTINCT g.chat_id, g.title, g.active, g.active_day_key, g.business_open, g.owner_user_id,
+	rows, err := s.pool.Query(ctx, `SELECT DISTINCT g.chat_id, g.title, g.active, g.active_day_key, g.active_expires_day_key, g.business_open, g.owner_user_id,
 		g.deposit_rate, g.payout_rate, g.deposit_exchange_rate, g.payout_exchange_rate,
 		g.exchange_rate_source, g.exchange_rate_rank, g.exchange_rate_offset, g.fee_rate,
 		g.cutoff_hour, g.all_members_can_record, g.created_at, g.updated_at

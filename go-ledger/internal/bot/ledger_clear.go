@@ -58,7 +58,7 @@ func (b *Bot) handleClearLedgerCallback(ctx context.Context, cb telegram.Callbac
 		if getErr != nil {
 			return getErr
 		}
-		clearedDayKey = businessDayKey(now, group.CutoffHour)
+		clearedDayKey = currentLedgerDayKey(group, now)
 		doneDelete := measurePerfStage(ctx, "db_record_delete")
 		count, err = b.store.SoftDeleteRecordsForDay(ctx, cb.Message.Chat.ID, clearedDayKey, now)
 		doneDelete()

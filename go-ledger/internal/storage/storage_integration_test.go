@@ -83,6 +83,16 @@ func TestPostgresStoreBasicFlow(t *testing.T) {
 	if group.OwnerUserID != userID {
 		t.Fatalf("owner mismatch: got %d want %d", group.OwnerUserID, userID)
 	}
+	if err := store.SetGroupActivePeriod(ctx, chatID, true, "2026-07-06", "2026-07-06", now); err != nil {
+		t.Fatalf("set active period: %v", err)
+	}
+	group, err = store.GetGroup(ctx, chatID)
+	if err != nil {
+		t.Fatalf("get active group: %v", err)
+	}
+	if !group.Active || group.ActiveDayKey != "2026-07-06" || group.ActiveExpiresDayKey != "2026-07-06" {
+		t.Fatalf("active period not persisted: %+v", group)
+	}
 
 	recordID, err := store.InsertRecord(ctx, Record{
 		ChatID:          chatID,

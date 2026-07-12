@@ -9,15 +9,15 @@ This document is the recovery handoff for reinstalling the local system and cont
 - Repository: `dayou0168/telegram-ledger-bot`
 - Main line: Go + PostgreSQL
 - Deprecated line: the old Python runtime is retired. Do not restore, test, or publish it as the active product line.
-- Current release target: `v2.4.0`
-- Release commit: the commit referenced by the `v2.4.0` tag
-- Release URL: `https://github.com/dayou0168/telegram-ledger-bot/releases/tag/v2.4.0`
+- Current release target: `v2.4.1`
+- Release commit: the commit referenced by the `v2.4.1` tag
+- Release URL: `https://github.com/dayou0168/telegram-ledger-bot/releases/tag/v2.4.1`
 
 Current images:
 
 ```text
-ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.0
-ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.0
+ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.1
+ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.1
 ```
 
 ## Current Architecture
@@ -29,7 +29,7 @@ ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.0
 - Bot fallback is not the normal path. After sustained watcher failure, all bots compete for a PostgreSQL lease and only one shared no-key leader scans until the watcher has recovered and its watermark is caught up.
 - Shared no-key fallback requires the watcher PostgreSQL DSN and a unique stable `BOT_FALLBACK_INSTANCE_ID` per bot; there is no per-bot emergency scanner switch or fixed maximum active time.
 
-## v2.4.0 Watcher Configuration
+## v2.4.1 Watcher Configuration
 
 Expected watcher-side values:
 
@@ -74,7 +74,7 @@ Related templates:
 
 ## Historical Online Snapshot
 
-Historical snapshot from the v2.3.1 release thread. It is not evidence that v2.4.0 has been deployed:
+Historical snapshot from the v2.3.1 release thread. It is not evidence that v2.4.1 has been deployed:
 
 - Host `ledger-chain-watcher` was updated to `v2.3.1` from the GitHub Release linux-amd64 package.
 - `zhuanfa-tianze-go` bot container was updated to `ghcr.io/dayou0168/telegram-ledger-bot-go:2.3.1`.
@@ -157,11 +157,11 @@ docs/reinstall-handoff.md
 6. Pull and start the current images.
 
 ```powershell
-docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.0
-docker pull ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.0
+docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.1
+docker pull ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.1
 ```
 
-For host systemd watcher, install the GitHub Release package for `v2.4.0` instead of extracting a binary from a container image.
+For host systemd watcher, install the GitHub Release package for `v2.4.1` instead of extracting a binary from a container image.
 
 7. Verify after startup.
 

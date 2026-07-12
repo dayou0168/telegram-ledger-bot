@@ -13,6 +13,7 @@ type Group struct {
 	Title               string
 	Active              bool
 	ActiveDayKey        string
+	ActiveExpiresDayKey string
 	BusinessOpen        bool
 	OwnerUserID         int64
 	DepositRate         string

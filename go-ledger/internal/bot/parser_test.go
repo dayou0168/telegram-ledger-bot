@@ -121,6 +121,10 @@ func TestParseSettings(t *testing.T) {
 	if !ok || cutoff.Kind != "cutoff" || cutoff.CutoffHour != 4 {
 		t.Fatalf("unexpected cutoff setting: %+v ok=%v", cutoff, ok)
 	}
+	disabled, ok := parseSetting("\u5173\u95ed\u65e5\u5207")
+	if !ok || disabled.Kind != "cutoff" || disabled.CutoffHour != cutoffDisabledHour {
+		t.Fatalf("unexpected disabled cutoff setting: %+v ok=%v", disabled, ok)
+	}
 }
 
 func TestParseMentions(t *testing.T) {

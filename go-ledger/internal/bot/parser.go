@@ -162,7 +162,7 @@ func parseSetting(text string) (settingCommand, bool) {
 		return settingCommand{Kind: "cutoff", CutoffHour: hour}, hour >= 0 && hour <= 23
 	}
 	if text == "关闭日切" {
-		return settingCommand{Kind: "cutoff", CutoffHour: 0}, true
+		return settingCommand{Kind: "cutoff", CutoffHour: cutoffDisabledHour}, true
 	}
 	return settingCommand{}, false
 }

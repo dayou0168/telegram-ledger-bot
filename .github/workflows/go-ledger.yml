@@ -69,30 +69,30 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf dist
-          mkdir -p dist/ledger-chain-watcher-v2.4.0-linux-amd64
+          mkdir -p dist/ledger-chain-watcher-v2.4.1-linux-amd64
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/ledger-chain-watcher-linux-amd64 ./cmd/chain-watcher
-          cp dist/ledger-chain-watcher-linux-amd64 dist/ledger-chain-watcher-v2.4.0-linux-amd64/ledger-chain-watcher
-          cp ../deploy/ledger-chain-watcher.env.example dist/ledger-chain-watcher-v2.4.0-linux-amd64/
-          cp ../deploy/ledger-chain-watcher.service dist/ledger-chain-watcher-v2.4.0-linux-amd64/
-          tar -C dist -czf dist/ledger-chain-watcher-v2.4.0-linux-amd64.tar.gz ledger-chain-watcher-v2.4.0-linux-amd64
+          cp dist/ledger-chain-watcher-linux-amd64 dist/ledger-chain-watcher-v2.4.1-linux-amd64/ledger-chain-watcher
+          cp ../deploy/ledger-chain-watcher.env.example dist/ledger-chain-watcher-v2.4.1-linux-amd64/
+          cp ../deploy/ledger-chain-watcher.service dist/ledger-chain-watcher-v2.4.1-linux-amd64/
+          tar -C dist -czf dist/ledger-chain-watcher-v2.4.1-linux-amd64.tar.gz ledger-chain-watcher-v2.4.1-linux-amd64
           sha256sum dist/ledger-chain-watcher-linux-amd64 > dist/ledger-chain-watcher-linux-amd64.sha256
-          sha256sum dist/ledger-chain-watcher-v2.4.0-linux-amd64.tar.gz > dist/ledger-chain-watcher-v2.4.0-linux-amd64.tar.gz.sha256
+          sha256sum dist/ledger-chain-watcher-v2.4.1-linux-amd64.tar.gz > dist/ledger-chain-watcher-v2.4.1-linux-amd64.tar.gz.sha256
 
       - name: Upload host chain watcher artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ledger-chain-watcher-v2.4.0-linux-amd64
+          name: ledger-chain-watcher-v2.4.1-linux-amd64
           path: |
             go-ledger/dist/ledger-chain-watcher-linux-amd64
             go-ledger/dist/ledger-chain-watcher-linux-amd64.sha256
-            go-ledger/dist/ledger-chain-watcher-v2.4.0-linux-amd64.tar.gz
-            go-ledger/dist/ledger-chain-watcher-v2.4.0-linux-amd64.tar.gz.sha256
+            go-ledger/dist/ledger-chain-watcher-v2.4.1-linux-amd64.tar.gz
+            go-ledger/dist/ledger-chain-watcher-v2.4.1-linux-amd64.tar.gz.sha256
 
       - name: Build Docker images
         working-directory: go-ledger
         run: |
-          docker build --build-arg APP=ledger-bot -t telegram-ledger-bot-go:2.4.0 .
-          docker build --build-arg APP=chain-watcher -t telegram-ledger-chain-watcher:2.4.0 .
+          docker build --build-arg APP=ledger-bot -t telegram-ledger-bot-go:2.4.1 .
+          docker build --build-arg APP=chain-watcher -t telegram-ledger-chain-watcher:2.4.1 .
 
       - name: Login to GHCR
         if: github.event_name == 'push'
@@ -104,13 +104,13 @@ jobs:
         run: |
           BOT_IMAGE="ghcr.io/${{ github.repository_owner }}/telegram-ledger-bot-go"
           WATCHER_IMAGE="ghcr.io/${{ github.repository_owner }}/telegram-ledger-chain-watcher"
-          docker tag telegram-ledger-bot-go:2.4.0 "$BOT_IMAGE:2.4.0"
-          docker tag telegram-ledger-bot-go:2.4.0 "$BOT_IMAGE:latest"
-          docker tag telegram-ledger-chain-watcher:2.4.0 "$WATCHER_IMAGE:2.4.0"
-          docker tag telegram-ledger-chain-watcher:2.4.0 "$WATCHER_IMAGE:latest"
-          docker push "$BOT_IMAGE:2.4.0"
+          docker tag telegram-ledger-bot-go:2.4.1 "$BOT_IMAGE:2.4.1"
+          docker tag telegram-ledger-bot-go:2.4.1 "$BOT_IMAGE:latest"
+          docker tag telegram-ledger-chain-watcher:2.4.1 "$WATCHER_IMAGE:2.4.1"
+          docker tag telegram-ledger-chain-watcher:2.4.1 "$WATCHER_IMAGE:latest"
+          docker push "$BOT_IMAGE:2.4.1"
           docker push "$BOT_IMAGE:latest"
-          docker push "$WATCHER_IMAGE:2.4.0"
+          docker push "$WATCHER_IMAGE:2.4.1"
           docker push "$WATCHER_IMAGE:latest"
 
       - name: Publish host chain watcher release asset
@@ -121,28 +121,29 @@ jobs:
         run: |
           set -euo pipefail
           cat > /tmp/release-notes.md <<'EOF'
-          Go v2.4.0 upgrades the shared TRON watcher architecture and must be deployed to both the bot and ledger-chain-watcher.
+          Go v2.4.1 fixes the ledger day-cutoff activation bug introduced in v2.4.0.
 
           Before upgrading:
-          - Back up the bot and watcher PostgreSQL databases.
-          - Set CHAIN_WATCHER_KEY_ENCRYPTION_KEY to a securely generated base64-encoded 32-byte key.
-          - Set a unique, stable BOT_FALLBACK_INSTANCE_ID for every bot instance.
-          - Configure BOT_FALLBACK_SHARED_DATABASE_URL for the shared PostgreSQL lease and recovery watermark.
+          - Back up the bot PostgreSQL database.
+          - Deploy the bot image and let PostgreSQL migrations add groups.active_expires_day_key.
+          - Affected groups cannot be auto-migrated safely because old cutoff_hour=0 may mean either disabled day cutoff or a real midnight cutoff.
+          - For affected groups, run Start and disable day cutoff again, or apply a targeted database correction only for confirmed chat_id values.
+          - Do not batch update every group with cutoff_hour=0.
 
-          CI runs the full Go suite against PostgreSQL 16, go vet, and both bot/watcher builds. Real Tronscan 429 behavior, real transfers, and live leader failover remain deployment acceptance checks.
+          CI runs the full Go suite against PostgreSQL 16, go vet, and both bot/watcher builds. This release does not require watcher deployment unless your deployment policy keeps bot and watcher versions aligned.
           EOF
           ASSETS=(
             "dist/ledger-chain-watcher-linux-amd64"
             "dist/ledger-chain-watcher-linux-amd64.sha256"
-            "dist/ledger-chain-watcher-v2.4.0-linux-amd64.tar.gz"
-            "dist/ledger-chain-watcher-v2.4.0-linux-amd64.tar.gz.sha256"
+            "dist/ledger-chain-watcher-v2.4.1-linux-amd64.tar.gz"
+            "dist/ledger-chain-watcher-v2.4.1-linux-amd64.tar.gz.sha256"
           )
-          if gh release view v2.4.0 --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release upload v2.4.0 "${ASSETS[@]}" --clobber --repo "${{ github.repository }}"
+          if gh release view v2.4.1 --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload v2.4.1 "${ASSETS[@]}" --clobber --repo "${{ github.repository }}"
           else
-            gh release create v2.4.0 "${ASSETS[@]}" \
+            gh release create v2.4.1 "${ASSETS[@]}" \
               --target "${{ github.sha }}" \
-              --title "Go v2.4.0" \
+              --title "Go v2.4.1" \
               --notes-file /tmp/release-notes.md \
               --latest \
               --repo "${{ github.repository }}"

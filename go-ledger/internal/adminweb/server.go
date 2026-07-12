@@ -309,11 +309,32 @@ func (s *Server) currentBillDay(group storage.Group) string {
 		loc = time.FixedZone("Asia/Shanghai", 8*3600)
 	}
 	now := time.Now().In(loc)
+	if adminGroupAccountingActive(group, now) {
+		return group.ActiveDayKey
+	}
 	cutoff := group.CutoffHour
 	if cutoff < 0 || cutoff > 23 {
 		cutoff = 0
 	}
 	return now.Add(-time.Duration(cutoff) * time.Hour).Format("2006-01-02")
+}
+
+func adminGroupAccountingActive(group storage.Group, now time.Time) bool {
+	if !group.Active || group.ActiveDayKey == "" {
+		return false
+	}
+	if group.CutoffHour == -1 {
+		return true
+	}
+	cutoff := group.CutoffHour
+	if cutoff < 0 || cutoff > 23 {
+		cutoff = 0
+	}
+	expiresDayKey := group.ActiveExpiresDayKey
+	if expiresDayKey == "" {
+		expiresDayKey = group.ActiveDayKey
+	}
+	return expiresDayKey == now.Add(-time.Duration(cutoff)*time.Hour).Format("2006-01-02")
 }
 
 func (s *Server) downloadBill(w http.ResponseWriter, group storage.Group, dayKey string, records []storage.Record) {

@@ -11,7 +11,7 @@ import (
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/tron"
 )
 
-const Version = "2.4.0"
+const Version = "2.4.1"
 
 type Config struct {
 	TelegramBotToken string
