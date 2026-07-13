@@ -67,8 +67,12 @@ The same global identities can use private global features. A disabled or invali
 - A primary sees its direct chats, groups it owns, groups explicitly assigned for use, its own secondaries, and permission rows it granted or received. It does not see peer-only chats, peer-only groups, another primary's secondaries, or unrelated third-party grants.
 - Secondary operators cannot create or manage groups.
 - Bot group selectors require ownership or explicit group-use permission. Membership overlap alone does not reveal a group, and targets are rechecked against current PostgreSQL permissions immediately before sending.
+- Only the host may transfer group management ownership. The target must be an active primary; default operators, other primaries, secondaries, disabled identities, and ordinary users cannot perform or receive an invalid transfer.
+- A transfer never removes or rewrites existing chat/group use permissions. If the target primary lacks direct permissions for member chats, the host must either reject the whole transaction with the exact missing count or explicitly fill every missing chat permission in the same transaction. Auto-filled rows record the host in `granted_by`.
 
 Group ownership uses a foreign key to `global_operators` and a trigger that accepts only a primary identity as a non-null owner. Group creation additionally locks and requires that owner to be active. Disabling a primary pauses its own management/use entry but preserves ownership so the host can still manage the group and re-enable restores the same owner. `NULL` means environment/host-managed or unresolved historical ownership; it is never interpreted as ownership by an arbitrary primary.
+
+The transfer transaction locks the group and target operator, compares the submitted expected owner with the current row, validates all member-chat scopes, writes any requested direct grants and permission audits, then updates `owner_user_id`. Stale or concurrent submissions fail before mutation. It preserves `created_by` as historical evidence. Each successful owner change appends a row to immutable `broadcast_group_owner_transfer_events` with actor, previous owner, new owner, auto-filled count, and timestamp, plus an `owner_transferred` group audit event.
 
 ## Address Watch And Backend
 
@@ -90,7 +94,7 @@ The v2.4.4 broadcast-group migration captures historical owner evidence exactly 
 
 Manual resolution of an ambiguous candidate must be a host-controlled transaction: lock the group and candidate, revalidate the proposed owner as an active primary, verify every member chat is in that primary's direct scope, set `owner_user_id`, mark the candidate `manual_primary_owner`, and insert a `broadcast_group_audit_events` row with the host actor and timestamp. Keeping the group host-managed uses `manual_environment_owner`. Deleting or renaming a group updates the candidate record in the same transaction so repair evidence never points at a stale live name.
 
-`permission_audit_events` is append-only and records global-operator create/update/level/parent/re-enable/disable actions and broadcast grant/revoke/restore actions with actor, subject, scope, and timestamp. `broadcast_group_audit_events` is also append-only and records create, ownership normalization, rename, deletion, and member changes.
+`permission_audit_events` is append-only and records global-operator create/update/level/parent/re-enable/disable actions and broadcast grant/revoke/restore actions with actor, subject, scope, and timestamp. `broadcast_group_audit_events` is also append-only and records create, ownership normalization, transfer, rename, deletion, and member changes. `broadcast_group_owner_transfer_events` is append-only and keeps the ownership-specific before/after evidence and auto-fill count.
 
 ## Module Boundary
 

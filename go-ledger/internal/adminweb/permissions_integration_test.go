@@ -424,3 +424,148 @@ func TestAdminPrimaryBroadcastGroupOwnershipAndForgedPOSTBoundaries(t *testing.T
 		t.Fatalf("peer page missing authorized use-only group: %+v", pageB.BGroups)
 	}
 }
+
+func TestAdminHostBroadcastGroupOwnerTransferBoundariesAndTemplateHooks(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store, err := storage.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	base := int64(980000000000 + now.UnixNano()%1000000)
+	hostID := base
+	primaryAID := base + 1
+	primaryBID := base + 2
+	secondaryID := base + 3
+	disabledPrimaryID := base + 4
+	chatID := -base
+	for _, op := range []struct {
+		userID, parentID, createdBy int64
+		level, remark               string
+	}{
+		{primaryAID, 0, hostID, "primary", "新一"},
+		{primaryBID, 0, hostID, "primary", "河马"},
+		{secondaryID, primaryAID, primaryAID, "secondary", "下级"},
+		{disabledPrimaryID, 0, hostID, "primary", "已禁用一级"},
+	} {
+		if err := store.UpsertGlobalOperator(ctx, op.userID, op.level, op.parentID, op.createdBy, op.remark, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.DisableGlobalOperator(ctx, disabledPrimaryID, hostID, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnsureGroup(ctx, chatID, "transfer handler chat", now); err != nil {
+		t.Fatal(err)
+	}
+	groupName := fmt.Sprintf("handler-transfer-%d", base)
+	if err := store.UpsertBroadcastGroup(ctx, groupName, hostID, now); err != nil {
+		t.Fatal(err)
+	}
+	if added, err := store.AddChatsToBroadcastGroupManaged(ctx, groupName, []int64{chatID}, hostID, true, now); err != nil || added != 1 {
+		t.Fatalf("add chat=%d err=%v", added, err)
+	}
+	if err := store.AddBroadcastPermission(ctx, primaryAID, "group", 0, groupName, hostID, now); err != nil {
+		t.Fatal(err)
+	}
+	hostOwnedName := groupName + "-host"
+	if err := store.UpsertBroadcastGroup(ctx, hostOwnedName, hostID, now); err != nil {
+		t.Fatal(err)
+	}
+
+	invalidator := &testPermissionInvalidator{}
+	s := New(config.Config{HostUserID: hostID}, store, invalidator)
+	hostSession := adminauth.Session{UserID: hostID, Role: adminauth.RoleHost}
+	primarySession := adminauth.Session{UserID: primaryAID, Role: adminauth.RoleOperator}
+	post := func(session adminauth.Session, form string) *httptest.ResponseRecorder {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/admin/group/transfer-owner", strings.NewReader(form))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req = req.WithContext(context.WithValue(req.Context(), adminContextKey{}, session))
+		s.transferGroupOwner(rec, req)
+		return rec
+	}
+	form := func(targetID int64, sync bool) string {
+		value := fmt.Sprintf("name=%s&expected_owner_user_id=0&new_owner_user_id=%d", groupName, targetID)
+		if sync {
+			value += "&sync_missing_permissions=1"
+		}
+		return value
+	}
+	if rec := post(primarySession, form(primaryBID, true)); rec.Code != http.StatusForbidden {
+		t.Fatalf("forged non-host transfer status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	for _, targetID := range []int64{secondaryID, disabledPrimaryID} {
+		if rec := post(hostSession, form(targetID, true)); rec.Code != http.StatusBadRequest {
+			t.Fatalf("invalid target %d status=%d body=%s", targetID, rec.Code, rec.Body.String())
+		}
+	}
+	if rec := post(hostSession, form(primaryBID, false)); rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "1 个") {
+		t.Fatalf("missing permission status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if invalidator.allPermissions {
+		t.Fatal("rejected transfer invalidated caches")
+	}
+	if group, ok, err := store.GetBroadcastGroup(ctx, groupName); err != nil || !ok || group.OwnerUserID != 0 {
+		t.Fatalf("rejected handler transfer group=%+v ok=%v err=%v", group, ok, err)
+	}
+	if rec := post(hostSession, form(primaryBID, true)); rec.Code != http.StatusSeeOther {
+		t.Fatalf("host transfer status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if !invalidator.allPermissions {
+		t.Fatal("successful transfer did not invalidate caches")
+	}
+	group, ok, err := store.GetBroadcastGroup(ctx, groupName)
+	if err != nil || !ok || group.OwnerUserID != primaryBID || group.OwnerRemark != "河马" {
+		t.Fatalf("transferred group=%+v ok=%v err=%v", group, ok, err)
+	}
+	if allowed, err := store.HasBroadcastPermissionScope(ctx, primaryAID, "group", 0, groupName); err != nil || !allowed {
+		t.Fatalf("old owner permission lost allowed=%v err=%v", allowed, err)
+	}
+	permissions, err := store.ListBroadcastPermissions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundAutoGrant := false
+	for _, permission := range permissions {
+		if permission.UserID == primaryBID && permission.Target == "chat" && permission.ChatID == chatID {
+			foundAutoGrant = permission.GrantedBy == hostID
+		}
+	}
+	if !foundAutoGrant {
+		t.Fatalf("missing host-granted chat permission: %+v", permissions)
+	}
+
+	data, err := s.loadPageData(ctx, "", hostSession)
+	if err != nil {
+		t.Fatal(err)
+	}
+	primaryCandidates := map[int64]bool{}
+	for _, op := range data.PrimaryOperators {
+		primaryCandidates[op.UserID] = true
+	}
+	if !primaryCandidates[primaryAID] || !primaryCandidates[primaryBID] || primaryCandidates[disabledPrimaryID] || primaryCandidates[secondaryID] {
+		t.Fatalf("owner candidates=%+v", data.PrimaryOperators)
+	}
+	var body strings.Builder
+	if err := adminTemplate.Execute(&body, data); err != nil {
+		t.Fatal(err)
+	}
+	html := body.String()
+	for _, want := range []string{"创建者", "河马", "宿主", `data-owner-transfer-hook="broadcast-groups"`} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("rendered template missing %q", want)
+		}
+	}
+	if strings.Contains(html, ">"+fmt.Sprint(primaryBID)+"<") {
+		t.Fatalf("rendered owner display exposed full UID %d", primaryBID)
+	}
+}

@@ -176,6 +176,14 @@ func TestPolicyBroadcastGroupOwnershipAndDelegation(t *testing.T) {
 	if !p.CanManageBroadcastGroup(1001, UserCapabilities{}, 5005) {
 		t.Fatal("host should manage groups regardless of owner")
 	}
+	if !p.CanTransferBroadcastGroupOwner(1001) {
+		t.Fatal("host should transfer broadcast group ownership")
+	}
+	for _, userID := range []int64{2002, 3003, 4004} {
+		if p.CanTransferBroadcastGroupOwner(userID) {
+			t.Fatalf("non-host %d should not transfer broadcast group ownership", userID)
+		}
+	}
 
 	if !p.CanDelegateBroadcastPermission(3003, primary, 4004, "primary", 0) {
 		t.Fatal("primary should grant broadcast use to another primary")

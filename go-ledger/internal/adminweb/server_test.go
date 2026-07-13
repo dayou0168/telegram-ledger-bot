@@ -296,6 +296,27 @@ func (i *testPermissionInvalidator) InvalidateWatchTargets() {
 	i.watchTargets = true
 }
 
+func TestBroadcastGroupOwnerLabelMasksUIDAndShowsLifecycle(t *testing.T) {
+	if got := broadcastGroupOwnerLabel(storage.BroadcastGroup{}); got != "宿主" {
+		t.Fatalf("host owner label=%q", got)
+	}
+	group := storage.BroadcastGroup{OwnerUserID: 987654321012, OwnerRemark: "河马", OwnerStatus: "active"}
+	if got := broadcastGroupOwnerLabel(group); got != "河马" {
+		t.Fatalf("active owner label=%q", got)
+	}
+	group.OwnerRemark = ""
+	group.OwnerUsername = "owner_name"
+	group.OwnerStatus = "disabled"
+	if got := broadcastGroupOwnerLabel(group); got != "@owner_name（已禁用）" {
+		t.Fatalf("disabled owner label=%q", got)
+	}
+	group.OwnerUsername = ""
+	group.OwnerStatus = "active"
+	if got := broadcastGroupOwnerLabel(group); strings.Contains(got, "987654321012") {
+		t.Fatalf("fallback label exposed full UID: %q", got)
+	}
+}
+
 func TestServerPermissionInvalidatorHooks(t *testing.T) {
 	invalidator := &testPermissionInvalidator{}
 	s := New(config.Config{}, nil, invalidator)

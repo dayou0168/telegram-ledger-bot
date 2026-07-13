@@ -201,6 +201,7 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("/admin/group/rename", s.withAuth(s.renameGroup))
 	mux.HandleFunc("/admin/group/add", s.withAuth(s.addGroupChats))
 	mux.HandleFunc("/admin/group/remove", s.withAuth(s.removeGroupChats))
+	mux.HandleFunc("/admin/group/transfer-owner", s.withAuth(s.transferGroupOwner))
 	mux.HandleFunc("/admin/operator/save", s.withAuth(s.saveOperator))
 	mux.HandleFunc("/admin/operator/disable", s.withAuth(s.disableOperator))
 	mux.HandleFunc("/admin/operator/cleanup", s.withAuth(s.saveOperatorCleanup))
@@ -795,6 +796,57 @@ func (s *Server) addGroupChats(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) removeGroupChats(w http.ResponseWriter, r *http.Request) {
 	s.changeGroupChats(w, r, false)
+}
+
+func (s *Server) transferGroupOwner(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r) {
+		return
+	}
+	session := adminSessionFromContext(r.Context())
+	if !s.perms.CanTransferBroadcastGroupOwner(session.UserID) {
+		http.Error(w, "只有宿主可以转让广播分组管理权", http.StatusForbidden)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	name := strings.TrimSpace(r.FormValue("name"))
+	expectedOwnerUserID, expectedErr := strconv.ParseInt(strings.TrimSpace(r.FormValue("expected_owner_user_id")), 10, 64)
+	newOwnerUserID, ownerErr := strconv.ParseInt(strings.TrimSpace(r.FormValue("new_owner_user_id")), 10, 64)
+	if name == "" || expectedErr != nil || expectedOwnerUserID < 0 || ownerErr != nil || newOwnerUserID <= 0 {
+		http.Error(w, "分组名称、当前创建者或新创建者参数不正确", http.StatusBadRequest)
+		return
+	}
+	autoGrantMissing := r.FormValue("sync_missing_permissions") == "1"
+	result, err := s.store.TransferBroadcastGroupOwner(
+		r.Context(), name, expectedOwnerUserID, newOwnerUserID, session.UserID,
+		true, autoGrantMissing, time.Now(),
+	)
+	switch {
+	case errors.Is(err, storage.ErrBroadcastGroupOwnerChanged):
+		http.Error(w, "分组创建者已变化，请刷新页面后重试", http.StatusConflict)
+		return
+	case errors.Is(err, storage.ErrBroadcastGroupOwnerInvalid):
+		http.Error(w, "新创建者必须是 active 一级操作人", http.StatusBadRequest)
+		return
+	case errors.Is(err, storage.ErrBroadcastGroupOwnerPermissionsMissing):
+		http.Error(w, fmt.Sprintf("目标一级操作人缺少 %d 个分组成员群的单群广播权限；请选择同步补齐后重试", result.MissingChatPermission), http.StatusConflict)
+		return
+	case errors.Is(err, storage.ErrBroadcastScopeDenied):
+		http.Error(w, "没有广播分组管理权转让权限", http.StatusForbidden)
+		return
+	case err != nil:
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	case !result.Found:
+		http.Error(w, "广播分组不存在", http.StatusNotFound)
+		return
+	}
+	if result.Changed || result.AutoGrantedChatPermission > 0 {
+		s.invalidateAllPermissionCaches()
+	}
+	redirectMsg(w, r, fmt.Sprintf("分组管理权已转让，自动补齐 %d 个单群广播权限", result.AutoGrantedChatPermission))
 }
 
 func (s *Server) changeGroupChats(w http.ResponseWriter, r *http.Request, add bool) {
@@ -1743,6 +1795,26 @@ func operatorLabel(op storage.GlobalOperator) string {
 		return displayName
 	}
 	return "未备注操作人 " + maskedUserID(op.UserID)
+}
+
+func broadcastGroupOwnerLabel(group storage.BroadcastGroup) string {
+	if group.OwnerUserID == 0 {
+		return "宿主"
+	}
+	label := strings.TrimSpace(group.OwnerRemark)
+	if label == "" && strings.TrimSpace(group.OwnerUsername) != "" {
+		label = "@" + strings.TrimSpace(group.OwnerUsername)
+	}
+	if label == "" {
+		label = strings.TrimSpace(group.OwnerDisplayName)
+	}
+	if label == "" {
+		label = "未备注操作人 " + maskedUserID(group.OwnerUserID)
+	}
+	if group.OwnerStatus != "active" {
+		label += "（已禁用）"
+	}
+	return label
 }
 
 func operatorLevelLabel(level string) string {
@@ -2879,28 +2951,29 @@ func canManageBroadcastGroupRow(group storage.BroadcastGroup, canManageGlobal bo
 }
 
 var adminTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
-	"chatLabel":               chatLabel,
-	"chatBroadcastGroups":     chatBroadcastGroups,
-	"permissionGroupUsers":    permissionGroupUsers,
-	"permissionChatUsers":     permissionChatUsers,
-	"operatorLabel":           operatorLabel,
-	"operatorLevelLabel":      operatorLevelLabel,
-	"operatorSourceLabel":     operatorSourceLabel,
-	"adminTime":               adminTime,
-	"permissionTarget":        permissionTarget,
-	"permissionUserLabel":     permissionUserLabel,
-	"grantorLabel":            grantorLabel,
-	"watchOwnerLabel":         watchOwnerLabel,
-	"watchLatestTime":         watchLatestTime,
-	"cleanupSummary":          cleanupSummary,
-	"cleanupDelayPreset":      cleanupDelayPreset,
-	"cleanupDelayCustomValue": cleanupDelayCustomValue,
-	"cleanupDelayCustomUnit":  cleanupDelayCustomUnit,
-	"cleanupScopeEnabled":     cleanupScopeEnabled,
-	"cleanupTimeHour":         cleanupTimeHour,
-	"cleanupTimeMinute":       cleanupTimeMinute,
-	"canMutateOperator":       canMutateOperatorRow,
-	"canManageBroadcastGroup": canManageBroadcastGroupRow,
+	"chatLabel":                chatLabel,
+	"chatBroadcastGroups":      chatBroadcastGroups,
+	"permissionGroupUsers":     permissionGroupUsers,
+	"permissionChatUsers":      permissionChatUsers,
+	"operatorLabel":            operatorLabel,
+	"broadcastGroupOwnerLabel": broadcastGroupOwnerLabel,
+	"operatorLevelLabel":       operatorLevelLabel,
+	"operatorSourceLabel":      operatorSourceLabel,
+	"adminTime":                adminTime,
+	"permissionTarget":         permissionTarget,
+	"permissionUserLabel":      permissionUserLabel,
+	"grantorLabel":             grantorLabel,
+	"watchOwnerLabel":          watchOwnerLabel,
+	"watchLatestTime":          watchLatestTime,
+	"cleanupSummary":           cleanupSummary,
+	"cleanupDelayPreset":       cleanupDelayPreset,
+	"cleanupDelayCustomValue":  cleanupDelayCustomValue,
+	"cleanupDelayCustomUnit":   cleanupDelayCustomUnit,
+	"cleanupScopeEnabled":      cleanupScopeEnabled,
+	"cleanupTimeHour":          cleanupTimeHour,
+	"cleanupTimeMinute":        cleanupTimeMinute,
+	"canMutateOperator":        canMutateOperatorRow,
+	"canManageBroadcastGroup":  canManageBroadcastGroupRow,
 }).Parse(adminHTML))
 
 var loginTemplate = template.Must(template.New("login").Parse(loginHTML))
@@ -3094,8 +3167,8 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 <button class="btn full" type="submit">从分组移除</button>
 </form>
 </div>
-<div class="scroll"><table><thead><tr><th>分组</th><th>权限</th><th>群数</th><th>群组</th></tr></thead><tbody>
-{{range .BGroups}}<tr><td>{{.Name}}</td><td>{{if canManageBroadcastGroup . $.CanManageGlobal $.AdminUserID}}可管理{{else}}仅可使用{{end}}</td><td>{{len .ChatIDs}}</td><td>{{range $i,$n := .ChatNames}}{{if $i}}、{{end}}{{$n}}{{end}}</td></tr>{{else}}<tr><td colspan="4">暂无广播分组</td></tr>{{end}}
+<div class="scroll" data-owner-transfer-hook="broadcast-groups"><table><thead><tr><th>分组</th><th>创建者</th><th>权限</th><th>群数</th><th>群组</th></tr></thead><tbody>
+{{range .BGroups}}<tr data-group-name="{{.Name}}" data-owner-user-id="{{.OwnerUserID}}"><td>{{.Name}}</td><td>{{broadcastGroupOwnerLabel .}}</td><td>{{if canManageBroadcastGroup . $.CanManageGlobal $.AdminUserID}}可管理{{else}}仅可使用{{end}}</td><td>{{len .ChatIDs}}</td><td>{{range $i,$n := .ChatNames}}{{if $i}}、{{end}}{{$n}}{{end}}</td></tr>{{else}}<tr><td colspan="5">暂无广播分组</td></tr>{{end}}
 </tbody></table></div>
 <div class="pager"><span>{{.BroadcastPager.ItemFrom}}-{{.BroadcastPager.ItemTo}} / {{.BroadcastPager.Total}}</span>{{if .BroadcastPager.HasPrev}}<a href="{{.BroadcastPager.PrevURL}}">上一页</a>{{else}}<span class="disabled">上一页</span>{{end}}{{if .BroadcastPager.HasNext}}<a href="{{.BroadcastPager.NextURL}}">下一页</a>{{else}}<span class="disabled">下一页</span>{{end}}</div>
 </div>

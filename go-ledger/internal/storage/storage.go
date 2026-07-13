@@ -19,7 +19,7 @@ type Store struct {
 	keyCipher *keyCipher
 }
 
-const latestSchemaMigrationVersion = "2.4.4-broadcast-group-ownership"
+const latestSchemaMigrationVersion = "2.4.5-broadcast-group-owner-transfer"
 
 func Open(ctx context.Context, databaseURL string) (*Store, error) {
 	return open(ctx, databaseURL, true)
@@ -508,6 +508,30 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE TRIGGER trg_broadcast_group_audit_immutable
 			BEFORE UPDATE OR DELETE ON broadcast_group_audit_events
 			FOR EACH ROW EXECUTE FUNCTION reject_broadcast_group_audit_mutation()`,
+		`CREATE TABLE IF NOT EXISTS broadcast_group_owner_transfer_events (
+			id BIGSERIAL PRIMARY KEY,
+			actor_user_id BIGINT NOT NULL,
+			group_name TEXT NOT NULL,
+			previous_owner_user_id BIGINT,
+			new_owner_user_id BIGINT NOT NULL REFERENCES global_operators(user_id) ON DELETE RESTRICT,
+			auto_granted_chat_permission_count INTEGER NOT NULL DEFAULT 0 CHECK (auto_granted_chat_permission_count >= 0),
+			created_at TIMESTAMPTZ NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_broadcast_group_owner_transfer_group
+			ON broadcast_group_owner_transfer_events(group_name, created_at DESC, id DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_broadcast_group_owner_transfer_actor
+			ON broadcast_group_owner_transfer_events(actor_user_id, created_at DESC, id DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_broadcast_group_owner_transfer_new_owner
+			ON broadcast_group_owner_transfer_events(new_owner_user_id, created_at DESC, id DESC)`,
+		`CREATE OR REPLACE FUNCTION reject_broadcast_group_owner_transfer_mutation() RETURNS trigger AS $$
+		BEGIN
+			RAISE EXCEPTION 'broadcast group owner transfer events are immutable';
+		END;
+		$$ LANGUAGE plpgsql`,
+		`DROP TRIGGER IF EXISTS trg_broadcast_group_owner_transfer_immutable ON broadcast_group_owner_transfer_events`,
+		`CREATE TRIGGER trg_broadcast_group_owner_transfer_immutable
+			BEFORE UPDATE OR DELETE ON broadcast_group_owner_transfer_events
+			FOR EACH ROW EXECUTE FUNCTION reject_broadcast_group_owner_transfer_mutation()`,
 		`CREATE TABLE IF NOT EXISTS broadcast_group_owner_repair_candidates (
 			group_name TEXT PRIMARY KEY,
 			created_by BIGINT NOT NULL,
@@ -1188,6 +1212,11 @@ func (s *Store) migrate(ctx context.Context) error {
 		VALUES('2.4.3-broadcast-permission-restore', NOW())
 		ON CONFLICT(version) DO NOTHING`); err != nil {
 		return fmt.Errorf("record broadcast permission restore migration: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
+		VALUES('2.4.4-broadcast-group-ownership', NOW())
+		ON CONFLICT(version) DO NOTHING`); err != nil {
+		return fmt.Errorf("record broadcast group ownership migration: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
 		VALUES($1, NOW())
@@ -2871,7 +2900,12 @@ func (s *Store) CleanupLedgerClearTickets(ctx context.Context, cutoff time.Time)
 	return tag.RowsAffected(), err
 }
 
-var ErrBroadcastScopeDenied = errors.New("broadcast scope denied")
+var (
+	ErrBroadcastScopeDenied                  = errors.New("broadcast scope denied")
+	ErrBroadcastGroupOwnerChanged            = errors.New("broadcast group owner changed")
+	ErrBroadcastGroupOwnerInvalid            = errors.New("broadcast group owner must be an active primary global operator")
+	ErrBroadcastGroupOwnerPermissionsMissing = errors.New("broadcast group owner is missing direct chat permissions")
+)
 
 func insertBroadcastGroupAudit(ctx context.Context, tx pgx.Tx, event BroadcastGroupAuditEvent) error {
 	_, err := tx.Exec(ctx, `INSERT INTO broadcast_group_audit_events(
@@ -2879,6 +2913,166 @@ func insertBroadcastGroupAudit(ctx context.Context, tx pgx.Tx, event BroadcastGr
 	) VALUES($1, $2, $3, $4, $5, $6)`,
 		event.ActorUserID, event.Action, event.GroupName, event.PreviousGroupName, event.ChatID, event.CreatedAt)
 	return err
+}
+
+func insertBroadcastGroupOwnerTransferAudit(ctx context.Context, tx pgx.Tx, event BroadcastGroupOwnerTransferEvent) error {
+	_, err := tx.Exec(ctx, `INSERT INTO broadcast_group_owner_transfer_events(
+		actor_user_id, group_name, previous_owner_user_id, new_owner_user_id,
+		auto_granted_chat_permission_count, created_at
+	) VALUES($1, $2, NULLIF($3::BIGINT, 0::BIGINT), $4, $5, $6)`,
+		event.ActorUserID, event.GroupName, event.PreviousOwnerUserID, event.NewOwnerUserID,
+		event.AutoGrantedChatPermission, event.CreatedAt)
+	return err
+}
+
+// TransferBroadcastGroupOwner atomically validates the target owner, fills any
+// explicitly requested direct chat permissions, and transfers management. The
+// expected owner protects browser retries and concurrent administrators from
+// applying a stale transfer.
+func (s *Store) TransferBroadcastGroupOwner(
+	ctx context.Context,
+	groupName string,
+	expectedOwnerUserID, newOwnerUserID, actorUserID int64,
+	actorIsHost, autoGrantMissing bool,
+	now time.Time,
+) (BroadcastGroupOwnerTransferResult, error) {
+	result := BroadcastGroupOwnerTransferResult{NewOwnerUserID: newOwnerUserID}
+	groupName = strings.TrimSpace(groupName)
+	if !actorIsHost {
+		return result, ErrBroadcastScopeDenied
+	}
+	if groupName == "" || newOwnerUserID <= 0 || actorUserID <= 0 {
+		return result, errors.New("broadcast group owner transfer parameters are invalid")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return result, err
+	}
+	defer rollback(ctx, tx)
+
+	var currentOwnerUserID int64
+	err = tx.QueryRow(ctx, `SELECT COALESCE(owner_user_id, 0) FROM broadcast_groups
+		WHERE name=$1 FOR UPDATE`, groupName).Scan(&currentOwnerUserID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return result, tx.Commit(ctx)
+	}
+	if err != nil {
+		return result, err
+	}
+	result.Found = true
+	result.PreviousOwnerUserID = currentOwnerUserID
+	if currentOwnerUserID != expectedOwnerUserID {
+		return result, ErrBroadcastGroupOwnerChanged
+	}
+
+	var targetLevel, targetStatus string
+	err = tx.QueryRow(ctx, `SELECT level, status FROM global_operators
+		WHERE user_id=$1::BIGINT FOR SHARE`, newOwnerUserID).Scan(&targetLevel, &targetStatus)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return result, ErrBroadcastGroupOwnerInvalid
+	}
+	if err != nil {
+		return result, err
+	}
+	if targetLevel != "primary" || targetStatus != "active" {
+		return result, ErrBroadcastGroupOwnerInvalid
+	}
+
+	permissionRows, err := tx.Query(ctx, `SELECT p.chat_id
+		FROM broadcast_operator_permissions p
+		JOIN broadcast_group_chats bgc ON bgc.chat_id=p.chat_id AND bgc.group_name=$1
+		WHERE p.user_id=$2::BIGINT AND p.target='chat'
+		FOR UPDATE OF p`, groupName, newOwnerUserID)
+	if err != nil {
+		return result, err
+	}
+	for permissionRows.Next() {
+		var chatID int64
+		if err := permissionRows.Scan(&chatID); err != nil {
+			permissionRows.Close()
+			return result, err
+		}
+	}
+	if err := permissionRows.Err(); err != nil {
+		permissionRows.Close()
+		return result, err
+	}
+	permissionRows.Close()
+
+	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM broadcast_group_chats bgc
+		WHERE bgc.group_name=$1 AND NOT EXISTS (
+			SELECT 1 FROM broadcast_operator_permissions p
+			WHERE p.user_id=$2::BIGINT AND p.target='chat' AND p.chat_id=bgc.chat_id
+		)`, groupName, newOwnerUserID).Scan(&result.MissingChatPermission); err != nil {
+		return result, err
+	}
+	if result.MissingChatPermission > 0 && !autoGrantMissing {
+		return result, ErrBroadcastGroupOwnerPermissionsMissing
+	}
+
+	if autoGrantMissing && result.MissingChatPermission > 0 {
+		rows, err := tx.Query(ctx, `INSERT INTO broadcast_operator_permissions(
+			user_id, target, chat_id, group_name, granted_by, created_at
+		)
+		SELECT $2::BIGINT, 'chat', bgc.chat_id, '', $3::BIGINT, $4
+		FROM broadcast_group_chats bgc
+		WHERE bgc.group_name=$1 AND NOT EXISTS (
+			SELECT 1 FROM broadcast_operator_permissions p
+			WHERE p.user_id=$2::BIGINT AND p.target='chat' AND p.chat_id=bgc.chat_id
+		)
+		ON CONFLICT DO NOTHING
+		RETURNING chat_id`, groupName, newOwnerUserID, actorUserID, now)
+		if err != nil {
+			return result, err
+		}
+		var grantedChatIDs []int64
+		for rows.Next() {
+			var chatID int64
+			if err := rows.Scan(&chatID); err != nil {
+				rows.Close()
+				return result, err
+			}
+			grantedChatIDs = append(grantedChatIDs, chatID)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return result, err
+		}
+		rows.Close()
+		for _, chatID := range grantedChatIDs {
+			if err := insertPermissionAudit(ctx, tx, PermissionAuditEvent{
+				ActorUserID: actorUserID, SubjectType: "broadcast_permission", SubjectUserID: newOwnerUserID,
+				Action: "granted", TargetType: "chat", ChatID: chatID, CreatedAt: now,
+			}); err != nil {
+				return result, err
+			}
+		}
+		result.AutoGrantedChatPermission = len(grantedChatIDs)
+	}
+
+	if currentOwnerUserID != newOwnerUserID {
+		if _, err := tx.Exec(ctx, `UPDATE broadcast_groups
+			SET owner_user_id=$2::BIGINT, updated_at=$3 WHERE name=$1`, groupName, newOwnerUserID, now); err != nil {
+			return result, err
+		}
+		result.Changed = true
+		if err := insertBroadcastGroupOwnerTransferAudit(ctx, tx, BroadcastGroupOwnerTransferEvent{
+			ActorUserID: actorUserID, GroupName: groupName, PreviousOwnerUserID: currentOwnerUserID,
+			NewOwnerUserID: newOwnerUserID, AutoGrantedChatPermission: result.AutoGrantedChatPermission, CreatedAt: now,
+		}); err != nil {
+			return result, err
+		}
+		if err := insertBroadcastGroupAudit(ctx, tx, BroadcastGroupAuditEvent{
+			ActorUserID: actorUserID, Action: "owner_transferred", GroupName: groupName, CreatedAt: now,
+		}); err != nil {
+			return result, err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return result, err
+	}
+	return result, nil
 }
 
 func (s *Store) CreateBroadcastGroup(ctx context.Context, name string, createdBy, ownerUserID int64, now time.Time) (bool, error) {
@@ -3210,9 +3404,16 @@ func (s *Store) ListVisibleBroadcastGroups(ctx context.Context, userID int64) ([
 }
 
 func (s *Store) listBroadcastGroups(ctx context.Context, userID int64, all bool) ([]BroadcastGroup, error) {
-	rows, err := s.pool.Query(ctx, `SELECT bg.name, bg.created_by, COALESCE(bg.owner_user_id, 0), bg.created_at, bg.updated_at,
+	rows, err := s.pool.Query(ctx, `SELECT bg.name, bg.created_by, COALESCE(bg.owner_user_id, 0),
+		COALESCE(owner_identity.username, ''), COALESCE(owner_identity.display_name, ''),
+		COALESCE(owner.remark, ''), COALESCE(owner.status, ''), bg.created_at, bg.updated_at,
 		COALESCE(g.chat_id, 0), COALESCE(g.title, '')
 		FROM broadcast_groups bg
+		LEFT JOIN global_operators owner ON owner.user_id=bg.owner_user_id
+		LEFT JOIN LATERAL (
+			SELECT username, display_name FROM users
+			WHERE user_id=bg.owner_user_id ORDER BY last_seen_at DESC LIMIT 1
+		) owner_identity ON TRUE
 		LEFT JOIN broadcast_group_chats bgc ON bgc.group_name=bg.name
 		LEFT JOIN groups g ON g.chat_id=bgc.chat_id
 		WHERE $1::BOOLEAN OR bg.owner_user_id=$2::BIGINT OR EXISTS (
@@ -3229,15 +3430,22 @@ func (s *Store) listBroadcastGroups(ctx context.Context, userID int64, all bool)
 	for rows.Next() {
 		var name string
 		var createdBy, ownerUserID int64
+		var ownerUsername, ownerDisplayName, ownerRemark, ownerStatus string
 		var createdAt, updatedAt time.Time
 		var chatID int64
 		var title string
-		if err := rows.Scan(&name, &createdBy, &ownerUserID, &createdAt, &updatedAt, &chatID, &title); err != nil {
+		if err := rows.Scan(&name, &createdBy, &ownerUserID, &ownerUsername, &ownerDisplayName,
+			&ownerRemark, &ownerStatus, &createdAt, &updatedAt, &chatID, &title); err != nil {
 			return nil, err
 		}
 		group := byName[name]
 		if group == nil {
-			group = &BroadcastGroup{Name: name, CreatedBy: createdBy, OwnerUserID: ownerUserID, CreatedAt: createdAt, UpdatedAt: updatedAt}
+			group = &BroadcastGroup{
+				Name: name, CreatedBy: createdBy, OwnerUserID: ownerUserID,
+				OwnerUsername: ownerUsername, OwnerDisplayName: ownerDisplayName,
+				OwnerRemark: ownerRemark, OwnerStatus: ownerStatus,
+				CreatedAt: createdAt, UpdatedAt: updatedAt,
+			}
 			byName[name] = group
 			order = append(order, name)
 		}
@@ -3262,9 +3470,19 @@ func (s *Store) GetBroadcastGroup(ctx context.Context, name string) (BroadcastGr
 		return BroadcastGroup{}, false, nil
 	}
 	var group BroadcastGroup
-	err := s.pool.QueryRow(ctx, `SELECT name, created_by, COALESCE(owner_user_id, 0), created_at, updated_at
-		FROM broadcast_groups WHERE name=$1`, name).Scan(
-		&group.Name, &group.CreatedBy, &group.OwnerUserID, &group.CreatedAt, &group.UpdatedAt,
+	err := s.pool.QueryRow(ctx, `SELECT bg.name, bg.created_by, COALESCE(bg.owner_user_id, 0),
+		COALESCE(owner_identity.username, ''), COALESCE(owner_identity.display_name, ''),
+		COALESCE(owner.remark, ''), COALESCE(owner.status, ''), bg.created_at, bg.updated_at
+		FROM broadcast_groups bg
+		LEFT JOIN global_operators owner ON owner.user_id=bg.owner_user_id
+		LEFT JOIN LATERAL (
+			SELECT username, display_name FROM users
+			WHERE user_id=bg.owner_user_id ORDER BY last_seen_at DESC LIMIT 1
+		) owner_identity ON TRUE
+		WHERE bg.name=$1`, name).Scan(
+		&group.Name, &group.CreatedBy, &group.OwnerUserID, &group.OwnerUsername,
+		&group.OwnerDisplayName, &group.OwnerRemark, &group.OwnerStatus,
+		&group.CreatedAt, &group.UpdatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return BroadcastGroup{}, false, nil
@@ -3331,6 +3549,31 @@ func (s *Store) ListBroadcastGroupAuditEvents(ctx context.Context, groupName str
 		var event BroadcastGroupAuditEvent
 		if err := rows.Scan(&event.ID, &event.ActorUserID, &event.Action, &event.GroupName,
 			&event.PreviousGroupName, &event.ChatID, &event.CreatedAt); err != nil {
+			return nil, err
+		}
+		events = append(events, event)
+	}
+	return events, rows.Err()
+}
+
+func (s *Store) ListBroadcastGroupOwnerTransferEvents(ctx context.Context, groupName string) ([]BroadcastGroupOwnerTransferEvent, error) {
+	groupName = strings.TrimSpace(groupName)
+	rows, err := s.pool.Query(ctx, `SELECT id, actor_user_id, group_name,
+		COALESCE(previous_owner_user_id, 0), new_owner_user_id,
+		auto_granted_chat_permission_count, created_at
+		FROM broadcast_group_owner_transfer_events
+		WHERE $1='' OR group_name=$1
+		ORDER BY created_at ASC, id ASC`, groupName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var events []BroadcastGroupOwnerTransferEvent
+	for rows.Next() {
+		var event BroadcastGroupOwnerTransferEvent
+		if err := rows.Scan(&event.ID, &event.ActorUserID, &event.GroupName,
+			&event.PreviousOwnerUserID, &event.NewOwnerUserID,
+			&event.AutoGrantedChatPermission, &event.CreatedAt); err != nil {
 			return nil, err
 		}
 		events = append(events, event)

@@ -89,12 +89,12 @@ func TestPostgresConcurrentOpenSerializesMigration(t *testing.T) {
 
 	var versions int
 	if err := admin.QueryRow(ctx,
-		"SELECT count(*) FROM "+quotedSchema+".schema_migrations WHERE version IN ('2.1.0', '2.2.0', '2.3.0', '2.4.1', '2.4.2', '2.4.3', '2.4.3-broadcast-permission-restore', '2.4.4-broadcast-group-ownership')",
+		"SELECT count(*) FROM "+quotedSchema+".schema_migrations WHERE version IN ('2.1.0', '2.2.0', '2.3.0', '2.4.1', '2.4.2', '2.4.3', '2.4.3-broadcast-permission-restore', '2.4.4-broadcast-group-ownership', '2.4.5-broadcast-group-owner-transfer')",
 	).Scan(&versions); err != nil {
 		t.Fatalf("query migration versions: %v", err)
 	}
-	if versions != 8 {
-		t.Fatalf("migration versions = %d, want 8", versions)
+	if versions != 9 {
+		t.Fatalf("migration versions = %d, want 9", versions)
 	}
 }
 
@@ -118,6 +118,7 @@ func TestPostgresV242ToV243MigrationIsIdempotent(t *testing.T) {
 	statements := []string{
 		"DELETE FROM " + quotedSchema + ".schema_migrations WHERE version LIKE '2.4.3%'",
 		"DELETE FROM " + quotedSchema + ".schema_migrations WHERE version LIKE '2.4.4%'",
+		"DELETE FROM " + quotedSchema + ".schema_migrations WHERE version LIKE '2.4.5%'",
 		"DROP INDEX IF EXISTS " + quotedSchema + ".idx_chain_watcher_gap_retention",
 		"DROP INDEX IF EXISTS " + quotedSchema + ".idx_chain_watcher_gap_window_overlap",
 		"ALTER TABLE " + quotedSchema + ".chain_watcher_gap_tasks DROP COLUMN IF EXISTS head_event_id",
@@ -248,7 +249,8 @@ func TestPostgresBroadcastGroupOwnershipMigrationUsesVerifiedCreatorEvidence(t *
 	) VALUES($1, 'created', 'audit-conflict', $2)`, otherPrimaryID, now); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.pool.Exec(ctx, `DELETE FROM schema_migrations WHERE version LIKE '2.4.4%'`); err != nil {
+	if _, err := store.pool.Exec(ctx, `DELETE FROM schema_migrations
+		WHERE version LIKE '2.4.4%' OR version LIKE '2.4.5%'`); err != nil {
 		t.Fatal(err)
 	}
 	store.Close()
@@ -359,7 +361,7 @@ func TestPostgresGlobalOperatorHierarchyRepair(t *testing.T) {
 	chatID := -base
 
 	if _, err := store.pool.Exec(ctx, `DELETE FROM schema_migrations
-		WHERE version LIKE '2.4.3%' OR version LIKE '2.4.4%'`); err != nil {
+		WHERE version LIKE '2.4.3%' OR version LIKE '2.4.4%' OR version LIKE '2.4.5%'`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.pool.Exec(ctx, `TRUNCATE global_operator_level_repair_candidates`); err != nil {
@@ -827,6 +829,223 @@ func TestPostgresBroadcastGroupOwnershipAndDelegationBoundaries(t *testing.T) {
 	}
 	if _, err := store.CreateBroadcastGroup(ctx, fmt.Sprintf("disabled-owner-%d", base), primaryAID, primaryAID, now.Add(3*time.Second)); !errors.Is(err, ErrBroadcastScopeDenied) {
 		t.Fatalf("disabled primary created owned group: %v", err)
+	}
+}
+
+func TestPostgresBroadcastGroupOwnerTransferMigrationFromV244IsIdempotent(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	migrationURL, admin, quotedSchema := postgresTestSchema(t, ctx, dsn, "broadcast_owner_transfer_migration")
+	store, err := Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+	if _, err := admin.Exec(ctx, "DELETE FROM "+quotedSchema+".schema_migrations WHERE version='2.4.5-broadcast-group-owner-transfer'"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admin.Exec(ctx, "DROP TABLE "+quotedSchema+".broadcast_group_owner_transfer_events CASCADE"); err != nil {
+		t.Fatal(err)
+	}
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		store, err = Open(ctx, migrationURL)
+		if err != nil {
+			t.Fatalf("open migration attempt %d: %v", attempt, err)
+		}
+		store.Close()
+		var markerCount int
+		var tableExists bool
+		if err := admin.QueryRow(ctx, "SELECT COUNT(*) FROM "+quotedSchema+`.schema_migrations
+			WHERE version='2.4.5-broadcast-group-owner-transfer'`).Scan(&markerCount); err != nil {
+			t.Fatal(err)
+		}
+		if err := admin.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`,
+			strings.Trim(quotedSchema, `"`)+".broadcast_group_owner_transfer_events").Scan(&tableExists); err != nil {
+			t.Fatal(err)
+		}
+		if markerCount != 1 || !tableExists {
+			t.Fatalf("attempt %d marker=%d table=%v", attempt, markerCount, tableExists)
+		}
+	}
+}
+
+func TestPostgresBroadcastGroupOwnerTransferIsAtomicAuditedAndConcurrentSafe(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	migrationURL, _, _ := postgresTestSchema(t, ctx, dsn, "broadcast_group_owner_transfer")
+	store, err := Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	base := int64(970000000000 + now.UnixNano()%1000000)
+	hostID := base
+	primaryAID := base + 1
+	primaryBID := base + 2
+	primaryCID := base + 3
+	secondaryID := base + 4
+	disabledPrimaryID := base + 5
+	ordinaryID := base + 6
+	chatAID := -base
+	chatBID := -base - 1
+	for _, op := range []struct {
+		userID, parentID, createdBy int64
+		level                       string
+	}{
+		{primaryAID, 0, hostID, "primary"},
+		{primaryBID, 0, hostID, "primary"},
+		{primaryCID, 0, hostID, "primary"},
+		{secondaryID, primaryAID, primaryAID, "secondary"},
+		{disabledPrimaryID, 0, hostID, "primary"},
+	} {
+		if err := store.UpsertGlobalOperator(ctx, op.userID, op.level, op.parentID, op.createdBy, "transfer fixture", now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.DisableGlobalOperator(ctx, disabledPrimaryID, hostID, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.TouchUser(ctx, primaryBID, User{ID: primaryBID, Username: "owner_b", DisplayName: "Owner B"}, now); err != nil {
+		t.Fatal(err)
+	}
+	for _, chatID := range []int64{chatAID, chatBID} {
+		if err := store.EnsureGroup(ctx, chatID, fmt.Sprintf("transfer %d", chatID), now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	groupName := fmt.Sprintf("host-transfer-%d", base)
+	if err := store.UpsertBroadcastGroup(ctx, groupName, hostID, now); err != nil {
+		t.Fatal(err)
+	}
+	if added, err := store.AddChatsToBroadcastGroupManaged(ctx, groupName, []int64{chatAID, chatBID}, hostID, true, now); err != nil || added != 2 {
+		t.Fatalf("add host group chats=%d err=%v", added, err)
+	}
+	if err := store.AddBroadcastPermission(ctx, primaryAID, "group", 0, groupName, hostID, now); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.TransferBroadcastGroupOwner(ctx, groupName, 0, primaryAID, primaryAID, false, true, now); !errors.Is(err, ErrBroadcastScopeDenied) {
+		t.Fatalf("non-host transfer error=%v", err)
+	}
+	for _, targetID := range []int64{secondaryID, disabledPrimaryID, ordinaryID} {
+		if _, err := store.TransferBroadcastGroupOwner(ctx, groupName, 0, targetID, hostID, true, true, now); !errors.Is(err, ErrBroadcastGroupOwnerInvalid) {
+			t.Fatalf("invalid owner %d error=%v", targetID, err)
+		}
+	}
+
+	missing, err := store.TransferBroadcastGroupOwner(ctx, groupName, 0, primaryAID, hostID, true, false, now.Add(2*time.Second))
+	if !errors.Is(err, ErrBroadcastGroupOwnerPermissionsMissing) || missing.MissingChatPermission != 2 {
+		t.Fatalf("missing permission result=%+v err=%v", missing, err)
+	}
+	if group, ok, err := store.GetBroadcastGroup(ctx, groupName); err != nil || !ok || group.OwnerUserID != 0 {
+		t.Fatalf("rejected transfer changed group=%+v ok=%v err=%v", group, ok, err)
+	}
+	var rejectedDirectGrantCount int
+	if err := store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM broadcast_operator_permissions
+		WHERE user_id=$1::BIGINT AND target='chat'`, primaryAID).Scan(&rejectedDirectGrantCount); err != nil || rejectedDirectGrantCount != 0 {
+		t.Fatalf("rejected transfer direct grants=%d err=%v", rejectedDirectGrantCount, err)
+	}
+
+	first, err := store.TransferBroadcastGroupOwner(ctx, groupName, 0, primaryAID, hostID, true, true, now.Add(3*time.Second))
+	if err != nil || !first.Changed || first.MissingChatPermission != 2 || first.AutoGrantedChatPermission != 2 {
+		t.Fatalf("first transfer result=%+v err=%v", first, err)
+	}
+	var grantedCount int
+	if err := store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM broadcast_operator_permissions
+		WHERE user_id=$1::BIGINT AND target='chat' AND granted_by=$2::BIGINT`, primaryAID, hostID).Scan(&grantedCount); err != nil || grantedCount != 2 {
+		t.Fatalf("auto grants=%d err=%v", grantedCount, err)
+	}
+	if allowed, err := store.HasBroadcastPermissionScope(ctx, primaryAID, "group", 0, groupName); err != nil || !allowed {
+		t.Fatalf("existing group permission lost allowed=%v err=%v", allowed, err)
+	}
+	for _, targetID := range []int64{primaryBID, primaryCID} {
+		for _, chatID := range []int64{chatAID, chatBID} {
+			if err := store.AddBroadcastPermission(ctx, targetID, "chat", chatID, "", hostID, now); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	second, err := store.TransferBroadcastGroupOwner(ctx, groupName, primaryAID, primaryBID, hostID, true, false, now.Add(4*time.Second))
+	if err != nil || !second.Changed || second.MissingChatPermission != 0 || second.AutoGrantedChatPermission != 0 {
+		t.Fatalf("zero-fill transfer result=%+v err=%v", second, err)
+	}
+	if group, ok, err := store.GetBroadcastGroup(ctx, groupName); err != nil || !ok || group.OwnerUserID != primaryBID ||
+		group.CreatedBy != hostID || group.OwnerUsername != "owner_b" || group.OwnerStatus != "active" {
+		t.Fatalf("new owner display fields group=%+v ok=%v err=%v", group, ok, err)
+	}
+	if _, err := store.TransferBroadcastGroupOwner(ctx, groupName, primaryAID, primaryBID, hostID, true, false, now.Add(5*time.Second)); !errors.Is(err, ErrBroadcastGroupOwnerChanged) {
+		t.Fatalf("stale repeat error=%v", err)
+	}
+	if repeat, err := store.TransferBroadcastGroupOwner(ctx, groupName, primaryBID, primaryBID, hostID, true, false, now.Add(6*time.Second)); err != nil || repeat.Changed {
+		t.Fatalf("same-owner repeat result=%+v err=%v", repeat, err)
+	}
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for _, targetID := range []int64{primaryAID, primaryCID} {
+		targetID := targetID
+		go func() {
+			<-start
+			_, err := store.TransferBroadcastGroupOwner(ctx, groupName, primaryBID, targetID, hostID, true, false, now.Add(7*time.Second))
+			results <- err
+		}()
+	}
+	close(start)
+	var successes, stale int
+	for range 2 {
+		err := <-results
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, ErrBroadcastGroupOwnerChanged):
+			stale++
+		default:
+			t.Fatalf("concurrent transfer error=%v", err)
+		}
+	}
+	if successes != 1 || stale != 1 {
+		t.Fatalf("concurrent results successes=%d stale=%d", successes, stale)
+	}
+
+	events, err := store.ListBroadcastGroupOwnerTransferEvents(ctx, groupName)
+	if err != nil || len(events) != 3 {
+		t.Fatalf("transfer events=%+v err=%v", events, err)
+	}
+	if events[0].PreviousOwnerUserID != 0 || events[0].NewOwnerUserID != primaryAID || events[0].AutoGrantedChatPermission != 2 {
+		t.Fatalf("first transfer audit=%+v", events[0])
+	}
+	groupEvents, err := store.ListBroadcastGroupAuditEvents(ctx, groupName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerTransferAudits := 0
+	for _, event := range groupEvents {
+		if event.Action == "owner_transferred" {
+			ownerTransferAudits++
+		}
+	}
+	if ownerTransferAudits != 3 {
+		t.Fatalf("generic owner transfer audits=%d events=%+v", ownerTransferAudits, groupEvents)
+	}
+	var permissionAuditCount int
+	if err := store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM permission_audit_events
+		WHERE actor_user_id=$1::BIGINT AND subject_user_id=$2::BIGINT
+		  AND subject_type='broadcast_permission' AND action='granted' AND target_type='chat'`, hostID, primaryAID).Scan(&permissionAuditCount); err != nil || permissionAuditCount != 2 {
+		t.Fatalf("permission audit count=%d err=%v", permissionAuditCount, err)
+	}
+	if _, err := store.pool.Exec(ctx, `DELETE FROM broadcast_group_owner_transfer_events WHERE group_name=$1`, groupName); err == nil {
+		t.Fatal("owner transfer audit delete should be rejected")
 	}
 }
 
