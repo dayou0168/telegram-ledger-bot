@@ -1518,7 +1518,7 @@ func (s *Store) ListPermissionAuditEvents(ctx context.Context, subjectUserID int
 	rows, err := s.pool.Query(ctx, `SELECT id, actor_user_id, subject_type, subject_user_id,
 		action, level, COALESCE(parent_user_id, 0), target_type, chat_id, group_name, created_at
 		FROM permission_audit_events
-		WHERE $1=0 OR subject_user_id=$1
+		WHERE $1::BIGINT=0::BIGINT OR subject_user_id=$1::BIGINT
 		ORDER BY created_at DESC, id DESC LIMIT $2`, subjectUserID, limit)
 	if err != nil {
 		return nil, err
@@ -3367,7 +3367,7 @@ func (s *Store) MarkNotificationSent(ctx context.Context, id int64, messageID in
 		FROM marked
 		WHERE marked.reference_kind='ledger_record'
 			AND marked.reference_id=r.id
-			AND $2 > 0`, id, messageID, now)
+			AND $2::BIGINT > 0::BIGINT`, id, messageID, now)
 	return err
 }
 

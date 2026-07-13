@@ -442,6 +442,30 @@ func TestPostgresStoreBasicFlow(t *testing.T) {
 	if recordID == 0 {
 		t.Fatalf("record id should be non-zero")
 	}
+	largeBotMessageID := int64(600000000000 + suffix%1000000)
+	dedupeKey := fmt.Sprintf("bigint-message-id-%d", suffix)
+	enqueued, err := store.EnqueueNotification(ctx, NotificationOutbox{
+		Kind:          "ledger_record",
+		DedupeKey:     dedupeKey,
+		ChatID:        chatID,
+		Text:          "BIGINT message id regression",
+		ReferenceKind: "ledger_record",
+		ReferenceID:   recordID,
+	}, now)
+	if err != nil || !enqueued {
+		t.Fatalf("enqueue BIGINT message id regression: %v, inserted=%v", err, enqueued)
+	}
+	var notificationID int64
+	if err := store.pool.QueryRow(ctx, `SELECT id FROM notification_outbox WHERE dedupe_key=$1`, dedupeKey).Scan(&notificationID); err != nil {
+		t.Fatalf("find BIGINT message id notification: %v", err)
+	}
+	if err := store.MarkNotificationSent(ctx, notificationID, largeBotMessageID, now); err != nil {
+		t.Fatalf("mark notification with BIGINT message id: %v", err)
+	}
+	record, ok, err := store.GetRecord(ctx, recordID)
+	if err != nil || !ok || record.BotMessageID != largeBotMessageID {
+		t.Fatalf("record BIGINT bot message id = %d, %v, %v; want %d", record.BotMessageID, ok, err, largeBotMessageID)
+	}
 
 	address := "TGhAAySHUUcEGua33pZZ88wP3bA6X5eQuZ"
 	if err := store.AddWatch(ctx, userID, address, "watch address", now); err != nil {
