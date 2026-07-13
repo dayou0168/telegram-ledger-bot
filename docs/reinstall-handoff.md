@@ -28,6 +28,8 @@ ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.1
 - In normal mode, the bot registers watched addresses with `ledger-chain-watcher` and claims watcher matched events.
 - Bot fallback is not the normal path. After sustained watcher failure, all bots compete for a PostgreSQL lease and only one shared no-key leader scans until the watcher has recovered and its watermark is caught up.
 - Shared no-key fallback requires the watcher PostgreSQL DSN and a unique stable `BOT_FALLBACK_INSTANCE_ID` per bot; there is no per-bot emergency scanner switch or fixed maximum active time.
+- v2.4.1 was the bot day-cutoff activation fix. The unpublished v2.4.2 candidate is the next bot + watcher synchronized rollout; use `docs/production-rollout-v2.4.2.md` after a real Release exists.
+- Ignore deployment files from the outer legacy worktree. The only candidate baseline is the confirmed `codex/v2.4.2-integration` commit.
 
 ## v2.4.2 Candidate Watcher Configuration
 
@@ -52,6 +54,8 @@ CHAIN_WATCHER_KEY_ENCRYPTION_KEY=base64_encoded_32_byte_key
 ```
 
 The main scan always creates three page jobs per second with an independent 3000ms API deadline and at most three in-flight rounds. Successful pages are committed even when another page fails; failures and missing anchors become fenced PostgreSQL gap tasks. High-priority page/anchor repair is separate from lower-priority watermark/window catch-up, and per-address polling is disabled by default. Key registry, usage, cooldown, cursor, and gap state are persisted; `/status` requires the admin Bearer token and exposes fingerprints only.
+
+The supported in-flight variable is `CHAIN_WATCHER_MAIN_MAX_INFLIGHT_ROUNDS`. Do not use the unsupported name `CHAIN_WATCHER_MAIN_SCAN_MAX_INFLIGHT`.
 
 Expected bot-side fallback values:
 
@@ -163,7 +167,7 @@ docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.1
 docker pull ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.1
 ```
 
-For host systemd watcher, install the GitHub Release package for `v2.4.1` instead of extracting a binary from a container image.
+For the current stable host systemd watcher, install the GitHub Release package for `v2.4.1` instead of extracting a binary from a container image. For v2.4.2, wait for its real Release package and checksum; do not invent a candidate URL or image tag.
 
 7. Verify after startup.
 

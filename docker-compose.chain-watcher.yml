@@ -1,4 +1,4 @@
-# Shared chain watcher for Telegram Ledger Bot Go v2.4.1
+# 当前正式 watcher 镜像为 v2.4.1；模板已包含未发布 v2.4.2 候选变量，禁止提前改标签。
 #
 # 宝塔多机器人部署：
 # 1. 先创建外部网络：docker network create ledger-chain-net

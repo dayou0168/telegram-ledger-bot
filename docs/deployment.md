@@ -1,13 +1,15 @@
 # Telegram 记账机器人 Go 部署运维
 
-当前已发布版本是 Go v2.4.1；本文同时记录尚未发布的 v2.4.2 watcher 配置兼容项。生产部署使用 GHCR 预构建镜像、PostgreSQL 和共享链上监听服务 `ledger-chain-watcher`。服务器上不需要源码构建作为默认路径。
+当前已发布版本是 Go v2.4.1；本文同时记录尚未发布的 v2.4.2 bot + watcher 同步升级候选配置。生产部署使用 GHCR 预构建镜像、PostgreSQL 和共享链上监听服务 `ledger-chain-watcher`。服务器上不需要源码构建作为默认路径。v2.4.2 的生产预检、备份、升级、回滚和验收见 [production-rollout-v2.4.2.md](production-rollout-v2.4.2.md)。
+
+唯一候选基线是 `codex/v2.4.2-integration` 的已确认提交；外层旧工作区中的部署文件和未跟踪脚本已过时或尚未审查，不得直接合并或投产。
 
 ## 部署基线
 
 - 机器人镜像：`ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.1`
 - watcher 镜像：`ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.1`
 
-v2.4.1 是 watcher 架构升级。上线前必须同时备份每个 bot 数据库和 watcher 数据库，配置新的 `CHAIN_WATCHER_KEY_ENCRYPTION_KEY`，并为每个 bot 设置唯一且稳定的 `BOT_FALLBACK_INSTANCE_ID`。bot 与 watcher 必须在同一个维护窗口同步升级。
+v2.4.1 是 bot 日切激活修复，生产 watcher 当时不要求同步升级。v2.4.2 才是当前 bot + watcher 同步升级候选：上线前必须同时备份每个 bot 数据库和 watcher 数据库，保留现有 `CHAIN_WATCHER_KEY_ENCRYPTION_KEY`，并确认每个 bot 的 `BOT_FALLBACK_INSTANCE_ID` 唯一且稳定。正式镜像和宿主机二进制发布前，模板继续固定 v2.4.1，不提前使用不存在的 v2.4.2 标签。
 - 数据库：每个机器人实例独立 PostgreSQL 16
 - 链上监听：多个机器人共享 `ledger-chain-watcher`，watcher 使用独立 PostgreSQL 保存订阅、匹配事件和投递游标
 - 推荐入口：宝塔 Docker Compose
@@ -89,6 +91,8 @@ CHAIN_WATCHER_LOOKBACK_SECONDS: "600"
 ```
 
 `CHAIN_WATCHER_TRONSCAN_API_KEYS` 只用于首次填充 watcher Key 注册表；旧单 Key 配置继续兼容。注册表最多保存 10 个 Key，禁用项也占槽；之后可通过受 `CHAIN_WATCHER_ADMIN_TOKEN` 保护的 `/v1/admin/keys*` 接口热增删、启停和立即复检。第 11 个 Key 会明确拒绝。
+
+实际二进制变量名是 `CHAIN_WATCHER_MAIN_MAX_INFLIGHT_ROUNDS`；`CHAIN_WATCHER_MAIN_SCAN_MAX_INFLIGHT` 不受支持，不要写入生产 env。
 
 watcher 是唯一主扫描中心：每秒以同一个 cutoff 并行读取 P1-P3，独立 API deadline 默认 3000ms，并允许最多 3 个有界在途轮次。成功页立即持久化，失败页生成精确 gap；锚点缺失时 P4-P20 由高优先 gap worker 扩页，低优先时间窗 catch-up 临近下一秒实时 deadline 时让路。cursor 只在封闭窗口完整落库后推进，safe head 默认落后实时头部 2 秒。逐地址轮询默认关闭，地址数只影响内存 hash 匹配。
 
@@ -336,8 +340,10 @@ environment:
   BOT_WATCHER_FAIL_THRESHOLD: "3"
   BOT_WATCHER_CLAIM_TIMEOUT_MS: "2000"
   BOT_FALLBACK_POLL_SECONDS: "1"
-  BOT_FALLBACK_SHARED_DATABASE_URL: "postgres://ledger:你的PostgreSQL密码@127.0.0.1:5432/ledgerchainwatcher?sslmode=disable"
+  BOT_FALLBACK_SHARED_DATABASE_URL: "postgres://ledger:你的PostgreSQL密码@host.docker.internal:5432/ledgerchainwatcher?sslmode=disable"
 ```
+
+这里的 bot 运行在 Docker 容器内，`127.0.0.1` 只指向 bot 容器自身，不能用于连接宿主机 PostgreSQL。上面同一个 bot 服务必须保留 `extra_hosts: ["host.docker.internal:host-gateway"]`。
 
 Docker 20.10+ 推荐使用：
 
@@ -504,7 +510,7 @@ ports:
 
 ## 未来接 TRON Lite FullNode + Kafka
 
-v2.4.1 第一版 watcher 统一请求 Tronscan/TronGrid。未来切换自建节点时，机器人配置不变，只调整 watcher：
+当前已发布 watcher 统一请求 Tronscan/TronGrid。未来切换自建节点时，机器人配置不变，只调整 watcher；跨服务器网络和安全验收必须先按 [production-rollout-v2.4.2.md](production-rollout-v2.4.2.md) 的事件服务器清单完成：
 
 ```yaml
 CHAIN_WATCHER_SOURCE: "kafka"
@@ -600,6 +606,8 @@ gzip backups/*.sql
 
 建议把 `backups/` 同步到服务器外部位置，例如另一台机器、对象存储或网盘。
 
+仓库提供 [deploy/offsite-backup.sh](../deploy/offsite-backup.sh) 作为默认只读、显式 `push --apply` 才上传的异地 rsync 模板。异地备份和季度恢复演练步骤见 [production-rollout-v2.4.2.md](production-rollout-v2.4.2.md)。没有完成异地下载与临时库恢复前，不应把本机压缩文件视为完整灾备。
+
 ## 日志保留和磁盘保护
 
 长期运行建议同时限制 Docker、journald 和 PostgreSQL 日志：
@@ -611,6 +619,8 @@ PostgreSQL 日志: 优先使用宝塔或系统 logrotate，避免单个 postgres
 ```
 
 Docker 的 `json-file` 驱动不能严格按时间保留 72 小时，只能按大小和文件数轮转。要严格按时间保留，需要切换到 journald 或额外 logrotate，但会改变 Docker/宝塔查看容器日志的方式。默认模板选择 `json-file` 大小上限，是为了兼容宝塔 Compose 并优先保护磁盘。
+
+当前生产 bot 已在容器 recreate 后实际加载 `max-size=20m`、`max-file=5`。新模板会在首次创建或下次 recreate 容器时应用同一上限；这不代表每种日志量下都能保留完整 72 小时。
 
 检查当前容器日志配置：
 

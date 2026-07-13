@@ -1,4 +1,4 @@
-# Telegram 记账机器人 Go v2.4.1 + PostgreSQL + shared chain watcher
+# 当前正式镜像为 v2.4.1；模板已包含未发布 v2.4.2 候选变量，禁止提前改成不存在的标签。
 #
 # 单机器人一体部署模板。多机器人共享 watcher 时，请使用仓库根目录
 # docker-compose.chain-watcher.yml 单独部署 watcher，再让每个机器人加入 ledger-chain-net。
@@ -121,11 +121,11 @@ services:
       CHAIN_WATCHER_URL: "http://ledger-chain-watcher:8090"
       CHAIN_WATCHER_BOT_ID: "ledger-main"
       CHAIN_WATCHER_SECRET: "change_this_chain_watcher_secret"
-      # Emergency fallback stays off by default. Normal mode only consumes watcher events.
+      # Normal mode only consumes watcher events. On sustained failure, all bots elect one shared no-key leader through PostgreSQL lease.
       DEFAULT_OPERATOR_USER_IDS: ""
       PUBLIC_BILL_BASE_URL: ""
       ADMIN_WEB_TOKEN: "change_this_admin_password"
-      # 普通用户最多可监听几个地址；宿主、默认操作人和操作人不受限制。
+      # 普通用户上限；仅宿主、DEFAULT_OPERATOR_USER_IDS、active global_operators 不受限，单群 operators 不豁免。
       ADDRESS_WATCH_FREE_LIMIT: "2"
       BOT_TIMEZONE: "Asia/Shanghai"
       BOT_WORKER_THREADS: "16"
@@ -141,7 +141,7 @@ services:
       TELEGRAM_API_BASE: "https://api.telegram.org"
       BOT_POLL_TIMEOUT: "50"
       BOT_REQUEST_TIMEOUT: "30"
-      # Automatic fallback uses public no-key API by default; fill only for persistent emergency mode.
+      # Shared leader fallback uses the public no-key API; fill only for an explicitly approved persistent fallback source.
       TRONGRID_API_KEY: ""
       TRON_USDT_CONTRACT: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
       TRON_ADDRESS_BACKFILL_SECONDS: "60"

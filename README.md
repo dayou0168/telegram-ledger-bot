@@ -138,7 +138,7 @@ https://bot.your-domain.example/b/-100xxx/20260705
 https://bot.your-domain.example/admin
 ```
 
-宿主、默认操作人和已启用的广播操作人可以在私聊菜单点击 `⚙后台管理` 获取 5 分钟有效的后台登录链接。宿主可查看和管理全部后台数据；默认操作人和普通操作人进入后台后只看到自己可管理的内容，例如自己的地址监听。直接打开 `/admin/login` 仍可使用 `ADMIN_WEB_TOKEN` 作为宿主紧急入口。
+宿主、`DEFAULT_OPERATOR_USER_IDS` 和 active `global_operators` 可以在私聊菜单点击 `⚙后台管理` 获取 5 分钟有效的后台登录链接。宿主可查看和管理全部后台数据；默认操作人和 active 全局操作人进入后台后只看到自己可管理的内容。单群 `operators` 不获得私聊后台资格。直接打开 `/admin/login` 仍可使用 `ADMIN_WEB_TOKEN` 作为宿主紧急入口。
 
 后台用标签页拆分为已保存群组、广播分组、权限/操作人、地址监听和广播替换，可管理广播操作人、广播分组、分组/单群权限、监听地址开关和广播替换开关。
 
@@ -168,7 +168,7 @@ BOT_WATCHER_CLAIM_TIMEOUT_MS=2000
 BOT_FALLBACK_POLL_SECONDS=1
 BOT_FALLBACK_SHARED_DATABASE_URL=postgres://chainwatcher:***@chain-postgres:5432/ledger_chain_watcher?sslmode=disable
 TRON_USDT_CONTRACT=TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t
-# bot 自动 fallback 默认无 Key 使用公开 API；常驻应急模式需要 Key 时才填写。
+# 多 bot 通过共享 PostgreSQL lease 只选一个无 Key leader fallback；仅明确批准持久在线备用源时填写 Key。
 TRONGRID_API_KEY=
 ```
 
@@ -248,4 +248,4 @@ P2P_RATE_CACHE_TTL_SECONDS=180
 docker compose -f docker-compose.ghcr.yml up -d
 ```
 
-服务器部署见 [docs/deployment.md](docs/deployment.md)，当前发布目标优先用 Go v2.4.1 镜像、PostgreSQL、共享 `ledger-chain-watcher` 和 Docker Compose。
+服务器部署见 [docs/deployment.md](docs/deployment.md)。当前正式生产仍使用 Go v2.4.1 镜像和上一版宿主机 watcher；尚未发布的 v2.4.2 候选必须按 [生产升级、回滚与验收](docs/production-rollout-v2.4.2.md) 同步升级 bot + watcher。外层旧工作区部署文件不得回灌，唯一候选基线是 `codex/v2.4.2-integration` 的已确认提交。
