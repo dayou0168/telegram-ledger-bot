@@ -262,6 +262,9 @@ func TestPostgresStoreBasicFlow(t *testing.T) {
 	suffix := now.UnixNano()
 	chatID := -900000000000 - suffix%1000000
 	userID := int64(700000000000 + suffix%1000000)
+	if userID <= 1<<31-1 {
+		t.Fatalf("integration user id %d must exceed PostgreSQL int4", userID)
+	}
 
 	claimed, err := store.ClaimUpdate(ctx, suffix, now)
 	if err != nil {
@@ -466,6 +469,20 @@ func TestPostgresStoreBasicFlow(t *testing.T) {
 	secondary, ok, err := store.GetGlobalOperator(ctx, secondaryUserID)
 	if err != nil || !ok || secondary.ParentUserID != userID || secondary.Level != "secondary" {
 		t.Fatalf("secondary operator = %+v, %v, %v", secondary, ok, err)
+	}
+	secondaryAudit, err := store.ListPermissionAuditEvents(ctx, secondaryUserID, 10)
+	if err != nil {
+		t.Fatalf("list secondary permission audit: %v", err)
+	}
+	foundSecondaryParent := false
+	for _, event := range secondaryAudit {
+		if event.Action == "created" && event.ParentUserID == userID {
+			foundSecondaryParent = true
+			break
+		}
+	}
+	if !foundSecondaryParent {
+		t.Fatalf("secondary audit did not preserve BIGINT parent %d: %+v", userID, secondaryAudit)
 	}
 	if err := store.UpsertGlobalOperator(ctx, secondaryUserID+1, "secondary", userID+999, userID, "invalid parent", now); err == nil {
 		t.Fatal("secondary with inactive or missing primary parent should fail")

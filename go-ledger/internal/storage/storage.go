@@ -1261,7 +1261,7 @@ func insertPermissionAudit(ctx context.Context, tx pgx.Tx, event PermissionAudit
 	_, err := tx.Exec(ctx, `INSERT INTO permission_audit_events(
 		actor_user_id, subject_type, subject_user_id, action, level, parent_user_id,
 		target_type, chat_id, group_name, created_at
-	) VALUES($1, $2, $3, $4, $5, NULLIF($6, 0), $7, $8, $9, $10)`,
+	) VALUES($1, $2, $3, $4, $5, NULLIF($6::BIGINT, 0::BIGINT), $7, $8, $9, $10)`,
 		event.ActorUserID, event.SubjectType, event.SubjectUserID, event.Action, event.Level,
 		event.ParentUserID, event.TargetType, event.ChatID, event.GroupName, event.CreatedAt)
 	return err
@@ -1294,7 +1294,7 @@ func (s *Store) UpsertGlobalOperator(ctx context.Context, userID int64, level st
 		return err
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO global_operators(user_id, level, status, parent_user_id, created_by, created_at, remark)
-		VALUES($1, $2, 'active', NULLIF($3, 0), $4, $5, $6)
+		VALUES($1, $2, 'active', NULLIF($3::BIGINT, 0::BIGINT), $4, $5, $6)
 		ON CONFLICT(user_id) DO UPDATE SET
 			level=excluded.level,
 			status='active',

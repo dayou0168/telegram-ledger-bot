@@ -26,6 +26,9 @@ func TestAdminGlobalOperatorDisableAndDelegatedBroadcastScope(t *testing.T) {
 
 	now := time.Now().UTC()
 	base := int64(880000000000 + now.UnixNano()%1000000)
+	if base <= 1<<31-1 {
+		t.Fatalf("integration user id %d must exceed PostgreSQL int4", base)
+	}
 	primaryID := base
 	secondaryID := base + 1
 	otherPrimaryID := base + 2
