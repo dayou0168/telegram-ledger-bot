@@ -596,7 +596,7 @@ func TestAdminTemplateForOperatorOnlyRendersWatchTab(t *testing.T) {
 	}
 }
 
-func TestAdminTemplateForPrimaryRendersOnlyDelegatedPermissionTools(t *testing.T) {
+func TestAdminTemplateForPrimaryRendersOwnedGroupAndDelegatedPermissionTools(t *testing.T) {
 	var buf bytes.Buffer
 	data := pageData{
 		Version:                       "2.4.2",
@@ -604,6 +604,18 @@ func TestAdminTemplateForPrimaryRendersOnlyDelegatedPermissionTools(t *testing.T
 		AdminUserID:                   3003,
 		CanManageOperators:            true,
 		CanManageBroadcastPermissions: true,
+		CanManageBroadcastGroups:      true,
+		Groups: []storage.Group{
+			{ChatID: -1001, Title: "owned chat"},
+		},
+		BGroups: []storage.BroadcastGroup{
+			{Name: "owned", OwnerUserID: 3003, ChatIDs: []int64{-1001}, ChatNames: []string{"owned chat"}},
+			{Name: "shared-use", OwnerUserID: 4004, ChatIDs: []int64{-1001}, ChatNames: []string{"owned chat"}},
+		},
+		BroadcastMemberships: []storage.BroadcastGroup{
+			{Name: "owned", OwnerUserID: 3003, ChatIDs: []int64{-1001}, ChatNames: []string{"owned chat"}},
+			{Name: "shared-use", OwnerUserID: 4004, ChatIDs: []int64{-1001}, ChatNames: []string{"owned chat"}},
+		},
 		BOperators: []storage.GlobalOperator{
 			{UserID: 3004, Level: "secondary", Status: "active", ParentUserID: 3003, Remark: "own active secondary"},
 			{UserID: 3005, Level: "secondary", Status: "disabled", ParentUserID: 3003, Remark: "own disabled secondary"},
@@ -613,12 +625,12 @@ func TestAdminTemplateForPrimaryRendersOnlyDelegatedPermissionTools(t *testing.T
 		t.Fatal(err)
 	}
 	html := buf.String()
-	for _, want := range []string{`data-admin-tab-target="permissions"`, `action="/admin/operator/save"`, `action="/admin/permission/grant"`, `data-admin-tab-target="watch"`} {
+	for _, want := range []string{`data-admin-tab-target="broadcast"`, `data-admin-tab-target="permissions"`, `action="/admin/group/save"`, `action="/admin/group/rename"`, `action="/admin/operator/save"`, `action="/admin/permission/grant"`, `data-admin-tab-target="watch"`, `可管理`, `仅可使用`} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("primary admin page missing %q", want)
 		}
 	}
-	for _, blocked := range []string{`data-admin-tab-target="groups"`, `data-admin-tab-target="broadcast"`, `data-admin-tab-target="replace"`} {
+	for _, blocked := range []string{`data-admin-tab-target="replace"`} {
 		if strings.Contains(html, blocked) {
 			t.Fatalf("primary admin page exposed host module %q", blocked)
 		}

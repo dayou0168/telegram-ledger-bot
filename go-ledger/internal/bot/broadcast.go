@@ -182,11 +182,18 @@ func (b *Bot) sendBroadcastChats(ctx context.Context, privateChatID, userID, rep
 }
 
 func (b *Bot) allowedBroadcastGroupOptions(ctx context.Context, userID int64) ([]broadcastGroupOption, error) {
-	groups, err := b.store.ListBroadcastGroups(ctx)
+	all := b.perms.HasGlobalBroadcastAccess(userID)
+	var groups []storage.BroadcastGroup
+	var err error
+	if all {
+		groups, err = b.store.ListBroadcastGroups(ctx)
+	} else {
+		groups, err = b.store.ListVisibleBroadcastGroups(ctx, userID)
+	}
 	if err != nil {
 		return nil, err
 	}
-	allowed, err := b.store.ListAllowedBroadcastChats(ctx, userID, b.perms.HasGlobalBroadcastAccess(userID))
+	allowed, err := b.store.ListAllowedBroadcastChats(ctx, userID, all)
 	if err != nil {
 		return nil, err
 	}
@@ -662,6 +669,10 @@ func (b *Bot) allowedChatsForBroadcastGroup(ctx context.Context, userID int64, n
 	}
 	if b.perms.HasGlobalBroadcastAccess(userID) {
 		return groupChats, nil
+	}
+	groupAllowed, err := b.store.HasBroadcastGroupUse(ctx, userID, name)
+	if err != nil || !groupAllowed {
+		return nil, err
 	}
 	allowed, err := b.store.ListAllowedBroadcastChats(ctx, userID, false)
 	if err != nil {

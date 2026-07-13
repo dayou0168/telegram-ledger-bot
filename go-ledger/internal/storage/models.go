@@ -32,12 +32,46 @@ type Group struct {
 }
 
 type BroadcastGroup struct {
-	Name      string
-	ChatIDs   []int64
-	ChatNames []string
-	CreatedBy int64
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	Name        string
+	ChatIDs     []int64
+	ChatNames   []string
+	CreatedBy   int64
+	OwnerUserID int64
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+type BroadcastGroupAuditEvent struct {
+	ID                int64
+	ActorUserID       int64
+	Action            string
+	GroupName         string
+	PreviousGroupName string
+	ChatID            int64
+	CreatedAt         time.Time
+}
+
+type BroadcastGroupOwnerRepairCandidate struct {
+	GroupName               string
+	CreatedBy               int64
+	CreatedByLevel          string
+	CreatedByStatus         string
+	LegacyOperatorStatus    string
+	CreatedAuditActorUserID int64
+	PermissionCount         int
+	DistinctGrantorCount    int
+	OutOfScopeChatCount     int
+	Resolution              string
+	ResolvedOwnerUserID     int64
+	Reason                  string
+	CapturedAt              time.Time
+	ResolvedAt              *time.Time
+}
+
+type BroadcastGroupOwnerRepairResult struct {
+	OwnedByPrimary int
+	Environment    int
+	Ambiguous      int
 }
 
 type GlobalOperator struct {
@@ -83,6 +117,11 @@ type BroadcastPermission struct {
 	GroupName string
 	GrantedBy int64
 	CreatedAt time.Time
+}
+
+type BroadcastPermissionMutationResult struct {
+	Changed                 bool
+	GroupMembershipsChanged bool
 }
 
 type BroadcastDelivery struct {

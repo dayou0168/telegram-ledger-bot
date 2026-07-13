@@ -19,7 +19,7 @@ type Store struct {
 	keyCipher *keyCipher
 }
 
-const latestSchemaMigrationVersion = "2.4.3-broadcast-permission-restore"
+const latestSchemaMigrationVersion = "2.4.4-broadcast-group-ownership"
 
 func Open(ctx context.Context, databaseURL string) (*Store, error) {
 	return open(ctx, databaseURL, true)
@@ -453,11 +453,92 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS broadcast_groups (
 			name TEXT PRIMARY KEY,
 			created_by BIGINT NOT NULL DEFAULT 0,
+			owner_user_id BIGINT,
 			created_at TIMESTAMPTZ NOT NULL,
 			updated_at TIMESTAMPTZ NOT NULL
 		)`,
+		`ALTER TABLE broadcast_groups ADD COLUMN IF NOT EXISTS owner_user_id BIGINT`,
 		`CREATE INDEX IF NOT EXISTS idx_broadcast_groups_updated
 			ON broadcast_groups(updated_at DESC, name)`,
+		`CREATE INDEX IF NOT EXISTS idx_broadcast_groups_owner
+			ON broadcast_groups(owner_user_id, updated_at DESC, name)
+			WHERE owner_user_id IS NOT NULL`,
+		`DO $$
+		BEGIN
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='broadcast_groups_owner_fkey' AND conrelid='broadcast_groups'::regclass) THEN
+				ALTER TABLE broadcast_groups ADD CONSTRAINT broadcast_groups_owner_fkey
+					FOREIGN KEY(owner_user_id) REFERENCES global_operators(user_id) ON DELETE RESTRICT;
+			END IF;
+		END $$`,
+		`CREATE OR REPLACE FUNCTION validate_broadcast_group_owner() RETURNS trigger AS $$
+		BEGIN
+			IF NEW.owner_user_id IS NOT NULL AND NOT EXISTS (
+				SELECT 1 FROM global_operators owner
+				WHERE owner.user_id=NEW.owner_user_id
+				  AND owner.level='primary'
+			) THEN
+				RAISE EXCEPTION 'broadcast group owner must be a primary global operator';
+			END IF;
+			RETURN NEW;
+		END;
+		$$ LANGUAGE plpgsql`,
+		`DROP TRIGGER IF EXISTS trg_validate_broadcast_group_owner ON broadcast_groups`,
+		`CREATE TRIGGER trg_validate_broadcast_group_owner
+			BEFORE INSERT OR UPDATE OF owner_user_id ON broadcast_groups
+			FOR EACH ROW EXECUTE FUNCTION validate_broadcast_group_owner()`,
+		`CREATE TABLE IF NOT EXISTS broadcast_group_audit_events (
+			id BIGSERIAL PRIMARY KEY,
+			actor_user_id BIGINT NOT NULL,
+			action TEXT NOT NULL,
+			group_name TEXT NOT NULL,
+			previous_group_name TEXT NOT NULL DEFAULT '',
+			chat_id BIGINT NOT NULL DEFAULT 0,
+			created_at TIMESTAMPTZ NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_broadcast_group_audit_group
+			ON broadcast_group_audit_events(group_name, created_at DESC, id DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_broadcast_group_audit_actor
+			ON broadcast_group_audit_events(actor_user_id, created_at DESC, id DESC)`,
+		`CREATE OR REPLACE FUNCTION reject_broadcast_group_audit_mutation() RETURNS trigger AS $$
+		BEGIN
+			RAISE EXCEPTION 'broadcast group audit events are immutable';
+		END;
+		$$ LANGUAGE plpgsql`,
+		`DROP TRIGGER IF EXISTS trg_broadcast_group_audit_immutable ON broadcast_group_audit_events`,
+		`CREATE TRIGGER trg_broadcast_group_audit_immutable
+			BEFORE UPDATE OR DELETE ON broadcast_group_audit_events
+			FOR EACH ROW EXECUTE FUNCTION reject_broadcast_group_audit_mutation()`,
+		`CREATE TABLE IF NOT EXISTS broadcast_group_owner_repair_candidates (
+			group_name TEXT PRIMARY KEY,
+			created_by BIGINT NOT NULL,
+			created_by_level TEXT NOT NULL DEFAULT '',
+			created_by_status TEXT NOT NULL DEFAULT '',
+			legacy_operator_status TEXT NOT NULL DEFAULT '',
+			created_audit_actor_user_id BIGINT NOT NULL DEFAULT 0,
+			permission_count INTEGER NOT NULL DEFAULT 0,
+			distinct_grantor_count INTEGER NOT NULL DEFAULT 0,
+			out_of_scope_chat_count INTEGER NOT NULL DEFAULT 0,
+			resolution TEXT NOT NULL DEFAULT 'pending',
+			resolved_owner_user_id BIGINT,
+			reason TEXT NOT NULL DEFAULT '',
+			captured_at TIMESTAMPTZ NOT NULL,
+			resolved_at TIMESTAMPTZ
+		)`,
+		`ALTER TABLE broadcast_group_owner_repair_candidates
+			ADD COLUMN IF NOT EXISTS out_of_scope_chat_count INTEGER NOT NULL DEFAULT 0`,
+		`DO $$
+		BEGIN
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='broadcast_group_owner_repair_resolution_check' AND conrelid='broadcast_group_owner_repair_candidates'::regclass) THEN
+				ALTER TABLE broadcast_group_owner_repair_candidates ADD CONSTRAINT broadcast_group_owner_repair_resolution_check
+					CHECK (resolution IN ('pending', 'primary_owner', 'environment_owner', 'ambiguous', 'deleted', 'manual_primary_owner', 'manual_environment_owner'));
+			END IF;
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='broadcast_group_owner_repair_resolved_owner_fkey' AND conrelid='broadcast_group_owner_repair_candidates'::regclass) THEN
+				ALTER TABLE broadcast_group_owner_repair_candidates ADD CONSTRAINT broadcast_group_owner_repair_resolved_owner_fkey
+					FOREIGN KEY(resolved_owner_user_id) REFERENCES global_operators(user_id) ON DELETE RESTRICT;
+			END IF;
+		END $$`,
+		`CREATE INDEX IF NOT EXISTS idx_broadcast_group_owner_repair_resolution
+			ON broadcast_group_owner_repair_candidates(resolution, captured_at, group_name)`,
 		`CREATE TABLE IF NOT EXISTS broadcast_group_chats (
 			group_name TEXT NOT NULL REFERENCES broadcast_groups(name) ON DELETE CASCADE,
 			chat_id BIGINT NOT NULL REFERENCES groups(chat_id) ON DELETE CASCADE,
@@ -496,6 +577,8 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_broadcast_permissions_group
 			ON broadcast_operator_permissions(user_id, target, group_name)
 			WHERE target = 'group'`,
+		`CREATE INDEX IF NOT EXISTS idx_broadcast_permissions_grant_source
+			ON broadcast_operator_permissions(granted_by, user_id, target, group_name, chat_id)`,
 		`DELETE FROM broadcast_operator_permissions p
 			WHERE (p.target='group' AND NOT EXISTS (
 				SELECT 1 FROM broadcast_groups g WHERE g.name=p.group_name
@@ -594,6 +677,44 @@ func (s *Store) migrate(ctx context.Context) error {
 			SELECT 1 FROM global_operators g
 			WHERE g.user_id=p.user_id AND g.status='active' AND g.level IN ('primary', 'secondary')
 		)`,
+		`WITH migration AS (
+			INSERT INTO schema_migrations(version, applied_at)
+			VALUES('2.4.4-broadcast-group-owner-candidates-captured', NOW())
+			ON CONFLICT(version) DO NOTHING
+			RETURNING 1
+		)
+		INSERT INTO broadcast_group_owner_repair_candidates(
+			group_name, created_by, created_by_level, created_by_status,
+			legacy_operator_status, created_audit_actor_user_id,
+			permission_count, distinct_grantor_count, out_of_scope_chat_count, captured_at
+		)
+		SELECT bg.name, bg.created_by,
+			COALESCE(go.level, ''), COALESCE(go.status, ''), COALESCE(bo.status, ''),
+			COALESCE((
+				SELECT CASE
+					WHEN count(DISTINCT a.actor_user_id)=0 THEN 0
+					WHEN count(DISTINCT a.actor_user_id)=1 THEN min(a.actor_user_id)
+					ELSE -1
+				END
+				FROM broadcast_group_audit_events a
+				WHERE a.group_name=bg.name AND a.action='created'
+			), 0),
+			(SELECT count(*) FROM broadcast_operator_permissions p
+			 WHERE p.target='group' AND p.group_name=bg.name),
+			(SELECT count(DISTINCT p.granted_by) FROM broadcast_operator_permissions p
+			 WHERE p.target='group' AND p.group_name=bg.name),
+			(SELECT count(*) FROM broadcast_group_chats bgc
+			 WHERE bgc.group_name=bg.name AND NOT EXISTS (
+				SELECT 1 FROM broadcast_operator_permissions p
+				WHERE p.user_id=bg.created_by AND p.target='chat' AND p.chat_id=bgc.chat_id
+			 )),
+			NOW()
+		FROM broadcast_groups bg
+		CROSS JOIN migration
+		LEFT JOIN global_operators go ON go.user_id=bg.created_by
+		LEFT JOIN broadcast_operators bo ON bo.user_id=bg.created_by
+		WHERE bg.owner_user_id IS NULL
+		ON CONFLICT(group_name) DO NOTHING`,
 		`CREATE TABLE IF NOT EXISTS admin_login_tickets (
 			token_hash TEXT PRIMARY KEY,
 			user_id BIGINT NOT NULL,
@@ -1062,6 +1183,11 @@ func (s *Store) migrate(ctx context.Context) error {
 		VALUES('2.4.3', NOW())
 		ON CONFLICT(version) DO NOTHING`); err != nil {
 		return fmt.Errorf("record chain gap migration: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
+		VALUES('2.4.3-broadcast-permission-restore', NOW())
+		ON CONFLICT(version) DO NOTHING`); err != nil {
+		return fmt.Errorf("record broadcast permission restore migration: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
 		VALUES($1, NOW())
@@ -1653,6 +1779,186 @@ func (s *Store) NormalizeGlobalOperatorHierarchy(ctx context.Context, hostUserID
 		return GlobalOperatorHierarchyRepairResult{}, err
 	}
 	return result, nil
+}
+
+func (s *Store) NormalizeBroadcastGroupOwnership(ctx context.Context, hostUserID int64, defaultOperatorIDs map[int64]struct{}, now time.Time) (BroadcastGroupOwnerRepairResult, error) {
+	var result BroadcastGroupOwnerRepairResult
+	if hostUserID <= 0 {
+		return result, errors.New("broadcast group ownership requires a configured host user id")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return result, err
+	}
+	defer rollback(ctx, tx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext(current_database()), $1)`, int32(0x42475250)); err != nil {
+		return result, err
+	}
+	var normalized bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(
+		SELECT 1 FROM schema_migrations WHERE version='2.4.4-broadcast-group-owners-normalized'
+	)`).Scan(&normalized); err != nil {
+		return result, err
+	}
+	if normalized {
+		return result, tx.Commit(ctx)
+	}
+
+	environmentIDs := map[int64]struct{}{hostUserID: {}}
+	for userID := range defaultOperatorIDs {
+		if userID > 0 {
+			environmentIDs[userID] = struct{}{}
+		}
+	}
+	rows, err := tx.Query(ctx, `SELECT c.group_name, c.created_by,
+		COALESCE(g.level, ''), COALESCE(g.status, ''), COALESCE(bo.status, ''),
+		COALESCE((
+			SELECT CASE
+				WHEN count(DISTINCT a.actor_user_id)=0 THEN 0
+				WHEN count(DISTINCT a.actor_user_id)=1 THEN min(a.actor_user_id)
+				ELSE -1
+			END
+			FROM broadcast_group_audit_events a
+			WHERE a.group_name=c.group_name AND a.action='created'
+		), 0),
+		(SELECT count(*) FROM broadcast_operator_permissions p
+		 WHERE p.target='group' AND p.group_name=c.group_name),
+		(SELECT count(DISTINCT p.granted_by) FROM broadcast_operator_permissions p
+		 WHERE p.target='group' AND p.group_name=c.group_name),
+		(SELECT count(*) FROM broadcast_group_chats bgc
+		 WHERE bgc.group_name=c.group_name AND NOT EXISTS (
+			SELECT 1 FROM broadcast_operator_permissions p
+			WHERE p.user_id=c.created_by AND p.target='chat' AND p.chat_id=bgc.chat_id
+		))
+		FROM broadcast_group_owner_repair_candidates c
+		JOIN broadcast_groups bg ON bg.name=c.group_name
+		LEFT JOIN global_operators g ON g.user_id=c.created_by
+		LEFT JOIN broadcast_operators bo ON bo.user_id=c.created_by
+		WHERE c.resolution='pending' AND bg.owner_user_id IS NULL
+		ORDER BY c.group_name
+		FOR UPDATE OF c, bg`)
+	if err != nil {
+		return result, err
+	}
+	type candidate struct {
+		groupName, level, status, legacyStatus string
+		createdBy, createdAuditActorUserID     int64
+		permissionCount, distinctGrantors      int
+		outOfScopeChatCount                    int
+	}
+	var candidates []candidate
+	for rows.Next() {
+		var c candidate
+		if err := rows.Scan(&c.groupName, &c.createdBy, &c.level, &c.status, &c.legacyStatus,
+			&c.createdAuditActorUserID, &c.permissionCount, &c.distinctGrantors,
+			&c.outOfScopeChatCount); err != nil {
+			rows.Close()
+			return result, err
+		}
+		candidates = append(candidates, c)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return result, err
+	}
+	rows.Close()
+
+	for _, c := range candidates {
+		resolution := "ambiguous"
+		reason := "created_by does not identify an active primary global operator"
+		ownerUserID := int64(0)
+		auditAction := "owner_ambiguous"
+		if c.createdAuditActorUserID == -1 || (c.createdAuditActorUserID > 0 && c.createdAuditActorUserID != c.createdBy) {
+			reason = "created_by conflicts with broadcast group creation audit"
+		} else if _, environmentIdentity := environmentIDs[c.createdBy]; environmentIdentity {
+			resolution = "environment_owner"
+			reason = "created_by is the configured host or a default operator"
+			auditAction = "owner_environment_confirmed"
+			result.Environment++
+		} else if c.level == "primary" && c.status == "active" && c.legacyStatus != "disabled" && c.outOfScopeChatCount == 0 {
+			resolution = "primary_owner"
+			reason = "created_by is an active primary and all group chats are within its direct scope"
+			ownerUserID = c.createdBy
+			auditAction = "owner_migrated"
+			result.OwnedByPrimary++
+		} else {
+			switch {
+			case c.level == "secondary":
+				reason = "created_by is a secondary global operator"
+			case c.level != "" && c.status != "active":
+				reason = "created_by global operator is not active"
+			case c.level == "primary" && c.legacyStatus == "disabled":
+				reason = "active primary conflicts with disabled compatibility evidence"
+			case c.level == "primary" && c.status == "active" && c.outOfScopeChatCount > 0:
+				reason = "group contains chats outside the created_by primary's direct scope"
+			case c.createdBy == 0:
+				reason = "created_by is zero"
+			}
+		}
+		if resolution == "ambiguous" {
+			result.Ambiguous++
+		}
+		if ownerUserID > 0 {
+			if _, err := tx.Exec(ctx, `UPDATE broadcast_groups SET owner_user_id=$2, updated_at=$3
+				WHERE name=$1 AND owner_user_id IS NULL`, c.groupName, ownerUserID, now); err != nil {
+				return result, err
+			}
+		}
+		if _, err := tx.Exec(ctx, `UPDATE broadcast_group_owner_repair_candidates SET
+			created_by_level=$2, created_by_status=$3, legacy_operator_status=$4,
+			created_audit_actor_user_id=$5, permission_count=$6, distinct_grantor_count=$7,
+			out_of_scope_chat_count=$8, resolution=$9,
+			resolved_owner_user_id=NULLIF($10::BIGINT, 0::BIGINT),
+			reason=$11, resolved_at=$12
+			WHERE group_name=$1 AND resolution='pending'`,
+			c.groupName, c.level, c.status, c.legacyStatus, c.createdAuditActorUserID,
+			c.permissionCount, c.distinctGrantors, c.outOfScopeChatCount,
+			resolution, ownerUserID, reason, now); err != nil {
+			return result, err
+		}
+		if err := insertBroadcastGroupAudit(ctx, tx, BroadcastGroupAuditEvent{
+			ActorUserID: hostUserID, Action: auditAction, GroupName: c.groupName, CreatedAt: now,
+		}); err != nil {
+			return result, err
+		}
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
+		VALUES('2.4.4-broadcast-group-owners-normalized', $1)`, now); err != nil {
+		return result, err
+	}
+	return result, tx.Commit(ctx)
+}
+
+func (s *Store) ListBroadcastGroupOwnerRepairCandidates(ctx context.Context) ([]BroadcastGroupOwnerRepairCandidate, error) {
+	rows, err := s.pool.Query(ctx, `SELECT group_name, created_by, created_by_level,
+		created_by_status, legacy_operator_status, created_audit_actor_user_id,
+		permission_count, distinct_grantor_count, out_of_scope_chat_count, resolution,
+		COALESCE(resolved_owner_user_id, 0), reason, captured_at, resolved_at
+		FROM broadcast_group_owner_repair_candidates
+		ORDER BY captured_at ASC, group_name ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var candidates []BroadcastGroupOwnerRepairCandidate
+	for rows.Next() {
+		var candidate BroadcastGroupOwnerRepairCandidate
+		var resolvedAt pgtype.Timestamptz
+		if err := rows.Scan(&candidate.GroupName, &candidate.CreatedBy, &candidate.CreatedByLevel,
+			&candidate.CreatedByStatus, &candidate.LegacyOperatorStatus,
+			&candidate.CreatedAuditActorUserID, &candidate.PermissionCount,
+			&candidate.DistinctGrantorCount, &candidate.OutOfScopeChatCount, &candidate.Resolution,
+			&candidate.ResolvedOwnerUserID, &candidate.Reason, &candidate.CapturedAt,
+			&resolvedAt); err != nil {
+			return nil, err
+		}
+		if resolvedAt.Valid {
+			resolved := resolvedAt.Time
+			candidate.ResolvedAt = &resolved
+		}
+		candidates = append(candidates, candidate)
+	}
+	return candidates, rows.Err()
 }
 
 func (s *Store) IsGlobalOperator(ctx context.Context, userID int64) (bool, error) {
@@ -2565,30 +2871,97 @@ func (s *Store) CleanupLedgerClearTickets(ctx context.Context, cutoff time.Time)
 	return tag.RowsAffected(), err
 }
 
-func (s *Store) UpsertBroadcastGroup(ctx context.Context, name string, createdBy int64, now time.Time) error {
+var ErrBroadcastScopeDenied = errors.New("broadcast scope denied")
+
+func insertBroadcastGroupAudit(ctx context.Context, tx pgx.Tx, event BroadcastGroupAuditEvent) error {
+	_, err := tx.Exec(ctx, `INSERT INTO broadcast_group_audit_events(
+		actor_user_id, action, group_name, previous_group_name, chat_id, created_at
+	) VALUES($1, $2, $3, $4, $5, $6)`,
+		event.ActorUserID, event.Action, event.GroupName, event.PreviousGroupName, event.ChatID, event.CreatedAt)
+	return err
+}
+
+func (s *Store) CreateBroadcastGroup(ctx context.Context, name string, createdBy, ownerUserID int64, now time.Time) (bool, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
-		return errors.New("broadcast group name is empty")
+		return false, errors.New("broadcast group name is empty")
 	}
-	_, err := s.pool.Exec(ctx, `INSERT INTO broadcast_groups(name, created_by, created_at, updated_at)
-		VALUES($1, $2, $3, $4)
-		ON CONFLICT(name) DO UPDATE SET updated_at=excluded.updated_at`,
-		name, createdBy, now, now)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer rollback(ctx, tx)
+	if ownerUserID > 0 {
+		var level, status string
+		if err := tx.QueryRow(ctx, `SELECT level, status FROM global_operators
+			WHERE user_id=$1 FOR SHARE`, ownerUserID).Scan(&level, &status); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return false, ErrBroadcastScopeDenied
+			}
+			return false, err
+		}
+		if level != "primary" || status != "active" {
+			return false, ErrBroadcastScopeDenied
+		}
+	}
+	tag, err := tx.Exec(ctx, `INSERT INTO broadcast_groups(
+		name, created_by, owner_user_id, created_at, updated_at
+	) VALUES($1, $2, NULLIF($3::BIGINT, 0::BIGINT), $4, $4)
+	ON CONFLICT(name) DO NOTHING`, name, createdBy, ownerUserID, now)
+	if err != nil {
+		return false, err
+	}
+	if tag.RowsAffected() == 0 {
+		return false, tx.Commit(ctx)
+	}
+	if err := insertBroadcastGroupAudit(ctx, tx, BroadcastGroupAuditEvent{
+		ActorUserID: createdBy, Action: "created", GroupName: name, CreatedAt: now,
+	}); err != nil {
+		return false, err
+	}
+	return true, tx.Commit(ctx)
+}
+
+// UpsertBroadcastGroup is retained for trusted internal setup paths. It never
+// infers ownership from created_by, so legacy and host-created groups remain
+// host-managed unless they were created through CreateBroadcastGroup with an
+// explicit active primary owner.
+func (s *Store) UpsertBroadcastGroup(ctx context.Context, name string, createdBy int64, now time.Time) error {
+	created, err := s.CreateBroadcastGroup(ctx, name, createdBy, 0, now)
+	if err != nil || created {
+		return err
+	}
+	_, err = s.pool.Exec(ctx, `UPDATE broadcast_groups SET updated_at=$2 WHERE name=$1`, strings.TrimSpace(name), now)
 	return err
 }
 
 func (s *Store) DeleteBroadcastGroup(ctx context.Context, name string) (bool, error) {
-	ok, _, err := s.DeleteBroadcastGroupManaged(ctx, name, 0, time.Now())
+	ok, _, err := s.DeleteBroadcastGroupManaged(ctx, name, 0, true, time.Now())
 	return ok, err
 }
 
-func (s *Store) DeleteBroadcastGroupManaged(ctx context.Context, name string, actorUserID int64, now time.Time) (bool, []int64, error) {
+func (s *Store) DeleteBroadcastGroupManaged(ctx context.Context, name string, actorUserID int64, manageAll bool, now time.Time) (bool, []int64, error) {
 	name = strings.TrimSpace(name)
+	if name == "" {
+		return false, nil, errors.New("broadcast group name is empty")
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return false, nil, err
 	}
 	defer rollback(ctx, tx)
+	var ownerUserID int64
+	err = tx.QueryRow(ctx, `SELECT COALESCE(owner_user_id, 0) FROM broadcast_groups
+		WHERE name=$1 FOR UPDATE`, name).Scan(&ownerUserID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil, tx.Commit(ctx)
+	}
+	if err != nil {
+		return false, nil, err
+	}
+	if !manageAll && (actorUserID <= 0 || ownerUserID != actorUserID) {
+		return false, nil, ErrBroadcastScopeDenied
+	}
 	rows, err := tx.Query(ctx, `SELECT user_id FROM broadcast_operator_permissions
 		WHERE target='group' AND group_name=$1 FOR UPDATE`, name)
 	if err != nil {
@@ -2614,10 +2987,20 @@ func (s *Store) DeleteBroadcastGroupManaged(ctx context.Context, name string, ac
 	if _, err := tx.Exec(ctx, `DELETE FROM broadcast_operator_permission_snapshots WHERE target='group' AND group_name=$1`, name); err != nil {
 		return false, nil, err
 	}
+	if _, err := tx.Exec(ctx, `UPDATE broadcast_group_owner_repair_candidates SET
+		resolution='deleted', reason='broadcast group deleted', resolved_at=$2
+		WHERE group_name=$1`, name, now); err != nil {
+		return false, nil, err
+	}
 	for _, userID := range affected {
 		if err := insertPermissionAudit(ctx, tx, PermissionAuditEvent{ActorUserID: actorUserID, SubjectType: "broadcast_permission", SubjectUserID: userID, Action: "revoke", TargetType: "group", GroupName: name, CreatedAt: now}); err != nil {
 			return false, nil, err
 		}
+	}
+	if err := insertBroadcastGroupAudit(ctx, tx, BroadcastGroupAuditEvent{
+		ActorUserID: actorUserID, Action: "deleted", GroupName: name, CreatedAt: now,
+	}); err != nil {
+		return false, nil, err
 	}
 	tag, err := tx.Exec(ctx, `DELETE FROM broadcast_groups WHERE name=$1`, name)
 	if err != nil {
@@ -2626,7 +3009,7 @@ func (s *Store) DeleteBroadcastGroupManaged(ctx context.Context, name string, ac
 	return tag.RowsAffected() > 0, uniqueInt64(affected), tx.Commit(ctx)
 }
 
-func (s *Store) RenameBroadcastGroup(ctx context.Context, oldName, newName string, actorUserID int64, now time.Time) (bool, []int64, error) {
+func (s *Store) RenameBroadcastGroup(ctx context.Context, oldName, newName string, actorUserID int64, manageAll bool, now time.Time) (bool, []int64, error) {
 	oldName = strings.TrimSpace(oldName)
 	newName = strings.TrimSpace(newName)
 	if oldName == "" || newName == "" || oldName == newName {
@@ -2637,8 +3020,20 @@ func (s *Store) RenameBroadcastGroup(ctx context.Context, oldName, newName strin
 		return false, nil, err
 	}
 	defer rollback(ctx, tx)
-	tag, err := tx.Exec(ctx, `INSERT INTO broadcast_groups(name, created_by, created_at, updated_at)
-		SELECT $2, created_by, created_at, $3 FROM broadcast_groups WHERE name=$1`, oldName, newName, now)
+	var ownerUserID int64
+	err = tx.QueryRow(ctx, `SELECT COALESCE(owner_user_id, 0) FROM broadcast_groups
+		WHERE name=$1 FOR UPDATE`, oldName).Scan(&ownerUserID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil, tx.Commit(ctx)
+	}
+	if err != nil {
+		return false, nil, err
+	}
+	if !manageAll && (actorUserID <= 0 || ownerUserID != actorUserID) {
+		return false, nil, ErrBroadcastScopeDenied
+	}
+	tag, err := tx.Exec(ctx, `INSERT INTO broadcast_groups(name, created_by, owner_user_id, created_at, updated_at)
+		SELECT $2, created_by, owner_user_id, created_at, $3 FROM broadcast_groups WHERE name=$1`, oldName, newName, now)
 	if err != nil {
 		return false, nil, err
 	}
@@ -2673,6 +3068,9 @@ func (s *Store) RenameBroadcastGroup(ctx context.Context, oldName, newName strin
 	if _, err := tx.Exec(ctx, `UPDATE broadcast_operator_permission_snapshots SET group_name=$2 WHERE target='group' AND group_name=$1`, oldName, newName); err != nil {
 		return false, nil, err
 	}
+	if _, err := tx.Exec(ctx, `UPDATE broadcast_group_owner_repair_candidates SET group_name=$2 WHERE group_name=$1`, oldName, newName); err != nil {
+		return false, nil, err
+	}
 	if _, err := tx.Exec(ctx, `DELETE FROM broadcast_groups WHERE name=$1`, oldName); err != nil {
 		return false, nil, err
 	}
@@ -2681,10 +3079,20 @@ func (s *Store) RenameBroadcastGroup(ctx context.Context, oldName, newName strin
 			return false, nil, err
 		}
 	}
+	if err := insertBroadcastGroupAudit(ctx, tx, BroadcastGroupAuditEvent{
+		ActorUserID: actorUserID, Action: "renamed", GroupName: newName,
+		PreviousGroupName: oldName, CreatedAt: now,
+	}); err != nil {
+		return false, nil, err
+	}
 	return true, uniqueInt64(affected), tx.Commit(ctx)
 }
 
 func (s *Store) AddChatsToBroadcastGroup(ctx context.Context, name string, chatIDs []int64, now time.Time) (int, error) {
+	return s.AddChatsToBroadcastGroupManaged(ctx, name, chatIDs, 0, true, now)
+}
+
+func (s *Store) AddChatsToBroadcastGroupManaged(ctx context.Context, name string, chatIDs []int64, actorUserID int64, manageAll bool, now time.Time) (int, error) {
 	name = strings.TrimSpace(name)
 	if name == "" || len(chatIDs) == 0 {
 		return 0, nil
@@ -2694,22 +3102,63 @@ func (s *Store) AddChatsToBroadcastGroup(ctx context.Context, name string, chatI
 		return 0, err
 	}
 	defer rollback(ctx, tx)
+	var ownerUserID int64
+	err = tx.QueryRow(ctx, `SELECT COALESCE(owner_user_id, 0) FROM broadcast_groups
+		WHERE name=$1 FOR UPDATE`, name).Scan(&ownerUserID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, tx.Commit(ctx)
+	}
+	if err != nil {
+		return 0, err
+	}
+	if !manageAll && (actorUserID <= 0 || ownerUserID != actorUserID) {
+		return 0, ErrBroadcastScopeDenied
+	}
+	uniqueChatIDs := uniqueInt64(chatIDs)
+	if !manageAll {
+		var allowedCount int
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM unnest($1::BIGINT[]) requested(chat_id)
+			WHERE EXISTS(SELECT 1 FROM groups g WHERE g.chat_id=requested.chat_id)
+			  AND EXISTS(
+				SELECT 1 FROM broadcast_operator_permissions p
+				WHERE p.user_id=$2::BIGINT AND p.target='chat' AND p.chat_id=requested.chat_id
+			  )`, uniqueChatIDs, actorUserID).Scan(&allowedCount); err != nil {
+			return 0, err
+		}
+		if allowedCount != len(uniqueChatIDs) {
+			return 0, ErrBroadcastScopeDenied
+		}
+	}
 	count := 0
-	for _, chatID := range uniqueInt64(chatIDs) {
+	for _, chatID := range uniqueChatIDs {
 		tag, err := tx.Exec(ctx, `INSERT INTO broadcast_group_chats(group_name, chat_id, created_at)
 			SELECT $1, $2, $3
-			WHERE EXISTS(SELECT 1 FROM broadcast_groups WHERE name=$1)
-			  AND EXISTS(SELECT 1 FROM groups WHERE chat_id=$2)
-			ON CONFLICT DO NOTHING`, name, chatID, now)
+			WHERE EXISTS(SELECT 1 FROM groups WHERE chat_id=$2)
+			  AND ($4::BOOLEAN OR EXISTS (
+				SELECT 1 FROM broadcast_operator_permissions p
+				WHERE p.user_id=$5::BIGINT AND p.target='chat' AND p.chat_id=$2
+			  ))
+			ON CONFLICT DO NOTHING`, name, chatID, now, manageAll, actorUserID)
 		if err != nil {
 			return 0, err
 		}
-		count += int(tag.RowsAffected())
+		if tag.RowsAffected() > 0 {
+			count++
+			if err := insertBroadcastGroupAudit(ctx, tx, BroadcastGroupAuditEvent{
+				ActorUserID: actorUserID, Action: "chat_added", GroupName: name, ChatID: chatID, CreatedAt: now,
+			}); err != nil {
+				return 0, err
+			}
+		}
 	}
 	return count, tx.Commit(ctx)
 }
 
 func (s *Store) RemoveChatsFromBroadcastGroup(ctx context.Context, name string, chatIDs []int64) (int, error) {
+	return s.RemoveChatsFromBroadcastGroupManaged(ctx, name, chatIDs, 0, true, time.Now())
+}
+
+func (s *Store) RemoveChatsFromBroadcastGroupManaged(ctx context.Context, name string, chatIDs []int64, actorUserID int64, manageAll bool, now time.Time) (int, error) {
 	name = strings.TrimSpace(name)
 	if name == "" || len(chatIDs) == 0 {
 		return 0, nil
@@ -2719,24 +3168,58 @@ func (s *Store) RemoveChatsFromBroadcastGroup(ctx context.Context, name string, 
 		return 0, err
 	}
 	defer rollback(ctx, tx)
+	var ownerUserID int64
+	err = tx.QueryRow(ctx, `SELECT COALESCE(owner_user_id, 0) FROM broadcast_groups
+		WHERE name=$1 FOR UPDATE`, name).Scan(&ownerUserID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, tx.Commit(ctx)
+	}
+	if err != nil {
+		return 0, err
+	}
+	if !manageAll && (actorUserID <= 0 || ownerUserID != actorUserID) {
+		return 0, ErrBroadcastScopeDenied
+	}
 	count := 0
 	for _, chatID := range uniqueInt64(chatIDs) {
 		tag, err := tx.Exec(ctx, `DELETE FROM broadcast_group_chats WHERE group_name=$1 AND chat_id=$2`, name, chatID)
 		if err != nil {
 			return 0, err
 		}
-		count += int(tag.RowsAffected())
+		if tag.RowsAffected() > 0 {
+			count++
+			if err := insertBroadcastGroupAudit(ctx, tx, BroadcastGroupAuditEvent{
+				ActorUserID: actorUserID, Action: "chat_removed", GroupName: name, ChatID: chatID, CreatedAt: now,
+			}); err != nil {
+				return 0, err
+			}
+		}
 	}
 	return count, tx.Commit(ctx)
 }
 
 func (s *Store) ListBroadcastGroups(ctx context.Context) ([]BroadcastGroup, error) {
-	rows, err := s.pool.Query(ctx, `SELECT bg.name, bg.created_by, bg.created_at, bg.updated_at,
+	return s.listBroadcastGroups(ctx, 0, true)
+}
+
+func (s *Store) ListVisibleBroadcastGroups(ctx context.Context, userID int64) ([]BroadcastGroup, error) {
+	if userID <= 0 {
+		return nil, nil
+	}
+	return s.listBroadcastGroups(ctx, userID, false)
+}
+
+func (s *Store) listBroadcastGroups(ctx context.Context, userID int64, all bool) ([]BroadcastGroup, error) {
+	rows, err := s.pool.Query(ctx, `SELECT bg.name, bg.created_by, COALESCE(bg.owner_user_id, 0), bg.created_at, bg.updated_at,
 		COALESCE(g.chat_id, 0), COALESCE(g.title, '')
 		FROM broadcast_groups bg
 		LEFT JOIN broadcast_group_chats bgc ON bgc.group_name=bg.name
 		LEFT JOIN groups g ON g.chat_id=bgc.chat_id
-		ORDER BY bg.updated_at DESC, bg.name ASC, g.title ASC, g.chat_id ASC`)
+		WHERE $1::BOOLEAN OR bg.owner_user_id=$2::BIGINT OR EXISTS (
+			SELECT 1 FROM broadcast_operator_permissions p
+			WHERE p.user_id=$2::BIGINT AND p.target='group' AND p.group_name=bg.name
+		)
+		ORDER BY bg.updated_at DESC, bg.name ASC, g.title ASC, g.chat_id ASC`, all, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -2745,16 +3228,16 @@ func (s *Store) ListBroadcastGroups(ctx context.Context) ([]BroadcastGroup, erro
 	var order []string
 	for rows.Next() {
 		var name string
-		var createdBy int64
+		var createdBy, ownerUserID int64
 		var createdAt, updatedAt time.Time
 		var chatID int64
 		var title string
-		if err := rows.Scan(&name, &createdBy, &createdAt, &updatedAt, &chatID, &title); err != nil {
+		if err := rows.Scan(&name, &createdBy, &ownerUserID, &createdAt, &updatedAt, &chatID, &title); err != nil {
 			return nil, err
 		}
 		group := byName[name]
 		if group == nil {
-			group = &BroadcastGroup{Name: name, CreatedBy: createdBy, CreatedAt: createdAt, UpdatedAt: updatedAt}
+			group = &BroadcastGroup{Name: name, CreatedBy: createdBy, OwnerUserID: ownerUserID, CreatedAt: createdAt, UpdatedAt: updatedAt}
 			byName[name] = group
 			order = append(order, name)
 		}
@@ -2771,6 +3254,88 @@ func (s *Store) ListBroadcastGroups(ctx context.Context) ([]BroadcastGroup, erro
 		groups = append(groups, *byName[name])
 	}
 	return groups, nil
+}
+
+func (s *Store) GetBroadcastGroup(ctx context.Context, name string) (BroadcastGroup, bool, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return BroadcastGroup{}, false, nil
+	}
+	var group BroadcastGroup
+	err := s.pool.QueryRow(ctx, `SELECT name, created_by, COALESCE(owner_user_id, 0), created_at, updated_at
+		FROM broadcast_groups WHERE name=$1`, name).Scan(
+		&group.Name, &group.CreatedBy, &group.OwnerUserID, &group.CreatedAt, &group.UpdatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return BroadcastGroup{}, false, nil
+	}
+	return group, err == nil, err
+}
+
+func (s *Store) HasBroadcastGroupUse(ctx context.Context, userID int64, name string) (bool, error) {
+	name = strings.TrimSpace(name)
+	if userID <= 0 || name == "" {
+		return false, nil
+	}
+	var one int
+	err := s.pool.QueryRow(ctx, `SELECT 1 FROM broadcast_groups bg
+		WHERE bg.name=$2 AND (
+			bg.owner_user_id=$1::BIGINT OR EXISTS (
+				SELECT 1 FROM broadcast_operator_permissions p
+				WHERE p.user_id=$1::BIGINT AND p.target='group' AND p.group_name=bg.name
+			)
+		) LIMIT 1`, userID, name).Scan(&one)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func (s *Store) ListDirectBroadcastChats(ctx context.Context, userID int64) ([]Group, error) {
+	rows, err := s.pool.Query(ctx, `SELECT g.chat_id, g.title, g.active, g.active_day_key, g.active_expires_day_key, g.active_period_started_at, g.business_open, g.owner_user_id,
+		g.deposit_rate, g.payout_rate, g.deposit_exchange_rate, g.payout_exchange_rate,
+		g.exchange_rate_source, g.exchange_rate_rank, g.exchange_rate_offset, g.fee_rate,
+		g.cutoff_hour, g.all_members_can_record, g.created_at, g.updated_at
+		FROM broadcast_operator_permissions p
+		JOIN groups g ON g.chat_id=p.chat_id
+		WHERE p.user_id=$1 AND p.target='chat' AND g.chat_id<0
+		ORDER BY g.title ASC, g.chat_id ASC`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var groups []Group
+	for rows.Next() {
+		group, err := scanGroup(rows)
+		if err != nil {
+			return nil, err
+		}
+		groups = append(groups, group)
+	}
+	return groups, rows.Err()
+}
+
+func (s *Store) ListBroadcastGroupAuditEvents(ctx context.Context, groupName string) ([]BroadcastGroupAuditEvent, error) {
+	groupName = strings.TrimSpace(groupName)
+	rows, err := s.pool.Query(ctx, `SELECT id, actor_user_id, action, group_name,
+		previous_group_name, chat_id, created_at
+		FROM broadcast_group_audit_events
+		WHERE $1='' OR group_name=$1 OR previous_group_name=$1
+		ORDER BY created_at ASC, id ASC`, groupName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var events []BroadcastGroupAuditEvent
+	for rows.Next() {
+		var event BroadcastGroupAuditEvent
+		if err := rows.Scan(&event.ID, &event.ActorUserID, &event.Action, &event.GroupName,
+			&event.PreviousGroupName, &event.ChatID, &event.CreatedAt); err != nil {
+			return nil, err
+		}
+		events = append(events, event)
+	}
+	return events, rows.Err()
 }
 
 func (s *Store) ListBroadcastGroupChats(ctx context.Context, name string) ([]Group, error) {
@@ -2798,86 +3363,220 @@ func (s *Store) ListBroadcastGroupChats(ctx context.Context, name string) ([]Gro
 }
 
 func (s *Store) AddBroadcastPermission(ctx context.Context, userID int64, target string, chatID int64, groupName string, grantedBy int64, now time.Time) error {
+	_, err := s.GrantBroadcastPermissionAuthorized(ctx, userID, target, chatID, groupName, grantedBy, true, now)
+	return err
+}
+
+func normalizeBroadcastPermissionTarget(target string, chatID int64, groupName string) (string, int64, string, error) {
 	target = strings.TrimSpace(target)
 	groupName = strings.TrimSpace(groupName)
 	if target != "chat" && target != "group" {
-		return errors.New("invalid broadcast permission target")
-	}
-	ok, err := s.IsGlobalOperator(ctx, userID)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return errors.New("broadcast permission user is not an active global operator")
+		return "", 0, "", errors.New("invalid broadcast permission target")
 	}
 	if target == "chat" {
 		if chatID == 0 {
-			return errors.New("broadcast permission chat is empty")
+			return "", 0, "", errors.New("broadcast permission chat is empty")
 		}
 		groupName = ""
 	} else {
 		if groupName == "" {
-			return errors.New("broadcast permission group is empty")
+			return "", 0, "", errors.New("broadcast permission group is empty")
 		}
 		chatID = 0
 	}
+	return target, chatID, groupName, nil
+}
+
+func (s *Store) GrantBroadcastPermissionAuthorized(ctx context.Context, userID int64, target string, chatID int64, groupName string, grantedBy int64, manageAll bool, now time.Time) (bool, error) {
+	target, chatID, groupName, err := normalizeBroadcastPermissionTarget(target, chatID, groupName)
+	if err != nil {
+		return false, err
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer rollback(ctx, tx)
+	var subjectLevel, subjectStatus string
+	var subjectParentID int64
+	err = tx.QueryRow(ctx, `SELECT level, status, COALESCE(parent_user_id, 0)
+		FROM global_operators WHERE user_id=$1 FOR SHARE`, userID).Scan(
+		&subjectLevel, &subjectStatus, &subjectParentID,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, ErrBroadcastScopeDenied
+		}
+		return false, err
+	}
+	if subjectStatus != "active" {
+		return false, ErrBroadcastScopeDenied
+	}
+	if !manageAll {
+		var actorLevel, actorStatus string
+		err = tx.QueryRow(ctx, `SELECT level, status FROM global_operators
+			WHERE user_id=$1 FOR SHARE`, grantedBy).Scan(&actorLevel, &actorStatus)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return false, ErrBroadcastScopeDenied
+			}
+			return false, err
+		}
+		if actorLevel != "primary" || actorStatus != "active" {
+			return false, ErrBroadcastScopeDenied
+		}
+		eligibleSubject := (subjectLevel == "primary" && userID != grantedBy) ||
+			(subjectLevel == "secondary" && subjectParentID == grantedBy)
+		if !eligibleSubject {
+			return false, ErrBroadcastScopeDenied
+		}
+	}
+	var targetExists, actorOwnsTarget bool
+	if target == "chat" {
+		err = tx.QueryRow(ctx, `SELECT
+			EXISTS(SELECT 1 FROM groups WHERE chat_id=$1),
+			$2::BOOLEAN OR EXISTS (
+				SELECT 1 FROM broadcast_operator_permissions
+				WHERE user_id=$3::BIGINT AND target='chat' AND chat_id=$1
+			)`, chatID, manageAll, grantedBy).Scan(&targetExists, &actorOwnsTarget)
+	} else {
+		err = tx.QueryRow(ctx, `SELECT
+			EXISTS(SELECT 1 FROM broadcast_groups WHERE name=$1),
+			$2::BOOLEAN OR EXISTS (
+				SELECT 1 FROM broadcast_groups bg
+				WHERE bg.name=$1 AND (
+					bg.owner_user_id=$3::BIGINT OR EXISTS (
+						SELECT 1 FROM broadcast_operator_permissions p
+						WHERE p.user_id=$3::BIGINT AND p.target='group' AND p.group_name=bg.name
+					)
+				)
+			)`, groupName, manageAll, grantedBy).Scan(&targetExists, &actorOwnsTarget)
+	}
+	if err != nil {
+		return false, err
+	}
+	if !targetExists || !actorOwnsTarget {
+		return false, ErrBroadcastScopeDenied
+	}
 	tag, err := tx.Exec(ctx, `INSERT INTO broadcast_operator_permissions(user_id, target, chat_id, group_name, granted_by, created_at)
 		VALUES($1, $2, $3, $4, $5, $6)
 		ON CONFLICT DO NOTHING`, userID, target, chatID, groupName, grantedBy, now)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if tag.RowsAffected() > 0 {
 		if err := insertPermissionAudit(ctx, tx, PermissionAuditEvent{
 			ActorUserID: grantedBy, SubjectType: "broadcast_permission", SubjectUserID: userID,
 			Action: "granted", TargetType: target, ChatID: chatID, GroupName: groupName, CreatedAt: now,
 		}); err != nil {
-			return err
-		}
-	}
-	return tx.Commit(ctx)
-}
-
-func (s *Store) RemoveBroadcastPermission(ctx context.Context, userID int64, target string, chatID int64, groupName string, revokedBy int64, now time.Time) (bool, error) {
-	target = strings.TrimSpace(target)
-	groupName = strings.TrimSpace(groupName)
-	if target == "chat" {
-		if chatID == 0 {
-			return false, errors.New("broadcast permission chat is empty")
-		}
-		groupName = ""
-	} else if target == "group" {
-		if groupName == "" {
-			return false, errors.New("broadcast permission group is empty")
-		}
-		chatID = 0
-	} else {
-		return false, errors.New("invalid broadcast permission target")
-	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return false, err
-	}
-	defer rollback(ctx, tx)
-	tag, err := tx.Exec(ctx, `DELETE FROM broadcast_operator_permissions
-		WHERE user_id=$1 AND target=$2 AND chat_id=$3 AND group_name=$4`, userID, target, chatID, groupName)
-	if err != nil {
-		return false, err
-	}
-	if tag.RowsAffected() > 0 {
-		if err := insertPermissionAudit(ctx, tx, PermissionAuditEvent{
-			ActorUserID: revokedBy, SubjectType: "broadcast_permission", SubjectUserID: userID,
-			Action: "revoked", TargetType: target, ChatID: chatID, GroupName: groupName, CreatedAt: now,
-		}); err != nil {
 			return false, err
 		}
 	}
 	return tag.RowsAffected() > 0, tx.Commit(ctx)
+}
+
+func (s *Store) RemoveBroadcastPermission(ctx context.Context, userID int64, target string, chatID int64, groupName string, revokedBy int64, now time.Time) (bool, error) {
+	result, err := s.RevokeBroadcastPermissionAuthorized(ctx, userID, target, chatID, groupName, revokedBy, true, now)
+	return result.Changed, err
+}
+
+func (s *Store) RevokeBroadcastPermissionAuthorized(ctx context.Context, userID int64, target string, chatID int64, groupName string, revokedBy int64, manageAll bool, now time.Time) (BroadcastPermissionMutationResult, error) {
+	var result BroadcastPermissionMutationResult
+	target, chatID, groupName, err := normalizeBroadcastPermissionTarget(target, chatID, groupName)
+	if err != nil {
+		return result, err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return result, err
+	}
+	defer rollback(ctx, tx)
+	if !manageAll {
+		var actorLevel, actorStatus, subjectLevel, subjectStatus string
+		var subjectParentID int64
+		err = tx.QueryRow(ctx, `SELECT level, status FROM global_operators
+			WHERE user_id=$1 FOR SHARE`, revokedBy).Scan(&actorLevel, &actorStatus)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return result, ErrBroadcastScopeDenied
+			}
+			return result, err
+		}
+		if actorLevel != "primary" || actorStatus != "active" {
+			return result, ErrBroadcastScopeDenied
+		}
+		err = tx.QueryRow(ctx, `SELECT level, status, COALESCE(parent_user_id, 0)
+			FROM global_operators WHERE user_id=$1 FOR SHARE`, userID).Scan(
+			&subjectLevel, &subjectStatus, &subjectParentID,
+		)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return result, ErrBroadcastScopeDenied
+			}
+			return result, err
+		}
+		if subjectStatus != "active" {
+			return result, ErrBroadcastScopeDenied
+		}
+		eligibleSubject := (subjectLevel == "primary" && userID != revokedBy) ||
+			(subjectLevel == "secondary" && subjectParentID == revokedBy)
+		if !eligibleSubject {
+			return result, ErrBroadcastScopeDenied
+		}
+	}
+	query := `DELETE FROM broadcast_operator_permissions
+		WHERE user_id=$1 AND target=$2 AND chat_id=$3 AND group_name=$4`
+	args := []any{userID, target, chatID, groupName}
+	if !manageAll {
+		query += ` AND granted_by=$5`
+		args = append(args, revokedBy)
+	}
+	tag, err := tx.Exec(ctx, query, args...)
+	if err != nil {
+		return result, err
+	}
+	if tag.RowsAffected() > 0 {
+		result.Changed = true
+		if err := insertPermissionAudit(ctx, tx, PermissionAuditEvent{
+			ActorUserID: revokedBy, SubjectType: "broadcast_permission", SubjectUserID: userID,
+			Action: "revoked", TargetType: target, ChatID: chatID, GroupName: groupName, CreatedAt: now,
+		}); err != nil {
+			return result, err
+		}
+		if target == "chat" {
+			rows, err := tx.Query(ctx, `DELETE FROM broadcast_group_chats bgc
+				USING broadcast_groups bg
+				WHERE bgc.group_name=bg.name AND bg.owner_user_id=$1 AND bgc.chat_id=$2
+				RETURNING bg.name`, userID, chatID)
+			if err != nil {
+				return result, err
+			}
+			var groupNames []string
+			for rows.Next() {
+				var name string
+				if err := rows.Scan(&name); err != nil {
+					rows.Close()
+					return result, err
+				}
+				groupNames = append(groupNames, name)
+			}
+			if err := rows.Err(); err != nil {
+				rows.Close()
+				return result, err
+			}
+			rows.Close()
+			for _, name := range groupNames {
+				result.GroupMembershipsChanged = true
+				if err := insertBroadcastGroupAudit(ctx, tx, BroadcastGroupAuditEvent{
+					ActorUserID: revokedBy, Action: "chat_removed_scope_revoked",
+					GroupName: name, ChatID: chatID, CreatedAt: now,
+				}); err != nil {
+					return result, err
+				}
+			}
+		}
+	}
+	return result, tx.Commit(ctx)
 }
 
 func (s *Store) HasBroadcastPermissionScope(ctx context.Context, userID int64, target string, chatID int64, groupName string) (bool, error) {
@@ -2889,26 +3588,76 @@ func (s *Store) HasBroadcastPermissionScope(ctx context.Context, userID int64, t
 		if groupName == "" {
 			return false, nil
 		}
-		row = s.pool.QueryRow(ctx, `SELECT 1 FROM broadcast_operator_permissions
-			WHERE user_id=$1 AND target='group' AND group_name=$2 LIMIT 1`, userID, groupName)
+		row = s.pool.QueryRow(ctx, `SELECT 1 FROM broadcast_groups bg
+			WHERE bg.name=$2 AND (
+				bg.owner_user_id=$1::BIGINT OR EXISTS (
+					SELECT 1 FROM broadcast_operator_permissions p
+					WHERE p.user_id=$1::BIGINT AND p.target='group' AND p.group_name=bg.name
+				)
+			) LIMIT 1`, userID, groupName)
 	case "chat":
 		if chatID == 0 {
 			return false, nil
 		}
 		row = s.pool.QueryRow(ctx, `SELECT 1
-			FROM broadcast_operator_permissions p
-			WHERE p.user_id=$1 AND (
-				(p.target='chat' AND p.chat_id=$2)
-				OR (p.target='group' AND EXISTS (
-					SELECT 1 FROM broadcast_group_chats bgc
-					WHERE bgc.group_name=p.group_name AND bgc.chat_id=$2
-				))
+			WHERE EXISTS (
+				SELECT 1 FROM broadcast_operator_permissions p
+				WHERE p.user_id=$1 AND (
+					(p.target='chat' AND p.chat_id=$2)
+					OR (p.target='group' AND EXISTS (
+						SELECT 1 FROM broadcast_group_chats bgc
+						WHERE bgc.group_name=p.group_name AND bgc.chat_id=$2
+					))
+				)
+			) OR EXISTS (
+				SELECT 1 FROM broadcast_groups bg
+				JOIN broadcast_group_chats bgc ON bgc.group_name=bg.name
+				WHERE bg.owner_user_id=$1 AND bgc.chat_id=$2
 			) LIMIT 1`, userID, chatID)
 	default:
 		return false, nil
 	}
 	var one int
 	err := row.Scan(&one)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func (s *Store) HasDelegableBroadcastPermissionScope(ctx context.Context, userID int64, target string, chatID int64, groupName string) (bool, error) {
+	target, chatID, groupName, err := normalizeBroadcastPermissionTarget(target, chatID, groupName)
+	if err != nil || userID <= 0 {
+		return false, err
+	}
+	var one int
+	if target == "chat" {
+		err = s.pool.QueryRow(ctx, `SELECT 1 FROM broadcast_operator_permissions
+			WHERE user_id=$1 AND target='chat' AND chat_id=$2 LIMIT 1`, userID, chatID).Scan(&one)
+	} else {
+		err = s.pool.QueryRow(ctx, `SELECT 1 FROM broadcast_groups bg
+			WHERE bg.name=$2 AND (
+				bg.owner_user_id=$1::BIGINT OR EXISTS (
+					SELECT 1 FROM broadcast_operator_permissions p
+					WHERE p.user_id=$1::BIGINT AND p.target='group' AND p.group_name=bg.name
+				)
+			) LIMIT 1`, userID, groupName).Scan(&one)
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func (s *Store) HasBroadcastPermissionGrantedBy(ctx context.Context, userID int64, target string, chatID int64, groupName string, grantedBy int64) (bool, error) {
+	target, chatID, groupName, err := normalizeBroadcastPermissionTarget(target, chatID, groupName)
+	if err != nil || userID <= 0 || grantedBy <= 0 {
+		return false, err
+	}
+	var one int
+	err = s.pool.QueryRow(ctx, `SELECT 1 FROM broadcast_operator_permissions
+		WHERE user_id=$1 AND target=$2 AND chat_id=$3 AND group_name=$4 AND granted_by=$5
+		LIMIT 1`, userID, target, chatID, groupName, grantedBy).Scan(&one)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}
@@ -2934,6 +3683,27 @@ func (s *Store) ListBroadcastPermissions(ctx context.Context) ([]BroadcastPermis
 	return permissions, rows.Err()
 }
 
+func (s *Store) ListBroadcastPermissionsRelevantTo(ctx context.Context, userID int64) ([]BroadcastPermission, error) {
+	rows, err := s.pool.Query(ctx, `SELECT user_id, target, chat_id, group_name, granted_by, created_at
+		FROM broadcast_operator_permissions
+		WHERE user_id=$1::BIGINT OR granted_by=$1::BIGINT
+		ORDER BY user_id ASC, target ASC, group_name ASC, chat_id ASC`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var permissions []BroadcastPermission
+	for rows.Next() {
+		var permission BroadcastPermission
+		if err := rows.Scan(&permission.UserID, &permission.Target, &permission.ChatID,
+			&permission.GroupName, &permission.GrantedBy, &permission.CreatedAt); err != nil {
+			return nil, err
+		}
+		permissions = append(permissions, permission)
+	}
+	return permissions, rows.Err()
+}
+
 func (s *Store) ListAllowedBroadcastChats(ctx context.Context, userID int64, all bool) ([]Group, error) {
 	if all {
 		return s.ListGroups(ctx)
@@ -2953,6 +3723,11 @@ func (s *Store) ListAllowedBroadcastChats(ctx context.Context, userID int64, all
 				SELECT 1 FROM broadcast_operator_permissions p
 				JOIN broadcast_group_chats bgc ON bgc.group_name=p.group_name AND bgc.chat_id=g.chat_id
 				WHERE p.user_id=$1 AND p.target='group'
+			)
+			OR EXISTS (
+				SELECT 1 FROM broadcast_groups bg
+				JOIN broadcast_group_chats bgc ON bgc.group_name=bg.name AND bgc.chat_id=g.chat_id
+				WHERE bg.owner_user_id=$1
 			)
 		  )
 		ORDER BY g.title ASC, g.chat_id ASC`, userID)

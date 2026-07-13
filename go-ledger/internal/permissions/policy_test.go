@@ -155,3 +155,38 @@ func TestPolicyBroadcastPermissionManagers(t *testing.T) {
 		t.Fatal("secondary should not grant broadcast permissions")
 	}
 }
+
+func TestPolicyBroadcastGroupOwnershipAndDelegation(t *testing.T) {
+	p := NewPolicy(1001, map[int64]struct{}{2002: {}})
+	primary := UserCapabilities{GlobalOperatorLevel: "primary"}
+	secondary := UserCapabilities{GlobalOperatorLevel: "secondary", ParentUserID: 3003}
+
+	if !p.CanManageBroadcastGroups(1001, UserCapabilities{}) {
+		t.Fatal("host should manage all broadcast groups")
+	}
+	if p.CanManageBroadcastGroups(2002, UserCapabilities{}) {
+		t.Fatal("default operator should retain broadcast use/grant access without group ownership management")
+	}
+	if !p.CanManageBroadcastGroups(3003, primary) || p.CanManageBroadcastGroups(4004, secondary) {
+		t.Fatal("only host and primary global operators should manage broadcast groups")
+	}
+	if !p.CanManageBroadcastGroup(3003, primary, 3003) || p.CanManageBroadcastGroup(3003, primary, 5005) {
+		t.Fatal("primary should manage only groups it owns")
+	}
+	if !p.CanManageBroadcastGroup(1001, UserCapabilities{}, 5005) {
+		t.Fatal("host should manage groups regardless of owner")
+	}
+
+	if !p.CanDelegateBroadcastPermission(3003, primary, 4004, "primary", 0) {
+		t.Fatal("primary should grant broadcast use to another primary")
+	}
+	if !p.CanDelegateBroadcastPermission(3003, primary, 5005, "secondary", 3003) {
+		t.Fatal("primary should grant broadcast use to its own secondary")
+	}
+	if p.CanDelegateBroadcastPermission(3003, primary, 5006, "secondary", 4004) {
+		t.Fatal("primary should not grant to another primary's secondary")
+	}
+	if p.CanDelegateBroadcastPermission(5005, secondary, 4004, "primary", 0) {
+		t.Fatal("secondary should not delegate broadcast permissions")
+	}
+}

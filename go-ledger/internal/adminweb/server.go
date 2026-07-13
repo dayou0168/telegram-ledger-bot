@@ -3,6 +3,7 @@ package adminweb
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
@@ -67,6 +68,7 @@ type pageData struct {
 	CanManageGlobal               bool
 	CanManageOperators            bool
 	CanManageBroadcastPermissions bool
+	CanManageBroadcastGroups      bool
 	ChatNames                     map[int64]string
 	OpLabels                      map[int64]string
 	GroupPager                    adminPager
@@ -667,10 +669,17 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) saveGroup(w http.ResponseWriter, r *http.Request) {
-	if !s.requireGlobalAdmin(w, r) {
+	if !requirePost(w, r) {
 		return
 	}
-	if !requirePost(w, r) {
+	session := adminSessionFromContext(r.Context())
+	caps, err := s.operatorActorCapabilities(r.Context(), session)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !s.perms.CanManageBroadcastGroups(session.UserID, caps) {
+		http.Error(w, "没有广播分组管理权限", http.StatusForbidden)
 		return
 	}
 	if err := r.ParseForm(); err != nil {
@@ -682,17 +691,24 @@ func (s *Server) saveGroup(w http.ResponseWriter, r *http.Request) {
 		redirectMsg(w, r, "分组名不能为空")
 		return
 	}
-	if err := s.store.UpsertBroadcastGroup(r.Context(), name, 0, time.Now()); err != nil {
+	ownerUserID := int64(0)
+	if caps.GlobalOperatorLevel == "primary" {
+		ownerUserID = session.UserID
+	}
+	created, err := s.store.CreateBroadcastGroup(r.Context(), name, session.UserID, ownerUserID, time.Now())
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	if !created {
+		redirectMsg(w, r, "分组名已存在")
+		return
+	}
+	s.invalidateAllPermissionCaches()
 	redirectMsg(w, r, "分组已保存")
 }
 
 func (s *Server) deleteGroup(w http.ResponseWriter, r *http.Request) {
-	if !s.requireGlobalAdmin(w, r) {
-		return
-	}
 	if !requirePost(w, r) {
 		return
 	}
@@ -706,7 +722,20 @@ func (s *Server) deleteGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	session := adminSessionFromContext(r.Context())
-	ok, _, err := s.store.DeleteBroadcastGroupManaged(r.Context(), name, session.UserID, time.Now())
+	caps, err := s.operatorActorCapabilities(r.Context(), session)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !s.perms.CanManageBroadcastGroups(session.UserID, caps) {
+		http.Error(w, "没有广播分组管理权限", http.StatusForbidden)
+		return
+	}
+	ok, _, err := s.store.DeleteBroadcastGroupManaged(r.Context(), name, session.UserID, s.perms.IsHost(session.UserID), time.Now())
+	if errors.Is(err, storage.ErrBroadcastScopeDenied) {
+		http.Error(w, "不能删除其他一级操作人的分组", http.StatusForbidden)
+		return
+	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -720,7 +749,7 @@ func (s *Server) deleteGroup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) renameGroup(w http.ResponseWriter, r *http.Request) {
-	if !s.requireGlobalAdmin(w, r) || !requirePost(w, r) {
+	if !requirePost(w, r) {
 		return
 	}
 	if err := r.ParseForm(); err != nil {
@@ -734,7 +763,20 @@ func (s *Server) renameGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	session := adminSessionFromContext(r.Context())
-	ok, _, err := s.store.RenameBroadcastGroup(r.Context(), oldName, newName, session.UserID, time.Now())
+	caps, err := s.operatorActorCapabilities(r.Context(), session)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !s.perms.CanManageBroadcastGroups(session.UserID, caps) {
+		http.Error(w, "没有广播分组管理权限", http.StatusForbidden)
+		return
+	}
+	ok, _, err := s.store.RenameBroadcastGroup(r.Context(), oldName, newName, session.UserID, s.perms.IsHost(session.UserID), time.Now())
+	if errors.Is(err, storage.ErrBroadcastScopeDenied) {
+		http.Error(w, "不能修改其他一级操作人的分组", http.StatusForbidden)
+		return
+	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -756,9 +798,6 @@ func (s *Server) removeGroupChats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) changeGroupChats(w http.ResponseWriter, r *http.Request, add bool) {
-	if !s.requireGlobalAdmin(w, r) {
-		return
-	}
 	if !requirePost(w, r) {
 		return
 	}
@@ -776,12 +815,26 @@ func (s *Server) changeGroupChats(w http.ResponseWriter, r *http.Request, add bo
 		redirectMsg(w, r, "请选择群")
 		return
 	}
+	session := adminSessionFromContext(r.Context())
+	caps, err := s.operatorActorCapabilities(r.Context(), session)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !s.perms.CanManageBroadcastGroups(session.UserID, caps) {
+		http.Error(w, "没有广播分组管理权限", http.StatusForbidden)
+		return
+	}
 	var count int
-	var err error
+	manageAll := s.perms.IsHost(session.UserID)
 	if add {
-		count, err = s.store.AddChatsToBroadcastGroup(r.Context(), name, chatIDs, time.Now())
+		count, err = s.store.AddChatsToBroadcastGroupManaged(r.Context(), name, chatIDs, session.UserID, manageAll, time.Now())
 	} else {
-		count, err = s.store.RemoveChatsFromBroadcastGroup(r.Context(), name, chatIDs)
+		count, err = s.store.RemoveChatsFromBroadcastGroupManaged(r.Context(), name, chatIDs, session.UserID, manageAll, time.Now())
+	}
+	if errors.Is(err, storage.ErrBroadcastScopeDenied) {
+		http.Error(w, "不能管理其他一级操作人的分组或未授权群", http.StatusForbidden)
+		return
 	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -819,13 +872,13 @@ func (s *Server) canMutateBroadcastPermission(ctx context.Context, session admin
 	if s.perms.CanManageAllBroadcastPermissions(session.UserID) {
 		return true, nil
 	}
-	if subject.Level != "secondary" || subject.ParentUserID != session.UserID {
+	if !s.perms.CanDelegateBroadcastPermission(session.UserID, caps, subject.UserID, subject.Level, subject.ParentUserID) {
 		return false, nil
 	}
-	if !granting {
-		return true, nil
+	if granting {
+		return s.store.HasDelegableBroadcastPermissionScope(ctx, session.UserID, target, chatID, groupName)
 	}
-	return s.store.HasBroadcastPermissionScope(ctx, session.UserID, target, chatID, groupName)
+	return s.store.HasBroadcastPermissionGrantedBy(ctx, subjectUserID, target, chatID, groupName, session.UserID)
 }
 
 func (s *Server) saveOperator(w http.ResponseWriter, r *http.Request) {
@@ -1068,7 +1121,13 @@ func (s *Server) grantPermission(w http.ResponseWriter, r *http.Request) {
 		redirectMsg(w, r, "操作人不存在或已禁用")
 		return
 	}
-	if err := s.store.AddBroadcastPermission(r.Context(), userID, target, chatID, groupName, session.UserID, time.Now()); err != nil {
+	_, err = s.store.GrantBroadcastPermissionAuthorized(r.Context(), userID, target, chatID, groupName,
+		session.UserID, s.perms.CanManageAllBroadcastPermissions(session.UserID), time.Now())
+	if errors.Is(err, storage.ErrBroadcastScopeDenied) {
+		http.Error(w, "broadcast grant exceeds actor scope", http.StatusForbidden)
+		return
+	}
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1099,12 +1158,21 @@ func (s *Server) revokePermission(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no permission to revoke broadcast scope", http.StatusForbidden)
 		return
 	}
-	_, err = s.store.RemoveBroadcastPermission(r.Context(), userID, target, chatID, groupName, session.UserID, time.Now())
+	result, err := s.store.RevokeBroadcastPermissionAuthorized(r.Context(), userID, target, chatID, groupName,
+		session.UserID, s.perms.CanManageAllBroadcastPermissions(session.UserID), time.Now())
+	if errors.Is(err, storage.ErrBroadcastScopeDenied) {
+		http.Error(w, "no permission to revoke broadcast scope", http.StatusForbidden)
+		return
+	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.invalidateBroadcastPermission(userID)
+	if result.GroupMembershipsChanged {
+		s.invalidateAllPermissionCaches()
+	} else {
+		s.invalidateBroadcastPermission(userID)
+	}
 	redirectMsg(w, r, "权限已取消")
 }
 
@@ -1239,14 +1307,30 @@ func (s *Server) loadPageData(ctx context.Context, message string, session admin
 	canManageOperators := s.perms.CanCreateGlobalOperator(session.UserID, caps, "primary") ||
 		s.perms.CanCreateGlobalOperator(session.UserID, caps, "secondary")
 	canManageBroadcastPermissions := s.perms.CanManageBroadcastPermissions(session.UserID, caps)
+	canManageBroadcastGroups := s.perms.CanManageBroadcastGroups(session.UserID, caps)
 	var (
-		groups      []storage.Group
-		bgroups     []storage.BroadcastGroup
-		operators   []storage.GlobalOperator
-		permissions []storage.BroadcastPermission
-		replace     storage.BroadcastReplaceSetting
+		groups              []storage.Group
+		bgroups             []storage.BroadcastGroup
+		operators           []storage.GlobalOperator
+		allOperators        []storage.GlobalOperator
+		permissionOperators []storage.GlobalOperator
+		permissions         []storage.BroadcastPermission
+		replace             storage.BroadcastReplaceSetting
 	)
-	if canManageGlobal || canManageBroadcastPermissions {
+	if canManageGlobal || canManageBroadcastPermissions || canManageBroadcastGroups {
+		allOperators, err = s.store.ListGlobalOperators(ctx)
+		if err != nil {
+			return pageData{}, err
+		}
+		filtered := allOperators[:0]
+		for _, op := range allOperators {
+			if !s.perms.IsPrivileged(op.UserID) {
+				filtered = append(filtered, op)
+			}
+		}
+		allOperators = filtered
+	}
+	if s.perms.CanManageAllBroadcastPermissions(session.UserID) {
 		groups, err = s.store.ListGroups(ctx)
 		if err != nil {
 			return pageData{}, err
@@ -1255,69 +1339,49 @@ func (s *Server) loadPageData(ctx context.Context, message string, session admin
 		if err != nil {
 			return pageData{}, err
 		}
-		operators, err = s.store.ListGlobalOperators(ctx)
-		if err != nil {
-			return pageData{}, err
-		}
 		permissions, err = s.store.ListBroadcastPermissions(ctx)
 		if err != nil {
 			return pageData{}, err
 		}
-		filtered := operators[:0]
-		for _, op := range operators {
-			if !s.perms.IsPrivileged(op.UserID) {
-				filtered = append(filtered, op)
+		operators = append(operators, allOperators...)
+		for _, op := range allOperators {
+			if op.Status == "active" && (op.Level == "primary" || op.Level == "secondary") {
+				permissionOperators = append(permissionOperators, op)
 			}
 		}
-		operators = filtered
+	} else if caps.GlobalOperatorLevel == "primary" {
+		groups, err = s.store.ListDirectBroadcastChats(ctx, session.UserID)
+		if err != nil {
+			return pageData{}, err
+		}
+		bgroups, err = s.store.ListVisibleBroadcastGroups(ctx, session.UserID)
+		if err != nil {
+			return pageData{}, err
+		}
+		permissions, err = s.store.ListBroadcastPermissionsRelevantTo(ctx, session.UserID)
+		if err != nil {
+			return pageData{}, err
+		}
+		for _, op := range allOperators {
+			if op.Level == "secondary" && op.ParentUserID == session.UserID {
+				operators = append(operators, op)
+			}
+			if op.Status == "active" && ((op.Level == "secondary" && op.ParentUserID == session.UserID) ||
+				(op.Level == "primary" && op.UserID != session.UserID)) {
+				permissionOperators = append(permissionOperators, op)
+			}
+		}
+	}
+	primaryOperators := make([]storage.GlobalOperator, 0, len(operators))
+	for _, op := range operators {
+		if op.Status == "active" && op.Level == "primary" {
+			primaryOperators = append(primaryOperators, op)
+		}
 	}
 	if canManageGlobal {
 		replace, err = s.store.GetBroadcastReplaceSetting(ctx)
 		if err != nil {
 			return pageData{}, err
-		}
-	} else if caps.GlobalOperatorLevel == "primary" {
-		managed := make([]storage.GlobalOperator, 0, len(operators))
-		managedIDs := map[int64]struct{}{}
-		for _, op := range operators {
-			if op.Level == "secondary" && op.ParentUserID == session.UserID {
-				managed = append(managed, op)
-				managedIDs[op.UserID] = struct{}{}
-			}
-		}
-		allPermissions := permissions
-		permissions = permissions[:0]
-		allowedGroups := map[string]struct{}{}
-		for _, permission := range allPermissions {
-			if permission.UserID == session.UserID && permission.Target == "group" {
-				allowedGroups[permission.GroupName] = struct{}{}
-			}
-			if _, ok := managedIDs[permission.UserID]; ok {
-				permissions = append(permissions, permission)
-			}
-		}
-		operators = managed
-		allowedChats, err := s.store.ListAllowedBroadcastChats(ctx, session.UserID, false)
-		if err != nil {
-			return pageData{}, err
-		}
-		groups = allowedChats
-		filteredGroups := make([]storage.BroadcastGroup, 0, len(bgroups))
-		for _, group := range bgroups {
-			if _, ok := allowedGroups[group.Name]; ok {
-				filteredGroups = append(filteredGroups, group)
-			}
-		}
-		bgroups = filteredGroups
-	}
-	permissionOperators := make([]storage.GlobalOperator, 0, len(operators))
-	primaryOperators := make([]storage.GlobalOperator, 0, len(operators))
-	for _, op := range operators {
-		if op.Status == "active" && (op.Level == "primary" || op.Level == "secondary") {
-			permissionOperators = append(permissionOperators, op)
-			if op.Level == "primary" {
-				primaryOperators = append(primaryOperators, op)
-			}
 		}
 	}
 	if canManageGlobal {
@@ -1367,7 +1431,10 @@ func (s *Server) loadPageData(ctx context.Context, message string, session admin
 	for _, group := range groups {
 		chatNames[group.ChatID] = group.Title
 	}
-	opLabels := make(map[int64]string, len(operators))
+	opLabels := make(map[int64]string, len(allOperators)+len(operators))
+	for _, op := range allOperators {
+		opLabels[op.UserID] = operatorLabel(op)
+	}
 	for _, op := range operators {
 		opLabels[op.UserID] = operatorLabel(op)
 	}
@@ -1397,6 +1464,7 @@ func (s *Server) loadPageData(ctx context.Context, message string, session admin
 		CanManageGlobal:               canManageGlobal,
 		CanManageOperators:            canManageOperators,
 		CanManageBroadcastPermissions: canManageBroadcastPermissions,
+		CanManageBroadcastGroups:      canManageBroadcastGroups,
 		ChatNames:                     chatNames,
 		OpLabels:                      opLabels,
 		GroupPager:                    groupPager,
@@ -2757,6 +2825,10 @@ func canMutateOperatorRow(op storage.GlobalOperator, canManageGlobal bool, admin
 	return op.Level == "secondary" && op.ParentUserID == adminUserID
 }
 
+func canManageBroadcastGroupRow(group storage.BroadcastGroup, canManageGlobal bool, adminUserID int64) bool {
+	return canManageGlobal || (adminUserID > 0 && group.OwnerUserID == adminUserID)
+}
+
 var adminTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
 	"chatLabel":               chatLabel,
 	"chatBroadcastGroups":     chatBroadcastGroups,
@@ -2777,6 +2849,7 @@ var adminTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
 	"cleanupDelayCustomUnit":  cleanupDelayCustomUnit,
 	"cleanupScopeEnabled":     cleanupScopeEnabled,
 	"canMutateOperator":       canMutateOperatorRow,
+	"canManageBroadcastGroup": canManageBroadcastGroupRow,
 }).Parse(adminHTML))
 
 var loginTemplate = template.Must(template.New("login").Parse(loginHTML))
@@ -2860,27 +2933,27 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 </head>
 <body><main class="wrap">
 <section class="top">
-<div><div class="brand">Telegram 记账机器人</div><div class="title">后台管理</div><div class="sub">Go v{{.Version}} · {{.AdminRoleLabel}} · {{if or .CanManageGlobal .CanManageOperators .CanManageBroadcastPermissions}}操作人、广播权限和地址监听{{else}}地址监听{{end}}</div></div>
+<div><div class="brand">Telegram 记账机器人</div><div class="title">后台管理</div><div class="sub">Go v{{.Version}} · {{.AdminRoleLabel}} · {{if or .CanManageGlobal .CanManageOperators .CanManageBroadcastPermissions .CanManageBroadcastGroups}}操作人、广播权限和地址监听{{else}}地址监听{{end}}</div></div>
 <div class="actions"><a class="btn secondary" href="/admin">刷新</a><a class="btn secondary" href="/admin/logout">退出</a></div>
 </section>
 {{if .TokenUnset}}<div class="warn">当前没有配置 ADMIN_WEB_TOKEN，公网部署请先设置后台密码。</div>{{end}}
 {{if .Message}}<div class="msg">{{.Message}}</div>{{end}}
 <nav class="tabs" aria-label="后台模块">
-{{if .CanManageGlobal}}
+{{if or .CanManageGlobal .CanManageBroadcastGroups}}
 <button class="tab-btn active" type="button" data-admin-tab-target="groups">已保存群组</button>
 <button class="tab-btn" type="button" data-admin-tab-target="broadcast">广播分组</button>
 {{end}}
 {{if or .CanManageOperators .CanManageBroadcastPermissions}}
-<button class="tab-btn {{if not .CanManageGlobal}}active{{end}}" type="button" data-admin-tab-target="permissions">权限/操作人</button>
+<button class="tab-btn {{if not (or .CanManageGlobal .CanManageBroadcastGroups)}}active{{end}}" type="button" data-admin-tab-target="permissions">权限/操作人</button>
 {{end}}
-<button class="tab-btn {{if not (or .CanManageGlobal .CanManageOperators .CanManageBroadcastPermissions)}}active{{end}}" type="button" data-admin-tab-target="watch">地址监听</button>
+<button class="tab-btn {{if not (or .CanManageGlobal .CanManageOperators .CanManageBroadcastPermissions .CanManageBroadcastGroups)}}active{{end}}" type="button" data-admin-tab-target="watch">地址监听</button>
 {{if .CanManageGlobal}}
 <button class="tab-btn" type="button" data-admin-tab-target="replace">广播替换</button>
 {{end}}
 </nav>
 
 <section class="grid">
-{{if .CanManageGlobal}}
+{{if or .CanManageGlobal .CanManageBroadcastGroups}}
 <div class="card tab-card active" data-admin-tab="groups">
 <h2>已保存群组</h2>
 <p class="hint">机器人被邀请进群，或群内有人发言后会自动保存群名；群改名后也会更新。</p>
@@ -2911,7 +2984,7 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 </div>
 
 {{end}}
-{{if .CanManageGlobal}}
+{{if or .CanManageGlobal .CanManageBroadcastGroups}}
 <div class="card wide tab-card" data-admin-tab="broadcast">
 <h2>广播分组</h2>
 <p class="hint">先创建分组，再用下方多选框批量添加或移除群组。页面显示群名，数据库仍用群 ID 去重。</p>
@@ -2919,14 +2992,14 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 <div class="toolbar-forms">
 <form method="post" action="/admin/group/save" class="inline-form">
 <input name="name" placeholder="输入新分组名，例如 财务">
-<button class="btn" type="submit">新建/更新分组</button>
+<button class="btn" type="submit">新建分组</button>
 </form>
 <form method="post" action="/admin/group/delete" class="inline-form">
-<select name="name">{{range .BGroups}}<option value="{{.Name}}">{{.Name}}</option>{{end}}</select>
+<select name="name">{{range .BGroups}}{{if canManageBroadcastGroup . $.CanManageGlobal $.AdminUserID}}<option value="{{.Name}}">{{.Name}}</option>{{end}}{{end}}</select>
 <button class="btn" type="submit">删除分组</button>
 </form>
 <form method="post" action="/admin/group/rename" class="inline-form">
-<select name="old_name">{{range .BGroups}}<option value="{{.Name}}">{{.Name}}</option>{{end}}</select>
+<select name="old_name">{{range .BGroups}}{{if canManageBroadcastGroup . $.CanManageGlobal $.AdminUserID}}<option value="{{.Name}}">{{.Name}}</option>{{end}}{{end}}</select>
 <input name="new_name" placeholder="新分组名">
 <button class="btn" type="submit">改名并迁移授权</button>
 </form>
@@ -2934,30 +3007,30 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 <div class="member-grid">
 <form method="post" action="/admin/group/add" class="member-form" data-mode="add">
 <div class="section-title">添加群组到分组</div>
-<label><span class="field-label">目标分组</span><select class="member-group-select" name="name">{{range .BGroups}}<option value="{{.Name}}">{{.Name}}</option>{{end}}</select></label>
+<label><span class="field-label">目标分组</span><select class="member-group-select" name="name">{{range .BGroups}}{{if canManageBroadcastGroup . $.CanManageGlobal $.AdminUserID}}<option value="{{.Name}}">{{.Name}}</option>{{end}}{{end}}</select></label>
 <label><span class="field-label">选择要加入的群，可按 Ctrl/Shift 多选</span><select class="member-chat-select" name="chat_id" multiple>{{range .Groups}}<option value="{{.ChatID}}" data-groups="{{chatBroadcastGroups . $.BroadcastMemberships}}">{{chatLabel .}}</option>{{end}}</select></label>
 <div class="hint member-empty" hidden>当前分组没有可选择的群。</div>
 <button class="btn full" type="submit">添加到分组</button>
 </form>
 <form method="post" action="/admin/group/remove" class="member-form" data-mode="remove">
 <div class="section-title">从分组移除群组</div>
-<label><span class="field-label">目标分组</span><select class="member-group-select" name="name">{{range .BGroups}}<option value="{{.Name}}">{{.Name}}</option>{{end}}</select></label>
+<label><span class="field-label">目标分组</span><select class="member-group-select" name="name">{{range .BGroups}}{{if canManageBroadcastGroup . $.CanManageGlobal $.AdminUserID}}<option value="{{.Name}}">{{.Name}}</option>{{end}}{{end}}</select></label>
 <label><span class="field-label">选择要移除的群，可按 Ctrl/Shift 多选</span><select class="member-chat-select" name="chat_id" multiple>{{range .Groups}}<option value="{{.ChatID}}" data-groups="{{chatBroadcastGroups . $.BroadcastMemberships}}">{{chatLabel .}}</option>{{end}}</select></label>
 <div class="hint member-empty" hidden>当前分组没有可移除的群。</div>
 <button class="btn full" type="submit">从分组移除</button>
 </form>
 </div>
-<div class="scroll"><table><thead><tr><th>分组</th><th>群数</th><th>群组</th></tr></thead><tbody>
-{{range .BGroups}}<tr><td>{{.Name}}</td><td>{{len .ChatIDs}}</td><td>{{range $i,$n := .ChatNames}}{{if $i}}、{{end}}{{$n}}{{end}}</td></tr>{{else}}<tr><td colspan="3">暂无广播分组</td></tr>{{end}}
+<div class="scroll"><table><thead><tr><th>分组</th><th>权限</th><th>群数</th><th>群组</th></tr></thead><tbody>
+{{range .BGroups}}<tr><td>{{.Name}}</td><td>{{if canManageBroadcastGroup . $.CanManageGlobal $.AdminUserID}}可管理{{else}}仅可使用{{end}}</td><td>{{len .ChatIDs}}</td><td>{{range $i,$n := .ChatNames}}{{if $i}}、{{end}}{{$n}}{{end}}</td></tr>{{else}}<tr><td colspan="4">暂无广播分组</td></tr>{{end}}
 </tbody></table></div>
 <div class="pager"><span>{{.BroadcastPager.ItemFrom}}-{{.BroadcastPager.ItemTo}} / {{.BroadcastPager.Total}}</span>{{if .BroadcastPager.HasPrev}}<a href="{{.BroadcastPager.PrevURL}}">上一页</a>{{else}}<span class="disabled">上一页</span>{{end}}{{if .BroadcastPager.HasNext}}<a href="{{.BroadcastPager.NextURL}}">下一页</a>{{else}}<span class="disabled">下一页</span>{{end}}</div>
 </div>
 
 {{end}}
 {{if .CanManageBroadcastPermissions}}
-<div class="card wide tab-card {{if not .CanManageGlobal}}active{{end}}" data-admin-tab="permissions">
+<div class="card wide tab-card {{if not (or .CanManageGlobal .CanManageBroadcastGroups)}}active{{end}}" data-admin-tab="permissions">
 <h2>广播权限</h2>
-<p class="hint">给普通广播操作人授权分组或单群。授权后，私聊机器人选择群发、分组广播或单群发送时只会看到允许的目标。</p>
+<p class="hint">宿主可管理全部授权；一级操作人只能把自己可使用的分组或直接拥有的单群授权给其他一级操作人和自己的下级。授权仅提供广播使用权，不转移分组管理权。</p>
 <form class="table-tools" method="get" action="/admin"><input name="groups_q" value="{{.GroupPager.Query}}" type="search" placeholder="搜索单群名称或群ID"><input name="broadcast_q" value="{{.BroadcastPager.Query}}" type="search" placeholder="搜索广播分组"><button class="btn mini" type="submit">筛选目标</button></form>
 <div class="permission-panels">
 <div class="permission-panel">

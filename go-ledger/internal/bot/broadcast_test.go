@@ -3,8 +3,11 @@ package bot
 import (
 	"context"
 	"fmt"
+	"os"
 	"testing"
+	"time"
 
+	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/permissions"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/telegram"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/worker"
@@ -158,5 +161,73 @@ func TestBroadcastQueueFullRunsFailureFallback(t *testing.T) {
 	})
 	if err != nil || !called {
 		t.Fatalf("queue-full fallback called=%t err=%v", called, err)
+	}
+}
+
+func TestPostgresBroadcastGroupVisibilityAndSendRecheck(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	store, err := storage.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	base := int64(970000000000 + now.UnixNano()%1000000)
+	hostID := base
+	ownerID := base + 1
+	peerID := base + 2
+	chatID := -base
+	for _, userID := range []int64{ownerID, peerID} {
+		if err := store.UpsertGlobalOperator(ctx, userID, "primary", 0, hostID, "bot fixture", now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.EnsureGroup(ctx, chatID, "bot scope", now); err != nil {
+		t.Fatal(err)
+	}
+	for _, userID := range []int64{ownerID, peerID} {
+		if err := store.AddBroadcastPermission(ctx, userID, "chat", chatID, "", hostID, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	groupName := fmt.Sprintf("bot-owned-%d", base)
+	if created, err := store.CreateBroadcastGroup(ctx, groupName, ownerID, ownerID, now); err != nil || !created {
+		t.Fatalf("create group=%v err=%v", created, err)
+	}
+	if added, err := store.AddChatsToBroadcastGroupManaged(ctx, groupName, []int64{chatID}, ownerID, false, now); err != nil || added != 1 {
+		t.Fatalf("add member=%d err=%v", added, err)
+	}
+	b := &Bot{store: store, perms: permissions.NewPolicy(hostID, nil)}
+
+	ownerOptions, err := b.allowedBroadcastGroupOptions(ctx, ownerID)
+	if err != nil || len(ownerOptions) != 1 || ownerOptions[0].Name != groupName {
+		t.Fatalf("owner options=%+v err=%v", ownerOptions, err)
+	}
+	peerOptions, err := b.allowedBroadcastGroupOptions(ctx, peerID)
+	if err != nil || len(peerOptions) != 0 {
+		t.Fatalf("chat overlap leaked group: options=%+v err=%v", peerOptions, err)
+	}
+	if err := store.AddBroadcastPermission(ctx, peerID, "group", 0, groupName, ownerID, now); err != nil {
+		t.Fatal(err)
+	}
+	peerOptions, err = b.allowedBroadcastGroupOptions(ctx, peerID)
+	if err != nil || len(peerOptions) != 1 || peerOptions[0].Name != groupName {
+		t.Fatalf("authorized peer options=%+v err=%v", peerOptions, err)
+	}
+	state := privateState{Mode: "group", TargetName: groupName, ChatIDs: []int64{chatID}}
+	if targets, err := b.currentBroadcastTargets(ctx, peerID, state); err != nil || len(targets) != 1 {
+		t.Fatalf("authorized send targets=%+v err=%v", targets, err)
+	}
+	if removed, err := store.RemoveBroadcastPermission(ctx, peerID, "group", 0, groupName, ownerID, now.Add(time.Second)); err != nil || !removed {
+		t.Fatalf("revoke group=%v err=%v", removed, err)
+	}
+	if targets, err := b.currentBroadcastTargets(ctx, peerID, state); err != nil || len(targets) != 0 {
+		t.Fatalf("send recheck retained revoked target=%+v err=%v", targets, err)
 	}
 }

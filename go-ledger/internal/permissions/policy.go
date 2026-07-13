@@ -86,6 +86,25 @@ func (p Policy) CanManageBroadcastPermissions(userID int64, caps UserCapabilitie
 	return p.IsPrivileged(userID) || caps.GlobalOperatorLevel == "primary"
 }
 
+func (p Policy) CanManageBroadcastGroups(userID int64, caps UserCapabilities) bool {
+	return p.IsHost(userID) || caps.GlobalOperatorLevel == "primary"
+}
+
+func (p Policy) CanManageBroadcastGroup(userID int64, caps UserCapabilities, ownerUserID int64) bool {
+	return p.IsHost(userID) || (caps.GlobalOperatorLevel == "primary" && ownerUserID == userID)
+}
+
+func (p Policy) CanDelegateBroadcastPermission(userID int64, caps UserCapabilities, subjectUserID int64, subjectLevel string, subjectParentUserID int64) bool {
+	if p.IsPrivileged(userID) {
+		return subjectLevel == "primary" || subjectLevel == "secondary"
+	}
+	if caps.GlobalOperatorLevel != "primary" {
+		return false
+	}
+	return (subjectLevel == "primary" && subjectUserID != userID) ||
+		(subjectLevel == "secondary" && subjectParentUserID == userID)
+}
+
 func (p Policy) CanManageAllBroadcastPermissions(userID int64) bool {
 	return p.IsPrivileged(userID)
 }

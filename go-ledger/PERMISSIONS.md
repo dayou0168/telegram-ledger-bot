@@ -1,4 +1,4 @@
-# Go Ledger Bot v2.4.3 Permissions
+# Go Ledger Bot v2.4.4 Permissions
 
 This file is the source of truth for Telegram user permissions in the Go/PostgreSQL runtime. Business modules must use `internal/permissions` and the storage capability helpers instead of reading host/default configuration or legacy operator tables directly.
 
@@ -51,11 +51,24 @@ The same global identities can use private global features. A disabled or invali
 ## Broadcast Delegation
 
 - Host/default identities may grant or revoke broadcast group/chat scopes for any active database primary or secondary without a parent-scope restriction.
-- A primary may grant or revoke scopes only for its own active secondaries.
-- A primary may grant a group only when it has that exact group scope.
-- A primary may grant a chat when it has that chat directly or through one of its group scopes.
+- A primary may grant scopes to another active primary or to one of its own active secondaries. It cannot target another primary's secondary.
+- A primary may grant a group when it owns that group or has an explicit group-use permission. The recipient receives use only; ownership and group-management rights do not move.
+- A primary may grant a chat only when it has that exact direct-chat permission. A chat reachable only through a group is not delegable as a standalone chat.
+- A primary may revoke only permission rows whose `granted_by` is that primary. Host/default may revoke any permission row.
 - A secondary cannot grant or revoke broadcast scopes.
 - `broadcast_operator_permissions.user_id` always references a `global_operators.user_id`.
+
+## Broadcast Group Ownership
+
+- The host can view and manage every broadcast group. Default operators retain global broadcast use and unrestricted target assignment, but do not gain group ownership management.
+- An active primary may create a group. The new row stores that primary in `broadcast_groups.owner_user_id`.
+- A primary may rename, delete, add members to, or remove members from only a group it owns. Explicit group-use permission never grants these operations.
+- A primary may add only chats for which it has an exact direct-chat permission. Creating a group cannot expand its chat visibility or broadcast scope.
+- A primary sees its direct chats, groups it owns, groups explicitly assigned for use, its own secondaries, and permission rows it granted or received. It does not see peer-only chats, peer-only groups, another primary's secondaries, or unrelated third-party grants.
+- Secondary operators cannot create or manage groups.
+- Bot group selectors require ownership or explicit group-use permission. Membership overlap alone does not reveal a group, and targets are rechecked against current PostgreSQL permissions immediately before sending.
+
+Group ownership uses a foreign key to `global_operators` and a trigger that accepts only a primary identity as a non-null owner. Group creation additionally locks and requires that owner to be active. Disabling a primary pauses its own management/use entry but preserves ownership so the host can still manage the group and re-enable restores the same owner. `NULL` means environment/host-managed or unresolved historical ownership; it is never interpreted as ownership by an arbitrary primary.
 
 ## Address Watch And Backend
 
@@ -63,7 +76,7 @@ Ordinary private users may manage up to `ADDRESS_WATCH_FREE_LIMIT` active addres
 
 The host can see all backend address watches. Default/global operators see only their own watches. Ordinary users cannot enter the backend.
 
-Host-only backend modules remain host-only. Default operators can manage unrestricted broadcast permission assignments. A primary can access only its own secondary-management and delegated broadcast-permission views.
+Host-only backend modules remain host-only. Default operators can manage unrestricted broadcast permission assignments. A primary can access its direct-chat list, owned/use-authorized groups, owned-group management, its own secondary-management, and grants made by that primary. Address-watch visibility is unchanged: only the host sees all owners; every other backend identity sees only its own addresses.
 
 ## Disable, Cache, Migration, And Audit
 
@@ -73,7 +86,11 @@ The 10-second `BOT_OPERATOR_CACHE_TTL_SECONDS` boundary remains only for ordinar
 
 The legacy active-`broadcast_operators` backfill is a strictly one-time migration and is skipped when upgrading a database that already had `global_operators`. Repeated startup cannot recreate a removed identity. The v2.4.3 hierarchy repair first quarantines legacy-derived identities, then uses host/parent/creator/audit evidence to normalize direct host grants to primary and their children to secondary. Ambiguous or explicitly disabled rows remain disabled. Environment identity shadows are detached. Broadcast scopes are preserved for identities recovered as active; scopes for disabled identities remain in `broadcast_operator_permission_snapshots` until that identity is re-enabled.
 
-`permission_audit_events` is append-only and records global-operator create/update/level/parent/re-enable/disable actions and broadcast grant/revoke/restore actions with actor, subject, scope, and timestamp.
+The v2.4.4 broadcast-group migration captures historical owner evidence exactly once. `created_by` is accepted as owner only when it identifies a current active primary, does not conflict with legacy disabled state or creation audit, and every existing group member is within that primary's direct-chat scope. Host/default creators remain environment-managed. Secondary, disabled, unknown, zero, conflicting, or out-of-scope creators remain `owner_user_id=NULL` and are recorded in `broadcast_group_owner_repair_candidates` for host review. The normalization marker makes repeated startup idempotent and never overwrites an already assigned or manually repaired owner.
+
+Manual resolution of an ambiguous candidate must be a host-controlled transaction: lock the group and candidate, revalidate the proposed owner as an active primary, verify every member chat is in that primary's direct scope, set `owner_user_id`, mark the candidate `manual_primary_owner`, and insert a `broadcast_group_audit_events` row with the host actor and timestamp. Keeping the group host-managed uses `manual_environment_owner`. Deleting or renaming a group updates the candidate record in the same transaction so repair evidence never points at a stale live name.
+
+`permission_audit_events` is append-only and records global-operator create/update/level/parent/re-enable/disable actions and broadcast grant/revoke/restore actions with actor, subject, scope, and timestamp. `broadcast_group_audit_events` is also append-only and records create, ownership normalization, rename, deletion, and member changes.
 
 ## Module Boundary
 

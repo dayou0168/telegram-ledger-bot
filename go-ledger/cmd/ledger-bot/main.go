@@ -39,6 +39,14 @@ func main() {
 		log.Printf("global operator hierarchy normalized: primary=%d secondary=%d recovered=%d quarantined=%d env_detached=%d",
 			repair.PrimaryNormalized, repair.SecondaryNormalized, repair.Recovered, repair.Quarantined, repair.EnvDetached)
 	}
+	groupRepair, err := db.NormalizeBroadcastGroupOwnership(ctx, cfg.HostUserID, cfg.DefaultOperatorIDs, time.Now())
+	if err != nil {
+		log.Fatalf("normalize broadcast group ownership: %v", err)
+	}
+	if groupRepair.OwnedByPrimary+groupRepair.Environment+groupRepair.Ambiguous > 0 {
+		log.Printf("broadcast group ownership normalized: primary=%d environment=%d ambiguous=%d",
+			groupRepair.OwnedByPrimary, groupRepair.Environment, groupRepair.Ambiguous)
+	}
 	var fallbackDB *storage.Store
 	if cfg.SharedFallbackEnabled() {
 		fallbackDB, err = storage.OpenExisting(ctx, cfg.BotFallbackSharedDatabaseURL)

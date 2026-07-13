@@ -50,6 +50,9 @@ func TestAdminGlobalOperatorDisableAndDelegatedBroadcastScope(t *testing.T) {
 	if err := store.UpsertGlobalOperator(ctx, otherSecondaryID, "secondary", otherPrimaryID, otherPrimaryID, "other secondary", now); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.EnsureGroup(ctx, chatID, "delegated chat", now); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.AddBroadcastPermission(ctx, primaryID, "chat", chatID, "", 1001, now); err != nil {
 		t.Fatal(err)
 	}
@@ -217,8 +220,8 @@ func TestAdminGlobalOperatorHierarchyHandlersAndSelectors(t *testing.T) {
 		[]int64{primaryID, otherPrimaryID, secondaryID, otherSecondaryID},
 		[]int64{hostID, defaultID, disabledSecondaryID})
 	primaryPage := assertSelector("primary", primarySession,
-		[]int64{secondaryID},
-		[]int64{hostID, defaultID, primaryID, otherPrimaryID, otherSecondaryID, disabledSecondaryID})
+		[]int64{secondaryID, otherPrimaryID},
+		[]int64{hostID, defaultID, primaryID, otherSecondaryID, disabledSecondaryID})
 	if ids := operatorIDs(primaryPage.BOperators); !ids[secondaryID] || !ids[disabledSecondaryID] || ids[otherSecondaryID] {
 		t.Fatalf("primary managed operator list = %v", ids)
 	}
@@ -268,6 +271,9 @@ func TestAdminGlobalOperatorHierarchyHandlersAndSelectors(t *testing.T) {
 	if rec := post(primarySession, "/admin/permission/grant", fmt.Sprintf("user_id=%d&target=chat&chat_id=%d", secondaryID, chatID), s.grantPermission); rec.Code != http.StatusSeeOther {
 		t.Fatalf("primary chat grant: status=%d body=%s", rec.Code, rec.Body.String())
 	}
+	if rec := post(primarySession, "/admin/permission/grant", fmt.Sprintf("user_id=%d&target=chat&chat_id=%d", otherPrimaryID, chatID), s.grantPermission); rec.Code != http.StatusSeeOther {
+		t.Fatalf("primary to peer-primary chat grant: status=%d body=%s", rec.Code, rec.Body.String())
+	}
 	if rec := post(primarySession, "/admin/operator/disable", fmt.Sprintf("user_id=%d", secondaryID), s.disableOperator); rec.Code != http.StatusSeeOther {
 		t.Fatalf("disable own secondary: status=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -281,5 +287,140 @@ func TestAdminGlobalOperatorHierarchyHandlersAndSelectors(t *testing.T) {
 	}
 	if allowed, err := store.HasBroadcastPermissionScope(ctx, secondaryID, "group", 0, groupName); err != nil || !allowed {
 		t.Fatalf("reenable did not restore group permission: allowed=%v err=%v", allowed, err)
+	}
+}
+
+func TestAdminPrimaryBroadcastGroupOwnershipAndForgedPOSTBoundaries(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store, err := storage.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	base := int64(960000000000 + now.UnixNano()%1000000)
+	hostID := base
+	primaryAID := base + 1
+	primaryBID := base + 2
+	secondaryAID := base + 3
+	secondaryBID := base + 4
+	chatAID := -base
+	chatBID := -base - 1
+	for _, op := range []struct {
+		userID, parentID, createdBy int64
+		level                       string
+	}{
+		{primaryAID, 0, hostID, "primary"},
+		{primaryBID, 0, hostID, "primary"},
+		{secondaryAID, primaryAID, primaryAID, "secondary"},
+		{secondaryBID, primaryBID, primaryBID, "secondary"},
+	} {
+		if err := store.UpsertGlobalOperator(ctx, op.userID, op.level, op.parentID, op.createdBy, "handler fixture", now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, chatID := range []int64{chatAID, chatBID} {
+		if err := store.EnsureGroup(ctx, chatID, fmt.Sprintf("handler %d", chatID), now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.AddBroadcastPermission(ctx, primaryAID, "chat", chatAID, "", hostID, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddBroadcastPermission(ctx, primaryBID, "chat", chatBID, "", hostID, now); err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(config.Config{HostUserID: hostID}, store)
+	primaryASession := adminauth.Session{UserID: primaryAID, Role: adminauth.RoleOperator}
+	primaryBSession := adminauth.Session{UserID: primaryBID, Role: adminauth.RoleOperator}
+	post := func(session adminauth.Session, path, form string, handler http.HandlerFunc) *httptest.ResponseRecorder {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(form))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req = req.WithContext(context.WithValue(req.Context(), adminContextKey{}, session))
+		handler(rec, req)
+		return rec
+	}
+
+	groupName := fmt.Sprintf("handler-owned-%d", base)
+	if rec := post(primaryASession, "/admin/group/save", "name="+groupName, s.saveGroup); rec.Code != http.StatusSeeOther {
+		t.Fatalf("primary create group: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	group, ok, err := store.GetBroadcastGroup(ctx, groupName)
+	if err != nil || !ok || group.OwnerUserID != primaryAID {
+		t.Fatalf("created group=%+v ok=%v err=%v", group, ok, err)
+	}
+	if rec := post(primaryASession, "/admin/group/add", fmt.Sprintf("name=%s&chat_id=%d", groupName, chatAID), s.addGroupChats); rec.Code != http.StatusSeeOther {
+		t.Fatalf("owner add chat: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := post(primaryASession, "/admin/group/add", fmt.Sprintf("name=%s&chat_id=%d", groupName, chatBID), s.addGroupChats); rec.Code != http.StatusForbidden {
+		t.Fatalf("owner forged out-of-scope add: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := post(primaryBSession, "/admin/group/rename", fmt.Sprintf("old_name=%s&new_name=forged", groupName), s.renameGroup); rec.Code != http.StatusForbidden {
+		t.Fatalf("peer forged rename: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	for _, tc := range []struct {
+		subjectID int64
+		target    string
+		value     string
+	}{
+		{secondaryAID, "group", groupName},
+		{primaryBID, "group", groupName},
+		{secondaryAID, "chat", fmt.Sprint(chatAID)},
+		{primaryBID, "chat", fmt.Sprint(chatAID)},
+	} {
+		form := fmt.Sprintf("user_id=%d&target=%s", tc.subjectID, tc.target)
+		if tc.target == "group" {
+			form += "&group_name=" + tc.value
+		} else {
+			form += "&chat_id=" + tc.value
+		}
+		if rec := post(primaryASession, "/admin/permission/grant", form, s.grantPermission); rec.Code != http.StatusSeeOther {
+			t.Fatalf("grant %+v: status=%d body=%s", tc, rec.Code, rec.Body.String())
+		}
+	}
+	if rec := post(primaryASession, "/admin/permission/grant", fmt.Sprintf("user_id=%d&target=chat&chat_id=%d", secondaryBID, chatAID), s.grantPermission); rec.Code != http.StatusForbidden {
+		t.Fatalf("cross-parent forged grant: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := post(primaryBSession, "/admin/group/delete", "name="+groupName, s.deleteGroup); rec.Code != http.StatusForbidden {
+		t.Fatalf("use-only peer deleted group: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	pageA, err := s.loadPageData(ctx, "", primaryASession)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pageA.Groups) != 1 || pageA.Groups[0].ChatID != chatAID {
+		t.Fatalf("primary A direct chats=%+v", pageA.Groups)
+	}
+	if len(pageA.BOperators) != 1 || pageA.BOperators[0].UserID != secondaryAID {
+		t.Fatalf("primary A managed operators=%+v", pageA.BOperators)
+	}
+	for _, permission := range pageA.Permissions {
+		if permission.GrantedBy != primaryAID && permission.UserID != primaryAID {
+			t.Fatalf("primary page exposed unrelated grant: %+v", permission)
+		}
+	}
+	pageB, err := s.loadPageData(ctx, "", primaryBSession)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundUseOnly := false
+	for _, candidate := range pageB.BGroups {
+		if candidate.Name == groupName {
+			foundUseOnly = candidate.OwnerUserID == primaryAID
+		}
+	}
+	if !foundUseOnly {
+		t.Fatalf("peer page missing authorized use-only group: %+v", pageB.BGroups)
 	}
 }
