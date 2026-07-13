@@ -601,15 +601,13 @@ func TestAdminTemplateForPrimaryRendersOnlyDelegatedPermissionTools(t *testing.T
 	data := pageData{
 		Version:                       "2.4.2",
 		AdminRoleLabel:                "一级操作人",
+		AdminUserID:                   3003,
 		CanManageOperators:            true,
 		CanManageBroadcastPermissions: true,
-		BOperators: []storage.GlobalOperator{{
-			UserID:       3004,
-			Level:        "secondary",
-			Status:       "active",
-			ParentUserID: 3003,
-			Remark:       "own secondary",
-		}},
+		BOperators: []storage.GlobalOperator{
+			{UserID: 3004, Level: "secondary", Status: "active", ParentUserID: 3003, Remark: "own active secondary"},
+			{UserID: 3005, Level: "secondary", Status: "disabled", ParentUserID: 3003, Remark: "own disabled secondary"},
+		},
 	}
 	if err := adminTemplate.Execute(&buf, data); err != nil {
 		t.Fatal(err)
@@ -624,6 +622,49 @@ func TestAdminTemplateForPrimaryRendersOnlyDelegatedPermissionTools(t *testing.T
 		if strings.Contains(html, blocked) {
 			t.Fatalf("primary admin page exposed host module %q", blocked)
 		}
+	}
+	for _, want := range []string{`name="level" value="secondary"`, `>禁用</button>`, `>启用</button>`} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("primary operator controls missing %q", want)
+		}
+	}
+	if strings.Contains(html, `name="level" value="primary"`) || strings.Contains(html, `<select name="level">`) {
+		t.Fatal("primary page should not offer primary creation or a mutable level selector")
+	}
+}
+
+func TestAdminTemplateForHostManagesPrimaryAndLabelsDisabledAction(t *testing.T) {
+	var buf bytes.Buffer
+	data := pageData{
+		Version:            "2.4.3",
+		AdminUserID:        1001,
+		AdminRoleLabel:     "宿主",
+		CanManageGlobal:    true,
+		CanManageOperators: true,
+		PermissionOperators: []storage.GlobalOperator{
+			{UserID: 3003, Level: "primary", Status: "active", Remark: "active primary"},
+		},
+		PrimaryOperators: []storage.GlobalOperator{
+			{UserID: 3003, Level: "primary", Status: "active", Remark: "active primary"},
+		},
+		BOperators: []storage.GlobalOperator{
+			{UserID: 3003, Level: "primary", Status: "active", Remark: "active primary"},
+			{UserID: 3004, Level: "primary", Status: "disabled", Remark: "disabled primary"},
+			{UserID: 3005, Level: "secondary", Status: "active", ParentUserID: 3003, Remark: "managed by primary"},
+			{UserID: 1001, Level: "host", Status: "active", Remark: "environment owner"},
+		},
+	}
+	if err := adminTemplate.Execute(&buf, data); err != nil {
+		t.Fatal(err)
+	}
+	html := buf.String()
+	for _, want := range []string{`<select name="level"><option value="primary">一级操作人</option><option value="secondary">下级操作人</option></select>`, `name="parent_user_id"`, `>禁用</button>`, `>启用</button>`, `环境配置`} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("host operator controls missing %q", want)
+		}
+	}
+	if strings.Contains(html, `name="level" value="secondary"><span class="field-label">新增自己的下级操作人`) {
+		t.Fatal("host page should use the explicit level and primary-parent selectors")
 	}
 }
 

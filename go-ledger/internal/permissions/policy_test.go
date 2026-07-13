@@ -118,7 +118,7 @@ func TestPolicyGlobalOperatorDelegationBoundaries(t *testing.T) {
 	secondary := UserCapabilities{GlobalOperatorLevel: "secondary", ParentUserID: 3003}
 
 	if !p.CanCreateGlobalOperator(1001, UserCapabilities{}, "primary") || !p.CanCreateGlobalOperator(1001, UserCapabilities{}, "secondary") {
-		t.Fatal("host should create primary and secondary operators")
+		t.Fatal("host should create primary operators and secondaries for a selected primary")
 	}
 	if p.CanCreateGlobalOperator(2002, UserCapabilities{}, "primary") || p.CanCreateGlobalOperator(2002, UserCapabilities{}, "secondary") {
 		t.Fatal("default operator should not create database global operators")
@@ -134,6 +134,9 @@ func TestPolicyGlobalOperatorDelegationBoundaries(t *testing.T) {
 	}
 	if p.CanDisableGlobalOperator(3003, primary, "secondary", 9999) || p.CanDisableGlobalOperator(3003, primary, "primary", 0) {
 		t.Fatal("primary should not disable unrelated or primary operators")
+	}
+	if !p.CanDisableGlobalOperator(1001, UserCapabilities{}, "primary", 0) || !p.CanDisableGlobalOperator(1001, UserCapabilities{}, "secondary", 3003) {
+		t.Fatal("host should disable primary and secondary operators")
 	}
 }
 

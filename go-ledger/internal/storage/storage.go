@@ -19,7 +19,7 @@ type Store struct {
 	keyCipher *keyCipher
 }
 
-const latestSchemaMigrationVersion = "2.4.2"
+const latestSchemaMigrationVersion = "2.4.3"
 
 func Open(ctx context.Context, databaseURL string) (*Store, error) {
 	return open(ctx, databaseURL, true)
@@ -380,6 +380,49 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE TRIGGER trg_validate_global_operator_parent
 			BEFORE INSERT OR UPDATE OF level, status, parent_user_id ON global_operators
 			FOR EACH ROW EXECUTE FUNCTION validate_global_operator_parent()`,
+		`CREATE TABLE IF NOT EXISTS global_operator_level_repair_candidates (
+			user_id BIGINT PRIMARY KEY,
+			original_level TEXT NOT NULL,
+			original_status TEXT NOT NULL,
+			original_parent_user_id BIGINT,
+			created_by BIGINT NOT NULL,
+			original_disabled_by BIGINT,
+			original_disabled_at TIMESTAMPTZ,
+			had_disable_audit BOOLEAN NOT NULL DEFAULT FALSE,
+			captured_at TIMESTAMPTZ NOT NULL
+		)`,
+		`DO $$
+		BEGIN
+			IF NOT EXISTS (
+				SELECT 1 FROM schema_migrations WHERE version='2.4.3-global-operator-level-repair-quarantined'
+			) THEN
+				INSERT INTO global_operator_level_repair_candidates(
+					user_id, original_level, original_status, original_parent_user_id,
+					created_by, original_disabled_by, original_disabled_at, had_disable_audit, captured_at
+				)
+				SELECT g.user_id, g.level, g.status, g.parent_user_id,
+					g.created_by, g.disabled_by, g.disabled_at,
+					EXISTS (
+						SELECT 1 FROM permission_audit_events e
+						WHERE e.subject_type='global_operator'
+						  AND e.subject_user_id=g.user_id
+						  AND e.action='disabled'
+					),
+					NOW()
+				FROM global_operators g
+				ON CONFLICT(user_id) DO NOTHING;
+
+				UPDATE global_operators
+				SET status='disabled', disabled_by=NULL, disabled_at=COALESCE(disabled_at, NOW())
+				WHERE status='active' AND level='secondary';
+				UPDATE global_operators
+				SET status='disabled', disabled_by=NULL, disabled_at=COALESCE(disabled_at, NOW())
+				WHERE status='active' AND level='primary';
+
+				INSERT INTO schema_migrations(version, applied_at)
+				VALUES('2.4.3-global-operator-level-repair-quarantined', NOW());
+			END IF;
+		END $$`,
 		`CREATE TABLE IF NOT EXISTS private_chat_messages (
 			id BIGSERIAL PRIMARY KEY,
 			operator_user_id BIGINT NOT NULL,
@@ -934,6 +977,11 @@ func (s *Store) migrate(ctx context.Context) error {
 		return fmt.Errorf("record schema migration: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
+		VALUES('2.4.2', NOW())
+		ON CONFLICT(version) DO NOTHING`); err != nil {
+		return fmt.Errorf("record schema migration: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
 		VALUES($1, NOW())
 		ON CONFLICT(version) DO NOTHING`, latestSchemaMigrationVersion); err != nil {
 		return fmt.Errorf("record schema migration: %w", err)
@@ -1234,6 +1282,295 @@ func normalizeGlobalOperatorLevel(level string) (string, error) {
 	default:
 		return "", errors.New("invalid global operator level")
 	}
+}
+
+type GlobalOperatorHierarchyRepairResult struct {
+	PrimaryNormalized   int
+	SecondaryNormalized int
+	Recovered           int
+	Quarantined         int
+	EnvDetached         int
+}
+
+func (r GlobalOperatorHierarchyRepairResult) Changed() int {
+	return r.PrimaryNormalized + r.SecondaryNormalized + r.Quarantined + r.EnvDetached
+}
+
+type globalOperatorRepairCandidate struct {
+	UserID             int64
+	OriginalLevel      string
+	OriginalStatus     string
+	OriginalParentID   int64
+	CreatedBy          int64
+	OriginalDisabledBy int64
+	OriginalDisabledAt *time.Time
+	HadDisableAudit    bool
+	CurrentLevel       string
+	CurrentParentID    int64
+}
+
+func (c globalOperatorRepairCandidate) restorableActive() bool {
+	return c.OriginalStatus == "active" ||
+		(c.OriginalStatus == "disabled" && c.OriginalDisabledBy == 0 && !c.HadDisableAudit)
+}
+
+func (s *Store) NormalizeGlobalOperatorHierarchy(ctx context.Context, hostUserID int64, defaultOperatorIDs map[int64]struct{}, now time.Time) (GlobalOperatorHierarchyRepairResult, error) {
+	if hostUserID <= 0 {
+		return GlobalOperatorHierarchyRepairResult{}, errors.New("global operator hierarchy requires a configured host user id")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return GlobalOperatorHierarchyRepairResult{}, err
+	}
+	defer rollback(ctx, tx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext(current_database()), $1)`, int32(0x5045524d)); err != nil {
+		return GlobalOperatorHierarchyRepairResult{}, err
+	}
+	var normalized bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(
+		SELECT 1 FROM schema_migrations WHERE version='2.4.3-global-operator-levels-normalized'
+	)`).Scan(&normalized); err != nil {
+		return GlobalOperatorHierarchyRepairResult{}, err
+	}
+	if normalized {
+		return GlobalOperatorHierarchyRepairResult{}, tx.Commit(ctx)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO global_operator_level_repair_candidates(
+			user_id, original_level, original_status, original_parent_user_id,
+			created_by, original_disabled_by, original_disabled_at, had_disable_audit, captured_at
+		)
+		SELECT g.user_id, g.level, g.status, g.parent_user_id,
+			g.created_by, g.disabled_by, g.disabled_at,
+			EXISTS (
+				SELECT 1 FROM permission_audit_events e
+				WHERE e.subject_type='global_operator'
+				  AND e.subject_user_id=g.user_id
+				  AND e.action='disabled'
+			),
+			$1
+		FROM global_operators g
+		ON CONFLICT(user_id) DO NOTHING`, now); err != nil {
+		return GlobalOperatorHierarchyRepairResult{}, err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE global_operators
+		SET status='disabled', disabled_by=NULL, disabled_at=COALESCE(disabled_at, $1)
+		WHERE status='active' AND level='secondary'`, now); err != nil {
+		return GlobalOperatorHierarchyRepairResult{}, err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE global_operators
+		SET status='disabled', disabled_by=NULL, disabled_at=COALESCE(disabled_at, $1)
+		WHERE status='active' AND level='primary'`, now); err != nil {
+		return GlobalOperatorHierarchyRepairResult{}, err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM broadcast_operator_permissions p
+		USING global_operator_level_repair_candidates c
+		WHERE p.user_id=c.user_id`); err != nil {
+		return GlobalOperatorHierarchyRepairResult{}, err
+	}
+	rows, err := tx.Query(ctx, `SELECT c.user_id, c.original_level, c.original_status,
+		COALESCE(c.original_parent_user_id, 0), c.created_by,
+		COALESCE(c.original_disabled_by, 0), c.original_disabled_at, c.had_disable_audit,
+		g.level, COALESCE(g.parent_user_id, 0)
+		FROM global_operator_level_repair_candidates c
+		JOIN global_operators g ON g.user_id=c.user_id
+		ORDER BY c.user_id FOR UPDATE OF g`)
+	if err != nil {
+		return GlobalOperatorHierarchyRepairResult{}, err
+	}
+	var candidates []globalOperatorRepairCandidate
+	for rows.Next() {
+		var candidate globalOperatorRepairCandidate
+		var disabledAt pgtype.Timestamptz
+		if err := rows.Scan(
+			&candidate.UserID,
+			&candidate.OriginalLevel,
+			&candidate.OriginalStatus,
+			&candidate.OriginalParentID,
+			&candidate.CreatedBy,
+			&candidate.OriginalDisabledBy,
+			&disabledAt,
+			&candidate.HadDisableAudit,
+			&candidate.CurrentLevel,
+			&candidate.CurrentParentID,
+		); err != nil {
+			rows.Close()
+			return GlobalOperatorHierarchyRepairResult{}, err
+		}
+		if disabledAt.Valid {
+			t := disabledAt.Time
+			candidate.OriginalDisabledAt = &t
+		}
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return GlobalOperatorHierarchyRepairResult{}, err
+	}
+	rows.Close()
+
+	envIDs := map[int64]struct{}{hostUserID: {}}
+	for userID := range defaultOperatorIDs {
+		if userID > 0 {
+			envIDs[userID] = struct{}{}
+		}
+	}
+	primaryCandidates := make(map[int64]globalOperatorRepairCandidate)
+	primaryActive := make(map[int64]bool)
+	for _, candidate := range candidates {
+		if _, isEnv := envIDs[candidate.UserID]; isEnv {
+			continue
+		}
+		if candidate.OriginalParentID == hostUserID ||
+			(candidate.OriginalLevel == "primary" && candidate.OriginalParentID == 0 && candidate.CreatedBy == hostUserID) {
+			primaryCandidates[candidate.UserID] = candidate
+			primaryActive[candidate.UserID] = candidate.restorableActive()
+		}
+	}
+	secondaryParents := make(map[int64]int64)
+	for _, candidate := range candidates {
+		if _, isEnv := envIDs[candidate.UserID]; isEnv {
+			continue
+		}
+		if _, isPrimary := primaryCandidates[candidate.UserID]; isPrimary {
+			continue
+		}
+		parentFromCreator := int64(0)
+		if _, ok := primaryCandidates[candidate.CreatedBy]; ok {
+			parentFromCreator = candidate.CreatedBy
+		}
+		parentFromStored := int64(0)
+		if _, ok := primaryCandidates[candidate.OriginalParentID]; ok {
+			parentFromStored = candidate.OriginalParentID
+		}
+		if parentFromCreator != 0 && parentFromStored != 0 && parentFromCreator != parentFromStored {
+			continue
+		}
+		parentID := parentFromStored
+		if parentID == 0 {
+			parentID = parentFromCreator
+		}
+		if parentID != 0 && (candidate.OriginalParentID == 0 || candidate.OriginalParentID == parentID) {
+			secondaryParents[candidate.UserID] = parentID
+		}
+	}
+
+	result := GlobalOperatorHierarchyRepairResult{}
+	apply := func(candidate globalOperatorRepairCandidate, level string, parentUserID int64, active bool, action string) error {
+		status := "disabled"
+		var disabledBy int64
+		var disabledAt any = now
+		if active {
+			status = "active"
+			disabledAt = nil
+		} else if candidate.OriginalStatus == "disabled" && (candidate.OriginalDisabledBy != 0 || candidate.HadDisableAudit) {
+			disabledBy = candidate.OriginalDisabledBy
+			if candidate.OriginalDisabledAt != nil {
+				disabledAt = *candidate.OriginalDisabledAt
+			}
+		} else {
+			disabledBy = hostUserID
+		}
+		if _, err := tx.Exec(ctx, `UPDATE global_operators SET
+			level=$2, status=$3, parent_user_id=NULLIF($4::BIGINT, 0::BIGINT),
+			disabled_by=NULLIF($5::BIGINT, 0::BIGINT), disabled_at=$6
+			WHERE user_id=$1`, candidate.UserID, level, status, parentUserID, disabledBy, disabledAt); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE broadcast_operators SET status=$2, updated_at=$3 WHERE user_id=$1`, candidate.UserID, status, now); err != nil {
+			return err
+		}
+		if status == "disabled" {
+			if _, err := tx.Exec(ctx, `DELETE FROM broadcast_operator_permissions WHERE user_id=$1`, candidate.UserID); err != nil {
+				return err
+			}
+		}
+		return insertPermissionAudit(ctx, tx, PermissionAuditEvent{
+			ActorUserID: hostUserID, SubjectType: "global_operator", SubjectUserID: candidate.UserID,
+			Action: action, Level: level, ParentUserID: parentUserID, CreatedAt: now,
+		})
+	}
+	for _, candidate := range candidates {
+		if _, ok := primaryCandidates[candidate.UserID]; !ok {
+			continue
+		}
+		if err := apply(candidate, "primary", 0, primaryActive[candidate.UserID], "hierarchy_normalized_primary"); err != nil {
+			return GlobalOperatorHierarchyRepairResult{}, err
+		}
+		result.PrimaryNormalized++
+		if candidate.OriginalStatus == "disabled" && primaryActive[candidate.UserID] {
+			result.Recovered++
+		}
+	}
+	for _, candidate := range candidates {
+		parentID, ok := secondaryParents[candidate.UserID]
+		if !ok {
+			continue
+		}
+		active := primaryActive[parentID] && candidate.restorableActive()
+		action := "hierarchy_normalized_secondary"
+		if candidate.OriginalStatus == "disabled" && active {
+			action = "hierarchy_recovered_secondary"
+			result.Recovered++
+		}
+		if err := apply(candidate, "secondary", parentID, active, action); err != nil {
+			return GlobalOperatorHierarchyRepairResult{}, err
+		}
+		result.SecondaryNormalized++
+	}
+	for _, candidate := range candidates {
+		if _, ok := primaryCandidates[candidate.UserID]; ok {
+			continue
+		}
+		if _, ok := secondaryParents[candidate.UserID]; ok {
+			continue
+		}
+		if _, isEnv := envIDs[candidate.UserID]; isEnv {
+			if _, err := tx.Exec(ctx, `UPDATE global_operators
+				SET status='disabled', disabled_by=$2, disabled_at=COALESCE(disabled_at, $3)
+				WHERE user_id=$1`, candidate.UserID, hostUserID, now); err != nil {
+				return GlobalOperatorHierarchyRepairResult{}, err
+			}
+			if _, err := tx.Exec(ctx, `DELETE FROM broadcast_operator_permissions WHERE user_id=$1`, candidate.UserID); err != nil {
+				return GlobalOperatorHierarchyRepairResult{}, err
+			}
+			if err := insertPermissionAudit(ctx, tx, PermissionAuditEvent{
+				ActorUserID: hostUserID, SubjectType: "global_operator", SubjectUserID: candidate.UserID,
+				Action: "env_identity_detached", Level: candidate.CurrentLevel,
+				ParentUserID: candidate.CurrentParentID, CreatedAt: now,
+			}); err != nil {
+				return GlobalOperatorHierarchyRepairResult{}, err
+			}
+			result.EnvDetached++
+			continue
+		}
+		if _, err := tx.Exec(ctx, `UPDATE global_operators
+			SET status='disabled', disabled_by=$2, disabled_at=COALESCE(disabled_at, $3)
+			WHERE user_id=$1`, candidate.UserID, hostUserID, now); err != nil {
+			return GlobalOperatorHierarchyRepairResult{}, err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE broadcast_operators SET status='disabled', updated_at=$2 WHERE user_id=$1`, candidate.UserID, now); err != nil {
+			return GlobalOperatorHierarchyRepairResult{}, err
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM broadcast_operator_permissions WHERE user_id=$1`, candidate.UserID); err != nil {
+			return GlobalOperatorHierarchyRepairResult{}, err
+		}
+		if err := insertPermissionAudit(ctx, tx, PermissionAuditEvent{
+			ActorUserID: hostUserID, SubjectType: "global_operator", SubjectUserID: candidate.UserID,
+			Action: "hierarchy_quarantined", Level: candidate.CurrentLevel,
+			ParentUserID: candidate.CurrentParentID, CreatedAt: now,
+		}); err != nil {
+			return GlobalOperatorHierarchyRepairResult{}, err
+		}
+		result.Quarantined++
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
+		VALUES('2.4.3-global-operator-levels-normalized', $1)`, now); err != nil {
+		return GlobalOperatorHierarchyRepairResult{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return GlobalOperatorHierarchyRepairResult{}, err
+	}
+	return result, nil
 }
 
 func (s *Store) IsGlobalOperator(ctx context.Context, userID int64) (bool, error) {

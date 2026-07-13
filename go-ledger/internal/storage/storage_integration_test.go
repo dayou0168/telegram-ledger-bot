@@ -87,12 +87,144 @@ func TestPostgresConcurrentOpenSerializesMigration(t *testing.T) {
 
 	var versions int
 	if err := admin.QueryRow(ctx,
-		"SELECT count(*) FROM "+quotedSchema+".schema_migrations WHERE version IN ('2.1.0', '2.2.0', '2.3.0', '2.4.1', '2.4.2')",
+		"SELECT count(*) FROM "+quotedSchema+".schema_migrations WHERE version IN ('2.1.0', '2.2.0', '2.3.0', '2.4.1', '2.4.2', '2.4.3')",
 	).Scan(&versions); err != nil {
 		t.Fatalf("query migration versions: %v", err)
 	}
-	if versions != 5 {
-		t.Fatalf("migration versions = %d, want 5", versions)
+	if versions != 6 {
+		t.Fatalf("migration versions = %d, want 6", versions)
+	}
+}
+
+func TestPostgresGlobalOperatorHierarchyRepair(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	migrationURL, _, _ := postgresTestSchema(t, ctx, dsn, "operator_hierarchy_repair")
+	store, err := Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	base := int64(920000000000 + now.UnixNano()%1000000)
+	hostID := base
+	defaultID := base + 1
+	primaryAID := base + 2
+	primaryBID := base + 3
+	secondaryAID := base + 4
+	secondaryBID := base + 5
+	explicitlyDisabledID := base + 6
+	ambiguousID := base + 7
+	validPrimaryID := base + 8
+	hostCreatedSecondaryID := base + 9
+	chatID := -base
+
+	if _, err := store.pool.Exec(ctx, `DELETE FROM schema_migrations
+		WHERE version IN ('2.4.3', '2.4.3-global-operator-level-repair-quarantined', '2.4.3-global-operator-levels-normalized')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `TRUNCATE global_operator_level_repair_candidates`); err != nil {
+		t.Fatal(err)
+	}
+	insertOperator := func(userID int64, level, status string, parentID, createdBy, disabledBy int64) {
+		t.Helper()
+		var disabledAt any
+		if status == "disabled" && disabledBy != 0 {
+			disabledAt = now.Add(-time.Hour)
+		}
+		if _, err := store.pool.Exec(ctx, `INSERT INTO global_operators(
+			user_id, level, status, parent_user_id, created_by, created_at, disabled_by, disabled_at, remark
+		) VALUES($1, $2, $3, NULLIF($4::BIGINT, 0::BIGINT), $5, $6,
+			NULLIF($7::BIGINT, 0::BIGINT), $8, $9)`,
+			userID, level, status, parentID, createdBy, now.Add(-2*time.Hour), disabledBy, disabledAt, fmt.Sprintf("operator-%d", userID)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.pool.Exec(ctx, `INSERT INTO broadcast_operators(
+			user_id, status, created_by, remark, created_at, updated_at
+		) VALUES($1, $2, $3, $4, $5, $5)`, userID, status, createdBy, fmt.Sprintf("operator-%d", userID), now.Add(-2*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insertOperator(hostID, "primary", "active", 0, 0, 0)
+	insertOperator(defaultID, "primary", "active", 0, 0, 0)
+	insertOperator(primaryAID, "secondary", "active", hostID, hostID, 0)
+	insertOperator(primaryBID, "secondary", "active", hostID, hostID, 0)
+	insertOperator(secondaryAID, "primary", "disabled", 0, primaryAID, 0)
+	insertOperator(secondaryBID, "primary", "disabled", 0, primaryAID, 0)
+	insertOperator(explicitlyDisabledID, "primary", "disabled", 0, primaryAID, primaryAID)
+	insertOperator(ambiguousID, "primary", "active", 0, base+99, 0)
+	insertOperator(validPrimaryID, "primary", "active", 0, hostID, 0)
+	insertOperator(hostCreatedSecondaryID, "secondary", "active", validPrimaryID, hostID, 0)
+	if _, err := store.pool.Exec(ctx, `INSERT INTO permission_audit_events(
+		actor_user_id, subject_type, subject_user_id, action, level, created_at
+	) VALUES($1, 'global_operator', $2, 'disabled', 'primary', $3)`, primaryAID, explicitlyDisabledID, now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnsureGroup(ctx, chatID, "legacy permission", now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO broadcast_operator_permissions(
+		user_id, target, chat_id, group_name, granted_by, created_at
+	) VALUES($1, 'chat', $2, '', $3, $4)`, secondaryBID, chatID, primaryAID, now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.migrate(ctx); err != nil {
+		t.Fatalf("run v2.4.3 quarantine migration: %v", err)
+	}
+	for _, userID := range []int64{hostID, defaultID, primaryAID, primaryBID, secondaryAID, secondaryBID, explicitlyDisabledID, ambiguousID, validPrimaryID, hostCreatedSecondaryID} {
+		if active, err := store.IsGlobalOperator(ctx, userID); err != nil || active {
+			t.Fatalf("user %d should be fail-closed after quarantine: active=%v err=%v", userID, active, err)
+		}
+	}
+
+	result, err := store.NormalizeGlobalOperatorHierarchy(ctx, hostID, map[int64]struct{}{defaultID: {}}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.PrimaryNormalized != 3 || result.SecondaryNormalized != 4 || result.Recovered != 2 || result.EnvDetached != 2 || result.Quarantined != 1 {
+		t.Fatalf("repair result = %+v", result)
+	}
+	assertOperator := func(userID int64, level, status string, parentID int64) {
+		t.Helper()
+		op, ok, err := store.GetGlobalOperator(ctx, userID)
+		if err != nil || !ok || op.Level != level || op.Status != status || op.ParentUserID != parentID {
+			t.Fatalf("operator %d = %+v, ok=%v err=%v; want level=%s status=%s parent=%d", userID, op, ok, err, level, status, parentID)
+		}
+	}
+	assertOperator(hostID, "primary", "disabled", 0)
+	assertOperator(defaultID, "primary", "disabled", 0)
+	assertOperator(primaryAID, "primary", "active", 0)
+	assertOperator(primaryBID, "primary", "active", 0)
+	assertOperator(secondaryAID, "secondary", "active", primaryAID)
+	assertOperator(secondaryBID, "secondary", "active", primaryAID)
+	assertOperator(explicitlyDisabledID, "secondary", "disabled", primaryAID)
+	assertOperator(ambiguousID, "primary", "disabled", 0)
+	assertOperator(validPrimaryID, "primary", "active", 0)
+	assertOperator(hostCreatedSecondaryID, "secondary", "active", validPrimaryID)
+	if allowed, err := store.HasBroadcastPermissionScope(ctx, secondaryBID, "chat", chatID, ""); err != nil || allowed {
+		t.Fatalf("recovered identity restored old permission: allowed=%v err=%v", allowed, err)
+	}
+	if again, err := store.NormalizeGlobalOperatorHierarchy(ctx, hostID, map[int64]struct{}{defaultID: {}}, now.Add(time.Minute)); err != nil || again.Changed() != 0 {
+		t.Fatalf("second normalization = %+v, err=%v", again, err)
+	}
+	events, err := store.ListPermissionAuditEvents(ctx, secondaryAID, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundRecovered := false
+	for _, event := range events {
+		if event.Action == "hierarchy_recovered_secondary" && event.ParentUserID == primaryAID {
+			foundRecovered = true
+		}
+	}
+	if !foundRecovered {
+		t.Fatalf("recovery audit missing: %+v", events)
 	}
 }
 
