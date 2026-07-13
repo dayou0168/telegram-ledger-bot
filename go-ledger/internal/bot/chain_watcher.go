@@ -158,8 +158,7 @@ func (b *Bot) pollChainWatcherEventsWithStatus(ctx context.Context) {
 	if err != nil {
 		timing.Error = err.Error()
 		b.watcherTiming.record(timing)
-		log.Printf("claim chain watcher events: %v", err)
-		b.recordChainWatcherFailure("claim")
+		b.recordChainWatcherFailure("claim", err.Error())
 		if fallbackErr := b.pollSharedFallbackEvents(ctx); fallbackErr != nil {
 			log.Printf("claim shared fallback events: %v", fallbackErr)
 		}
@@ -231,21 +230,26 @@ func (b *Bot) checkChainWatcherHealth(ctx context.Context) {
 	defer cancel()
 	status, err := b.watcher.Ready(healthCtx)
 	if err != nil {
-		log.Printf("chain watcher readiness: %v", err)
-		b.recordChainWatcherFailure("ready")
+		b.recordChainWatcherFailure("ready", err.Error())
 		return
 	}
 	if !status.Ready {
-		log.Printf("chain watcher source degraded: %s", status.Status)
-		b.recordChainWatcherFailure("ready")
+		b.recordChainWatcherFailure("ready", status.Status)
 		return
 	}
 	b.recordChainWatcherSuccess("ready", time.Duration(status.CatchupLagSeconds)*time.Second)
 }
 
-func (b *Bot) recordChainWatcherFailure(source string) {
-	if b.watcherFallback.recordFailure(source, time.Now()) {
-		log.Printf("chain watcher %s failed repeatedly; requesting shared fallback lease", source)
+func (b *Bot) recordChainWatcherFailure(source, detail string) {
+	notice := b.watcherFallback.recordFailure(source, time.Now())
+	if notice.ModeChanged {
+		log.Printf("chain watcher fallback state changed: %s -> %s source=%s detail=%s", notice.PreviousMode, notice.Mode, source, detail)
+	}
+	if notice.LeaseRequested {
+		log.Printf("chain watcher %s failed repeatedly; requesting shared fallback lease detail=%s", source, detail)
+	}
+	if notice.SuppressedFailures > 0 {
+		log.Printf("chain watcher shared fallback lease still pending: source=%s suppressed_failures=%d detail=%s", source, notice.SuppressedFailures, detail)
 	}
 }
 
@@ -597,6 +601,8 @@ type watcherFallbackController struct {
 	startedAt          time.Time
 	lastWatcherSuccess time.Time
 	leaseRequested     bool
+	lastFailureSummary time.Time
+	suppressedFailures int
 }
 
 type notificationTiming struct {
@@ -651,11 +657,21 @@ func newWatcherFallbackControllerWithRecovery(failThreshold int, recoveryThresho
 	return &watcherFallbackController{failThreshold: failThreshold, recoveryThreshold: recoveryThreshold, lagThreshold: lagThreshold, mode: fallbackModePrimary}
 }
 
-func (c *watcherFallbackController) recordFailure(source string, now time.Time) bool {
+type fallbackFailureNotice struct {
+	PreviousMode       fallbackMode
+	Mode               fallbackMode
+	ModeChanged        bool
+	LeaseRequested     bool
+	SuppressedFailures int
+}
+
+func (c *watcherFallbackController) recordFailure(source string, now time.Time) fallbackFailureNotice {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	previousMode := c.mode
+	notice := fallbackFailureNotice{PreviousMode: previousMode, Mode: previousMode}
 	if c.mode == fallbackModeDegraded {
-		return false
+		return c.summarizeFailureLocked(now, notice)
 	}
 	if source == "ready" {
 		c.readyFailures++
@@ -672,19 +688,43 @@ func (c *watcherFallbackController) recordFailure(source string, now time.Time) 
 	}
 	if c.mode == fallbackModePrimary {
 		c.mode = fallbackModePending
-		return false
+		c.lastFailureSummary = now
+		notice.Mode = c.mode
+		notice.ModeChanged = true
+		return notice
 	}
 	if c.mode == fallbackModeRecovery {
 		c.mode = fallbackModeActive
-		return true
+		notice.Mode = c.mode
+		notice.ModeChanged = true
+		return notice
 	}
 	readyFailed := c.readyFailures >= c.failThreshold && !c.firstReadyFailure.IsZero() && now.Sub(c.firstReadyFailure) >= 3*time.Second
 	claimFailed := c.claimFailures >= c.failThreshold && !c.firstClaimFailure.IsZero() && now.Sub(c.firstClaimFailure) >= 3*time.Second
 	if c.mode == fallbackModeActive || (!readyFailed && !claimFailed) {
-		return false
+		return c.summarizeFailureLocked(now, notice)
 	}
-	c.leaseRequested = true
-	return true
+	if !c.leaseRequested {
+		c.leaseRequested = true
+		c.lastFailureSummary = now
+		c.suppressedFailures = 0
+		notice.LeaseRequested = true
+		return notice
+	}
+	return c.summarizeFailureLocked(now, notice)
+}
+
+func (c *watcherFallbackController) summarizeFailureLocked(now time.Time, notice fallbackFailureNotice) fallbackFailureNotice {
+	c.suppressedFailures++
+	if c.lastFailureSummary.IsZero() {
+		c.lastFailureSummary = now
+	}
+	if now.Sub(c.lastFailureSummary) >= time.Minute {
+		notice.SuppressedFailures = c.suppressedFailures
+		c.suppressedFailures = 0
+		c.lastFailureSummary = now
+	}
+	return notice
 }
 
 func (c *watcherFallbackController) activateLease(now time.Time) {
@@ -711,6 +751,7 @@ func (c *watcherFallbackController) recordSuccess(source string, now time.Time, 
 	if c.mode == fallbackModePending && c.readyFailures == 0 && c.claimFailures == 0 {
 		c.mode = fallbackModePrimary
 		c.leaseRequested = false
+		c.suppressedFailures = 0
 		return true
 	}
 	if c.mode == fallbackModeActive || c.mode == fallbackModeDegraded {
@@ -734,6 +775,7 @@ func (c *watcherFallbackController) recordSuccess(source string, now time.Time, 
 	c.mode = fallbackModePrimary
 	c.startedAt = time.Time{}
 	c.leaseRequested = false
+	c.suppressedFailures = 0
 	return true
 }
 

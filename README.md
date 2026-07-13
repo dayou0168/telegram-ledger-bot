@@ -196,6 +196,7 @@ CHAIN_WATCHER_CATCHUP_ENABLED=true
 CHAIN_WATCHER_CATCHUP_STATE_INTERVAL_SECONDS=30
 CHAIN_WATCHER_CATCHUP_PAGE_LIMIT=3
 CHAIN_WATCHER_CATCHUP_MAX_REQUESTS_PER_TICK=6
+CHAIN_WATCHER_CATCHUP_MAX_INFLIGHT=3
 CHAIN_WATCHER_CATCHUP_WINDOW_SECONDS=30
 CHAIN_WATCHER_CATCHUP_OVERLAP_SECONDS=2
 CHAIN_WATCHER_CATCHUP_MAX_RPS=8
@@ -219,7 +220,7 @@ watcher 有两种部署模式：
 
 `/healthz` 只表示 watcher 进程存活；`/readyz` 综合链源新鲜度、连续 watermark 和未闭合 gap，cursor 未建立时明确显示 `catchup_lag_unknown=true`。`/status` 受 `CHAIN_WATCHER_ADMIN_TOKEN` 保护，包含 round ID、最多 3 个在途主轮次、分段耗时、429/key 状态、pending/claim lag、gap 和 retention 统计；最近轮次明细有界保存，分钟聚合保留 72 小时。bot 自动 fallback 依据 `/readyz` 的链源状态，不把“没有新交易”误判为故障。
 
-主扫描仍固定每秒一轮、每轮最新 3 页。`CHAIN_WATCHER_MAIN_SCAN_TIMEOUT_MS=3000` 是独立 API deadline，不再由 1 秒轮询间隔乘系数推导；`CHAIN_WATCHER_MAIN_MAX_INFLIGHT_ROUNDS=3` 允许慢轮次有界流水并发。成功页会立即落库，失败页形成持久化、带 lease generation 的精确 gap；高优先扩页和低优先时间窗补偿不按监听地址发请求，低优先任务会给下一秒实时 deadline 让路。
+主扫描仍固定每秒一轮、每轮最新 3 页。`CHAIN_WATCHER_MAIN_SCAN_TIMEOUT_MS=3000` 是独立 API deadline，不再由 1 秒轮询间隔乘系数推导；`CHAIN_WATCHER_MAIN_MAX_INFLIGHT_ROUNDS=3` 允许慢轮次有界流水并发。成功页会立即落库，失败页形成持久化、带 lease generation 的精确 gap；高优先扩页和低优先时间窗补偿不按监听地址发请求，低优先任务会给下一秒实时 deadline 让路。`CHAIN_WATCHER_CATCHUP_MAX_INFLIGHT=3` 只增加受 compensation token、每 Key 5 RPS 和实时预留约束的补洞 worker，不增加每秒实时 3 页请求量；启动时会事务化合并遗留的重叠时间窗 gap。
 
 自动 fallback 使用 `PRIMARY -> FAILOVER_PENDING -> FALLBACK_ACTIVE -> RECOVERING` 状态机；watcher 连续异常 3 秒后，多个 bot 通过 PostgreSQL lease 只选出一个无 Key公共扫描 leader。leader 每轮同 cutoff 扫最新 3 页并使用共享锚点/事件幂等，429 时按 1/2/3/5/10 秒退避；不再按 600 秒强制停止。watcher 恢复并补齐共享 cursor，ready/claim 连续成功且 lag 归零后才释放 lease。未配置共享 DSN 时明确 DEGRADED，不会退回每 bot 逐地址扫描。
 

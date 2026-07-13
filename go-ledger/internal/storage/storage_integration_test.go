@@ -87,7 +87,7 @@ func TestPostgresConcurrentOpenSerializesMigration(t *testing.T) {
 
 	var versions int
 	if err := admin.QueryRow(ctx,
-		"SELECT count(*) FROM "+quotedSchema+".schema_migrations WHERE version IN ('2.1.0', '2.2.0', '2.3.0', '2.4.1', '2.4.2')",
+		"SELECT count(*) FROM "+quotedSchema+".schema_migrations WHERE version IN ('2.1.0', '2.2.0', '2.3.0', '2.4.1', '2.4.3')",
 	).Scan(&versions); err != nil {
 		t.Fatalf("query migration versions: %v", err)
 	}
@@ -1085,4 +1085,224 @@ func TestChainWatcherGapLeaseFencingRejectsExpiredWorker(t *testing.T) {
 		t.Fatalf("reopened completed gap = %+v/%v/%v", reopened, ok, err)
 	}
 	_, _ = store.CompleteChainWatcherGap(ctx, reopened.ID, reopened.LeaseGeneration, reopened.LeaseOwner, now.Add(3*time.Second))
+}
+
+func TestChainWatcherOverlappingWindowsCoalesceConcurrentlyAndSurviveRestart(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	migrationURL, _, _ := postgresTestSchema(t, ctx, dsn, "gap_coalesce")
+	store, err := Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	base := now.UnixMilli()
+	const writers = 32
+	start := make(chan struct{})
+	errCh := make(chan error, writers)
+	var wg sync.WaitGroup
+	for writer := 0; writer < writers; writer++ {
+		writer := writer
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, enqueueErr := store.EnqueueChainWatcherGap(ctx, ChainWatcherGapTask{
+				Kind: "window", Source: "watcher", Priority: 10, Reason: "overlap",
+				FromTimestamp: base + int64(writer), ToTimestamp: base + 10_000 + int64(writer),
+			}, now.Add(time.Duration(writer)*time.Millisecond))
+			errCh <- enqueueErr
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errCh)
+	for enqueueErr := range errCh {
+		if enqueueErr != nil {
+			t.Fatalf("concurrent enqueue: %v", enqueueErr)
+		}
+	}
+	stats, err := store.ChainWatcherGapStats(ctx, now.Add(time.Second))
+	if err != nil || stats.PendingCount != 1 || stats.LeasedCount != 0 {
+		t.Fatalf("coalesced stats = %+v/%v, want one pending", stats, err)
+	}
+	store.Close()
+
+	reopened, err := Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	task, ok, err := reopened.ClaimChainWatcherGap(ctx, "restart-worker", "watcher", time.Second, now.Add(2*time.Second))
+	if err != nil || !ok {
+		t.Fatalf("claim after restart = %+v/%v/%v", task, ok, err)
+	}
+	if task.FromTimestamp != base || task.ToTimestamp != base+10_000+writers-1 {
+		t.Fatalf("coalesced range = %d..%d", task.FromTimestamp, task.ToTimestamp)
+	}
+	if completed, err := reopened.CompleteChainWatcherGap(ctx, task.ID, task.LeaseGeneration, task.LeaseOwner, now.Add(2*time.Second)); err != nil || !completed {
+		t.Fatalf("complete coalesced task = %v/%v", completed, err)
+	}
+	stats, err = reopened.ChainWatcherGapStats(ctx, now.Add(3*time.Second))
+	if err != nil || stats.PendingCount != 0 || stats.LeasedCount != 0 {
+		t.Fatalf("drained stats = %+v/%v", stats, err)
+	}
+}
+
+func TestChainWatcherWindowSplitRestartsBothChildPageCursors(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	migrationURL, _, _ := postgresTestSchema(t, ctx, dsn, "gap_split_cursor")
+	store, err := Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now().UTC()
+	base := now.UnixMilli()
+	if _, err := store.EnqueueChainWatcherGap(ctx, ChainWatcherGapTask{
+		Kind: "window", Source: "watcher", Priority: 10,
+		FromTimestamp: base, ToTimestamp: base + 10_000,
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+	task, ok, err := store.ClaimChainWatcherGap(ctx, "split-worker", "watcher", time.Minute, now)
+	if err != nil || !ok {
+		t.Fatalf("claim = %+v/%v/%v", task, ok, err)
+	}
+	if advanced, err := store.AdvanceChainWatcherGapPage(ctx, task.ID, task.LeaseGeneration, task.LeaseOwner, 19, time.Minute, now); err != nil || !advanced {
+		t.Fatalf("advance page = %v/%v", advanced, err)
+	}
+	if split, err := store.SplitChainWatcherGapWindow(ctx, task, base+5_000, now.Add(time.Second)); err != nil || !split {
+		t.Fatalf("split = %v/%v", split, err)
+	}
+	for child := 0; child < 2; child++ {
+		claimed, ok, err := store.ClaimChainWatcherGap(ctx, fmt.Sprintf("child-%d", child), "watcher", time.Minute, now.Add(2*time.Second))
+		if err != nil || !ok {
+			t.Fatalf("child %d claim = %+v/%v/%v", child, claimed, ok, err)
+		}
+		if claimed.NextPage != claimed.StartPage {
+			t.Fatalf("child %d cursor = %d, want %d", child, claimed.NextPage, claimed.StartPage)
+		}
+		if completed, err := store.CompleteChainWatcherGap(ctx, claimed.ID, claimed.LeaseGeneration, claimed.LeaseOwner, now.Add(2*time.Second)); err != nil || !completed {
+			t.Fatalf("child %d complete = %v/%v", child, completed, err)
+		}
+	}
+}
+
+func TestNormalizeChainWatcherGapBacklogCollapsesLegacyOverlap(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	migrationURL, _, _ := postgresTestSchema(t, ctx, dsn, "gap_legacy_normalize")
+	store, err := Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now().UTC()
+	base := now.UnixMilli()
+	const legacyWindows = 800
+	for index := 0; index < legacyWindows; index++ {
+		from := base + int64(index)
+		to := base + 10_000 + int64(index)
+		if _, err := store.pool.Exec(ctx, `INSERT INTO chain_watcher_gap_tasks(
+			kind,source,priority,reason,from_timestamp,to_timestamp,status,created_at,updated_at
+		) VALUES('window','watcher',10,'legacy-overlap',$1,$2,'pending',$3,$3)`, from, to, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before, err := store.ChainWatcherGapStats(ctx, now)
+	if err != nil || before.PendingCount != legacyWindows {
+		t.Fatalf("before normalize = %+v/%v", before, err)
+	}
+	started := time.Now()
+	merged, err := store.NormalizeChainWatcherGapBacklog(ctx, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := store.ChainWatcherGapStats(ctx, now.Add(time.Second))
+	if err != nil || merged != legacyWindows-1 || after.PendingCount != 1 {
+		t.Fatalf("normalized merged/stats = %d/%+v/%v", merged, after, err)
+	}
+	t.Logf("normalized %d overlapping legacy windows to 1 in %s", legacyWindows, time.Since(started))
+	task, ok, err := store.ClaimChainWatcherGap(ctx, "normalized-worker", "watcher", time.Minute, now.Add(2*time.Second))
+	if err != nil || !ok || task.FromTimestamp != base || task.ToTimestamp != base+10_000+legacyWindows-1 {
+		t.Fatalf("normalized task = %+v/%v/%v", task, ok, err)
+	}
+}
+
+func TestThreeTimedOutMainRoundsCreateAtMostNinePrecisePageGaps(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	migrationURL, _, _ := postgresTestSchema(t, ctx, dsn, "gap_timeout_bound")
+	store, err := Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now().UTC()
+	base := now.UnixMilli()
+	for replay := 0; replay < 10; replay++ {
+		for round := 0; round < 3; round++ {
+			cutoff := base + int64(round+1)*1000
+			for page := 0; page < 3; page++ {
+				if _, err := store.EnqueueChainWatcherGap(ctx, ChainWatcherGapTask{
+					Kind: "page", Source: "watcher", Priority: 0, Reason: "deadline",
+					FromTimestamp: base - 600_000, ToTimestamp: cutoff,
+					StartPage: page, EndPage: page + 1, NextPage: page,
+				}, now); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	}
+	stats, err := store.ChainWatcherGapStats(ctx, now)
+	if err != nil || stats.PendingCount != 9 {
+		t.Fatalf("three timeout rounds gap stats = %+v/%v, want 9 pending", stats, err)
+	}
+}
+
+func TestRealtimeWatermarkRejectsOlderCompletedRound(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	migrationURL, _, _ := postgresTestSchema(t, ctx, dsn, "realtime_watermark_order")
+	store, err := Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now().UTC()
+	newer := now.UnixMilli()
+	advanced, err := store.AdvanceChainWatcherRealtimeWatermark(ctx, newer, "newer-anchor", now)
+	if err != nil || !advanced {
+		t.Fatalf("newer watermark = %v/%v", advanced, err)
+	}
+	advanced, err = store.AdvanceChainWatcherRealtimeWatermark(ctx, newer-1000, "older-anchor", now.Add(time.Second))
+	if err != nil || advanced {
+		t.Fatalf("older watermark = %v/%v, want rejected", advanced, err)
+	}
+	watermark, err := store.GetChainWatcherRealtimeWatermark(ctx)
+	if err != nil || watermark.Timestamp != newer || watermark.TxHash != "newer-anchor" {
+		t.Fatalf("watermark after old round = %+v/%v", watermark, err)
+	}
 }

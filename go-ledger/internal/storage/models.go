@@ -326,6 +326,7 @@ type ChainWatcherGapStats struct {
 type ChainWatcherReadiness struct {
 	CursorTimestamp   int64
 	RealtimeTimestamp int64
+	OldestGapFrom     int64
 	CatchupRequired   bool
 	OpenGapCount      int64
 	LeasedGapCount    int64
