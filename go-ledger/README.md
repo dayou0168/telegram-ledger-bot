@@ -1,6 +1,8 @@
-# Telegram Ledger Bot Go Runtime v2.4.1
+# Telegram Ledger Bot Go Runtime v2.4.2
 
-这是机器人 Go 版 v2.4.1 主线，目标是把同步、异步、队列、并发、缓存、数据库和共享链上监听从架构层面重新设计。当前已具备：
+这是机器人 Go 版 v2.4.2 发布候选主线，目标是把同步、异步、队列、并发、缓存、数据库和共享链上监听从架构层面重新设计。当前已具备：
+
+候选版发布说明见 [../docs/releases/v2.4.2.md](../docs/releases/v2.4.2.md)。
 
 - Telegram long polling。
 - 按 `chat_id` / `user_id` 串行分发。
@@ -31,15 +33,15 @@
 - 群内发送 TRC20 地址会自动记录验证次数；首次出现回复防篡改核对图，重复出现显示上次发送人和本次发送人。
 - `查询T...` / `查询TRX地址 T...` 查询 TRON 地址余额、创建/活跃时间和最近 USDT 流水，走独立查询池。
 - 地址监听权限：普通用户最多 2 个监听地址；只有宿主、`DEFAULT_OPERATOR_USER_IDS` 和 active `global_operators` 不受数量限制，单群 `operators` 不获得该私聊全局资格。私聊按钮面板支持添加/删除地址、收入/支出/TRX 通知开关、最小提醒金额。
-- v2.4.1 链上监听通过共享 `ledger-chain-watcher` 获取链上数据；机器人侧继续保存监听地址、tx_hash 去重和 Telegram outbox。
+- v2.4.2 链上监听通过共享 `ledger-chain-watcher` 获取链上数据；机器人侧继续保存监听地址、event identity 去重和 Telegram outbox。
 
 ## 构建
 
 推荐直接使用 GitHub Actions 构建发布的镜像：
 
 ```bash
-docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.1
-docker pull ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.1
+docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.2
+docker pull ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.2
 ```
 
 本目录也保留独立 Dockerfile，方便本地构建：
@@ -49,7 +51,7 @@ docker build -t telegram-ledger-bot-go:dev .
 docker build --build-arg APP=chain-watcher -t telegram-ledger-chain-watcher:dev .
 ```
 
-推荐直接用仓库根目录的 `docker-compose.yml` 或 `docker-compose.ghcr.yml` 启动，同一个 Compose 项目里包含 PostgreSQL 独立容器和 `ledger-chain-watcher` 独立容器，默认拉取 `ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.1` 与 `ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.1`：
+正式发布后，推荐直接用仓库根目录的 `docker-compose.yml` 或 `docker-compose.ghcr.yml` 启动，同一个 Compose 项目里包含 PostgreSQL 独立容器和 `ledger-chain-watcher` 独立容器，默认拉取 `ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.2` 与 `ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.2`：
 
 ```bash
 docker compose -f ../docker-compose.yml up -d
@@ -64,7 +66,7 @@ deploy/ledger-chain-watcher.env.example
 deploy/ledger-chain-watcher.service
 ```
 
-GitHub Release `v2.4.1` 同时发布 `ledger-chain-watcher-v2.4.1-linux-amd64.tar.gz` 宿主机包，里面已经包含 Linux amd64 二进制和上述两个模板。
+GitHub Release `v2.4.2` 同时发布 `ledger-chain-watcher-v2.4.2-linux-amd64.tar.gz` 宿主机包，里面包含 Linux amd64 二进制和上述两个模板。在 Release 真实可用前不要尝试生产下载。
 
 机器人仍然用自己的 `DATABASE_URL` 连接自己的 PostgreSQL 数据库，并通过 `CHAIN_WATCHER_URL=http://host.docker.internal:8090` 或 Docker 网桥 IP 访问宿主机 watcher。
 
@@ -119,8 +121,8 @@ BOT_BROADCAST_DELIVERY_RETENTION_HOURS=168
 - Telegram 更新去重、账本、权限、广播任务、链上通知都落 PostgreSQL。
 - 表设计从第一版就使用 `BIGINT` Telegram ID、`TIMESTAMPTZ` 时间、`BOOLEAN` 开关和高频组合索引。
 - 金额类字段在写库前统一格式化为两位小数，减少长尾小数导致的账单阅读问题。
-- PostgreSQL 是 v2.4.1 的唯一主库目标，避免后续再次迁移。
+- PostgreSQL 是 v2.4.2 的唯一主库目标，避免后续再次迁移。
 
 ## 启动原则
 
-Go v2.4.1 直接按 PostgreSQL 空库启动。等账单、广播、监听三块经过真实群测试后，再切换生产 Bot Token。多机器人部署时，每个机器人实例独立 PostgreSQL；只有 `ledger-chain-watcher` 共享。
+Go v2.4.2 直接按 PostgreSQL 空库启动。等账单、广播、监听三块经过真实群测试后，再切换生产 Bot Token。多机器人部署时，每个机器人实例独立 PostgreSQL；只有 `ledger-chain-watcher` 共享。

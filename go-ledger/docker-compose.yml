@@ -1,4 +1,4 @@
-# 当前正式镜像为 v2.4.1；模板已包含未发布 v2.4.2 候选变量，禁止提前改成不存在的标签。
+# v2.4.2 发布候选模板；仅在显式发布 workflow 成功后用于生产升级。
 #
 # 单机器人一体部署模板。多机器人共享 watcher 时，请使用仓库根目录
 # docker-compose.chain-watcher.yml 单独部署 watcher，再让每个机器人加入 ledger-chain-net。
@@ -51,7 +51,7 @@ services:
       retries: 10
 
   ledger-chain-watcher:
-    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.1
+    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.2
     container_name: ledger-chain-watcher
     restart: unless-stopped
     logging:
@@ -100,7 +100,7 @@ services:
       retries: 10
 
   ledger-bot:
-    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.1
+    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.2
     container_name: ledger-bot-go
     restart: unless-stopped
     logging:

@@ -1,15 +1,15 @@
 # Telegram 记账机器人 Go 部署运维
 
-当前已发布版本是 Go v2.4.1；本文同时记录尚未发布的 v2.4.2 bot + watcher 同步升级候选配置。生产部署使用 GHCR 预构建镜像、PostgreSQL 和共享链上监听服务 `ledger-chain-watcher`。服务器上不需要源码构建作为默认路径。v2.4.2 的生产预检、备份、升级、回滚和验收见 [production-rollout-v2.4.2.md](production-rollout-v2.4.2.md)。
+当前源码发布候选为 Go v2.4.2，正式 tag、Release 和 GHCR 镜像只能由显式发布 workflow 产生。生产部署使用 GHCR 预构建镜像、PostgreSQL 和共享链上监听服务 `ledger-chain-watcher`。服务器上不需要源码构建作为默认路径。v2.4.2 的发布说明见 [releases/v2.4.2.md](releases/v2.4.2.md)，生产预检、备份、升级、回滚和验收见 [production-rollout-v2.4.2.md](production-rollout-v2.4.2.md)。
 
 唯一候选基线是 `codex/v2.4.2-integration` 的已确认提交；外层旧工作区中的部署文件和未跟踪脚本已过时或尚未审查，不得直接合并或投产。
 
 ## 部署基线
 
-- 机器人镜像：`ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.1`
-- watcher 镜像：`ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.1`
+- 机器人镜像：`ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.2`
+- watcher 镜像：`ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.2`
 
-v2.4.1 是 bot 日切激活修复，生产 watcher 当时不要求同步升级。v2.4.2 才是当前 bot + watcher 同步升级候选：上线前必须同时备份每个 bot 数据库和 watcher 数据库，保留现有 `CHAIN_WATCHER_KEY_ENCRYPTION_KEY`，并确认每个 bot 的 `BOT_FALLBACK_INSTANCE_ID` 唯一且稳定。正式镜像和宿主机二进制发布前，模板继续固定 v2.4.1，不提前使用不存在的 v2.4.2 标签。
+v2.4.1 是 bot 日切激活修复，生产 watcher 当时不要求同步升级。v2.4.2 是 bot + watcher 同步升级：上线前必须同时备份每个 bot 数据库和 watcher 数据库，保留现有 `CHAIN_WATCHER_KEY_ENCRYPTION_KEY`，并确认每个 bot 的 `BOT_FALLBACK_INSTANCE_ID` 唯一且稳定。只有 Release、镜像 digest 和二进制校验和实际可用后才能执行生产升级。
 - 数据库：每个机器人实例独立 PostgreSQL 16
 - 链上监听：多个机器人共享 `ledger-chain-watcher`，watcher 使用独立 PostgreSQL 保存订阅、匹配事件和投递游标
 - 推荐入口：宝塔 Docker Compose
@@ -279,14 +279,14 @@ BOT_TIMEZONE=Asia/Shanghai
 BOT_REQUEST_TIMEOUT=70
 ```
 
-下载 v2.4.1 发布包并安装二进制到固定路径：
+正式 Release 可用后，下载 v2.4.2 发布包并安装二进制到固定路径：
 
 ```bash
 cd /tmp
-wget -O ledger-chain-watcher-v2.4.1-linux-amd64.tar.gz \
-  https://github.com/dayou0168/telegram-ledger-bot/releases/download/v2.4.1/ledger-chain-watcher-v2.4.1-linux-amd64.tar.gz
-tar -xzf ledger-chain-watcher-v2.4.1-linux-amd64.tar.gz
-install -m 0755 ledger-chain-watcher-v2.4.1-linux-amd64/ledger-chain-watcher /usr/local/bin/ledger-chain-watcher
+wget -O ledger-chain-watcher-v2.4.2-linux-amd64.tar.gz \
+  https://github.com/dayou0168/telegram-ledger-bot/releases/download/v2.4.2/ledger-chain-watcher-v2.4.2-linux-amd64.tar.gz
+tar -xzf ledger-chain-watcher-v2.4.2-linux-amd64.tar.gz
+install -m 0755 ledger-chain-watcher-v2.4.2-linux-amd64/ledger-chain-watcher /usr/local/bin/ledger-chain-watcher
 /usr/local/bin/ledger-chain-watcher --help
 ```
 
@@ -396,7 +396,7 @@ journalctl -u ledger-chain-watcher -f
 ```text
 ledger-chain-watcher        共享链上监听服务和 watcher PostgreSQL
 ledger-main                 当前记账机器人实例
-ledger-ops                  第二个独立 Go v2.4.1 机器人实例
+ledger-ops                  第二个独立 Go v2.4.2 机器人实例
 ```
 
 先创建共享 Docker 网络：

@@ -5,21 +5,38 @@ on:
     branches:
       - main
       - master
+    tags:
+      - "v*.*.*"
     paths:
-      - "go-ledger/**"
+      - ".env.example"
       - ".github/workflows/go-ledger.yml"
+      - "README.md"
+      - "deploy/**"
+      - "docker-compose*.yml"
+      - "docs/**"
+      - "go-ledger/**"
   pull_request:
     paths:
-      - "go-ledger/**"
+      - ".env.example"
       - ".github/workflows/go-ledger.yml"
+      - "README.md"
+      - "deploy/**"
+      - "docker-compose*.yml"
+      - "docs/**"
+      - "go-ledger/**"
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version without the v prefix; must equal config.Version"
+        required: true
+        type: string
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 jobs:
-  test:
+  ci:
+    name: PostgreSQL 16 CI
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -38,17 +55,92 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version-file: go-ledger/go.mod
+          cache-dependency-path: go-ledger/go.sum
+
+      - name: Validate shell syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' scripts < <(find deploy -type f -name '*.sh' -print0)
+          test "${#scripts[@]}" -gt 0
+          for script in "${scripts[@]}"; do
+            bash -n "$script"
+          done
+
+      - name: Validate YAML syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' files < <(find . -type f \( -name '*.yml' -o -name '*.yaml' \) -print0)
+          test "${#files[@]}" -gt 0
+          ruby -e 'require "yaml"; ARGV.each { |file| abort("invalid YAML: #{file}") unless YAML.parse_file(file) }' "${files[@]}"
+
+      - name: Scan tracked files for sensitive material
+        shell: bash
+        run: |
+          set -euo pipefail
+          forbidden_files="$RUNNER_TEMP/forbidden-secret-files.txt"
+          pattern='-----BEGIN (RSA |OPENSSH |EC )?PRIVATE KEY-----|github_pat_[A-Za-z0-9_]{40,}|gh[pousr]_[A-Za-z0-9_]{30,}|[0-9]{8,10}:[A-Za-z0-9_-]{35,}'
+          git grep -IlE -e "$pattern" -- . > "$forbidden_files" || true
+          git ls-files | grep -E '(^|/)(\.env|id_rsa|id_ed25519|[^/]+\.(pem|key))$' >> "$forbidden_files" || true
+          sort -u -o "$forbidden_files" "$forbidden_files"
+          if test -s "$forbidden_files"; then
+            echo "Potential secret material exists in these tracked files:"
+            sed 's/^/  /' "$forbidden_files"
+            exit 1
+          fi
+
+      - name: Check Go formatting
+        shell: bash
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            base="$PR_BASE_SHA"
+          elif [[ "$EVENT_NAME" == "push" && "$GITHUB_REF" != refs/tags/* ]]; then
+            base="$BEFORE_SHA"
+          else
+            base="$(git describe --tags --abbrev=0 "${GITHUB_SHA}^" 2>/dev/null || true)"
+          fi
+          if [[ -z "$base" || "$base" =~ ^0+$ ]] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            base="$(git rev-list --max-parents=0 HEAD)"
+          fi
+          mapfile -t files < <(git diff --name-only --diff-filter=ACMRT "$base" "$GITHUB_SHA" -- go-ledger | sed -n '/\.go$/p')
+          if [[ "${#files[@]}" -eq 0 ]]; then
+            exit 0
+          fi
+          unformatted="$(gofmt -l "${files[@]}")"
+          if test -n "$unformatted"; then
+            echo "Go files require gofmt:"
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
+
+      - name: Validate release metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(awk -F'"' '/^const Version = / { print $2; exit }' go-ledger/internal/config/config.go)"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test -f "docs/releases/v${version}.md"
+          grep -Fq "telegram-ledger-bot-go:${version}" docker-compose.yml
+          grep -Fq "telegram-ledger-chain-watcher:${version}" docker-compose.yml
 
       - name: Download dependencies
         working-directory: go-ledger
         run: go mod download
 
-      - name: Test
+      - name: Test against isolated PostgreSQL 16
         working-directory: go-ledger
         env:
           TEST_DATABASE_URL: postgres://ledger:ledger@localhost:5432/ledger_bot_test?sslmode=disable
@@ -58,93 +150,217 @@ jobs:
         working-directory: go-ledger
         run: go vet ./...
 
-      - name: Build
-        working-directory: go-ledger
-        run: |
-          go build ./cmd/ledger-bot
-          go build ./cmd/chain-watcher
-
-      - name: Build host chain watcher package
+      - name: Build bot and watcher
         working-directory: go-ledger
         run: |
           set -euo pipefail
-          rm -rf dist
-          mkdir -p dist/ledger-chain-watcher-v2.4.1-linux-amd64
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/ledger-chain-watcher-linux-amd64 ./cmd/chain-watcher
-          cp dist/ledger-chain-watcher-linux-amd64 dist/ledger-chain-watcher-v2.4.1-linux-amd64/ledger-chain-watcher
-          cp ../deploy/ledger-chain-watcher.env.example dist/ledger-chain-watcher-v2.4.1-linux-amd64/
-          cp ../deploy/ledger-chain-watcher.service dist/ledger-chain-watcher-v2.4.1-linux-amd64/
-          tar -C dist -czf dist/ledger-chain-watcher-v2.4.1-linux-amd64.tar.gz ledger-chain-watcher-v2.4.1-linux-amd64
-          sha256sum dist/ledger-chain-watcher-linux-amd64 > dist/ledger-chain-watcher-linux-amd64.sha256
-          sha256sum dist/ledger-chain-watcher-v2.4.1-linux-amd64.tar.gz > dist/ledger-chain-watcher-v2.4.1-linux-amd64.tar.gz.sha256
+          go build -o "$RUNNER_TEMP/ledger-bot" ./cmd/ledger-bot
+          go build -o "$RUNNER_TEMP/ledger-chain-watcher" ./cmd/chain-watcher
 
-      - name: Upload host chain watcher artifact
-        uses: actions/upload-artifact@v4
+  race:
+    name: Critical package race tests
+    needs: ci
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: ledger_bot_race_test
+          POSTGRES_USER: ledger
+          POSTGRES_PASSWORD: ledger
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ledger -d ledger_bot_race_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          name: ledger-chain-watcher-v2.4.1-linux-amd64
-          path: |
-            go-ledger/dist/ledger-chain-watcher-linux-amd64
-            go-ledger/dist/ledger-chain-watcher-linux-amd64.sha256
-            go-ledger/dist/ledger-chain-watcher-v2.4.1-linux-amd64.tar.gz
-            go-ledger/dist/ledger-chain-watcher-v2.4.1-linux-amd64.tar.gz.sha256
+          go-version-file: go-ledger/go.mod
+          cache-dependency-path: go-ledger/go.sum
 
-      - name: Build Docker images
+      - name: Download dependencies
         working-directory: go-ledger
-        run: |
-          docker build --build-arg APP=ledger-bot -t telegram-ledger-bot-go:2.4.1 .
-          docker build --build-arg APP=chain-watcher -t telegram-ledger-chain-watcher:2.4.1 .
+        run: go mod download
 
-      - name: Login to GHCR
-        if: github.event_name == 'push'
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-      - name: Publish Docker image
-        if: github.event_name == 'push'
-        working-directory: go-ledger
-        run: |
-          BOT_IMAGE="ghcr.io/${{ github.repository_owner }}/telegram-ledger-bot-go"
-          WATCHER_IMAGE="ghcr.io/${{ github.repository_owner }}/telegram-ledger-chain-watcher"
-          docker tag telegram-ledger-bot-go:2.4.1 "$BOT_IMAGE:2.4.1"
-          docker tag telegram-ledger-bot-go:2.4.1 "$BOT_IMAGE:latest"
-          docker tag telegram-ledger-chain-watcher:2.4.1 "$WATCHER_IMAGE:2.4.1"
-          docker tag telegram-ledger-chain-watcher:2.4.1 "$WATCHER_IMAGE:latest"
-          docker push "$BOT_IMAGE:2.4.1"
-          docker push "$BOT_IMAGE:latest"
-          docker push "$WATCHER_IMAGE:2.4.1"
-          docker push "$WATCHER_IMAGE:latest"
-
-      - name: Publish host chain watcher release asset
-        if: github.event_name == 'push'
+      - name: Race test critical packages against isolated PostgreSQL 16
         working-directory: go-ledger
         env:
+          TEST_DATABASE_URL: postgres://ledger:ledger@localhost:5432/ledger_bot_race_test?sslmode=disable
+        run: >-
+          go test -race -count=1
+          ./internal/permissions
+          ./internal/bot
+          ./internal/adminweb
+          ./internal/storage
+          ./internal/chainwatcher
+          ./internal/tron
+
+  release:
+    name: Explicit release
+    needs:
+      - ci
+      - race
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go-ledger/go.mod
+          cache-dependency-path: go-ledger/go.sum
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Validate explicit release request
+        id: release
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          REQUESTED_VERSION: ${{ inputs.version }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          cat > /tmp/release-notes.md <<'EOF'
-          Go v2.4.1 fixes the ledger day-cutoff activation bug introduced in v2.4.0.
+          source_version="$(awk -F'"' '/^const Version = / { print $2; exit }' go-ledger/internal/config/config.go)"
+          if [[ ! "$source_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "config.Version is not a release version"
+            exit 1
+          fi
 
-          Before upgrading:
-          - Back up the bot PostgreSQL database.
-          - Deploy the bot image and let PostgreSQL migrations add groups.active_expires_day_key.
-          - Affected groups cannot be auto-migrated safely because old cutoff_hour=0 may mean either disabled day cutoff or a real midnight cutoff.
-          - For affected groups, run Start and disable day cutoff again, or apply a targeted database correction only for confirmed chat_id values.
-          - Do not batch update every group with cutoff_hour=0.
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            case "$GITHUB_REF" in
+              refs/heads/main|refs/heads/master) ;;
+              *) echo "Manual releases must run from main or master"; exit 1 ;;
+            esac
+            if [[ "$REQUESTED_VERSION" != "$source_version" ]]; then
+              echo "Requested version does not match config.Version"
+              exit 1
+            fi
+          else
+            if [[ "$REF_NAME" != "v${source_version}" ]]; then
+              echo "Tag does not match config.Version"
+              exit 1
+            fi
+            if [[ "$(git rev-list -n 1 "$REF_NAME")" != "$GITHUB_SHA" ]]; then
+              echo "Release tag does not point to the checked out commit"
+              exit 1
+            fi
+            if ! git branch -r --contains "$GITHUB_SHA" | grep -Eq 'origin/(main|master)$'; then
+              echo "Release tag commit is not contained in main or master"
+              exit 1
+            fi
+          fi
 
-          CI runs the full Go suite against PostgreSQL 16, go vet, and both bot/watcher builds. This release does not require watcher deployment unless your deployment policy keeps bot and watcher versions aligned.
-          EOF
-          ASSETS=(
+          tag="v${source_version}"
+          notes="docs/releases/${tag}.md"
+          test -f "$notes"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release already exists; refusing to overwrite it"
+            exit 1
+          fi
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]] && git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "Tag already exists; use the tag-triggered release path instead"
+            exit 1
+          fi
+
+          echo "version=$source_version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "notes=$notes" >> "$GITHUB_OUTPUT"
+
+      - name: Build release files
+        working-directory: go-ledger
+        shell: bash
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          package="ledger-chain-watcher-v${VERSION}-linux-amd64"
+          mkdir -p "dist/${package}"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/ledger-chain-watcher-linux-amd64 ./cmd/chain-watcher
+          cp dist/ledger-chain-watcher-linux-amd64 "dist/${package}/ledger-chain-watcher"
+          cp ../deploy/ledger-chain-watcher.env.example "dist/${package}/"
+          cp ../deploy/ledger-chain-watcher.service "dist/${package}/"
+          tar -C dist -czf "dist/${package}.tar.gz" "$package"
+          git -C .. archive --format=tar.gz -o "go-ledger/dist/telegram-ledger-bot-v${VERSION}-source.tar.gz" HEAD
+          (
+            cd dist
+            sha256sum ledger-chain-watcher-linux-amd64 > ledger-chain-watcher-linux-amd64.sha256
+            sha256sum "${package}.tar.gz" > "${package}.tar.gz.sha256"
+            sha256sum "telegram-ledger-bot-v${VERSION}-source.tar.gz" > "telegram-ledger-bot-v${VERSION}-source.tar.gz.sha256"
+            sha256sum ledger-chain-watcher-linux-amd64 "${package}.tar.gz" "telegram-ledger-bot-v${VERSION}-source.tar.gz" > SHA256SUMS
+          )
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish exact and latest images
+        working-directory: go-ledger
+        shell: bash
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          bot_image="ghcr.io/${GITHUB_REPOSITORY_OWNER}/telegram-ledger-bot-go"
+          watcher_image="ghcr.io/${GITHUB_REPOSITORY_OWNER}/telegram-ledger-chain-watcher"
+          docker buildx build --platform linux/amd64 --build-arg APP=ledger-bot --tag "${bot_image}:${VERSION}" --tag "${bot_image}:latest" --push .
+          docker buildx build --platform linux/amd64 --build-arg APP=chain-watcher --tag "${watcher_image}:${VERSION}" --tag "${watcher_image}:latest" --push .
+
+          bot_digest="$(docker buildx imagetools inspect "${bot_image}:${VERSION}" | awk '/^Digest:/ { print $2; exit }')"
+          watcher_digest="$(docker buildx imagetools inspect "${watcher_image}:${VERSION}" | awk '/^Digest:/ { print $2; exit }')"
+          [[ "$bot_digest" == sha256:* ]]
+          [[ "$watcher_digest" == sha256:* ]]
+          {
+            printf '%s:%s %s@%s\n' "$bot_image" "$VERSION" "$bot_image" "$bot_digest"
+            printf '%s:%s %s@%s\n' "$watcher_image" "$VERSION" "$watcher_image" "$watcher_digest"
+          } > dist/image-digests.txt
+
+      - name: Create immutable GitHub Release
+        working-directory: go-ledger
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.release.outputs.version }}
+          TAG: ${{ steps.release.outputs.tag }}
+          NOTES: ${{ steps.release.outputs.notes }}
+        run: |
+          set -euo pipefail
+          package="ledger-chain-watcher-v${VERSION}-linux-amd64"
+          assets=(
             "dist/ledger-chain-watcher-linux-amd64"
             "dist/ledger-chain-watcher-linux-amd64.sha256"
-            "dist/ledger-chain-watcher-v2.4.1-linux-amd64.tar.gz"
-            "dist/ledger-chain-watcher-v2.4.1-linux-amd64.tar.gz.sha256"
+            "dist/${package}.tar.gz"
+            "dist/${package}.tar.gz.sha256"
+            "dist/telegram-ledger-bot-v${VERSION}-source.tar.gz"
+            "dist/telegram-ledger-bot-v${VERSION}-source.tar.gz.sha256"
+            "dist/SHA256SUMS"
+            "dist/image-digests.txt"
           )
-          if gh release view v2.4.1 --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release upload v2.4.1 "${ASSETS[@]}" --clobber --repo "${{ github.repository }}"
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            gh release create "$TAG" "${assets[@]}" --verify-tag --title "Go ${TAG}" --notes-file "../${NOTES}" --latest --repo "$GITHUB_REPOSITORY"
           else
-            gh release create v2.4.1 "${ASSETS[@]}" \
-              --target "${{ github.sha }}" \
-              --title "Go v2.4.1" \
-              --notes-file /tmp/release-notes.md \
-              --latest \
-              --repo "${{ github.repository }}"
+            gh release create "$TAG" "${assets[@]}" --target "$GITHUB_SHA" --title "Go ${TAG}" --notes-file "../${NOTES}" --latest --repo "$GITHUB_REPOSITORY"
           fi

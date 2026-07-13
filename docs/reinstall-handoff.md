@@ -1,6 +1,6 @@
 # Reinstall Handoff and Current State
 
-Last updated: 2026-07-10
+Last updated: 2026-07-13
 
 This document is the recovery handoff for reinstalling the local system and continuing work from the current GitHub state. It intentionally does not contain any real token, password, API key, or SSH credential.
 
@@ -9,15 +9,15 @@ This document is the recovery handoff for reinstalling the local system and cont
 - Repository: `dayou0168/telegram-ledger-bot`
 - Main line: Go + PostgreSQL
 - Deprecated line: the old Python runtime is retired. Do not restore, test, or publish it as the active product line.
-- Current release target: `v2.4.1`
-- Release commit: the commit referenced by the `v2.4.1` tag
-- Release URL: `https://github.com/dayou0168/telegram-ledger-bot/releases/tag/v2.4.1`
+- Current source release candidate: `v2.4.2`
+- Last confirmed published release before this candidate: `v2.4.1`
+- The v2.4.2 release commit and URL do not exist until the explicit release workflow succeeds. Do not invent them from a local commit.
 
-Current images:
+Intended v2.4.2 images after the explicit release workflow succeeds:
 
 ```text
-ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.1
-ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.1
+ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.2
+ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.2
 ```
 
 ## Current Architecture
@@ -163,11 +163,11 @@ docs/reinstall-handoff.md
 6. Pull and start the current images.
 
 ```powershell
-docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.1
-docker pull ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.1
+docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.2
+docker pull ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.2
 ```
 
-For the current stable host systemd watcher, install the GitHub Release package for `v2.4.1` instead of extracting a binary from a container image. For v2.4.2, wait for its real Release package and checksum; do not invent a candidate URL or image tag.
+For the host systemd watcher, install the GitHub Release package for `v2.4.2` instead of extracting a binary from a container image. Wait for the real Release package, checksum, and `image-digests.txt`; do not invent them from candidate files.
 
 7. Verify after startup.
 

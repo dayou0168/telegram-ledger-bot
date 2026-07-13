@@ -1,6 +1,6 @@
 # v2.4.2 生产升级、回滚与验收
 
-本文只描述尚未发布的 v2.4.2 候选版本。当前正式生产仍使用 bot v2.4.1 和上一版宿主机 watcher；取得正式 Release、镜像 digest、宿主机二进制 SHA256 和部署授权前，不执行升级。
+本文只描述尚未发布的 v2.4.2 候选版本。当前正式生产仍使用 bot v2.4.1 和上一版宿主机 watcher；取得正式 Release、镜像 digest、宿主机二进制 SHA256 和部署授权前，不执行升级。发布内容摘要见 [releases/v2.4.2.md](releases/v2.4.2.md)；普通 push/PR 只跑 CI，不会产生 tag、Release 或镜像。
 
 唯一代码基线是 `codex/v2.4.2-integration` 的已确认提交。外层旧工作区中的部署文件、旧权限文案和未跟踪 TRON 安装脚本不得直接合并或投产。
 
