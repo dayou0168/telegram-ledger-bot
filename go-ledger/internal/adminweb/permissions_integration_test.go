@@ -510,6 +510,31 @@ func TestAdminHostBroadcastGroupOwnerTransferBoundariesAndTemplateHooks(t *testi
 	}
 	if rec := post(hostSession, form(primaryBID, false)); rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "1 个") {
 		t.Fatalf("missing permission status=%d body=%s", rec.Code, rec.Body.String())
+	} else {
+		body := rec.Body.String()
+		for _, want := range []string{
+			`data-initial-tab="broadcast"`,
+			`class="msg error"`,
+			fmt.Sprintf(`<option value="%s" data-owner-user-id="0" selected>`, groupName),
+			fmt.Sprintf(`<option value="%d" selected>河马</option>`, primaryBID),
+			`name="expected_owner_user_id" value="0"`,
+		} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("conflict response missing %q", want)
+			}
+		}
+		transferStart := strings.Index(body, `data-owner-transfer-form`)
+		if transferStart < 0 {
+			t.Fatal("conflict response missing transfer form")
+		}
+		transferEnd := strings.Index(body[transferStart:], `</form>`)
+		if transferEnd < 0 {
+			t.Fatal("conflict response transfer form is incomplete")
+		}
+		transferHTML := body[transferStart : transferStart+transferEnd]
+		if strings.Contains(transferHTML, `name="sync_missing_permissions" value="1" checked`) {
+			t.Fatal("conflict response did not preserve disabled permission sync choice")
+		}
 	}
 	if invalidator.allPermissions {
 		t.Fatal("rejected transfer invalidated caches")

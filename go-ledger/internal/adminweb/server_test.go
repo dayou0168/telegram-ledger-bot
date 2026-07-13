@@ -315,6 +315,15 @@ func TestBroadcastGroupOwnerLabelMasksUIDAndShowsLifecycle(t *testing.T) {
 	if got := broadcastGroupOwnerLabel(group); strings.Contains(got, "987654321012") {
 		t.Fatalf("fallback label exposed full UID: %q", got)
 	}
+	operator := storage.GlobalOperator{UserID: 987654321012, Remark: "河马", Username: "hippo_owner"}
+	if got := ownerTransferCandidateLabel(operator); got != "河马 · @hippo_owner" {
+		t.Fatalf("candidate label=%q", got)
+	}
+	operator.Remark = ""
+	operator.Username = ""
+	if got := ownerTransferCandidateLabel(operator); strings.Contains(got, "987654321012") {
+		t.Fatalf("candidate fallback exposed full UID: %q", got)
+	}
 }
 
 func TestServerPermissionInvalidatorHooks(t *testing.T) {
@@ -534,6 +543,9 @@ func TestAdminTemplateRendersReadableBroadcastManagement(t *testing.T) {
 		},
 		BGroups:              []storage.BroadcastGroup{{Name: "出款", ChatIDs: []int64{-1001}, ChatNames: []string{"出款群"}}},
 		BroadcastMemberships: []storage.BroadcastGroup{{Name: "出款", ChatIDs: []int64{-1001}, ChatNames: []string{"出款群"}}},
+		PrimaryOperators: []storage.GlobalOperator{{
+			UserID: 7611260151, Level: "primary", Status: "active", Remark: "柚子", Username: "yuzu_owner",
+		}},
 		BOperators: []storage.GlobalOperator{{
 			UserID:                              7611260151,
 			Level:                               "primary",
@@ -593,7 +605,16 @@ func TestAdminTemplateRendersReadableBroadcastManagement(t *testing.T) {
 		`一级 / 下级操作人`,
 		`一级操作人`,
 		`下级操作人`,
-		`class="toolbar-forms"`,
+		`class="group-operations" data-owner-transfer-hook="broadcast-groups"`,
+		`class="group-operation group-operation-create"`,
+		`class="group-operation group-operation-edit"`,
+		`class="group-operation group-operation-danger"`,
+		`action="/admin/group/transfer-owner#broadcast"`,
+		`name="expected_owner_user_id"`,
+		`name="new_owner_user_id"`,
+		`name="sync_missing_permissions" value="1" checked`,
+		`柚子 · @yuzu_owner`,
+		`data-transfer-submit`,
 		`添加群组到分组`,
 		`从分组移除群组`,
 		`class="permission-panels"`,
@@ -635,6 +656,8 @@ func TestAdminTemplateRendersReadableBroadcastManagement(t *testing.T) {
 		`后台管理`,
 		`document.querySelectorAll('.permission-form')`,
 		`document.querySelectorAll('.cleanup-open')`,
+		`document.querySelectorAll('[data-owner-transfer-form]')`,
+		`确认将分组“`,
 		`localStorage.setItem('ledger-admin-tab',name)`,
 	}
 	for _, want := range wants {
@@ -713,6 +736,26 @@ func TestAdminSearchBarsAndCleanupDialogResponsiveCSS(t *testing.T) {
 	}
 }
 
+func TestBroadcastGroupOperationsResponsiveCSS(t *testing.T) {
+	for _, want := range []string{
+		`.group-operations{display:grid;grid-template-columns:minmax(250px,.8fr) minmax(480px,1.45fr);grid-template-areas:"create edit" "danger edit"`,
+		`.group-operation-edit{grid-area:edit;min-height:100%;border-left:1px solid #d7e1ec}`,
+		`.group-operation-form input,.group-operation-form select{width:100%;max-width:100%}`,
+		`.group-operation-danger{grid-area:danger;border-top:1px solid #d7e1ec;background:#fffafa}`,
+		`.btn.danger{background:#b42318`,
+		`@media(max-width:900px){.top{align-items:flex-start;flex-direction:column}.row,.row.two,.group-operations`,
+		`.group-operations{grid-template-areas:"create" "edit" "danger"}`,
+		`.group-operation-edit{min-height:0;border-left:0;border-top:1px solid #d7e1ec}`,
+	} {
+		if !strings.Contains(adminHTML, want) {
+			t.Fatalf("broadcast group responsive CSS missing %q", want)
+		}
+	}
+	if strings.Contains(adminHTML, `.toolbar-forms{`) || strings.Contains(adminHTML, `class="inline-form"`) {
+		t.Fatal("broadcast group operations should not use the old crowded toolbar")
+	}
+}
+
 func TestAdminTemplateForOperatorOnlyRendersWatchTab(t *testing.T) {
 	var buf bytes.Buffer
 	data := pageData{
@@ -783,6 +826,11 @@ func TestAdminTemplateForPrimaryRendersOwnedGroupAndDelegatedPermissionTools(t *
 	for _, blocked := range []string{`data-admin-tab-target="replace"`} {
 		if strings.Contains(html, blocked) {
 			t.Fatalf("primary admin page exposed host module %q", blocked)
+		}
+	}
+	for _, blocked := range []string{`action="/admin/group/transfer-owner#broadcast"`, `name="expected_owner_user_id"`, `name="sync_missing_permissions"`} {
+		if strings.Contains(html, blocked) {
+			t.Fatalf("primary admin page exposed host owner transfer control %q", blocked)
 		}
 	}
 	for _, want := range []string{`name="level" value="secondary"`, `>禁用</button>`, `>启用</button>`} {

@@ -52,6 +52,9 @@ type pageData struct {
 	Version                       string
 	TokenUnset                    bool
 	Message                       string
+	MessageIsError                bool
+	ActiveAdminTab                string
+	OwnerTransferForm             ownerTransferFormState
 	Groups                        []storage.Group
 	BGroups                       []storage.BroadcastGroup
 	BroadcastMemberships          []storage.BroadcastGroup
@@ -75,6 +78,14 @@ type pageData struct {
 	BroadcastPager                adminPager
 	OperatorPager                 adminPager
 	PermissionPager               adminPager
+}
+
+type ownerTransferFormState struct {
+	Present                bool
+	GroupName              string
+	ExpectedOwnerUserID    int64
+	NewOwnerUserID         int64
+	SyncMissingPermissions bool
 }
 
 type adminPager struct {
@@ -819,19 +830,26 @@ func (s *Server) transferGroupOwner(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	autoGrantMissing := r.FormValue("sync_missing_permissions") == "1"
+	formState := ownerTransferFormState{
+		Present:                true,
+		GroupName:              name,
+		ExpectedOwnerUserID:    expectedOwnerUserID,
+		NewOwnerUserID:         newOwnerUserID,
+		SyncMissingPermissions: autoGrantMissing,
+	}
 	result, err := s.store.TransferBroadcastGroupOwner(
 		r.Context(), name, expectedOwnerUserID, newOwnerUserID, session.UserID,
 		true, autoGrantMissing, time.Now(),
 	)
 	switch {
 	case errors.Is(err, storage.ErrBroadcastGroupOwnerChanged):
-		http.Error(w, "分组创建者已变化，请刷新页面后重试", http.StatusConflict)
+		s.renderOwnerTransferConflict(w, r, "分组当前管理者已变化，页面已加载最新状态；请重新确认后提交", formState)
 		return
 	case errors.Is(err, storage.ErrBroadcastGroupOwnerInvalid):
 		http.Error(w, "新创建者必须是 active 一级操作人", http.StatusBadRequest)
 		return
 	case errors.Is(err, storage.ErrBroadcastGroupOwnerPermissionsMissing):
-		http.Error(w, fmt.Sprintf("目标一级操作人缺少 %d 个分组成员群的单群广播权限；请选择同步补齐后重试", result.MissingChatPermission), http.StatusConflict)
+		s.renderOwnerTransferConflict(w, r, fmt.Sprintf("目标一级操作人缺少 %d 个分组成员群的单群广播权限；可开启“同步补齐缺少的单群权限”后重试", result.MissingChatPermission), formState)
 		return
 	case errors.Is(err, storage.ErrBroadcastScopeDenied):
 		http.Error(w, "没有广播分组管理权转让权限", http.StatusForbidden)
@@ -847,6 +865,23 @@ func (s *Server) transferGroupOwner(w http.ResponseWriter, r *http.Request) {
 		s.invalidateAllPermissionCaches()
 	}
 	redirectMsg(w, r, fmt.Sprintf("分组管理权已转让，自动补齐 %d 个单群广播权限", result.AutoGrantedChatPermission))
+}
+
+func (s *Server) renderOwnerTransferConflict(w http.ResponseWriter, r *http.Request, message string, form ownerTransferFormState) {
+	filters := adminListFilters{BroadcastQuery: form.GroupName}
+	data, err := s.loadPageData(r.Context(), message, adminSessionFromContext(r.Context()), filters)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	data.MessageIsError = true
+	data.ActiveAdminTab = "broadcast"
+	data.OwnerTransferForm = form
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusConflict)
+	if err := adminTemplate.Execute(w, data); err != nil {
+		log.Printf("render owner transfer conflict: %v", err)
+	}
 }
 
 func (s *Server) changeGroupChats(w http.ResponseWriter, r *http.Request, add bool) {
@@ -1815,6 +1850,24 @@ func broadcastGroupOwnerLabel(group storage.BroadcastGroup) string {
 		label += "（已禁用）"
 	}
 	return label
+}
+
+func ownerTransferCandidateLabel(op storage.GlobalOperator) string {
+	remark := strings.TrimSpace(op.Remark)
+	username := strings.TrimSpace(op.Username)
+	if remark != "" && username != "" {
+		return remark + " · @" + username
+	}
+	if remark != "" {
+		return remark
+	}
+	if username != "" {
+		return "@" + username
+	}
+	if displayName := strings.TrimSpace(op.DisplayName); displayName != "" {
+		return displayName
+	}
+	return "未备注操作人 " + maskedUserID(op.UserID)
 }
 
 func operatorLevelLabel(level string) string {
@@ -2951,29 +3004,30 @@ func canManageBroadcastGroupRow(group storage.BroadcastGroup, canManageGlobal bo
 }
 
 var adminTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
-	"chatLabel":                chatLabel,
-	"chatBroadcastGroups":      chatBroadcastGroups,
-	"permissionGroupUsers":     permissionGroupUsers,
-	"permissionChatUsers":      permissionChatUsers,
-	"operatorLabel":            operatorLabel,
-	"broadcastGroupOwnerLabel": broadcastGroupOwnerLabel,
-	"operatorLevelLabel":       operatorLevelLabel,
-	"operatorSourceLabel":      operatorSourceLabel,
-	"adminTime":                adminTime,
-	"permissionTarget":         permissionTarget,
-	"permissionUserLabel":      permissionUserLabel,
-	"grantorLabel":             grantorLabel,
-	"watchOwnerLabel":          watchOwnerLabel,
-	"watchLatestTime":          watchLatestTime,
-	"cleanupSummary":           cleanupSummary,
-	"cleanupDelayPreset":       cleanupDelayPreset,
-	"cleanupDelayCustomValue":  cleanupDelayCustomValue,
-	"cleanupDelayCustomUnit":   cleanupDelayCustomUnit,
-	"cleanupScopeEnabled":      cleanupScopeEnabled,
-	"cleanupTimeHour":          cleanupTimeHour,
-	"cleanupTimeMinute":        cleanupTimeMinute,
-	"canMutateOperator":        canMutateOperatorRow,
-	"canManageBroadcastGroup":  canManageBroadcastGroupRow,
+	"chatLabel":                   chatLabel,
+	"chatBroadcastGroups":         chatBroadcastGroups,
+	"permissionGroupUsers":        permissionGroupUsers,
+	"permissionChatUsers":         permissionChatUsers,
+	"operatorLabel":               operatorLabel,
+	"broadcastGroupOwnerLabel":    broadcastGroupOwnerLabel,
+	"ownerTransferCandidateLabel": ownerTransferCandidateLabel,
+	"operatorLevelLabel":          operatorLevelLabel,
+	"operatorSourceLabel":         operatorSourceLabel,
+	"adminTime":                   adminTime,
+	"permissionTarget":            permissionTarget,
+	"permissionUserLabel":         permissionUserLabel,
+	"grantorLabel":                grantorLabel,
+	"watchOwnerLabel":             watchOwnerLabel,
+	"watchLatestTime":             watchLatestTime,
+	"cleanupSummary":              cleanupSummary,
+	"cleanupDelayPreset":          cleanupDelayPreset,
+	"cleanupDelayCustomValue":     cleanupDelayCustomValue,
+	"cleanupDelayCustomUnit":      cleanupDelayCustomUnit,
+	"cleanupScopeEnabled":         cleanupScopeEnabled,
+	"cleanupTimeHour":             cleanupTimeHour,
+	"cleanupTimeMinute":           cleanupTimeMinute,
+	"canMutateOperator":           canMutateOperatorRow,
+	"canManageBroadcastGroup":     canManageBroadcastGroupRow,
 }).Parse(adminHTML))
 
 var loginTemplate = template.Must(template.New("login").Parse(loginHTML))
@@ -3033,8 +3087,8 @@ const adminHTML = `<!doctype html>
 .top{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px 20px;display:flex;justify-content:space-between;gap:16px;align-items:center}
 .brand{color:#b97914;font-weight:700;margin-bottom:5px}.title{font-size:28px;font-weight:800}.sub{color:var(--muted)}
 .btn{height:38px;border:0;border-radius:6px;background:var(--navy);color:#fff;font-weight:700;padding:0 16px;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;justify-content:center}
-.btn.secondary{background:#fff;color:var(--navy);border:1px solid var(--line)}
-.msg{margin-top:14px;background:#eef8ff;border:1px solid #b8d8ff;color:#16437b;border-radius:6px;padding:10px 12px}
+.btn.secondary{background:#fff;color:var(--navy);border:1px solid var(--line)}.btn.danger{background:#b42318;color:#fff}.btn.danger:hover{background:#8f1c13}
+.msg{margin-top:14px;background:#eef8ff;border:1px solid #b8d8ff;color:#16437b;border-radius:6px;padding:10px 12px}.msg.error{background:#fff2f0;border-color:#f0b4ae;color:#9f2016}
 .warn{margin-top:14px;background:#fff7dd;border:1px solid #e1bd5f;border-radius:6px;padding:10px 12px}
 .tabs{margin-top:16px;display:flex;gap:8px;flex-wrap:wrap}.tab-btn{height:38px;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--navy);font-weight:800;padding:0 14px;cursor:pointer}.tab-btn.active{background:var(--navy);color:#fff;border-color:var(--navy)}
 .grid{margin-top:16px;display:grid;grid-template-columns:minmax(0,1fr);gap:16px;align-items:start}
@@ -3050,19 +3104,19 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 .pager{display:flex;gap:10px;align-items:center;justify-content:flex-end;margin-top:10px;color:var(--muted);font-size:13px}.pager a{color:var(--navy);font-weight:800;text-decoration:none}.pager .disabled{opacity:.4}
 .pill{display:inline-block;border:1px solid #d5e1ec;background:#f7fafc;border-radius:999px;padding:3px 9px;color:#40566f}
 .actions{display:flex;gap:8px;flex-wrap:wrap}.mini{height:32px;padding:0 10px}
-.toolbar-forms{display:grid;grid-template-columns:repeat(3,minmax(240px,1fr));gap:12px;margin-bottom:14px}.inline-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px}.cleanup-cell{min-width:150px;max-width:230px}.cleanup-cell-inner{display:flex;gap:8px;align-items:center;justify-content:space-between;text-align:left}.cleanup-summary{display:block;min-width:0;max-width:170px;color:var(--muted);font-size:12px;line-height:1.35;overflow-wrap:anywhere}.cleanup-dialog{width:min(680px,calc(100vw - 32px));max-height:min(760px,calc(100vh - 32px));padding:0;border:1px solid var(--line);border-radius:8px;color:var(--ink);box-shadow:0 18px 60px rgba(14,27,47,.26)}.cleanup-dialog::backdrop{background:rgba(14,27,47,.48)}.cleanup-dialog-form{display:flex;flex-direction:column;max-height:min(760px,calc(100vh - 32px))}.cleanup-dialog-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:16px 18px;border-bottom:1px solid var(--line);background:#f7f9fc}.cleanup-dialog-title{margin:0;font-size:19px}.cleanup-dialog-body{padding:16px 18px;overflow:auto;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:end}.cleanup-dialog-body .wide{grid-column:1/-1}.cleanup-dialog-body select,.cleanup-dialog-body input{width:100%}.cleanup-scopes{display:flex;gap:14px;align-items:center;flex-wrap:wrap;border:1px solid #dce5ef;border-radius:6px;padding:9px 10px}.cleanup-scopes label{display:flex;gap:5px;align-items:center}.cleanup-scopes input{width:auto;min-height:auto;height:auto}.cleanup-time{display:grid;grid-template-columns:minmax(90px,1fr) auto minmax(90px,1fr) auto;gap:8px;align-items:end}.cleanup-time-colon{font-size:22px;font-weight:800;padding-bottom:7px}.cleanup-time-clear{align-self:end}.cleanup-note{color:var(--muted);font-size:12px;line-height:1.45}.cleanup-dialog-actions{position:sticky;bottom:0;display:flex;justify-content:flex-end;gap:8px;padding:12px 18px;border-top:1px solid var(--line);background:#fff}.section-title{margin:4px 0 8px;font-size:15px;font-weight:800;color:#243852}.member-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:14px}.member-form{border:1px solid #dce5ef;background:var(--soft);border-radius:8px;padding:12px;min-width:0}.member-form select{width:100%;margin-bottom:8px}.member-form select[multiple]{height:220px;min-height:220px;background:#fff}.group-name-list{max-width:760px;text-align:left;line-height:1.65}.permission-panels{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:14px}.permission-panel{border:1px solid #dce5ef;background:var(--soft);border-radius:8px;padding:12px;min-width:0}.permission-panel form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;align-items:end}.permission-panel .btn{grid-column:1/-1;justify-self:start;min-width:180px}.permission-table td:first-child,.operator-name{text-align:left}.field-label{display:block;margin:0 0 5px;color:var(--muted);font-size:12px;font-weight:700}.field-stack{min-width:0}.field-stack select{width:100%}.field-stack.disabled{opacity:.45}
+.group-operations{display:grid;grid-template-columns:minmax(250px,.8fr) minmax(480px,1.45fr);grid-template-areas:"create edit" "danger edit";align-items:start;margin-bottom:14px;border:1px solid #d7e1ec;border-radius:8px;overflow:hidden;background:#fff}.group-operation{min-width:0;padding:14px}.group-operation-create{grid-area:create}.group-operation-edit{grid-area:edit;min-height:100%;border-left:1px solid #d7e1ec}.group-operation-title{margin:0 0 4px;color:#243852;font-size:15px;font-weight:800}.group-operation-desc{min-height:34px;margin:0 0 10px;color:var(--muted);font-size:12px;line-height:1.4}.group-operation-form{display:grid;gap:9px;min-width:0}.group-operation-form label{display:block;min-width:0}.group-operation-form input,.group-operation-form select{width:100%;max-width:100%}.group-operation-form .btn{width:100%;white-space:normal}.group-edit-forms{display:grid;gap:14px}.group-transfer-form{padding-top:14px;border-top:1px solid #d7e1ec}.group-transfer-form .sync-option{display:flex;gap:8px;align-items:flex-start;padding:9px 10px;border:1px solid #d7e1ec;border-radius:6px;background:#f7f9fc;color:#334a66;font-size:13px;line-height:1.4}.group-transfer-form .sync-option input{flex:0 0 auto;width:auto;min-height:auto;margin-top:2px}.transfer-summary{min-height:34px;padding:8px 10px;border-left:3px solid var(--gold);background:#fbf8ef;color:#394f68;font-size:12px;line-height:1.45;overflow-wrap:anywhere}.group-operation-danger{grid-area:danger;border-top:1px solid #d7e1ec;background:#fffafa}.group-operation-danger .group-operation-title{color:#9f2016}.broadcast-group-table .group-name-cell{min-width:150px;font-weight:700;text-align:left;overflow-wrap:anywhere}.broadcast-group-table .group-owner-cell{min-width:130px;overflow-wrap:anywhere}.broadcast-group-table .group-members-cell{min-width:220px;text-align:left;overflow-wrap:anywhere}.cleanup-cell{min-width:150px;max-width:230px}.cleanup-cell-inner{display:flex;gap:8px;align-items:center;justify-content:space-between;text-align:left}.cleanup-summary{display:block;min-width:0;max-width:170px;color:var(--muted);font-size:12px;line-height:1.35;overflow-wrap:anywhere}.cleanup-dialog{width:min(680px,calc(100vw - 32px));max-height:min(760px,calc(100vh - 32px));padding:0;border:1px solid var(--line);border-radius:8px;color:var(--ink);box-shadow:0 18px 60px rgba(14,27,47,.26)}.cleanup-dialog::backdrop{background:rgba(14,27,47,.48)}.cleanup-dialog-form{display:flex;flex-direction:column;max-height:min(760px,calc(100vh - 32px))}.cleanup-dialog-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:16px 18px;border-bottom:1px solid var(--line);background:#f7f9fc}.cleanup-dialog-title{margin:0;font-size:19px}.cleanup-dialog-body{padding:16px 18px;overflow:auto;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:end}.cleanup-dialog-body .wide{grid-column:1/-1}.cleanup-dialog-body select,.cleanup-dialog-body input{width:100%}.cleanup-scopes{display:flex;gap:14px;align-items:center;flex-wrap:wrap;border:1px solid #dce5ef;border-radius:6px;padding:9px 10px}.cleanup-scopes label{display:flex;gap:5px;align-items:center}.cleanup-scopes input{width:auto;min-height:auto;height:auto}.cleanup-time{display:grid;grid-template-columns:minmax(90px,1fr) auto minmax(90px,1fr) auto;gap:8px;align-items:end}.cleanup-time-colon{font-size:22px;font-weight:800;padding-bottom:7px}.cleanup-time-clear{align-self:end}.cleanup-note{color:var(--muted);font-size:12px;line-height:1.45}.cleanup-dialog-actions{position:sticky;bottom:0;display:flex;justify-content:flex-end;gap:8px;padding:12px 18px;border-top:1px solid var(--line);background:#fff}.section-title{margin:4px 0 8px;font-size:15px;font-weight:800;color:#243852}.member-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:14px}.member-form{border:1px solid #dce5ef;background:var(--soft);border-radius:8px;padding:12px;min-width:0}.member-form select{width:100%;margin-bottom:8px}.member-form select[multiple]{height:220px;min-height:220px;background:#fff}.group-name-list{max-width:760px;text-align:left;line-height:1.65}.permission-panels{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:14px}.permission-panel{border:1px solid #dce5ef;background:var(--soft);border-radius:8px;padding:12px;min-width:0}.permission-panel form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;align-items:end}.permission-panel .btn{grid-column:1/-1;justify-self:start;min-width:180px}.permission-table td:first-child,.operator-name{text-align:left}.field-label{display:block;margin:0 0 5px;color:var(--muted);font-size:12px;font-weight:700}.field-stack{min-width:0}.field-stack select{width:100%}.field-stack.disabled{opacity:.45}
 .watch-panel{max-height:620px;overflow:auto;border:1px solid #dce5ef;border-radius:8px;background:#fff}.watch-panel form{margin:0}.watch-head,.watch-row{display:grid;grid-template-columns:minmax(130px,.7fr) minmax(330px,1.6fr) minmax(150px,.7fr) repeat(2,88px) minmax(110px,.5fr) auto auto;gap:8px;align-items:center}.watch-head{position:sticky;top:0;z-index:1;background:#f4f7fb;font-weight:800;padding:10px;border-bottom:1px solid #dce5ef;text-align:center}.watch-row{padding:10px;border-bottom:1px solid #e7eef6}.watch-row:last-child{border-bottom:0}.watch-row code{word-break:break-all;color:#173f82}.watch-row .owner{font-weight:700}.watch-row .latest{color:var(--muted);font-size:12px}.watch-check{display:flex;gap:5px;align-items:center;justify-content:center}.watch-check input{min-height:auto}.watch-row .btn{height:34px;min-width:64px;padding:0 10px}.watch-empty{border:1px dashed #cbd8e8;border-radius:8px;padding:22px;text-align:center;color:var(--muted);background:var(--soft)}
-@media(max-width:900px){.top{align-items:flex-start;flex-direction:column}.row,.row.two,.toolbar-forms,.member-grid,.permission-panels,.permission-panel form{grid-template-columns:1fr}.watch-head{display:none}.watch-row{grid-template-columns:1fr}.btn{width:100%}.table-tools{flex-wrap:nowrap}.table-tools input[type=search]{flex:1 1 0;width:0;min-width:0}.table-tools .btn{flex:0 0 auto;width:auto;min-width:68px}.cleanup-dialog-body{grid-template-columns:1fr}.cleanup-dialog-body .wide{grid-column:auto}.cleanup-dialog-actions .btn,.cleanup-time .btn{width:auto}.cleanup-cell{min-width:140px;max-width:190px}.cleanup-summary{max-width:125px}}
-@media(max-width:420px){.wrap{padding:12px}.card{padding:14px}.table-tools{gap:6px}.table-tools .btn{min-width:64px;padding:0 10px}.cleanup-time{grid-template-columns:minmax(76px,1fr) auto minmax(76px,1fr)}.cleanup-time-clear{grid-column:1/-1;justify-self:start}.cleanup-dialog{width:calc(100vw - 16px);max-height:calc(100vh - 16px)}.cleanup-dialog-form{max-height:calc(100vh - 16px)}}
+@media(max-width:900px){.top{align-items:flex-start;flex-direction:column}.row,.row.two,.group-operations,.member-grid,.permission-panels,.permission-panel form{grid-template-columns:1fr}.group-operations{grid-template-areas:"create" "edit" "danger"}.group-operation-edit{min-height:0;border-left:0;border-top:1px solid #d7e1ec}.group-operation-desc{min-height:0}.watch-head{display:none}.watch-row{grid-template-columns:1fr}.btn{width:100%}.table-tools{flex-wrap:nowrap}.table-tools input[type=search]{flex:1 1 0;width:0;min-width:0}.table-tools .btn{flex:0 0 auto;width:auto;min-width:68px}.cleanup-dialog-body{grid-template-columns:1fr}.cleanup-dialog-body .wide{grid-column:auto}.cleanup-dialog-actions .btn,.cleanup-time .btn{width:auto}.cleanup-cell{min-width:140px;max-width:190px}.cleanup-summary{max-width:125px}}
+@media(max-width:420px){.wrap{padding:12px}.card{padding:14px}.table-tools{gap:6px}.table-tools .btn{min-width:64px;padding:0 10px}.group-operation{padding:12px}.group-transfer-form .sync-option{padding:8px}.cleanup-time{grid-template-columns:minmax(76px,1fr) auto minmax(76px,1fr)}.cleanup-time-clear{grid-column:1/-1;justify-self:start}.cleanup-dialog{width:calc(100vw - 16px);max-height:calc(100vh - 16px)}.cleanup-dialog-form{max-height:calc(100vh - 16px)}}
 </style>
 </head>
-<body><main class="wrap">
+<body><main class="wrap" data-initial-tab="{{.ActiveAdminTab}}">
 <section class="top">
 <div><div class="brand">Telegram 记账机器人</div><div class="title">后台管理</div><div class="sub">Go v{{.Version}} · {{.AdminRoleLabel}} · {{if or .CanManageGlobal .CanManageOperators .CanManageBroadcastPermissions .CanManageBroadcastGroups}}操作人、广播权限和地址监听{{else}}地址监听{{end}}</div></div>
 <div class="actions"><a class="btn secondary" href="/admin">刷新</a><a class="btn secondary" href="/admin/logout">退出</a></div>
 </section>
 {{if .TokenUnset}}<div class="warn">当前没有配置 ADMIN_WEB_TOKEN，公网部署请先设置后台密码。</div>{{end}}
-{{if .Message}}<div class="msg">{{.Message}}</div>{{end}}
+{{if .Message}}<div class="msg {{if .MessageIsError}}error{{end}}">{{.Message}}</div>{{end}}
 <nav class="tabs" aria-label="后台模块">
 {{if or .CanManageGlobal .CanManageBroadcastGroups}}
 <button class="tab-btn active" type="button" data-admin-tab-target="groups">已保存群组</button>
@@ -3136,20 +3190,44 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 <h2>广播分组</h2>
 <p class="hint">先创建分组，再用下方多选框批量添加或移除群组。页面显示群名，数据库仍用群 ID 去重。</p>
 <form class="table-tools" method="get" action="/admin"><input name="broadcast_q" value="{{.BroadcastPager.Query}}" type="search" placeholder="搜索分组名或群名"><button class="btn mini" type="submit">搜索</button></form>
-<div class="toolbar-forms">
-<form method="post" action="/admin/group/save" class="inline-form">
-<input name="name" placeholder="输入新分组名，例如 财务">
+<div class="group-operations" data-owner-transfer-hook="broadcast-groups">
+<section class="group-operation group-operation-create">
+<h3 class="group-operation-title">新建分组</h3>
+<p class="group-operation-desc">创建一个新的广播目标集合。</p>
+<form method="post" action="/admin/group/save" class="group-operation-form group-create-form">
+<label><span class="field-label">分组名称</span><input name="name" placeholder="例如：财务通知" autocomplete="off"></label>
 <button class="btn" type="submit">新建分组</button>
 </form>
-<form method="post" action="/admin/group/delete" class="inline-form">
-<select name="name">{{range .BGroups}}{{if canManageBroadcastGroup . $.CanManageGlobal $.AdminUserID}}<option value="{{.Name}}">{{.Name}}</option>{{end}}{{end}}</select>
-<button class="btn" type="submit">删除分组</button>
+</section>
+<section class="group-operation group-operation-edit">
+<h3 class="group-operation-title">编辑分组</h3>
+<p class="group-operation-desc">修改名称；宿主还可以转让管理权。</p>
+<div class="group-edit-forms">
+<form method="post" action="/admin/group/rename" class="group-operation-form group-rename-form">
+<label><span class="field-label">选择分组</span><select name="old_name">{{range .BGroups}}{{if canManageBroadcastGroup . $.CanManageGlobal $.AdminUserID}}<option value="{{.Name}}">{{.Name}}</option>{{end}}{{end}}</select></label>
+<label><span class="field-label">新名称</span><input name="new_name" placeholder="输入新的分组名称" autocomplete="off"></label>
+<button class="btn secondary" type="submit">重命名并迁移授权</button>
 </form>
-<form method="post" action="/admin/group/rename" class="inline-form">
-<select name="old_name">{{range .BGroups}}{{if canManageBroadcastGroup . $.CanManageGlobal $.AdminUserID}}<option value="{{.Name}}">{{.Name}}</option>{{end}}{{end}}</select>
-<input name="new_name" placeholder="新分组名">
-<button class="btn" type="submit">改名并迁移授权</button>
+{{if .CanManageGlobal}}
+<form method="post" action="/admin/group/transfer-owner#broadcast" class="group-operation-form group-transfer-form" data-owner-transfer-form>
+<label><span class="field-label">转让分组</span><select class="owner-transfer-group" name="name">{{range .BGroups}}{{if canManageBroadcastGroup . $.CanManageGlobal $.AdminUserID}}<option value="{{.Name}}" data-owner-user-id="{{.OwnerUserID}}" {{if and $.OwnerTransferForm.Present (eq $.OwnerTransferForm.GroupName .Name)}}selected{{end}}>{{.Name}}</option>{{end}}{{end}}</select></label>
+<input class="owner-transfer-expected" type="hidden" name="expected_owner_user_id" value="{{.OwnerTransferForm.ExpectedOwnerUserID}}">
+<label><span class="field-label">新的管理者</span><select class="owner-transfer-target" name="new_owner_user_id">{{range .PrimaryOperators}}{{if and (eq .Status "active") (eq .Level "primary")}}<option value="{{.UserID}}" {{if and $.OwnerTransferForm.Present (eq $.OwnerTransferForm.NewOwnerUserID .UserID)}}selected{{end}}>{{ownerTransferCandidateLabel .}}</option>{{end}}{{end}}</select></label>
+<label class="sync-option"><input type="checkbox" name="sync_missing_permissions" value="1" {{if or (not .OwnerTransferForm.Present) .OwnerTransferForm.SyncMissingPermissions}}checked{{end}}><span><strong>同步补齐缺少的单群权限</strong><br>建议开启；关闭后如有缺失，系统会返回精确数量且不会转让。</span></label>
+<div class="transfer-summary" aria-live="polite">请选择分组和新的管理者。</div>
+<button class="btn" type="submit" data-transfer-submit>确认转让管理权</button>
 </form>
+{{end}}
+</div>
+</section>
+<section class="group-operation group-operation-danger">
+<h3 class="group-operation-title">删除分组</h3>
+<p class="group-operation-desc">删除分组并清理相关广播授权，不影响群本身。</p>
+<form method="post" action="/admin/group/delete" class="group-operation-form group-delete-form">
+<label><span class="field-label">选择分组</span><select name="name">{{range .BGroups}}{{if canManageBroadcastGroup . $.CanManageGlobal $.AdminUserID}}<option value="{{.Name}}">{{.Name}}</option>{{end}}{{end}}</select></label>
+<button class="btn danger" type="submit">删除分组</button>
+</form>
+</section>
 </div>
 <div class="member-grid">
 <form method="post" action="/admin/group/add" class="member-form" data-mode="add">
@@ -3167,8 +3245,8 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 <button class="btn full" type="submit">从分组移除</button>
 </form>
 </div>
-<div class="scroll" data-owner-transfer-hook="broadcast-groups"><table><thead><tr><th>分组</th><th>创建者</th><th>权限</th><th>群数</th><th>群组</th></tr></thead><tbody>
-{{range .BGroups}}<tr data-group-name="{{.Name}}" data-owner-user-id="{{.OwnerUserID}}"><td>{{.Name}}</td><td>{{broadcastGroupOwnerLabel .}}</td><td>{{if canManageBroadcastGroup . $.CanManageGlobal $.AdminUserID}}可管理{{else}}仅可使用{{end}}</td><td>{{len .ChatIDs}}</td><td>{{range $i,$n := .ChatNames}}{{if $i}}、{{end}}{{$n}}{{end}}</td></tr>{{else}}<tr><td colspan="5">暂无广播分组</td></tr>{{end}}
+<div class="scroll"><table class="broadcast-group-table"><thead><tr><th>分组</th><th>创建者</th><th>权限</th><th>群数</th><th>群组</th></tr></thead><tbody>
+{{range .BGroups}}<tr data-group-name="{{.Name}}" data-owner-user-id="{{.OwnerUserID}}"><td class="group-name-cell">{{.Name}}</td><td class="group-owner-cell">{{broadcastGroupOwnerLabel .}}</td><td>{{if canManageBroadcastGroup . $.CanManageGlobal $.AdminUserID}}可管理{{else}}仅可使用{{end}}</td><td>{{len .ChatIDs}}</td><td class="group-members-cell">{{range $i,$n := .ChatNames}}{{if $i}}、{{end}}{{$n}}{{end}}</td></tr>{{else}}<tr><td colspan="5">暂无广播分组</td></tr>{{end}}
 </tbody></table></div>
 <div class="pager"><span>{{.BroadcastPager.ItemFrom}}-{{.BroadcastPager.ItemTo}} / {{.BroadcastPager.Total}}</span>{{if .BroadcastPager.HasPrev}}<a href="{{.BroadcastPager.PrevURL}}">上一页</a>{{else}}<span class="disabled">上一页</span>{{end}}{{if .BroadcastPager.HasNext}}<a href="{{.BroadcastPager.NextURL}}">下一页</a>{{else}}<span class="disabled">下一页</span>{{end}}</div>
 </div>
@@ -3270,7 +3348,8 @@ function setAdminTab(name){
   if(location.hash !== '#'+name){history.replaceState(null,'','#'+name);}
 }
 adminTabs.forEach(function(btn){btn.addEventListener('click',function(){setAdminTab(btn.dataset.adminTabTarget);});});
-let initialTab=(location.hash || '').slice(1);
+const adminRoot=document.querySelector('main.wrap');
+let initialTab=(adminRoot && adminRoot.dataset.initialTab) || (location.hash || '').slice(1);
 if(!initialTab){try{initialTab=localStorage.getItem('ledger-admin-tab') || '';}catch(e){}}
 setAdminTab(initialTab || 'groups');
 document.querySelectorAll('.cleanup-open').forEach(function(button){
@@ -3377,6 +3456,33 @@ document.querySelectorAll('.member-form').forEach(function(form){
   }
   if(groupSelect){groupSelect.addEventListener('change',syncMemberOptions);}
   syncMemberOptions();
+});
+document.querySelectorAll('[data-owner-transfer-form]').forEach(function(form){
+  const groupSelect=form.querySelector('.owner-transfer-group');
+  const expectedOwner=form.querySelector('.owner-transfer-expected');
+  const targetSelect=form.querySelector('.owner-transfer-target');
+  const summary=form.querySelector('.transfer-summary');
+  const submit=form.querySelector('[data-transfer-submit]');
+  function selectedText(select){
+    if(!select || select.selectedIndex<0){return '';}
+    return (select.options[select.selectedIndex].textContent || '').trim();
+  }
+  function syncTransfer(){
+    const groupOption=groupSelect && groupSelect.selectedIndex>=0 ? groupSelect.options[groupSelect.selectedIndex] : null;
+    const groupName=selectedText(groupSelect);
+    const targetName=selectedText(targetSelect);
+    if(expectedOwner){expectedOwner.value=groupOption ? (groupOption.dataset.ownerUserId || '0') : '';}
+    if(summary){summary.textContent=groupName && targetName ? '将分组“'+groupName+'”的管理权转让给“'+targetName+'”' : '请选择分组和新的管理者。';}
+    if(submit){submit.disabled=!(groupName && targetName);submit.textContent=targetName ? '确认转让给 '+targetName : '确认转让管理权';}
+  }
+  if(groupSelect){groupSelect.addEventListener('change',syncTransfer);}
+  if(targetSelect){targetSelect.addEventListener('change',syncTransfer);}
+  form.addEventListener('submit',function(event){
+    const groupName=selectedText(groupSelect);
+    const targetName=selectedText(targetSelect);
+    if(!groupName || !targetName || !window.confirm('确认将分组“'+groupName+'”的管理权转让给“'+targetName+'”？')){event.preventDefault();}
+  });
+  syncTransfer();
 });
 </script>
 </main></body></html>`
