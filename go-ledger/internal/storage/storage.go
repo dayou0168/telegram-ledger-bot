@@ -361,6 +361,8 @@ func (s *Store) migrate(ctx context.Context) error {
 		`ALTER TABLE private_chat_messages ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE private_chat_messages ADD COLUMN IF NOT EXISTS cleanup_after_seconds INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE private_chat_messages ADD COLUMN IF NOT EXISTS due_at TIMESTAMPTZ`,
+		`UPDATE private_chat_messages SET category='menu'
+			WHERE category IN ('', 'private', 'bot_prompt')`,
 		`CREATE INDEX IF NOT EXISTS idx_private_chat_messages_operator_pending
 			ON private_chat_messages(operator_user_id, id)
 			WHERE deleted_at IS NULL`,
@@ -402,6 +404,12 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_broadcast_permissions_group
 			ON broadcast_operator_permissions(user_id, target, group_name)
 			WHERE target = 'group'`,
+		`DELETE FROM broadcast_operator_permissions p
+			WHERE (p.target='group' AND NOT EXISTS (
+				SELECT 1 FROM broadcast_groups g WHERE g.name=p.group_name
+			)) OR (p.target='chat' AND NOT EXISTS (
+				SELECT 1 FROM groups g WHERE g.chat_id=p.chat_id
+			))`,
 		`WITH migration AS (
 			INSERT INTO schema_migrations(version, applied_at)
 			VALUES('2.4.2-disabled-global-operator-permissions', NOW())
@@ -445,6 +453,20 @@ func (s *Store) migrate(ctx context.Context) error {
 			ON admin_login_tickets(user_id, created_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_admin_login_tickets_expires
 			ON admin_login_tickets(expires_at)`,
+		`CREATE TABLE IF NOT EXISTS ledger_clear_tickets (
+			token_hash TEXT PRIMARY KEY,
+			chat_id BIGINT NOT NULL,
+			requested_by_user_id BIGINT NOT NULL,
+			day_key TEXT NOT NULL,
+			active_period_started_at TIMESTAMPTZ NOT NULL,
+			expires_at TIMESTAMPTZ NOT NULL,
+			consumed_at TIMESTAMPTZ,
+			created_at TIMESTAMPTZ NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_ledger_clear_tickets_expires
+			ON ledger_clear_tickets(expires_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_ledger_clear_tickets_chat_created
+			ON ledger_clear_tickets(chat_id, created_at DESC)`,
 		`CREATE TABLE IF NOT EXISTS broadcast_deliveries (
 			id BIGSERIAL PRIMARY KEY,
 			operator_user_id BIGINT NOT NULL,
@@ -1339,7 +1361,8 @@ func (s *Store) DisableGlobalOperator(ctx context.Context, userID, disabledBy in
 }
 
 func (s *Store) ListGlobalOperators(ctx context.Context) ([]GlobalOperator, error) {
-	rows, err := s.pool.Query(ctx, `SELECT g.user_id, g.level, g.status, COALESCE(g.parent_user_id, 0),
+	rows, err := s.pool.Query(ctx, `SELECT g.user_id, COALESCE(u.username, ''), COALESCE(u.display_name, ''),
+			g.level, g.status, COALESCE(g.parent_user_id, 0),
 			g.remark, g.created_by, g.created_at, COALESCE(g.disabled_by, 0), g.disabled_at,
 			COALESCE(b.private_cleanup_enabled, FALSE),
 			COALESCE(b.private_cleanup_time, ''),
@@ -1351,6 +1374,10 @@ func (s *Store) ListGlobalOperators(ctx context.Context) ([]GlobalOperator, erro
 			COALESCE(b.updated_at, g.created_at)
 		FROM global_operators g
 		LEFT JOIN broadcast_operators b ON b.user_id=g.user_id
+		LEFT JOIN LATERAL (
+			SELECT username, display_name FROM users
+			WHERE user_id=g.user_id ORDER BY last_seen_at DESC LIMIT 1
+		) u ON TRUE
 		ORDER BY g.status ASC, CASE WHEN g.level='primary' THEN 0 ELSE 1 END, g.created_at ASC, g.user_id ASC`)
 	if err != nil {
 		return nil, err
@@ -1362,6 +1389,8 @@ func (s *Store) ListGlobalOperators(ctx context.Context) ([]GlobalOperator, erro
 		var disabledAt pgtype.Timestamptz
 		if err := rows.Scan(
 			&op.UserID,
+			&op.Username,
+			&op.DisplayName,
 			&op.Level,
 			&op.Status,
 			&op.ParentUserID,
@@ -1388,6 +1417,16 @@ func (s *Store) ListGlobalOperators(ctx context.Context) ([]GlobalOperator, erro
 		operators = append(operators, op)
 	}
 	return operators, rows.Err()
+}
+
+func (s *Store) GetLatestUserIdentity(ctx context.Context, userID int64) (User, bool, error) {
+	var user User
+	err := s.pool.QueryRow(ctx, `SELECT user_id, username, display_name FROM users
+		WHERE user_id=$1 ORDER BY last_seen_at DESC LIMIT 1`, userID).Scan(&user.ID, &user.Username, &user.DisplayName)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return User{}, false, nil
+	}
+	return user, err == nil, err
 }
 
 func (s *Store) ListPermissionAuditEvents(ctx context.Context, subjectUserID int64, limit int) ([]PermissionAuditEvent, error) {
@@ -1425,6 +1464,17 @@ func (s *Store) SetBroadcastOperatorPrivateCleanup(ctx context.Context, userID i
 	}, now)
 }
 
+func (s *Store) EnsurePrivateCleanupCarrier(ctx context.Context, userID, createdBy int64, remark string, now time.Time) error {
+	if userID <= 0 {
+		return errors.New("private cleanup user id is invalid")
+	}
+	_, err := s.pool.Exec(ctx, `INSERT INTO broadcast_operators(user_id, status, created_by, remark, created_at, updated_at)
+		VALUES($1, 'active', $2, $3, $4, $4)
+		ON CONFLICT(user_id) DO UPDATE SET status='active', updated_at=excluded.updated_at`,
+		userID, createdBy, strings.TrimSpace(remark), now)
+	return err
+}
+
 func (s *Store) SetBroadcastOperatorPrivateCleanupSettings(ctx context.Context, userID int64, settings PrivateCleanupSettings, now time.Time) (bool, error) {
 	settings = NormalizePrivateCleanupSettings(settings)
 	tx, err := s.pool.Begin(ctx)
@@ -1442,11 +1492,7 @@ func (s *Store) SetBroadcastOperatorPrivateCleanupSettings(ctx context.Context, 
 			private_cleanup_scope=$7,
 			updated_at=$8
 		WHERE user_id=$9
-		  AND status='active'
-		  AND EXISTS (
-			SELECT 1 FROM global_operators g
-			WHERE g.user_id=$9 AND g.status='active' AND g.level IN ('primary', 'secondary')
-		  )`,
+		  AND status='active'`,
 		settings.Enabled,
 		settings.DailyTime,
 		settings.DailyLastRunDate,
@@ -1468,11 +1514,36 @@ func (s *Store) SetBroadcastOperatorPrivateCleanupSettings(ctx context.Context, 
 			WHERE operator_user_id=$2 AND deleted_at IS NULL`, now, userID); err != nil {
 			return false, err
 		}
-	} else if !settings.IncomingEnabled {
+	} else {
+		scopes := PrivateCleanupScopes(settings.Scope)
 		if _, err := tx.Exec(ctx, `UPDATE private_chat_messages
 			SET deleted_at=$1, last_error=''
-			WHERE operator_user_id=$2 AND deleted_at IS NULL AND direction='incoming'`, now, userID); err != nil {
+			WHERE operator_user_id=$2 AND deleted_at IS NULL
+			  AND NOT (category = ANY($3::text[]))`, now, userID, scopes); err != nil {
 			return false, err
+		}
+		if !settings.IncomingEnabled {
+			if _, err := tx.Exec(ctx, `UPDATE private_chat_messages
+				SET deleted_at=$1, last_error=''
+				WHERE operator_user_id=$2 AND deleted_at IS NULL AND direction='incoming'`, now, userID); err != nil {
+				return false, err
+			}
+		}
+		if _, err := tx.Exec(ctx, `UPDATE private_chat_messages
+			SET cleanup_after_seconds=$1,
+				due_at=CASE WHEN $1::integer > 0 THEN created_at + make_interval(secs => $1::integer) ELSE NULL END
+			WHERE operator_user_id=$2 AND deleted_at IS NULL AND direction<>'incoming'
+			  AND category = ANY($3::text[])`, settings.BotDeleteAfter, userID, scopes); err != nil {
+			return false, err
+		}
+		if settings.IncomingEnabled {
+			if _, err := tx.Exec(ctx, `UPDATE private_chat_messages
+				SET cleanup_after_seconds=$1,
+					due_at=CASE WHEN $1::integer > 0 THEN created_at + make_interval(secs => $1::integer) ELSE NULL END
+				WHERE operator_user_id=$2 AND deleted_at IS NULL AND direction='incoming'
+				  AND category = ANY($3::text[])`, settings.IncomingDeleteAfter, userID, scopes); err != nil {
+				return false, err
+			}
 		}
 	}
 	return true, tx.Commit(ctx)
@@ -1481,11 +1552,8 @@ func (s *Store) SetBroadcastOperatorPrivateCleanupSettings(ctx context.Context, 
 func (s *Store) IsPrivateCleanupEnabled(ctx context.Context, userID int64) (bool, error) {
 	row := s.pool.QueryRow(ctx, `SELECT 1
 		FROM broadcast_operators b
-		JOIN global_operators g ON g.user_id=b.user_id
 		WHERE b.user_id=$1
 		  AND b.status='active'
-		  AND g.status='active'
-		  AND g.level IN ('primary', 'secondary')
 		  AND b.private_cleanup_enabled=TRUE
 		  AND (
 			b.private_cleanup_time <> ''
@@ -1506,9 +1574,7 @@ func (s *Store) GetPrivateCleanupSettings(ctx context.Context, userID int64) (Pr
 			private_cleanup_bot_after_seconds, private_cleanup_incoming_enabled,
 			private_cleanup_incoming_after_seconds, private_cleanup_scope
 		FROM broadcast_operators b
-		JOIN global_operators g ON g.user_id=b.user_id
 		WHERE b.user_id=$1 AND b.status='active'
-		  AND g.status='active' AND g.level IN ('primary', 'secondary')
 		LIMIT 1`, userID)
 	var settings PrivateCleanupSettings
 	err := row.Scan(
@@ -1562,10 +1628,7 @@ func (s *Store) PurgePrivateChatMessages(ctx context.Context, cutoff time.Time) 
 func (s *Store) ListDuePrivateCleanupTargets(ctx context.Context, nowMinutes int, today string) ([]PrivateCleanupTarget, error) {
 	rows, err := s.pool.Query(ctx, `SELECT b.user_id, b.private_cleanup_time
 		FROM broadcast_operators b
-		JOIN global_operators g ON g.user_id=b.user_id
 		WHERE b.status='active'
-		  AND g.status='active'
-		  AND g.level IN ('primary', 'secondary')
 		  AND b.private_cleanup_enabled=TRUE
 		  AND b.private_cleanup_time <> ''
 		  AND b.private_cleanup_last_run_date <> $1
@@ -1700,10 +1763,7 @@ func DefaultPrivateCleanupScope() string {
 func NormalizePrivateCleanupSettings(settings PrivateCleanupSettings) PrivateCleanupSettings {
 	settings.DailyTime = strings.TrimSpace(settings.DailyTime)
 	settings.DailyLastRunDate = strings.TrimSpace(settings.DailyLastRunDate)
-	settings.Scope = strings.TrimSpace(settings.Scope)
-	if settings.Scope == "" {
-		settings.Scope = DefaultPrivateCleanupScope()
-	}
+	settings.Scope = strings.Join(PrivateCleanupScopes(settings.Scope), ",")
 	if settings.BotDeleteAfter < 0 {
 		settings.BotDeleteAfter = 0
 	}
@@ -1721,6 +1781,37 @@ func NormalizePrivateCleanupSettings(settings PrivateCleanupSettings) PrivateCle
 		settings.IncomingDeleteAfter = 0
 	}
 	return settings
+}
+
+func PrivateCleanupScopes(scope string) []string {
+	allowed := map[string]bool{"broadcast": true, "quick_reply": true, "menu": true}
+	seen := map[string]bool{}
+	for _, item := range strings.Split(scope, ",") {
+		item = strings.TrimSpace(item)
+		if allowed[item] {
+			seen[item] = true
+		}
+	}
+	if len(seen) == 0 {
+		return []string{"broadcast", "quick_reply", "menu"}
+	}
+	ordered := make([]string, 0, len(seen))
+	for _, item := range []string{"broadcast", "quick_reply", "menu"} {
+		if seen[item] {
+			ordered = append(ordered, item)
+		}
+	}
+	return ordered
+}
+
+func PrivateCleanupScopeIncludes(scope, category string) bool {
+	category = strings.TrimSpace(category)
+	for _, item := range PrivateCleanupScopes(scope) {
+		if item == category {
+			return true
+		}
+	}
+	return false
 }
 
 func trimError(value string, limit int) string {
@@ -1779,6 +1870,103 @@ func (s *Store) CleanupAdminLoginTickets(ctx context.Context, cutoff time.Time) 
 	return err
 }
 
+const (
+	LedgerClearTicketApplied       = "applied"
+	LedgerClearTicketConsumed      = "consumed"
+	LedgerClearTicketNotFound      = "not_found"
+	LedgerClearTicketWrongChat     = "wrong_chat"
+	LedgerClearTicketWrongUser     = "wrong_user"
+	LedgerClearTicketExpired       = "expired"
+	LedgerClearTicketPeriodChanged = "period_changed"
+)
+
+func (s *Store) CreateLedgerClearTicket(ctx context.Context, ticket LedgerClearTicket) error {
+	ticket.TokenHash = strings.TrimSpace(ticket.TokenHash)
+	ticket.DayKey = strings.TrimSpace(ticket.DayKey)
+	if ticket.TokenHash == "" || ticket.ChatID == 0 || ticket.RequestedByUserID <= 0 || ticket.DayKey == "" || ticket.ActivePeriodStartedAt.IsZero() {
+		return errors.New("ledger clear ticket is incomplete")
+	}
+	_, err := s.pool.Exec(ctx, `INSERT INTO ledger_clear_tickets(
+			token_hash, chat_id, requested_by_user_id, day_key, active_period_started_at,
+			expires_at, created_at
+		) VALUES($1,$2,$3,$4,$5,$6,$7)`,
+		ticket.TokenHash, ticket.ChatID, ticket.RequestedByUserID, ticket.DayKey,
+		ticket.ActivePeriodStartedAt, ticket.ExpiresAt, ticket.CreatedAt)
+	return err
+}
+
+func (s *Store) ConsumeLedgerClearTicketAndDelete(ctx context.Context, tokenHash string, chatID, userID int64, now time.Time) (LedgerClearTicketResult, error) {
+	result := LedgerClearTicketResult{Status: LedgerClearTicketNotFound}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return result, err
+	}
+	defer rollback(ctx, tx)
+
+	var ticket LedgerClearTicket
+	var consumed pgtype.Timestamptz
+	err = tx.QueryRow(ctx, `SELECT token_hash, chat_id, requested_by_user_id, day_key,
+			active_period_started_at, expires_at, consumed_at, created_at
+		FROM ledger_clear_tickets WHERE token_hash=$1 FOR UPDATE`, strings.TrimSpace(tokenHash)).Scan(
+		&ticket.TokenHash, &ticket.ChatID, &ticket.RequestedByUserID, &ticket.DayKey,
+		&ticket.ActivePeriodStartedAt, &ticket.ExpiresAt, &consumed, &ticket.CreatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return result, tx.Commit(ctx)
+	}
+	if err != nil {
+		return result, err
+	}
+	if consumed.Valid {
+		result.Status = LedgerClearTicketConsumed
+		return result, tx.Commit(ctx)
+	}
+	if ticket.ChatID != chatID {
+		result.Status = LedgerClearTicketWrongChat
+		return result, tx.Commit(ctx)
+	}
+	if ticket.RequestedByUserID != userID {
+		result.Status = LedgerClearTicketWrongUser
+		return result, tx.Commit(ctx)
+	}
+	if !ticket.ExpiresAt.After(now) {
+		result.Status = LedgerClearTicketExpired
+		return result, tx.Commit(ctx)
+	}
+
+	var active bool
+	var dayKey string
+	var periodStartedAt time.Time
+	err = tx.QueryRow(ctx, `SELECT active, active_day_key, active_period_started_at
+		FROM groups WHERE chat_id=$1 FOR UPDATE`, chatID).Scan(&active, &dayKey, &periodStartedAt)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return result, err
+	}
+	if errors.Is(err, pgx.ErrNoRows) || !active || dayKey != ticket.DayKey || !periodStartedAt.Equal(ticket.ActivePeriodStartedAt) {
+		result.Status = LedgerClearTicketPeriodChanged
+		return result, tx.Commit(ctx)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE ledger_clear_tickets SET consumed_at=$1
+		WHERE token_hash=$2 AND consumed_at IS NULL`, now, ticket.TokenHash); err != nil {
+		return result, err
+	}
+	tag, err := tx.Exec(ctx, `UPDATE records SET deleted_at=$1
+		WHERE chat_id=$2 AND day_key=$3 AND created_at >= $4 AND deleted_at IS NULL`,
+		now, chatID, ticket.DayKey, ticket.ActivePeriodStartedAt)
+	if err != nil {
+		return result, err
+	}
+	result.Status = LedgerClearTicketApplied
+	result.DayKey = ticket.DayKey
+	result.DeletedCount = tag.RowsAffected()
+	return result, tx.Commit(ctx)
+}
+
+func (s *Store) CleanupLedgerClearTickets(ctx context.Context, cutoff time.Time) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM ledger_clear_tickets WHERE expires_at < $1`, cutoff)
+	return tag.RowsAffected(), err
+}
+
 func (s *Store) UpsertBroadcastGroup(ctx context.Context, name string, createdBy int64, now time.Time) error {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -1792,8 +1980,104 @@ func (s *Store) UpsertBroadcastGroup(ctx context.Context, name string, createdBy
 }
 
 func (s *Store) DeleteBroadcastGroup(ctx context.Context, name string) (bool, error) {
-	tag, err := s.pool.Exec(ctx, `DELETE FROM broadcast_groups WHERE name=$1`, strings.TrimSpace(name))
-	return tag.RowsAffected() > 0, err
+	ok, _, err := s.DeleteBroadcastGroupManaged(ctx, name, 0, time.Now())
+	return ok, err
+}
+
+func (s *Store) DeleteBroadcastGroupManaged(ctx context.Context, name string, actorUserID int64, now time.Time) (bool, []int64, error) {
+	name = strings.TrimSpace(name)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, nil, err
+	}
+	defer rollback(ctx, tx)
+	rows, err := tx.Query(ctx, `SELECT user_id FROM broadcast_operator_permissions
+		WHERE target='group' AND group_name=$1 FOR UPDATE`, name)
+	if err != nil {
+		return false, nil, err
+	}
+	var affected []int64
+	for rows.Next() {
+		var userID int64
+		if err := rows.Scan(&userID); err != nil {
+			rows.Close()
+			return false, nil, err
+		}
+		affected = append(affected, userID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return false, nil, err
+	}
+	rows.Close()
+	if _, err := tx.Exec(ctx, `DELETE FROM broadcast_operator_permissions WHERE target='group' AND group_name=$1`, name); err != nil {
+		return false, nil, err
+	}
+	for _, userID := range affected {
+		if err := insertPermissionAudit(ctx, tx, PermissionAuditEvent{ActorUserID: actorUserID, SubjectType: "broadcast_permission", SubjectUserID: userID, Action: "revoke", TargetType: "group", GroupName: name, CreatedAt: now}); err != nil {
+			return false, nil, err
+		}
+	}
+	tag, err := tx.Exec(ctx, `DELETE FROM broadcast_groups WHERE name=$1`, name)
+	if err != nil {
+		return false, nil, err
+	}
+	return tag.RowsAffected() > 0, uniqueInt64(affected), tx.Commit(ctx)
+}
+
+func (s *Store) RenameBroadcastGroup(ctx context.Context, oldName, newName string, actorUserID int64, now time.Time) (bool, []int64, error) {
+	oldName = strings.TrimSpace(oldName)
+	newName = strings.TrimSpace(newName)
+	if oldName == "" || newName == "" || oldName == newName {
+		return false, nil, errors.New("broadcast group rename is invalid")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, nil, err
+	}
+	defer rollback(ctx, tx)
+	tag, err := tx.Exec(ctx, `INSERT INTO broadcast_groups(name, created_by, created_at, updated_at)
+		SELECT $2, created_by, created_at, $3 FROM broadcast_groups WHERE name=$1`, oldName, newName, now)
+	if err != nil {
+		return false, nil, err
+	}
+	if tag.RowsAffected() == 0 {
+		return false, nil, tx.Commit(ctx)
+	}
+	rows, err := tx.Query(ctx, `SELECT user_id FROM broadcast_operator_permissions
+		WHERE target='group' AND group_name=$1 FOR UPDATE`, oldName)
+	if err != nil {
+		return false, nil, err
+	}
+	var affected []int64
+	for rows.Next() {
+		var userID int64
+		if err := rows.Scan(&userID); err != nil {
+			rows.Close()
+			return false, nil, err
+		}
+		affected = append(affected, userID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return false, nil, err
+	}
+	rows.Close()
+	if _, err := tx.Exec(ctx, `UPDATE broadcast_group_chats SET group_name=$2 WHERE group_name=$1`, oldName, newName); err != nil {
+		return false, nil, err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE broadcast_operator_permissions SET group_name=$2 WHERE target='group' AND group_name=$1`, oldName, newName); err != nil {
+		return false, nil, err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM broadcast_groups WHERE name=$1`, oldName); err != nil {
+		return false, nil, err
+	}
+	for _, userID := range affected {
+		if err := insertPermissionAudit(ctx, tx, PermissionAuditEvent{ActorUserID: actorUserID, SubjectType: "broadcast_permission", SubjectUserID: userID, Action: "rename_scope", TargetType: "group", GroupName: newName, CreatedAt: now}); err != nil {
+			return false, nil, err
+		}
+	}
+	return true, uniqueInt64(affected), tx.Commit(ctx)
 }
 
 func (s *Store) AddChatsToBroadcastGroup(ctx context.Context, name string, chatIDs []int64, now time.Time) (int, error) {
@@ -1826,15 +2110,20 @@ func (s *Store) RemoveChatsFromBroadcastGroup(ctx context.Context, name string, 
 	if name == "" || len(chatIDs) == 0 {
 		return 0, nil
 	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer rollback(ctx, tx)
 	count := 0
 	for _, chatID := range uniqueInt64(chatIDs) {
-		tag, err := s.pool.Exec(ctx, `DELETE FROM broadcast_group_chats WHERE group_name=$1 AND chat_id=$2`, name, chatID)
+		tag, err := tx.Exec(ctx, `DELETE FROM broadcast_group_chats WHERE group_name=$1 AND chat_id=$2`, name, chatID)
 		if err != nil {
 			return 0, err
 		}
 		count += int(tag.RowsAffected())
 	}
-	return count, nil
+	return count, tx.Commit(ctx)
 }
 
 func (s *Store) ListBroadcastGroups(ctx context.Context) ([]BroadcastGroup, error) {
@@ -2141,6 +2430,21 @@ func (s *Store) MarkBroadcastDeliveryReplaced(ctx context.Context, id int64, now
 		SET replaced_at=$1
 		WHERE id=$2 AND replaced_at IS NULL`, now, id)
 	return tag.RowsAffected() > 0, err
+}
+
+func (s *Store) ReplaceBroadcastDeliveryMessage(ctx context.Context, id, targetMessageID int64, now time.Time) (bool, error) {
+	if id <= 0 || targetMessageID <= 0 {
+		return false, errors.New("broadcast replacement message is invalid")
+	}
+	tag, err := s.pool.Exec(ctx, `UPDATE broadcast_deliveries
+		SET target_message_id=$1, replaced_at=$2
+		WHERE id=$3 AND replaced_at IS NULL`, targetMessageID, now, id)
+	return tag.RowsAffected() > 0, err
+}
+
+func (s *Store) CleanupBroadcastDeliveries(ctx context.Context, cutoff time.Time) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM broadcast_deliveries WHERE created_at < $1`, cutoff)
+	return tag.RowsAffected(), err
 }
 
 func (s *Store) GetBroadcastReplaceSetting(ctx context.Context) (BroadcastReplaceSetting, error) {

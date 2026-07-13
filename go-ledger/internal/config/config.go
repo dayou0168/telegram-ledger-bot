@@ -23,27 +23,28 @@ type Config struct {
 	HostUserID         int64
 	DefaultOperatorIDs map[int64]struct{}
 
-	LedgerWorkers         int
-	ControlWorkers        int
-	ChainWorkers          int
-	RateWorkers           int
-	BroadcastWorkers      int
-	QueryWorkers          int
-	NotifyWorkers         int
-	QueueSize             int
-	OutboxSentRetention   time.Duration
-	OutboxFailedRetention time.Duration
-	OutboxStatsWindow     time.Duration
-	GroupCacheTTL         time.Duration
-	BillSummaryCacheTTL   time.Duration
-	UserTouchCacheTTL     time.Duration
-	OperatorCacheTTL      time.Duration
-	WatchCacheTTL         time.Duration
-	SlowUpdateThreshold   time.Duration
-	PollTimeout           time.Duration
-	RequestTimeout        time.Duration
-	TronBackfillEvery     time.Duration
-	TronLookbackMinutes   int
+	LedgerWorkers              int
+	ControlWorkers             int
+	ChainWorkers               int
+	RateWorkers                int
+	BroadcastWorkers           int
+	QueryWorkers               int
+	NotifyWorkers              int
+	QueueSize                  int
+	OutboxSentRetention        time.Duration
+	OutboxFailedRetention      time.Duration
+	OutboxStatsWindow          time.Duration
+	BroadcastDeliveryRetention time.Duration
+	GroupCacheTTL              time.Duration
+	BillSummaryCacheTTL        time.Duration
+	UserTouchCacheTTL          time.Duration
+	OperatorCacheTTL           time.Duration
+	WatchCacheTTL              time.Duration
+	SlowUpdateThreshold        time.Duration
+	PollTimeout                time.Duration
+	RequestTimeout             time.Duration
+	TronBackfillEvery          time.Duration
+	TronLookbackMinutes        int
 
 	TronAPIBase                   string
 	TronAPIKey                    string
@@ -105,6 +106,7 @@ func Load() (Config, error) {
 		OutboxSentRetention:           hoursEnv("BOT_OUTBOX_SENT_RETENTION_HOURS", 72),
 		OutboxFailedRetention:         hoursEnv("BOT_OUTBOX_FAILED_RETENTION_HOURS", 24*14),
 		OutboxStatsWindow:             hoursEnv("BOT_OUTBOX_STATS_WINDOW_HOURS", 72),
+		BroadcastDeliveryRetention:    hoursEnv("BOT_BROADCAST_DELIVERY_RETENTION_HOURS", 168),
 		GroupCacheTTL:                 secondsEnv("BOT_GROUP_CACHE_TTL_SECONDS", 60),
 		BillSummaryCacheTTL:           secondsEnv("BOT_BILL_SUMMARY_CACHE_TTL_SECONDS", 30),
 		UserTouchCacheTTL:             secondsEnv("BOT_USER_TOUCH_CACHE_TTL_SECONDS", 180),
@@ -180,6 +182,9 @@ func Load() (Config, error) {
 	}
 	if cfg.OutboxStatsWindow <= 0 {
 		cfg.OutboxStatsWindow = 72 * time.Hour
+	}
+	if cfg.BroadcastDeliveryRetention <= 0 {
+		cfg.BroadcastDeliveryRetention = 168 * time.Hour
 	}
 	if cfg.ChainWatcherBatchSize < 1 {
 		cfg.ChainWatcherBatchSize = 1

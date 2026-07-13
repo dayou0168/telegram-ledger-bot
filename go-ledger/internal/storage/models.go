@@ -42,6 +42,8 @@ type BroadcastGroup struct {
 
 type GlobalOperator struct {
 	UserID                              int64
+	Username                            string
+	DisplayName                         string
 	Level                               string
 	Status                              string
 	ParentUserID                        int64
@@ -321,6 +323,23 @@ type AdminLoginTicket struct {
 	ExpiresAt time.Time
 	UsedAt    *time.Time
 	CreatedAt time.Time
+}
+
+type LedgerClearTicket struct {
+	TokenHash             string
+	ChatID                int64
+	RequestedByUserID     int64
+	DayKey                string
+	ActivePeriodStartedAt time.Time
+	ExpiresAt             time.Time
+	ConsumedAt            *time.Time
+	CreatedAt             time.Time
+}
+
+type LedgerClearTicketResult struct {
+	Status       string
+	DayKey       string
+	DeletedCount int64
 }
 
 type AddressValidation struct {

@@ -11,6 +11,7 @@ import (
 
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/telegram"
+	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/worker"
 )
 
 type privateState struct {
@@ -28,6 +29,13 @@ type privateState struct {
 	ReturnNotifyAll        bool
 	ReturnControlMessageID int64
 	CreatedAt              time.Time
+}
+
+const broadcastPickerPageSize = 12
+
+type broadcastGroupOption struct {
+	Name    string
+	ChatIDs []int64
 }
 
 func isBroadcastMenuText(text string) bool {
@@ -90,11 +98,34 @@ func (b *Bot) handleBroadcastCallback(ctx context.Context, cb telegram.CallbackQ
 			return err
 		}
 		return b.sendBroadcastGroups(ctx, chatID, cb.From.ID, replyTo)
+	case strings.HasPrefix(cb.Data, "bc:gp:"):
+		page, _ := strconv.Atoi(strings.TrimPrefix(cb.Data, "bc:gp:"))
+		return b.editBroadcastGroupsPage(ctx, cb, page)
+	case strings.HasPrefix(cb.Data, "bc:gi:"):
+		parts := strings.Split(strings.TrimPrefix(cb.Data, "bc:gi:"), ":")
+		if len(parts) != 2 {
+			return b.tg.AnswerCallback(ctx, cb.ID, "分组无效")
+		}
+		page, pageErr := strconv.Atoi(parts[0])
+		index, indexErr := strconv.Atoi(parts[1])
+		options, err := b.allowedBroadcastGroupOptions(ctx, cb.From.ID)
+		if err != nil {
+			return err
+		}
+		absolute := page*broadcastPickerPageSize + index
+		if pageErr != nil || indexErr != nil || absolute < 0 || absolute >= len(options) {
+			return b.tg.AnswerCallback(ctx, cb.ID, "分组已变化，请重新选择")
+		}
+		option := options[absolute]
+		return b.setBroadcastTargets(ctx, cb, "group", option.Name, option.ChatIDs)
 	case cb.Data == "bc:chats":
 		if err := b.tg.AnswerCallback(ctx, cb.ID, "请选择群"); err != nil {
 			return err
 		}
 		return b.sendBroadcastChats(ctx, chatID, cb.From.ID, replyTo)
+	case strings.HasPrefix(cb.Data, "bc:cp:"):
+		page, _ := strconv.Atoi(strings.TrimPrefix(cb.Data, "bc:cp:"))
+		return b.editBroadcastChatsPage(ctx, cb, page)
 	case strings.HasPrefix(cb.Data, "bc:g:"):
 		name, err := url.QueryUnescape(strings.TrimPrefix(cb.Data, "bc:g:"))
 		if err != nil {
@@ -127,31 +158,14 @@ func (b *Bot) handleBroadcastCallback(ctx context.Context, cb telegram.CallbackQ
 }
 
 func (b *Bot) sendBroadcastGroups(ctx context.Context, privateChatID, userID, replyTo int64) error {
-	groups, err := b.store.ListBroadcastGroups(ctx)
+	options, err := b.allowedBroadcastGroupOptions(ctx, userID)
 	if err != nil {
 		return err
 	}
-	var rows [][]telegram.InlineKeyboardButton
-	for _, group := range groups {
-		if !b.perms.HasGlobalBroadcastAccess(userID) && !b.broadcastGroupAllowed(ctx, userID, group.Name) {
-			continue
-		}
-		label := fmt.Sprintf("%s（%d个群）", group.Name, len(group.ChatIDs))
-		data := "bc:g:" + url.QueryEscape(group.Name)
-		if len(data) > 64 {
-			label = group.Name
-			data = "bc:g:" + truncateCallback(group.Name, 59)
-		}
-		rows = append(rows, []telegram.InlineKeyboardButton{{Text: label, CallbackData: data}})
-	}
-	rows = append(rows, []telegram.InlineKeyboardButton{{Text: "返回", CallbackData: "bc:cancel"}})
-	text := "请选择分组广播目标。"
-	if len(rows) == 1 {
-		text = "暂无可用广播分组，请先在后台创建分组并添加群。"
-	}
+	text, keyboard := renderBroadcastGroupPage(options, 0)
 	return b.enqueueReliableText(ctx, sendPriorityNormal, "broadcast_groups", messageScopedDedupe("broadcast_groups", privateChatID, replyTo), privateChatID, text, map[string]any{
 		"reply_to_message_id": replyTo,
-		"reply_markup":        telegram.InlineKeyboardMarkup{InlineKeyboard: rows},
+		"reply_markup":        keyboard,
 	}, reliableMessageRef{}, time.Now().In(b.loc))
 }
 
@@ -160,29 +174,134 @@ func (b *Bot) sendBroadcastChats(ctx context.Context, privateChatID, userID, rep
 	if err != nil {
 		return err
 	}
-	var rows [][]telegram.InlineKeyboardButton
-	for i, target := range targets {
-		if i >= 40 {
-			break
+	text, keyboard := renderBroadcastChatPage(targets, 0)
+	return b.enqueueReliableText(ctx, sendPriorityNormal, "broadcast_chats", messageScopedDedupe("broadcast_chats", privateChatID, replyTo), privateChatID, text, map[string]any{
+		"reply_to_message_id": replyTo,
+		"reply_markup":        keyboard,
+	}, reliableMessageRef{}, time.Now().In(b.loc))
+}
+
+func (b *Bot) allowedBroadcastGroupOptions(ctx context.Context, userID int64) ([]broadcastGroupOption, error) {
+	groups, err := b.store.ListBroadcastGroups(ctx)
+	if err != nil {
+		return nil, err
+	}
+	allowed, err := b.store.ListAllowedBroadcastChats(ctx, userID, b.perms.HasGlobalBroadcastAccess(userID))
+	if err != nil {
+		return nil, err
+	}
+	allowedSet := make(map[int64]struct{}, len(allowed))
+	for _, group := range allowed {
+		allowedSet[group.ChatID] = struct{}{}
+	}
+	options := make([]broadcastGroupOption, 0, len(groups))
+	for _, group := range groups {
+		chatIDs := make([]int64, 0, len(group.ChatIDs))
+		for _, chatID := range group.ChatIDs {
+			if _, ok := allowedSet[chatID]; ok {
+				chatIDs = append(chatIDs, chatID)
+			}
 		}
-		label := target.Title
+		if len(chatIDs) > 0 {
+			options = append(options, broadcastGroupOption{Name: group.Name, ChatIDs: chatIDs})
+		}
+	}
+	return options, nil
+}
+
+func renderBroadcastGroupPage(options []broadcastGroupOption, page int) (string, telegram.InlineKeyboardMarkup) {
+	page, start, end, pages := pickerBounds(len(options), page)
+	rows := make([][]telegram.InlineKeyboardButton, 0, end-start+2)
+	for index, option := range options[start:end] {
+		rows = append(rows, []telegram.InlineKeyboardButton{{Text: fmt.Sprintf("%s（%d个群）", option.Name, len(option.ChatIDs)), CallbackData: fmt.Sprintf("bc:gi:%d:%d", page, index)}})
+	}
+	rows = appendPickerNavigation(rows, "bc:gp:", page, pages)
+	rows = append(rows, []telegram.InlineKeyboardButton{{Text: "返回", CallbackData: "bc:cancel"}})
+	if len(options) == 0 {
+		return "暂无可用广播分组，请先在后台创建分组并添加群。", telegram.InlineKeyboardMarkup{InlineKeyboard: rows}
+	}
+	return fmt.Sprintf("请选择分组广播目标（第 %d/%d 页）。", page+1, pages), telegram.InlineKeyboardMarkup{InlineKeyboard: rows}
+}
+
+func renderBroadcastChatPage(targets []storage.Group, page int) (string, telegram.InlineKeyboardMarkup) {
+	page, start, end, pages := pickerBounds(len(targets), page)
+	rows := make([][]telegram.InlineKeyboardButton, 0, end-start+2)
+	for _, target := range targets[start:end] {
+		label := strings.TrimSpace(target.Title)
 		if label == "" {
 			label = formatID(target.ChatID)
 		}
 		rows = append(rows, []telegram.InlineKeyboardButton{{Text: label, CallbackData: "bc:c:" + formatID(target.ChatID)}})
 	}
+	rows = appendPickerNavigation(rows, "bc:cp:", page, pages)
 	rows = append(rows, []telegram.InlineKeyboardButton{{Text: "返回", CallbackData: "bc:cancel"}})
-	text := "请选择单群发送目标。"
-	if len(rows) == 1 {
-		text = "暂无可用群。机器人进群或群内有人发言后，会自动保存群组。"
+	if len(targets) == 0 {
+		return "暂无可用群。机器人进群或群内有人发言后，会自动保存群组。", telegram.InlineKeyboardMarkup{InlineKeyboard: rows}
 	}
-	return b.enqueueReliableText(ctx, sendPriorityNormal, "broadcast_chats", messageScopedDedupe("broadcast_chats", privateChatID, replyTo), privateChatID, text, map[string]any{
-		"reply_to_message_id": replyTo,
-		"reply_markup":        telegram.InlineKeyboardMarkup{InlineKeyboard: rows},
-	}, reliableMessageRef{}, time.Now().In(b.loc))
+	return fmt.Sprintf("请选择单群发送目标（第 %d/%d 页）。", page+1, pages), telegram.InlineKeyboardMarkup{InlineKeyboard: rows}
+}
+
+func pickerBounds(total, page int) (int, int, int, int) {
+	pages := (total + broadcastPickerPageSize - 1) / broadcastPickerPageSize
+	if pages < 1 {
+		pages = 1
+	}
+	if page < 0 {
+		page = 0
+	}
+	if page >= pages {
+		page = pages - 1
+	}
+	start := page * broadcastPickerPageSize
+	end := start + broadcastPickerPageSize
+	if end > total {
+		end = total
+	}
+	return page, start, end, pages
+}
+
+func appendPickerNavigation(rows [][]telegram.InlineKeyboardButton, prefix string, page, pages int) [][]telegram.InlineKeyboardButton {
+	if pages <= 1 {
+		return rows
+	}
+	var nav []telegram.InlineKeyboardButton
+	if page > 0 {
+		nav = append(nav, telegram.InlineKeyboardButton{Text: "上一页", CallbackData: prefix + strconv.Itoa(page-1)})
+	}
+	if page+1 < pages {
+		nav = append(nav, telegram.InlineKeyboardButton{Text: "下一页", CallbackData: prefix + strconv.Itoa(page+1)})
+	}
+	return append(rows, nav)
+}
+
+func (b *Bot) editBroadcastGroupsPage(ctx context.Context, cb telegram.CallbackQuery, page int) error {
+	options, err := b.allowedBroadcastGroupOptions(ctx, cb.From.ID)
+	if err != nil {
+		return err
+	}
+	text, keyboard := renderBroadcastGroupPage(options, page)
+	if err := b.tg.AnswerCallback(ctx, cb.ID, ""); err != nil {
+		return err
+	}
+	_, err = b.editText(ctx, cb.Message.Chat.ID, cb.Message.MessageID, text, map[string]any{"reply_markup": keyboard})
+	return err
+}
+
+func (b *Bot) editBroadcastChatsPage(ctx context.Context, cb telegram.CallbackQuery, page int) error {
+	targets, err := b.store.ListAllowedBroadcastChats(ctx, cb.From.ID, b.perms.HasGlobalBroadcastAccess(cb.From.ID))
+	if err != nil {
+		return err
+	}
+	text, keyboard := renderBroadcastChatPage(targets, page)
+	if err := b.tg.AnswerCallback(ctx, cb.ID, ""); err != nil {
+		return err
+	}
+	_, err = b.editText(ctx, cb.Message.Chat.ID, cb.Message.MessageID, text, map[string]any{"reply_markup": keyboard})
+	return err
 }
 
 func (b *Bot) setBroadcastTargets(ctx context.Context, cb telegram.CallbackQuery, mode, name string, chatIDs []int64) error {
+	ctx = withPrivateCleanupCategory(ctx, "broadcast")
 	if len(chatIDs) == 0 {
 		return b.tg.AnswerCallback(ctx, cb.ID, "没有可发送的目标群")
 	}
@@ -207,6 +326,7 @@ func (b *Bot) setBroadcastTargets(ctx context.Context, cb telegram.CallbackQuery
 }
 
 func (b *Bot) toggleBroadcastNotifyAll(ctx context.Context, cb telegram.CallbackQuery) error {
+	ctx = withPrivateCleanupCategory(ctx, "broadcast")
 	state, ok := b.privateStates.Get(formatID(cb.From.ID))
 	if !ok || len(state.ChatIDs) == 0 || state.Mode == "quick_reply" {
 		return b.tg.AnswerCallback(ctx, cb.ID, "请先选择广播目标")
@@ -226,6 +346,7 @@ func (b *Bot) toggleBroadcastNotifyAll(ctx context.Context, cb telegram.Callback
 }
 
 func (b *Bot) handleBroadcastMaterial(ctx context.Context, msg telegram.Message, user storage.User, state privateState, now time.Time) error {
+	ctx = withPrivateCleanupCategory(ctx, "broadcast")
 	if !b.canUseBroadcast(ctx, user.ID) {
 		b.privateStates.Delete(formatID(user.ID))
 		return b.enqueueReplyText(ctx, sendPriorityNormal, "broadcast_denied", msg.Chat.ID, msg.MessageID, "没有广播权限。", nil, now)
@@ -244,8 +365,16 @@ func (b *Bot) handleBroadcastMaterial(ctx context.Context, msg telegram.Message,
 	}
 	if isBroadcastSwitchTargetText(msg.Text) {
 		b.privateStates.Delete(formatID(user.ID))
+		removed, removeErr := b.sendText(ctx, sendPriorityNormal, msg.Chat.ID, "请选择新的广播目标。", map[string]any{
+			"reply_markup": telegram.ReplyKeyboardRemove{RemoveKeyboard: true},
+		})
+		if removeErr != nil {
+			return removeErr
+		}
 		err := b.sendBroadcastMenu(ctx, msg, user, "群发广播")
 		b.deleteMessageBestEffort(ctx, msg.Chat.ID, msg.MessageID)
+		b.deleteMessageBestEffort(ctx, msg.Chat.ID, state.ControlMessageID)
+		b.deleteMessageBestEffort(ctx, msg.Chat.ID, removed.MessageID)
 		return err
 	}
 	if isBroadcastTargetLabelText(msg.Text) {
@@ -278,7 +407,7 @@ func (b *Bot) handleBroadcastMaterial(ctx context.Context, msg telegram.Message,
 	if err != nil {
 		return err
 	}
-	b.broadcastPool.Submit(func(jobCtx context.Context) {
+	job := func(jobCtx context.Context) {
 		success, failed := b.copyBroadcast(jobCtx, operatorID, sourceChatID, sourceMessageID, targets, mode, targetName, notifyAll)
 		text := formatBroadcastResultText(mode, success, failed, notifyAll)
 		if _, err := b.editText(jobCtx, sourceChatID, status.MessageID, text, nil); err != nil {
@@ -288,25 +417,53 @@ func (b *Bot) handleBroadcastMaterial(ctx context.Context, msg telegram.Message,
 				log.Printf("enqueue broadcast result fallback: %v", err)
 			}
 		}
+	}
+	return submitBroadcastJob(b.broadcastPool, job, func() error {
+		text := "发送失败：广播队列繁忙，请稍后重试。"
+		if _, err := b.editText(ctx, sourceChatID, status.MessageID, text, nil); err != nil {
+			b.deleteMessageBestEffort(ctx, sourceChatID, status.MessageID)
+			return b.enqueueReliableText(ctx, sendPriorityNormal, "broadcast_queue_full", fmt.Sprintf("broadcast_queue_full:%d:%d", sourceChatID, sourceMessageID), sourceChatID, text, map[string]any{"reply_markup": sessionKeyboard}, reliableMessageRef{}, now)
+		}
+		return nil
 	})
+}
+
+func submitBroadcastJob(pool *worker.Pool, job worker.Job, onFull func() error) error {
+	if pool != nil && pool.Submit(job) {
+		return nil
+	}
+	if onFull != nil {
+		return onFull()
+	}
 	return nil
 }
 
-func (b *Bot) currentBroadcastTargets(ctx context.Context, userID int64, state privateState) ([]int64, error) {
-	if b.perms.HasGlobalBroadcastAccess(userID) {
-		return append([]int64(nil), state.ChatIDs...), nil
-	}
+func (b *Bot) currentBroadcastTargets(ctx context.Context, userID int64, state privateState) ([]storage.Group, error) {
 	var allowed []storage.Group
 	var err error
 	if state.Mode == "group" {
 		allowed, err = b.allowedChatsForBroadcastGroup(ctx, userID, state.TargetName)
 	} else {
-		allowed, err = b.store.ListAllowedBroadcastChats(ctx, userID, false)
+		allowed, err = b.store.ListAllowedBroadcastChats(ctx, userID, b.perms.HasGlobalBroadcastAccess(userID))
 	}
 	if err != nil {
 		return nil, err
 	}
-	return intersectChatIDs(state.ChatIDs, groupsToIDs(allowed)), nil
+	return intersectBroadcastTargets(state.ChatIDs, allowed), nil
+}
+
+func intersectBroadcastTargets(original []int64, allowed []storage.Group) []storage.Group {
+	allowedByID := make(map[int64]storage.Group, len(allowed))
+	for _, group := range allowed {
+		allowedByID[group.ChatID] = group
+	}
+	filtered := make([]storage.Group, 0, len(original))
+	for _, chatID := range original {
+		if group, ok := allowedByID[chatID]; ok {
+			filtered = append(filtered, group)
+		}
+	}
+	return filtered
 }
 
 func intersectChatIDs(original []int64, allowed []int64) []int64 {
@@ -323,27 +480,23 @@ func intersectChatIDs(original []int64, allowed []int64) []int64 {
 	return filtered
 }
 
-func (b *Bot) copyBroadcast(ctx context.Context, operatorID, fromChatID, messageID int64, targetChatIDs []int64, mode, targetName string, notifyAll bool) (int, int) {
+func (b *Bot) copyBroadcast(ctx context.Context, operatorID, fromChatID, messageID int64, targets []storage.Group, mode, targetName string, notifyAll bool) (int, int) {
 	success := 0
 	failed := 0
 	now := time.Now().In(b.loc)
-	for _, targetChatID := range targetChatIDs {
-		targetMsg, err := b.copyMessageWithPriority(ctx, sendPriorityBulk, targetChatID, fromChatID, messageID, nil)
+	for _, target := range targets {
+		targetMsg, err := b.copyMessageWithPriority(ctx, sendPriorityBulk, target.ChatID, fromChatID, messageID, nil)
 		if err != nil {
 			failed++
-			log.Printf("copy broadcast to %d: %v", targetChatID, err)
+			log.Printf("copy broadcast to %d: %v", target.ChatID, err)
 		} else {
 			success++
-			title := ""
-			if targetMsg.Chat.Title != "" {
-				title = targetMsg.Chat.Title
-			}
 			if _, err := b.store.InsertBroadcastDelivery(ctx, storage.BroadcastDelivery{
 				OperatorUserID:  operatorID,
 				SourceChatID:    fromChatID,
 				SourceMessageID: messageID,
-				TargetChatID:    targetChatID,
-				TargetTitle:     title,
+				TargetChatID:    target.ChatID,
+				TargetTitle:     target.Title,
 				TargetMessageID: targetMsg.MessageID,
 				Mode:            mode,
 				TargetName:      targetName,
@@ -352,12 +505,16 @@ func (b *Bot) copyBroadcast(ctx context.Context, operatorID, fromChatID, message
 				log.Printf("record broadcast delivery: %v", err)
 			}
 			if notifyAll {
-				b.notifyAllInChatAsync(ctx, targetChatID, targetMsg.MessageID)
+				if !b.notifyAllInChatAsync(ctx, target.ChatID, targetMsg.MessageID) {
+					if err := b.enqueueReliableText(ctx, sendPriorityLow, "notify_all_queue_full", fmt.Sprintf("notify_all_queue_full:%d:%d", target.ChatID, targetMsg.MessageID), target.ChatID, "通知所有人未发送：发送队列繁忙，请稍后重试。", map[string]any{"reply_to_message_id": targetMsg.MessageID}, reliableMessageRef{}, time.Now().In(b.loc)); err != nil {
+						log.Printf("enqueue notify-all queue failure: %v", err)
+					}
+				}
 			}
 		}
 		select {
 		case <-ctx.Done():
-			return success, failed + len(targetChatIDs) - success - failed
+			return success, failed + len(targets) - success - failed
 		case <-time.After(60 * time.Millisecond):
 		}
 	}
@@ -460,6 +617,7 @@ func isBroadcastTargetLabelText(text string) bool {
 }
 
 func (b *Bot) refreshBroadcastSessionKeyboard(ctx context.Context, msg telegram.Message, state privateState) error {
+	ctx = withPrivateCleanupCategory(ctx, "broadcast")
 	oldControlMessageID := state.ControlMessageID
 	refresh, err := b.sendText(ctx, sendPriorityNormal, msg.Chat.ID, formatBroadcastReadyText(state.TargetName, len(state.ChatIDs), state.NotifyAll), map[string]any{
 		"reply_markup": broadcastSessionKeyboard(state.TargetName, state.NotifyAll),

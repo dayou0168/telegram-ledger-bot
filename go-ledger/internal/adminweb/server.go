@@ -25,6 +25,8 @@ import (
 
 const adminCookieName = "ledger_admin_token"
 
+const adminListPageSize = 50
+
 type adminContextKey struct{}
 
 type Server struct {
@@ -51,8 +53,11 @@ type pageData struct {
 	Message                       string
 	Groups                        []storage.Group
 	BGroups                       []storage.BroadcastGroup
+	BroadcastMemberships          []storage.BroadcastGroup
 	BOperators                    []storage.GlobalOperator
+	PermissionOperators           []storage.GlobalOperator
 	Permissions                   []storage.BroadcastPermission
+	PermissionFilterData          []storage.BroadcastPermission
 	Replace                       storage.BroadcastReplaceSetting
 	WatchTargets                  []storage.WatchTarget
 	AdminUserID                   int64
@@ -63,6 +68,33 @@ type pageData struct {
 	CanManageBroadcastPermissions bool
 	ChatNames                     map[int64]string
 	OpLabels                      map[int64]string
+	GroupPager                    adminPager
+	BroadcastPager                adminPager
+	OperatorPager                 adminPager
+	PermissionPager               adminPager
+}
+
+type adminPager struct {
+	Query    string
+	Page     int
+	HasPrev  bool
+	HasNext  bool
+	PrevURL  string
+	NextURL  string
+	ItemFrom int
+	ItemTo   int
+	Total    int
+}
+
+type adminListFilters struct {
+	GroupQuery      string
+	GroupPage       int
+	BroadcastQuery  string
+	BroadcastPage   int
+	OperatorQuery   string
+	OperatorPage    int
+	PermissionQuery string
+	PermissionPage  int
 }
 
 type outboxStatusResponse struct {
@@ -163,6 +195,7 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("/admin", s.withAuth(s.index))
 	mux.HandleFunc("/admin/group/save", s.withAuth(s.saveGroup))
 	mux.HandleFunc("/admin/group/delete", s.withAuth(s.deleteGroup))
+	mux.HandleFunc("/admin/group/rename", s.withAuth(s.renameGroup))
 	mux.HandleFunc("/admin/group/add", s.withAuth(s.addGroupChats))
 	mux.HandleFunc("/admin/group/remove", s.withAuth(s.removeGroupChats))
 	mux.HandleFunc("/admin/operator/save", s.withAuth(s.saveOperator))
@@ -620,7 +653,8 @@ func parseBroadcastPermissionForm(r *http.Request) (int64, string, int64, string
 }
 
 func (s *Server) index(w http.ResponseWriter, r *http.Request) {
-	data, err := s.loadPageData(r.Context(), r.URL.Query().Get("msg"), adminSessionFromContext(r.Context()))
+	filters := parseAdminListFilters(r)
+	data, err := s.loadPageData(r.Context(), r.URL.Query().Get("msg"), adminSessionFromContext(r.Context()), filters)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -670,7 +704,8 @@ func (s *Server) deleteGroup(w http.ResponseWriter, r *http.Request) {
 		redirectMsg(w, r, "分组名不能为空")
 		return
 	}
-	ok, err := s.store.DeleteBroadcastGroup(r.Context(), name)
+	session := adminSessionFromContext(r.Context())
+	ok, _, err := s.store.DeleteBroadcastGroupManaged(r.Context(), name, session.UserID, time.Now())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -679,7 +714,36 @@ func (s *Server) deleteGroup(w http.ResponseWriter, r *http.Request) {
 		redirectMsg(w, r, "分组不存在")
 		return
 	}
+	s.invalidateAllPermissionCaches()
 	redirectMsg(w, r, "分组已删除")
+}
+
+func (s *Server) renameGroup(w http.ResponseWriter, r *http.Request) {
+	if !s.requireGlobalAdmin(w, r) || !requirePost(w, r) {
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	oldName := strings.TrimSpace(r.FormValue("old_name"))
+	newName := strings.TrimSpace(r.FormValue("new_name"))
+	if oldName == "" || newName == "" {
+		redirectMsg(w, r, "原分组名和新分组名不能为空")
+		return
+	}
+	session := adminSessionFromContext(r.Context())
+	ok, _, err := s.store.RenameBroadcastGroup(r.Context(), oldName, newName, session.UserID, time.Now())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !ok {
+		redirectMsg(w, r, "原分组不存在")
+		return
+	}
+	s.invalidateAllPermissionCaches()
+	redirectMsg(w, r, "分组已改名，成员和授权已迁移")
 }
 
 func (s *Server) addGroupChats(w http.ResponseWriter, r *http.Request) {
@@ -721,6 +785,9 @@ func (s *Server) changeGroupChats(w http.ResponseWriter, r *http.Request, add bo
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	if count > 0 {
+		s.invalidateAllPermissionCaches()
 	}
 	action := "添加"
 	if !add {
@@ -869,11 +936,16 @@ func (s *Server) saveOperatorCleanup(w http.ResponseWriter, r *http.Request) {
 		redirectMsg(w, r, "操作人 UID 不正确")
 		return
 	}
-	if ok, err := s.store.IsGlobalOperator(r.Context(), userID); err != nil {
+	if !s.perms.IsPrivileged(userID) {
+		if ok, err := s.store.IsGlobalOperator(r.Context(), userID); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		} else if !ok {
+			redirectMsg(w, r, "操作人不存在或已禁用")
+			return
+		}
+	} else if err := s.store.EnsurePrivateCleanupCarrier(r.Context(), userID, adminSessionFromContext(r.Context()).UserID, "", time.Now()); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	} else if !ok {
-		redirectMsg(w, r, "操作人不存在或已禁用")
 		return
 	}
 	enabled := r.FormValue("enabled") == "1"
@@ -911,6 +983,11 @@ func (s *Server) saveOperatorCleanup(w http.ResponseWriter, r *http.Request) {
 		redirectMsg(w, r, "清理用户临时消息时，请选择发送后删除时间或每日兜底时间")
 		return
 	}
+	scope := strings.Join(storage.PrivateCleanupScopes(strings.Join(r.Form["scope"], ",")), ",")
+	if enabled && len(r.Form["scope"]) == 0 {
+		redirectMsg(w, r, "请至少选择一个清理范围")
+		return
+	}
 	now := time.Now()
 	runDate := ""
 	if enabled && cleanupTime != "" {
@@ -926,7 +1003,7 @@ func (s *Server) saveOperatorCleanup(w http.ResponseWriter, r *http.Request) {
 		BotDeleteAfter:      botAfter,
 		IncomingEnabled:     incomingEnabled,
 		IncomingDeleteAfter: incomingAfter,
-		Scope:               storage.DefaultPrivateCleanupScope(),
+		Scope:               scope,
 	}, now)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1131,7 +1208,11 @@ func (s *Server) saveReplace(w http.ResponseWriter, r *http.Request) {
 	redirectMsg(w, r, "广播替换设置已保存")
 }
 
-func (s *Server) loadPageData(ctx context.Context, message string, session adminauth.Session) (pageData, error) {
+func (s *Server) loadPageData(ctx context.Context, message string, session adminauth.Session, filterArgs ...adminListFilters) (pageData, error) {
+	var filters adminListFilters
+	if len(filterArgs) > 0 {
+		filters = filterArgs[0]
+	}
 	caps, err := s.operatorActorCapabilities(ctx, session)
 	if err != nil {
 		return pageData{}, err
@@ -1203,6 +1284,39 @@ func (s *Server) loadPageData(ctx context.Context, message string, session admin
 		}
 		bgroups = filteredGroups
 	}
+	permissionOperators := append([]storage.GlobalOperator(nil), operators...)
+	if canManageGlobal {
+		configuredIDs := map[int64]struct{}{}
+		for _, op := range operators {
+			configuredIDs[op.UserID] = struct{}{}
+		}
+		var configOperators []storage.GlobalOperator
+		if s.cfg.HostUserID > 0 {
+			if op, err := s.privateCleanupConfigOperator(ctx, s.cfg.HostUserID, "host", "宿主"); err != nil {
+				return pageData{}, err
+			} else {
+				configOperators = append(configOperators, op)
+			}
+		}
+		defaultIDs := make([]int64, 0, len(s.cfg.DefaultOperatorIDs))
+		for userID := range s.cfg.DefaultOperatorIDs {
+			if userID > 0 && userID != s.cfg.HostUserID {
+				defaultIDs = append(defaultIDs, userID)
+			}
+		}
+		sort.Slice(defaultIDs, func(i, j int) bool { return defaultIDs[i] < defaultIDs[j] })
+		for _, userID := range defaultIDs {
+			if _, exists := configuredIDs[userID]; exists {
+				continue
+			}
+			op, err := s.privateCleanupConfigOperator(ctx, userID, "default", "默认操作人")
+			if err != nil {
+				return pageData{}, err
+			}
+			configOperators = append(configOperators, op)
+		}
+		operators = append(configOperators, operators...)
+	}
 	var watchTargets []storage.WatchTarget
 	if s.perms.IsHost(session.UserID) {
 		watchTargets, err = s.store.ListWatchTargets(ctx)
@@ -1220,14 +1334,24 @@ func (s *Server) loadPageData(ctx context.Context, message string, session admin
 	for _, op := range operators {
 		opLabels[op.UserID] = operatorLabel(op)
 	}
+	allBroadcastGroups := append([]storage.BroadcastGroup(nil), bgroups...)
+	allPermissions := append([]storage.BroadcastPermission(nil), permissions...)
+	groups, groupPager := pageAdminGroups(groups, filters)
+	bgroups, broadcastPager := pageAdminBroadcastGroups(bgroups, filters)
+	permissionOperators, _ = pageAdminOperators(permissionOperators, filters)
+	operators, operatorPager := pageAdminOperators(operators, filters)
+	permissions, permissionPager := pageAdminPermissions(permissions, chatNames, opLabels, filters)
 	return pageData{
 		Version:                       config.Version,
 		TokenUnset:                    s.cfg.AdminWebToken == "",
 		Message:                       message,
 		Groups:                        groups,
 		BGroups:                       bgroups,
+		BroadcastMemberships:          allBroadcastGroups,
 		BOperators:                    operators,
+		PermissionOperators:           permissionOperators,
 		Permissions:                   permissions,
+		PermissionFilterData:          allPermissions,
 		Replace:                       replace,
 		WatchTargets:                  watchTargets,
 		AdminUserID:                   session.UserID,
@@ -1238,7 +1362,157 @@ func (s *Server) loadPageData(ctx context.Context, message string, session admin
 		CanManageBroadcastPermissions: canManageBroadcastPermissions,
 		ChatNames:                     chatNames,
 		OpLabels:                      opLabels,
+		GroupPager:                    groupPager,
+		BroadcastPager:                broadcastPager,
+		OperatorPager:                 operatorPager,
+		PermissionPager:               permissionPager,
 	}, nil
+}
+
+func parseAdminListFilters(r *http.Request) adminListFilters {
+	query := r.URL.Query()
+	return adminListFilters{
+		GroupQuery:      strings.TrimSpace(query.Get("groups_q")),
+		GroupPage:       parseAdminPage(query.Get("groups_page")),
+		BroadcastQuery:  strings.TrimSpace(query.Get("broadcast_q")),
+		BroadcastPage:   parseAdminPage(query.Get("broadcast_page")),
+		OperatorQuery:   strings.TrimSpace(query.Get("operators_q")),
+		OperatorPage:    parseAdminPage(query.Get("operators_page")),
+		PermissionQuery: strings.TrimSpace(query.Get("permissions_q")),
+		PermissionPage:  parseAdminPage(query.Get("permissions_page")),
+	}
+}
+
+func parseAdminPage(value string) int {
+	page, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || page < 1 {
+		return 1
+	}
+	return page
+}
+
+func adminPagerFor(filters adminListFilters, kind, query string, requestedPage, total int) adminPager {
+	if requestedPage < 1 {
+		requestedPage = 1
+	}
+	lastPage := (total + adminListPageSize - 1) / adminListPageSize
+	if lastPage < 1 {
+		lastPage = 1
+	}
+	if requestedPage > lastPage {
+		requestedPage = lastPage
+	}
+	from := (requestedPage - 1) * adminListPageSize
+	to := from + adminListPageSize
+	if to > total {
+		to = total
+	}
+	pager := adminPager{Query: query, Page: requestedPage, HasPrev: requestedPage > 1, HasNext: requestedPage < lastPage, Total: total}
+	if total > 0 {
+		pager.ItemFrom = from + 1
+		pager.ItemTo = to
+	}
+	pager.PrevURL = adminListURL(filters, kind, requestedPage-1)
+	pager.NextURL = adminListURL(filters, kind, requestedPage+1)
+	return pager
+}
+
+func adminListURL(filters adminListFilters, kind string, page int) string {
+	values := url.Values{}
+	set := func(name, query string, currentPage int) {
+		if query != "" {
+			values.Set(name+"_q", query)
+		}
+		if currentPage > 1 {
+			values.Set(name+"_page", strconv.Itoa(currentPage))
+		}
+	}
+	pages := map[string]int{
+		"groups": filters.GroupPage, "broadcast": filters.BroadcastPage,
+		"operators": filters.OperatorPage, "permissions": filters.PermissionPage,
+	}
+	pages[kind] = page
+	set("groups", filters.GroupQuery, pages["groups"])
+	set("broadcast", filters.BroadcastQuery, pages["broadcast"])
+	set("operators", filters.OperatorQuery, pages["operators"])
+	set("permissions", filters.PermissionQuery, pages["permissions"])
+	if encoded := values.Encode(); encoded != "" {
+		return "/admin?" + encoded
+	}
+	return "/admin"
+}
+
+func pageAdminGroups(items []storage.Group, filters adminListFilters) ([]storage.Group, adminPager) {
+	query := strings.ToLower(filters.GroupQuery)
+	filtered := make([]storage.Group, 0, len(items))
+	for _, item := range items {
+		if query == "" || strings.Contains(strings.ToLower(item.Title), query) || strings.Contains(strconv.FormatInt(item.ChatID, 10), query) {
+			filtered = append(filtered, item)
+		}
+	}
+	pager := adminPagerFor(filters, "groups", filters.GroupQuery, filters.GroupPage, len(filtered))
+	return filtered[(pager.Page-1)*adminListPageSize : pager.ItemTo], pager
+}
+
+func pageAdminBroadcastGroups(items []storage.BroadcastGroup, filters adminListFilters) ([]storage.BroadcastGroup, adminPager) {
+	query := strings.ToLower(filters.BroadcastQuery)
+	filtered := make([]storage.BroadcastGroup, 0, len(items))
+	for _, item := range items {
+		haystack := strings.ToLower(item.Name + " " + strings.Join(item.ChatNames, " "))
+		if query == "" || strings.Contains(haystack, query) {
+			filtered = append(filtered, item)
+		}
+	}
+	pager := adminPagerFor(filters, "broadcast", filters.BroadcastQuery, filters.BroadcastPage, len(filtered))
+	return filtered[(pager.Page-1)*adminListPageSize : pager.ItemTo], pager
+}
+
+func pageAdminOperators(items []storage.GlobalOperator, filters adminListFilters) ([]storage.GlobalOperator, adminPager) {
+	query := strings.ToLower(filters.OperatorQuery)
+	filtered := make([]storage.GlobalOperator, 0, len(items))
+	for _, item := range items {
+		haystack := strings.ToLower(strings.Join([]string{operatorLabel(item), item.Username, item.DisplayName, item.Remark, maskedUserID(item.UserID)}, " "))
+		if query == "" || strings.Contains(haystack, query) {
+			filtered = append(filtered, item)
+		}
+	}
+	pager := adminPagerFor(filters, "operators", filters.OperatorQuery, filters.OperatorPage, len(filtered))
+	return filtered[(pager.Page-1)*adminListPageSize : pager.ItemTo], pager
+}
+
+func pageAdminPermissions(items []storage.BroadcastPermission, chatNames, opLabels map[int64]string, filters adminListFilters) ([]storage.BroadcastPermission, adminPager) {
+	query := strings.ToLower(filters.PermissionQuery)
+	filtered := make([]storage.BroadcastPermission, 0, len(items))
+	for _, item := range items {
+		haystack := strings.ToLower(strings.Join([]string{permissionUserLabel(item, opLabels), permissionTarget(item, chatNames), grantorLabel(item, opLabels)}, " "))
+		if query == "" || strings.Contains(haystack, query) {
+			filtered = append(filtered, item)
+		}
+	}
+	pager := adminPagerFor(filters, "permissions", filters.PermissionQuery, filters.PermissionPage, len(filtered))
+	return filtered[(pager.Page-1)*adminListPageSize : pager.ItemTo], pager
+}
+
+func (s *Server) privateCleanupConfigOperator(ctx context.Context, userID int64, level, fallbackLabel string) (storage.GlobalOperator, error) {
+	op := storage.GlobalOperator{UserID: userID, Level: level, Status: "active", Remark: fallbackLabel}
+	if user, ok, err := s.store.GetLatestUserIdentity(ctx, userID); err != nil {
+		return op, err
+	} else if ok {
+		op.Username = user.Username
+		op.DisplayName = user.DisplayName
+	}
+	if settings, ok, err := s.store.GetPrivateCleanupSettings(ctx, userID); err != nil {
+		return op, err
+	} else if ok {
+		op.PrivateCleanupEnabled = settings.Enabled
+		op.PrivateCleanupTime = settings.DailyTime
+		op.PrivateCleanupLastRunDate = settings.DailyLastRunDate
+		op.PrivateCleanupBotDeleteAfterSeconds = settings.BotDeleteAfter
+		op.PrivateCleanupIncomingEnabled = settings.IncomingEnabled
+		op.PrivateCleanupIncomingAfterSeconds = settings.IncomingDeleteAfter
+		op.PrivateCleanupScope = settings.Scope
+	}
+	return op, nil
 }
 
 func redirectMsg(w http.ResponseWriter, r *http.Request, msg string) {
@@ -1361,6 +1635,12 @@ func operatorLabel(op storage.GlobalOperator) string {
 	if remark != "" {
 		return remark
 	}
+	if username := strings.TrimSpace(op.Username); username != "" {
+		return "@" + username
+	}
+	if displayName := strings.TrimSpace(op.DisplayName); displayName != "" {
+		return displayName
+	}
 	return "未备注操作人 " + maskedUserID(op.UserID)
 }
 
@@ -1370,6 +1650,10 @@ func operatorLevelLabel(level string) string {
 		return "一级操作人"
 	case "secondary":
 		return "下级操作人"
+	case "host":
+		return "宿主"
+	case "default":
+		return "默认操作人"
 	default:
 		return level
 	}
@@ -2375,6 +2659,10 @@ func cleanupSummary(op storage.GlobalOperator) string {
 	return strings.Join(parts, "；")
 }
 
+func cleanupScopeEnabled(scope, category string) bool {
+	return storage.PrivateCleanupScopeIncludes(scope, category)
+}
+
 func cleanupDelayLabel(seconds int) string {
 	switch seconds {
 	case 0:
@@ -2443,6 +2731,7 @@ var adminTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
 	"cleanupDelayPreset":      cleanupDelayPreset,
 	"cleanupDelayCustomValue": cleanupDelayCustomValue,
 	"cleanupDelayCustomUnit":  cleanupDelayCustomUnit,
+	"cleanupScopeEnabled":     cleanupScopeEnabled,
 }).Parse(adminHTML))
 
 var loginTemplate = template.Must(template.New("login").Parse(loginHTML))
@@ -2516,9 +2805,10 @@ input,select,textarea{border:1px solid #b8c8dc;border-radius:6px;background:#fff
 select[multiple]{min-height:150px}.full{width:100%}
 table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid #dce5ef;padding:10px;text-align:center;vertical-align:middle}th{background:#f4f7fb;font-weight:800}
 .table-tools{display:flex;gap:8px;align-items:center;margin:8px 0 10px}.table-tools input{flex:1;width:100%}.scroll{max-height:280px;overflow:auto;border:1px solid #dce5ef;border-radius:6px}.scroll.tall{max-height:520px}.scroll table{margin:0;border:0}.scroll th:first-child,.scroll td:first-child{border-left:0}.scroll th:last-child,.scroll td:last-child{border-right:0}.scroll th{position:sticky;top:0;z-index:1}
+.pager{display:flex;gap:10px;align-items:center;justify-content:flex-end;margin-top:10px;color:var(--muted);font-size:13px}.pager a{color:var(--navy);font-weight:800;text-decoration:none}.pager .disabled{opacity:.4}
 .pill{display:inline-block;border:1px solid #d5e1ec;background:#f7fafc;border-radius:999px;padding:3px 9px;color:#40566f}
 .actions{display:flex;gap:8px;flex-wrap:wrap}.mini{height:32px;padding:0 10px}
-.toolbar-forms{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,.45fr);gap:12px;margin-bottom:14px}.inline-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px}.cleanup-box{text-align:left;min-width:260px}.cleanup-box summary{cursor:pointer;font-weight:800;color:var(--navy)}.cleanup-summary{display:block;margin-top:4px;color:var(--muted);font-size:12px;line-height:1.35}.cleanup-form{display:grid;grid-template-columns:130px minmax(120px,1fr) minmax(84px,.5fr) minmax(84px,.5fr);gap:7px;align-items:end;margin-top:10px}.cleanup-form .wide{grid-column:1/-1}.cleanup-form select,.cleanup-form input{min-height:32px;height:32px;padding:4px 7px}.cleanup-note{grid-column:1/-1;color:var(--muted);font-size:12px;line-height:1.45}.section-title{margin:4px 0 8px;font-size:15px;font-weight:800;color:#243852}.member-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:14px}.member-form{border:1px solid #dce5ef;background:var(--soft);border-radius:8px;padding:12px;min-width:0}.member-form select{width:100%;margin-bottom:8px}.member-form select[multiple]{height:220px;min-height:220px;background:#fff}.group-name-list{max-width:760px;text-align:left;line-height:1.65}.permission-panels{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:14px}.permission-panel{border:1px solid #dce5ef;background:var(--soft);border-radius:8px;padding:12px;min-width:0}.permission-panel form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;align-items:end}.permission-panel .btn{grid-column:1/-1;justify-self:start;min-width:180px}.permission-table td:first-child,.operator-name{text-align:left}.field-label{display:block;margin:0 0 5px;color:var(--muted);font-size:12px;font-weight:700}.field-stack{min-width:0}.field-stack select{width:100%}.field-stack.disabled{opacity:.45}
+.toolbar-forms{display:grid;grid-template-columns:repeat(3,minmax(240px,1fr));gap:12px;margin-bottom:14px}.inline-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px}.cleanup-box{text-align:left;min-width:260px}.cleanup-box summary{cursor:pointer;font-weight:800;color:var(--navy)}.cleanup-summary{display:block;margin-top:4px;color:var(--muted);font-size:12px;line-height:1.35}.cleanup-form{display:grid;grid-template-columns:130px minmax(120px,1fr) minmax(84px,.5fr) minmax(84px,.5fr);gap:7px;align-items:end;margin-top:10px}.cleanup-form .wide{grid-column:1/-1}.cleanup-form select,.cleanup-form input{min-height:32px;height:32px;padding:4px 7px}.cleanup-scopes{display:flex;gap:14px;align-items:center;border:1px solid #dce5ef;border-radius:6px;padding:7px 10px}.cleanup-scopes label{display:flex;gap:5px;align-items:center}.cleanup-scopes input{min-height:auto;height:auto}.cleanup-note{grid-column:1/-1;color:var(--muted);font-size:12px;line-height:1.45}.section-title{margin:4px 0 8px;font-size:15px;font-weight:800;color:#243852}.member-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:14px}.member-form{border:1px solid #dce5ef;background:var(--soft);border-radius:8px;padding:12px;min-width:0}.member-form select{width:100%;margin-bottom:8px}.member-form select[multiple]{height:220px;min-height:220px;background:#fff}.group-name-list{max-width:760px;text-align:left;line-height:1.65}.permission-panels{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:14px}.permission-panel{border:1px solid #dce5ef;background:var(--soft);border-radius:8px;padding:12px;min-width:0}.permission-panel form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;align-items:end}.permission-panel .btn{grid-column:1/-1;justify-self:start;min-width:180px}.permission-table td:first-child,.operator-name{text-align:left}.field-label{display:block;margin:0 0 5px;color:var(--muted);font-size:12px;font-weight:700}.field-stack{min-width:0}.field-stack select{width:100%}.field-stack.disabled{opacity:.45}
 .watch-panel{max-height:620px;overflow:auto;border:1px solid #dce5ef;border-radius:8px;background:#fff}.watch-panel form{margin:0}.watch-head,.watch-row{display:grid;grid-template-columns:minmax(130px,.7fr) minmax(330px,1.6fr) minmax(150px,.7fr) repeat(3,88px) minmax(110px,.5fr) auto auto;gap:8px;align-items:center}.watch-head{position:sticky;top:0;z-index:1;background:#f4f7fb;font-weight:800;padding:10px;border-bottom:1px solid #dce5ef;text-align:center}.watch-row{padding:10px;border-bottom:1px solid #e7eef6}.watch-row:last-child{border-bottom:0}.watch-row code{word-break:break-all;color:#173f82}.watch-row .owner{font-weight:700}.watch-row .latest{color:var(--muted);font-size:12px}.watch-check{display:flex;gap:5px;align-items:center;justify-content:center}.watch-check input{min-height:auto}.watch-row .btn{height:34px;min-width:64px;padding:0 10px}.watch-empty{border:1px dashed #cbd8e8;border-radius:8px;padding:22px;text-align:center;color:var(--muted);background:var(--soft)}
 @media(max-width:900px){.top{align-items:flex-start;flex-direction:column}.row,.row.two,.toolbar-forms,.member-grid,.permission-panels,.permission-panel form,.cleanup-form{grid-template-columns:1fr}.watch-head{display:none}.watch-row{grid-template-columns:1fr}.btn{width:100%}}
 </style>
@@ -2549,10 +2839,11 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 <div class="card tab-card active" data-admin-tab="groups">
 <h2>已保存群组</h2>
 <p class="hint">机器人被邀请进群，或群内有人发言后会自动保存群名；群改名后也会更新。</p>
-<div class="table-tools"><input id="saved-group-search" type="search" placeholder="搜索群名或群ID"></div>
+<form class="table-tools" method="get" action="/admin"><input id="saved-group-search" name="groups_q" value="{{.GroupPager.Query}}" type="search" placeholder="搜索群名或群ID"><button class="btn mini" type="submit">搜索</button></form>
 <div class="scroll tall"><table><thead><tr><th>群名</th><th>群ID</th><th>更新时间</th></tr></thead><tbody id="saved-group-rows">
 {{range .Groups}}<tr data-search="{{chatLabel .}} {{.ChatID}}"><td>{{chatLabel .}}</td><td>{{.ChatID}}</td><td>{{.UpdatedAt.Format "2006-01-02 15:04"}}</td></tr>{{else}}<tr><td colspan="3">暂无群组</td></tr>{{end}}
 </tbody></table></div>
+<div class="pager"><span>{{.GroupPager.ItemFrom}}-{{.GroupPager.ItemTo}} / {{.GroupPager.Total}}</span>{{if .GroupPager.HasPrev}}<a href="{{.GroupPager.PrevURL}}">上一页</a>{{else}}<span class="disabled">上一页</span>{{end}}{{if .GroupPager.HasNext}}<a href="{{.GroupPager.NextURL}}">下一页</a>{{else}}<span class="disabled">下一页</span>{{end}}</div>
 </div>
 
 {{end}}
@@ -2560,16 +2851,19 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 <div class="card tab-card {{if not .CanManageGlobal}}active{{end}}" data-admin-tab="permissions">
 <h2>一级 / 下级操作人</h2>
 <p class="hint">宿主和默认操作人来自环境配置；这里添加的是全局一级/下级操作人，可邀请机器人、进入后台和使用授权广播范围。页面不直接显示 UID，保存时仍按 UID 精确处理。</p>
+<p class="hint">私聊清空只处理该操作人与机器人私聊，不会删除目标群投递或广播投递映射。</p>
 <form method="post" action="/admin/operator/save" class="row">
 <input name="user_id" placeholder="操作人 UID">
 <select name="level"><option value="primary">一级操作人</option><option value="secondary">下级操作人</option></select>
-<select name="parent_user_id"><option value="">下级的一级授权人</option>{{range .BOperators}}{{if and (eq .Level "primary") (eq .Status "active")}}<option value="{{.UserID}}">{{operatorLabel .}}</option>{{end}}{{end}}</select>
+<select name="parent_user_id"><option value="">下级的一级授权人</option>{{range .PermissionOperators}}{{if and (eq .Level "primary") (eq .Status "active")}}<option value="{{.UserID}}">{{operatorLabel .}}</option>{{end}}{{end}}</select>
 <input name="remark" placeholder="备注，可选">
 <button class="btn" type="submit">保存</button>
 </form>
+<form class="table-tools" method="get" action="/admin"><input name="operators_q" value="{{.OperatorPager.Query}}" type="search" placeholder="搜索备注、用户名或掩码"><button class="btn mini" type="submit">搜索</button></form>
 <div class="scroll"><table><thead><tr><th>操作人</th><th>级别</th><th>授权来源</th><th>授权时间</th><th>私聊清空</th><th>状态</th><th>操作</th></tr></thead><tbody>
-{{range .BOperators}}<tr><td>{{operatorLabel .}}</td><td>{{operatorLevelLabel .Level}}</td><td>{{operatorSourceLabel . $.OpLabels}}</td><td>{{adminTime .CreatedAt}}</td><td><div class="cleanup-box"><details><summary>私聊自动清理</summary><form method="post" action="/admin/operator/cleanup" class="cleanup-form"><input type="hidden" name="user_id" value="{{.UserID}}"><label><span class="field-label">总开关</span><select name="enabled"><option value="0" {{if not .PrivateCleanupEnabled}}selected{{end}}>关闭</option><option value="1" {{if .PrivateCleanupEnabled}}selected{{end}}>开启</option></select></label><label><span class="field-label">bot 提示消息</span><select name="bot_delete_after"><option value="0" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "0"}}selected{{end}}>不自动删</option><option value="30" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "30"}}selected{{end}}>30 秒后</option><option value="60" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "60"}}selected{{end}}>1 分钟后</option><option value="300" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "300"}}selected{{end}}>5 分钟后</option><option value="600" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "600"}}selected{{end}}>10 分钟后</option><option value="1800" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "1800"}}selected{{end}}>30 分钟后</option><option value="3600" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "3600"}}selected{{end}}>1 小时后</option><option value="custom" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "custom"}}selected{{end}}>自定义</option></select></label><label><span class="field-label">自定义</span><input name="bot_delete_after_custom" value="{{cleanupDelayCustomValue .PrivateCleanupBotDeleteAfterSeconds}}" placeholder="数值"></label><label><span class="field-label">单位</span><select name="bot_delete_after_unit"><option value="minutes" {{if eq (cleanupDelayCustomUnit .PrivateCleanupBotDeleteAfterSeconds) "minutes"}}selected{{end}}>分钟</option><option value="seconds" {{if eq (cleanupDelayCustomUnit .PrivateCleanupBotDeleteAfterSeconds) "seconds"}}selected{{end}}>秒</option></select></label><label><span class="field-label">用户临时消息</span><select name="incoming_enabled"><option value="0" {{if not .PrivateCleanupIncomingEnabled}}selected{{end}}>不清理</option><option value="1" {{if .PrivateCleanupIncomingEnabled}}selected{{end}}>尝试清理</option></select></label><label><span class="field-label">用户消息多久删</span><select name="incoming_delete_after"><option value="0" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "0"}}selected{{end}}>仅每日兜底</option><option value="30" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "30"}}selected{{end}}>30 秒后</option><option value="60" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "60"}}selected{{end}}>1 分钟后</option><option value="300" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "300"}}selected{{end}}>5 分钟后</option><option value="600" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "600"}}selected{{end}}>10 分钟后</option><option value="1800" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "1800"}}selected{{end}}>30 分钟后</option><option value="3600" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "3600"}}selected{{end}}>1 小时后</option><option value="custom" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "custom"}}selected{{end}}>自定义</option></select></label><label><span class="field-label">自定义</span><input name="incoming_delete_after_custom" value="{{cleanupDelayCustomValue .PrivateCleanupIncomingAfterSeconds}}" placeholder="数值"></label><label><span class="field-label">单位</span><select name="incoming_delete_after_unit"><option value="minutes" {{if eq (cleanupDelayCustomUnit .PrivateCleanupIncomingAfterSeconds) "minutes"}}selected{{end}}>分钟</option><option value="seconds" {{if eq (cleanupDelayCustomUnit .PrivateCleanupIncomingAfterSeconds) "seconds"}}selected{{end}}>秒</option></select></label><label class="wide"><span class="field-label">每日兜底清空（北京时间，可留空）</span><input name="cleanup_time" value="{{.PrivateCleanupTime}}" placeholder="HH:MM"></label><div class="cleanup-note">只处理该操作人与机器人私聊里的广播菜单、单群发送、快速回复、后台入口等提示记录；不删除目标群投递，也不删除 broadcast_deliveries。用户发来的素材/临时指令仅在开启后尝试清理，仍受 Telegram 删除限制。</div><button class="btn mini wide" type="submit">保存私聊清理</button></form></details><span class="cleanup-summary">{{cleanupSummary .}}</span></div></td><td><span class="pill">{{.Status}}</span></td><td><form method="post" action="/admin/operator/disable"><input type="hidden" name="user_id" value="{{.UserID}}"><button class="btn mini" type="submit">禁用</button></form></td></tr>{{else}}<tr><td colspan="7">暂无全局操作人</td></tr>{{end}}
+{{range .BOperators}}<tr><td>{{operatorLabel .}}</td><td>{{operatorLevelLabel .Level}}</td><td>{{operatorSourceLabel . $.OpLabels}}</td><td>{{adminTime .CreatedAt}}</td><td><div class="cleanup-box">{{if $.CanManageGlobal}}<details><summary>私聊自动清理</summary><form method="post" action="/admin/operator/cleanup" class="cleanup-form"><input type="hidden" name="user_id" value="{{.UserID}}"><label><span class="field-label">总开关</span><select name="enabled"><option value="0" {{if not .PrivateCleanupEnabled}}selected{{end}}>关闭</option><option value="1" {{if .PrivateCleanupEnabled}}selected{{end}}>开启</option></select></label><label><span class="field-label">bot 提示消息</span><select name="bot_delete_after"><option value="0" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "0"}}selected{{end}}>不自动删</option><option value="30" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "30"}}selected{{end}}>30 秒后</option><option value="60" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "60"}}selected{{end}}>1 分钟后</option><option value="300" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "300"}}selected{{end}}>5 分钟后</option><option value="600" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "600"}}selected{{end}}>10 分钟后</option><option value="1800" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "1800"}}selected{{end}}>30 分钟后</option><option value="3600" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "3600"}}selected{{end}}>1 小时后</option><option value="custom" {{if eq (cleanupDelayPreset .PrivateCleanupBotDeleteAfterSeconds) "custom"}}selected{{end}}>自定义</option></select></label><label><span class="field-label">自定义</span><input name="bot_delete_after_custom" value="{{cleanupDelayCustomValue .PrivateCleanupBotDeleteAfterSeconds}}" placeholder="数值"></label><label><span class="field-label">单位</span><select name="bot_delete_after_unit"><option value="minutes" {{if eq (cleanupDelayCustomUnit .PrivateCleanupBotDeleteAfterSeconds) "minutes"}}selected{{end}}>分钟</option><option value="seconds" {{if eq (cleanupDelayCustomUnit .PrivateCleanupBotDeleteAfterSeconds) "seconds"}}selected{{end}}>秒</option></select></label><label><span class="field-label">用户临时消息</span><select name="incoming_enabled"><option value="0" {{if not .PrivateCleanupIncomingEnabled}}selected{{end}}>不清理</option><option value="1" {{if .PrivateCleanupIncomingEnabled}}selected{{end}}>尝试清理</option></select></label><label><span class="field-label">用户消息多久删</span><select name="incoming_delete_after"><option value="0" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "0"}}selected{{end}}>仅每日兜底</option><option value="30" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "30"}}selected{{end}}>30 秒后</option><option value="60" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "60"}}selected{{end}}>1 分钟后</option><option value="300" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "300"}}selected{{end}}>5 分钟后</option><option value="600" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "600"}}selected{{end}}>10 分钟后</option><option value="1800" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "1800"}}selected{{end}}>30 分钟后</option><option value="3600" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "3600"}}selected{{end}}>1 小时后</option><option value="custom" {{if eq (cleanupDelayPreset .PrivateCleanupIncomingAfterSeconds) "custom"}}selected{{end}}>自定义</option></select></label><label><span class="field-label">自定义</span><input name="incoming_delete_after_custom" value="{{cleanupDelayCustomValue .PrivateCleanupIncomingAfterSeconds}}" placeholder="数值"></label><label><span class="field-label">单位</span><select name="incoming_delete_after_unit"><option value="minutes" {{if eq (cleanupDelayCustomUnit .PrivateCleanupIncomingAfterSeconds) "minutes"}}selected{{end}}>分钟</option><option value="seconds" {{if eq (cleanupDelayCustomUnit .PrivateCleanupIncomingAfterSeconds) "seconds"}}selected{{end}}>秒</option></select></label><fieldset class="wide cleanup-scopes"><legend>清理范围</legend><label><input type="checkbox" name="scope" value="broadcast" {{if cleanupScopeEnabled .PrivateCleanupScope "broadcast"}}checked{{end}}>广播/单群</label><label><input type="checkbox" name="scope" value="quick_reply" {{if cleanupScopeEnabled .PrivateCleanupScope "quick_reply"}}checked{{end}}>快速回复</label><label><input type="checkbox" name="scope" value="menu" {{if cleanupScopeEnabled .PrivateCleanupScope "menu"}}checked{{end}}>菜单/后台提示</label></fieldset><label class="wide"><span class="field-label">每日兜底清空（北京时间，可留空）</span><input name="cleanup_time" value="{{.PrivateCleanupTime}}" placeholder="HH:MM"></label><div class="cleanup-note">按上方范围处理该操作人与机器人私聊记录；不删除目标群投递，也不删除 broadcast_deliveries。用户发来的素材/临时指令仅在开启后尝试清理，仍受 Telegram 删除限制。</div><button class="btn mini wide" type="submit">保存私聊清理</button></form></details>{{end}}<span class="cleanup-summary">{{cleanupSummary .}}</span></div></td><td><span class="pill">{{.Status}}</span></td><td>{{if or (eq .Level "primary") (eq .Level "secondary")}}<form method="post" action="/admin/operator/disable"><input type="hidden" name="user_id" value="{{.UserID}}"><button class="btn mini" type="submit">禁用</button></form>{{else}}环境配置{{end}}</td></tr>{{else}}<tr><td colspan="7">暂无全局操作人</td></tr>{{end}}
 </tbody></table></div>
+<div class="pager"><span>{{.OperatorPager.ItemFrom}}-{{.OperatorPager.ItemTo}} / {{.OperatorPager.Total}}</span>{{if .OperatorPager.HasPrev}}<a href="{{.OperatorPager.PrevURL}}">上一页</a>{{else}}<span class="disabled">上一页</span>{{end}}{{if .OperatorPager.HasNext}}<a href="{{.OperatorPager.NextURL}}">下一页</a>{{else}}<span class="disabled">下一页</span>{{end}}</div>
 </div>
 
 {{end}}
@@ -2577,6 +2871,7 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 <div class="card wide tab-card" data-admin-tab="broadcast">
 <h2>广播分组</h2>
 <p class="hint">先创建分组，再用下方多选框批量添加或移除群组。页面显示群名，数据库仍用群 ID 去重。</p>
+<form class="table-tools" method="get" action="/admin"><input name="broadcast_q" value="{{.BroadcastPager.Query}}" type="search" placeholder="搜索分组名或群名"><button class="btn mini" type="submit">搜索</button></form>
 <div class="toolbar-forms">
 <form method="post" action="/admin/group/save" class="inline-form">
 <input name="name" placeholder="输入新分组名，例如 财务">
@@ -2586,19 +2881,24 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 <select name="name">{{range .BGroups}}<option value="{{.Name}}">{{.Name}}</option>{{end}}</select>
 <button class="btn" type="submit">删除分组</button>
 </form>
+<form method="post" action="/admin/group/rename" class="inline-form">
+<select name="old_name">{{range .BGroups}}<option value="{{.Name}}">{{.Name}}</option>{{end}}</select>
+<input name="new_name" placeholder="新分组名">
+<button class="btn" type="submit">改名并迁移授权</button>
+</form>
 </div>
 <div class="member-grid">
 <form method="post" action="/admin/group/add" class="member-form" data-mode="add">
 <div class="section-title">添加群组到分组</div>
 <label><span class="field-label">目标分组</span><select class="member-group-select" name="name">{{range .BGroups}}<option value="{{.Name}}">{{.Name}}</option>{{end}}</select></label>
-<label><span class="field-label">选择要加入的群，可按 Ctrl/Shift 多选</span><select class="member-chat-select" name="chat_id" multiple>{{range .Groups}}<option value="{{.ChatID}}" data-groups="{{chatBroadcastGroups . $.BGroups}}">{{chatLabel .}}</option>{{end}}</select></label>
+<label><span class="field-label">选择要加入的群，可按 Ctrl/Shift 多选</span><select class="member-chat-select" name="chat_id" multiple>{{range .Groups}}<option value="{{.ChatID}}" data-groups="{{chatBroadcastGroups . $.BroadcastMemberships}}">{{chatLabel .}}</option>{{end}}</select></label>
 <div class="hint member-empty" hidden>当前分组没有可选择的群。</div>
 <button class="btn full" type="submit">添加到分组</button>
 </form>
 <form method="post" action="/admin/group/remove" class="member-form" data-mode="remove">
 <div class="section-title">从分组移除群组</div>
 <label><span class="field-label">目标分组</span><select class="member-group-select" name="name">{{range .BGroups}}<option value="{{.Name}}">{{.Name}}</option>{{end}}</select></label>
-<label><span class="field-label">选择要移除的群，可按 Ctrl/Shift 多选</span><select class="member-chat-select" name="chat_id" multiple>{{range .Groups}}<option value="{{.ChatID}}" data-groups="{{chatBroadcastGroups . $.BGroups}}">{{chatLabel .}}</option>{{end}}</select></label>
+<label><span class="field-label">选择要移除的群，可按 Ctrl/Shift 多选</span><select class="member-chat-select" name="chat_id" multiple>{{range .Groups}}<option value="{{.ChatID}}" data-groups="{{chatBroadcastGroups . $.BroadcastMemberships}}">{{chatLabel .}}</option>{{end}}</select></label>
 <div class="hint member-empty" hidden>当前分组没有可移除的群。</div>
 <button class="btn full" type="submit">从分组移除</button>
 </form>
@@ -2606,6 +2906,7 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 <div class="scroll"><table><thead><tr><th>分组</th><th>群数</th><th>群组</th></tr></thead><tbody>
 {{range .BGroups}}<tr><td>{{.Name}}</td><td>{{len .ChatIDs}}</td><td>{{range $i,$n := .ChatNames}}{{if $i}}、{{end}}{{$n}}{{end}}</td></tr>{{else}}<tr><td colspan="3">暂无广播分组</td></tr>{{end}}
 </tbody></table></div>
+<div class="pager"><span>{{.BroadcastPager.ItemFrom}}-{{.BroadcastPager.ItemTo}} / {{.BroadcastPager.Total}}</span>{{if .BroadcastPager.HasPrev}}<a href="{{.BroadcastPager.PrevURL}}">上一页</a>{{else}}<span class="disabled">上一页</span>{{end}}{{if .BroadcastPager.HasNext}}<a href="{{.BroadcastPager.NextURL}}">下一页</a>{{else}}<span class="disabled">下一页</span>{{end}}</div>
 </div>
 
 {{end}}
@@ -2613,24 +2914,25 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 <div class="card wide tab-card {{if not .CanManageGlobal}}active{{end}}" data-admin-tab="permissions">
 <h2>广播权限</h2>
 <p class="hint">给普通广播操作人授权分组或单群。授权后，私聊机器人选择群发、分组广播或单群发送时只会看到允许的目标。</p>
+<form class="table-tools" method="get" action="/admin"><input name="groups_q" value="{{.GroupPager.Query}}" type="search" placeholder="搜索单群名称或群ID"><input name="broadcast_q" value="{{.BroadcastPager.Query}}" type="search" placeholder="搜索广播分组"><button class="btn mini" type="submit">筛选目标</button></form>
 <div class="permission-panels">
 <div class="permission-panel">
 <div class="section-title">授权广播目标</div>
 <form method="post" action="/admin/permission/grant" class="permission-form" data-mode="grant">
-<label class="field-stack"><span class="field-label">操作人</span><select class="permission-user-select" name="user_id">{{range .BOperators}}{{if eq .Status "active"}}<option value="{{.UserID}}">{{operatorLabel .}}</option>{{end}}{{end}}</select></label>
+<label class="field-stack"><span class="field-label">操作人</span><select class="permission-user-select" name="user_id">{{range .PermissionOperators}}{{if eq .Status "active"}}<option value="{{.UserID}}">{{operatorLabel .}}</option>{{end}}{{end}}</select></label>
 <label class="field-stack"><span class="field-label">权限类型</span><select class="target-type" name="target"><option value="group">分组</option><option value="chat">单群</option></select></label>
-<label class="field-stack target-group"><span class="field-label">选择分组</span><select class="permission-group-select" name="group_name">{{range .BGroups}}<option value="{{.Name}}" data-users="{{permissionGroupUsers .Name $.Permissions}}">{{.Name}}</option>{{end}}</select></label>
-<label class="field-stack target-chat"><span class="field-label">选择单群</span><select class="permission-chat-select" name="chat_id">{{range .Groups}}<option value="{{.ChatID}}" data-users="{{permissionChatUsers . $.Permissions}}">{{chatLabel .}}</option>{{end}}</select></label>
+<label class="field-stack target-group"><span class="field-label">选择分组</span><select class="permission-group-select" name="group_name">{{range .BGroups}}<option value="{{.Name}}" data-users="{{permissionGroupUsers .Name $.PermissionFilterData}}">{{.Name}}</option>{{end}}</select></label>
+<label class="field-stack target-chat"><span class="field-label">选择单群</span><select class="permission-chat-select" name="chat_id">{{range .Groups}}<option value="{{.ChatID}}" data-users="{{permissionChatUsers . $.PermissionFilterData}}">{{chatLabel .}}</option>{{end}}</select></label>
 <button class="btn" type="submit">授权</button>
 </form>
 </div>
 <div class="permission-panel">
 <div class="section-title">取消广播权限</div>
 <form method="post" action="/admin/permission/revoke" class="permission-form" data-mode="revoke">
-<label class="field-stack"><span class="field-label">操作人</span><select class="permission-user-select" name="user_id">{{range .BOperators}}{{if eq .Status "active"}}<option value="{{.UserID}}">{{operatorLabel .}}</option>{{end}}{{end}}</select></label>
+<label class="field-stack"><span class="field-label">操作人</span><select class="permission-user-select" name="user_id">{{range .PermissionOperators}}{{if eq .Status "active"}}<option value="{{.UserID}}">{{operatorLabel .}}</option>{{end}}{{end}}</select></label>
 <label class="field-stack"><span class="field-label">权限类型</span><select class="target-type" name="target"><option value="group">分组</option><option value="chat">单群</option></select></label>
-<label class="field-stack target-group"><span class="field-label">选择分组</span><select class="permission-group-select" name="group_name">{{range .BGroups}}<option value="{{.Name}}" data-users="{{permissionGroupUsers .Name $.Permissions}}">{{.Name}}</option>{{end}}</select></label>
-<label class="field-stack target-chat"><span class="field-label">选择单群</span><select class="permission-chat-select" name="chat_id">{{range .Groups}}<option value="{{.ChatID}}" data-users="{{permissionChatUsers . $.Permissions}}">{{chatLabel .}}</option>{{end}}</select></label>
+<label class="field-stack target-group"><span class="field-label">选择分组</span><select class="permission-group-select" name="group_name">{{range .BGroups}}<option value="{{.Name}}" data-users="{{permissionGroupUsers .Name $.PermissionFilterData}}">{{.Name}}</option>{{end}}</select></label>
+<label class="field-stack target-chat"><span class="field-label">选择单群</span><select class="permission-chat-select" name="chat_id">{{range .Groups}}<option value="{{.ChatID}}" data-users="{{permissionChatUsers . $.PermissionFilterData}}">{{chatLabel .}}</option>{{end}}</select></label>
 <button class="btn" type="submit">取消授权</button>
 </form>
 </div>
@@ -2638,6 +2940,8 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 <div class="scroll"><table class="permission-table"><thead><tr><th>操作人</th><th>权限范围</th><th>授权来源</th></tr></thead><tbody>
 {{range .Permissions}}<tr><td>{{permissionUserLabel . $.OpLabels}}</td><td>{{permissionTarget . $.ChatNames}}</td><td>{{grantorLabel . $.OpLabels}}</td></tr>{{else}}<tr><td colspan="3">暂无权限</td></tr>{{end}}
 </tbody></table></div>
+<form class="table-tools" method="get" action="/admin"><input name="permissions_q" value="{{.PermissionPager.Query}}" type="search" placeholder="搜索操作人、群名或授权来源"><button class="btn mini" type="submit">搜索</button></form>
+<div class="pager"><span>{{.PermissionPager.ItemFrom}}-{{.PermissionPager.ItemTo}} / {{.PermissionPager.Total}}</span>{{if .PermissionPager.HasPrev}}<a href="{{.PermissionPager.PrevURL}}">上一页</a>{{else}}<span class="disabled">上一页</span>{{end}}{{if .PermissionPager.HasNext}}<a href="{{.PermissionPager.NextURL}}">下一页</a>{{else}}<span class="disabled">下一页</span>{{end}}</div>
 </div>
 
 {{end}}

@@ -1,6 +1,14 @@
 package bot
 
-import "testing"
+import (
+	"context"
+	"fmt"
+	"testing"
+
+	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
+	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/telegram"
+	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/worker"
+)
 
 func TestFormatBroadcastProgressText(t *testing.T) {
 	if got := formatBroadcastProgressText("chat", 1); got != "发送中..." {
@@ -100,5 +108,55 @@ func TestQuickReplyControlsAndExitState(t *testing.T) {
 
 	if _, ok := quickReplyReturnState(privateState{Mode: "quick_reply"}); ok {
 		t.Fatal("quick reply without return state should fall back to menu")
+	}
+}
+
+func TestBroadcastPickerPagesPastFortyChats(t *testing.T) {
+	items := make([]storage.Group, 65)
+	for i := range items {
+		items[i] = storage.Group{ChatID: int64(-1000 - i), Title: fmt.Sprintf("群 %02d", i+1)}
+	}
+	page, start, end, pages := pickerBounds(len(items), 4)
+	if start != 48 || end != 60 || page != 4 || pages != 6 {
+		t.Fatalf("picker page = start %d end %d page %d pages %d", start, end, page, pages)
+	}
+	page, start, end, pages = pickerBounds(len(items), 99)
+	if start != 60 || end != 65 || page != 5 || pages != 6 {
+		t.Fatalf("clamped picker page = start %d end %d page %d pages %d", start, end, page, pages)
+	}
+}
+
+func TestIntersectBroadcastTargetsRechecksAndKeepsStoredTitle(t *testing.T) {
+	allowed := []storage.Group{{ChatID: -1002, Title: "当前群名"}, {ChatID: -1004, Title: "新增群"}}
+	got := intersectBroadcastTargets([]int64{-1001, -1002, -1003}, allowed)
+	if len(got) != 1 || got[0].ChatID != -1002 || got[0].Title != "当前群名" {
+		t.Fatalf("dynamic targets = %+v", got)
+	}
+}
+
+func TestBroadcastReplyKeyboardHidesQuickReplyWithoutPermission(t *testing.T) {
+	msg := telegram.Message{Chat: telegram.Chat{ID: -1001}, MessageID: 20}
+	delivery := storage.BroadcastDelivery{ID: 7, TargetChatID: -1001, TargetMessageID: 10}
+	viewer := broadcastReplyKeyboard(msg, delivery, false)
+	if len(viewer.InlineKeyboard) != 1 {
+		t.Fatalf("viewer keyboard rows = %#v", viewer.InlineKeyboard)
+	}
+	operator := broadcastReplyKeyboard(msg, delivery, true)
+	if len(operator.InlineKeyboard) != 2 || operator.InlineKeyboard[0][0].CallbackData != "br:q:7" {
+		t.Fatalf("operator keyboard rows = %#v", operator.InlineKeyboard)
+	}
+}
+
+func TestBroadcastQueueFullRunsFailureFallback(t *testing.T) {
+	pool := worker.NewPool("broadcast-test", 1, 1)
+	for pool.Submit(func(context.Context) {}) {
+	}
+	called := false
+	err := submitBroadcastJob(pool, func(context.Context) {}, func() error {
+		called = true
+		return nil
+	})
+	if err != nil || !called {
+		t.Fatalf("queue-full fallback called=%t err=%v", called, err)
 	}
 }

@@ -3,11 +3,46 @@ package bot
 import (
 	"context"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/telegram"
 )
+
+type privateCleanupCategoryKey struct{}
+
+func withPrivateCleanupCategory(ctx context.Context, category string) context.Context {
+	return context.WithValue(ctx, privateCleanupCategoryKey{}, normalizePrivateCleanupCategory(category))
+}
+
+func privateCleanupCategoryFromContext(ctx context.Context) string {
+	if category, ok := ctx.Value(privateCleanupCategoryKey{}).(string); ok {
+		return normalizePrivateCleanupCategory(category)
+	}
+	return "menu"
+}
+
+func normalizePrivateCleanupCategory(category string) string {
+	switch strings.TrimSpace(category) {
+	case "broadcast", "quick_reply", "menu":
+		return strings.TrimSpace(category)
+	default:
+		return "menu"
+	}
+}
+
+func privateCleanupCategoryForKind(kind string) string {
+	kind = strings.ToLower(strings.TrimSpace(kind))
+	switch {
+	case strings.HasPrefix(kind, "quick_reply"), strings.HasPrefix(kind, "broadcast_reply"):
+		return "quick_reply"
+	case strings.HasPrefix(kind, "broadcast"):
+		return "broadcast"
+	default:
+		return "menu"
+	}
+}
 
 const (
 	privateCleanupCheckEvery = 30 * time.Second
@@ -19,17 +54,29 @@ func (b *Bot) recordIncomingPrivateChatMessage(ctx context.Context, msg telegram
 	if msg.Chat.Type != "private" || msg.Chat.ID <= 0 || msg.MessageID <= 0 || user.ID <= 0 {
 		return
 	}
+	category := "menu"
+	if state, ok := b.privateStates.Get(formatID(user.ID)); ok {
+		if state.Mode == "quick_reply" {
+			category = "quick_reply"
+		} else if len(state.ChatIDs) > 0 {
+			category = "broadcast"
+		}
+	}
 	b.recordPrivateChatMessage(ctx, storage.PrivateChatMessage{
 		OperatorUserID: user.ID,
 		ChatID:         msg.Chat.ID,
 		MessageID:      msg.MessageID,
 		Direction:      "incoming",
-		Category:       "operator_message",
+		Category:       category,
 		CreatedAt:      now,
 	})
 }
 
 func (b *Bot) recordOutgoingPrivateChatMessage(ctx context.Context, msg telegram.Message, direction string) {
+	b.recordOutgoingPrivateChatMessageCategory(ctx, msg, direction, privateCleanupCategoryFromContext(ctx))
+}
+
+func (b *Bot) recordOutgoingPrivateChatMessageCategory(ctx context.Context, msg telegram.Message, direction, category string) {
 	if msg.Chat.Type != "private" || msg.Chat.ID <= 0 || msg.MessageID <= 0 {
 		return
 	}
@@ -45,7 +92,7 @@ func (b *Bot) recordOutgoingPrivateChatMessage(ctx context.Context, msg telegram
 		ChatID:         msg.Chat.ID,
 		MessageID:      msg.MessageID,
 		Direction:      direction,
-		Category:       "bot_prompt",
+		Category:       normalizePrivateCleanupCategory(category),
 		CreatedAt:      createdAt,
 	})
 }
@@ -60,6 +107,9 @@ func (b *Bot) recordPrivateChatMessage(ctx context.Context, msg storage.PrivateC
 		return
 	}
 	if !ok || !settings.Enabled {
+		return
+	}
+	if !storage.PrivateCleanupScopeIncludes(settings.Scope, msg.Category) {
 		return
 	}
 	msg.Category, msg.CleanupAfterSeconds, msg.DueAt = privateCleanupMessageSchedule(msg, settings)

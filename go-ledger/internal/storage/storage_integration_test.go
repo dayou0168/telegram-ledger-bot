@@ -9,6 +9,240 @@ import (
 	"time"
 )
 
+func TestPostgresLedgerClearTicketSecurity(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	storeA, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open store A: %v", err)
+	}
+	defer storeA.Close()
+	storeB, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open store B: %v", err)
+	}
+	defer storeB.Close()
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	suffix := now.UnixNano()
+	chatID := int64(-910000000000 - suffix%1000000)
+	requesterID := int64(710000000000 + suffix%1000000)
+	otherUserID := requesterID + 1
+	dayKey := now.Format("2006-01-02")
+	if err := storeA.EnsureGroup(ctx, chatID, "clear ticket integration", now); err != nil {
+		t.Fatalf("ensure group: %v", err)
+	}
+	if err := storeA.SetGroupActivePeriod(ctx, chatID, true, dayKey, dayKey, now); err != nil {
+		t.Fatalf("start period: %v", err)
+	}
+	group, err := storeA.GetGroup(ctx, chatID)
+	if err != nil {
+		t.Fatalf("get group: %v", err)
+	}
+	recordID, err := storeA.InsertRecord(ctx, Record{
+		ChatID: chatID, DayKey: dayKey, Kind: "deposit", Currency: "CNY", Amount: "1",
+		Rate: "1", FeeRate: "0", ResultUSDT: "1", ActorUserID: requesterID,
+		CreatedAt: group.ActivePeriodStartedAt.Add(time.Second),
+	})
+	if err != nil {
+		t.Fatalf("insert record: %v", err)
+	}
+	ticket := LedgerClearTicket{
+		TokenHash: "clear-59-" + fmt.Sprint(suffix), ChatID: chatID, RequestedByUserID: requesterID,
+		DayKey: dayKey, ActivePeriodStartedAt: group.ActivePeriodStartedAt,
+		ExpiresAt: now.Add(60 * time.Second), CreatedAt: now,
+	}
+	if err := storeA.CreateLedgerClearTicket(ctx, ticket); err != nil {
+		t.Fatalf("create ticket: %v", err)
+	}
+	if got, err := storeA.ConsumeLedgerClearTicketAndDelete(ctx, ticket.TokenHash, chatID, otherUserID, now.Add(10*time.Second)); err != nil || got.Status != LedgerClearTicketWrongUser {
+		t.Fatalf("other user result = %+v, %v", got, err)
+	}
+	if record, ok, err := storeA.GetRecord(ctx, recordID); err != nil || !ok || record.DeletedAt != nil {
+		t.Fatalf("other user changed record = %+v, ok=%t err=%v", record, ok, err)
+	}
+	if got, err := storeB.ConsumeLedgerClearTicketAndDelete(ctx, ticket.TokenHash, chatID, requesterID, now.Add(59*time.Second)); err != nil || got.Status != LedgerClearTicketApplied || got.DeletedCount != 1 {
+		t.Fatalf("second instance 59s result = %+v, %v", got, err)
+	}
+	if got, err := storeA.ConsumeLedgerClearTicketAndDelete(ctx, ticket.TokenHash, chatID, requesterID, now.Add(59*time.Second)); err != nil || got.Status != LedgerClearTicketConsumed {
+		t.Fatalf("repeat result = %+v, %v", got, err)
+	}
+
+	expired := ticket
+	expired.TokenHash = "clear-61-" + fmt.Sprint(suffix)
+	if err := storeA.CreateLedgerClearTicket(ctx, expired); err != nil {
+		t.Fatalf("create expiring ticket: %v", err)
+	}
+	if got, err := storeA.ConsumeLedgerClearTicketAndDelete(ctx, expired.TokenHash, chatID, requesterID, now.Add(61*time.Second)); err != nil || got.Status != LedgerClearTicketExpired {
+		t.Fatalf("61s result = %+v, %v", got, err)
+	}
+
+	oldPeriod := ticket
+	oldPeriod.TokenHash = "clear-period-" + fmt.Sprint(suffix)
+	if err := storeA.CreateLedgerClearTicket(ctx, oldPeriod); err != nil {
+		t.Fatalf("create old-period ticket: %v", err)
+	}
+	if err := storeA.SetGroupActivePeriod(ctx, chatID, false, "", "", now.Add(2*time.Minute)); err != nil {
+		t.Fatalf("stop period: %v", err)
+	}
+	if err := storeA.SetGroupActivePeriod(ctx, chatID, true, dayKey, dayKey, now.Add(2*time.Minute+time.Second)); err != nil {
+		t.Fatalf("restart period: %v", err)
+	}
+	if got, err := storeB.ConsumeLedgerClearTicketAndDelete(ctx, oldPeriod.TokenHash, chatID, requesterID, now.Add(30*time.Second)); err != nil || got.Status != LedgerClearTicketPeriodChanged {
+		t.Fatalf("old period result = %+v, %v", got, err)
+	}
+}
+
+func TestPostgresBroadcastGroupRenameDeleteKeepsPermissionsConsistent(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	store, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+	now := time.Now().UTC()
+	suffix := now.UnixNano()
+	chatID := int64(-920000000000 - suffix%1000000)
+	userID := int64(720000000000 + suffix%1000000)
+	oldName := fmt.Sprintf("integration-old-%d", suffix)
+	newName := fmt.Sprintf("integration-new-%d", suffix)
+	if err := store.EnsureGroup(ctx, chatID, "permission group", now); err != nil {
+		t.Fatalf("ensure group: %v", err)
+	}
+	if err := store.UpsertGlobalOperator(ctx, userID, "primary", 0, userID+100, "integration", now); err != nil {
+		t.Fatalf("upsert operator: %v", err)
+	}
+	if err := store.UpsertBroadcastGroup(ctx, oldName, userID, now); err != nil {
+		t.Fatalf("upsert broadcast group: %v", err)
+	}
+	if _, err := store.AddChatsToBroadcastGroup(ctx, oldName, []int64{chatID}, now); err != nil {
+		t.Fatalf("add group chat: %v", err)
+	}
+	if err := store.AddBroadcastPermission(ctx, userID, "group", 0, oldName, userID+100, now); err != nil {
+		t.Fatalf("add permission: %v", err)
+	}
+	if renamed, affected, err := store.RenameBroadcastGroup(ctx, oldName, newName, userID+100, now.Add(time.Second)); err != nil || !renamed || len(affected) != 1 || affected[0] != userID {
+		t.Fatalf("rename = %t affected=%v err=%v", renamed, affected, err)
+	}
+	permissions, err := store.ListBroadcastPermissions(ctx)
+	if err != nil {
+		t.Fatalf("list permissions: %v", err)
+	}
+	foundNew := false
+	for _, permission := range permissions {
+		if permission.UserID == userID && permission.Target == "group" {
+			if permission.GroupName == oldName {
+				t.Fatalf("old group permission remains: %+v", permission)
+			}
+			if permission.GroupName == newName {
+				foundNew = true
+			}
+		}
+	}
+	if !foundNew {
+		t.Fatal("renamed permission was not migrated")
+	}
+	if deleted, affected, err := store.DeleteBroadcastGroupManaged(ctx, newName, userID+100, now.Add(2*time.Second)); err != nil || !deleted || len(affected) != 1 || affected[0] != userID {
+		t.Fatalf("delete = %t affected=%v err=%v", deleted, affected, err)
+	}
+	permissions, err = store.ListBroadcastPermissions(ctx)
+	if err != nil {
+		t.Fatalf("list permissions after delete: %v", err)
+	}
+	for _, permission := range permissions {
+		if permission.UserID == userID && permission.Target == "group" && permission.GroupName == newName {
+			t.Fatalf("deleted group permission remains: %+v", permission)
+		}
+	}
+	oldDeliveryID, err := store.InsertBroadcastDelivery(ctx, BroadcastDelivery{
+		OperatorUserID: userID, SourceChatID: userID, SourceMessageID: 1,
+		TargetChatID: chatID, TargetTitle: "permission group", TargetMessageID: suffix%1000000 + 100,
+		Mode: "chat", TargetName: "permission group", CreatedAt: now.Add(-169 * time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("insert old delivery: %v", err)
+	}
+	recentDeliveryID, err := store.InsertBroadcastDelivery(ctx, BroadcastDelivery{
+		OperatorUserID: userID, SourceChatID: userID, SourceMessageID: 2,
+		TargetChatID: chatID, TargetTitle: "permission group", TargetMessageID: suffix%1000000 + 101,
+		Mode: "chat", TargetName: "permission group", CreatedAt: now.Add(-167 * time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("insert recent delivery: %v", err)
+	}
+	if deleted, err := store.CleanupBroadcastDeliveries(ctx, now.Add(-168*time.Hour)); err != nil || deleted < 1 {
+		t.Fatalf("cleanup deliveries deleted=%d err=%v", deleted, err)
+	}
+	if _, ok, err := store.GetBroadcastDelivery(ctx, oldDeliveryID); err != nil || ok {
+		t.Fatalf("old delivery remains ok=%t err=%v", ok, err)
+	}
+	if _, ok, err := store.GetBroadcastDelivery(ctx, recentDeliveryID); err != nil || !ok {
+		t.Fatalf("valid delivery was removed ok=%t err=%v", ok, err)
+	}
+}
+
+func TestPostgresPrivateCleanupScopeAndReschedule(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	store, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	userID := int64(730000000000 + now.UnixNano()%1000000)
+	if err := store.EnsurePrivateCleanupCarrier(ctx, userID, userID, "cleanup integration", now); err != nil {
+		t.Fatalf("ensure carrier: %v", err)
+	}
+	if saved, err := store.SetBroadcastOperatorPrivateCleanupSettings(ctx, userID, PrivateCleanupSettings{
+		Enabled: true, BotDeleteAfter: 300, Scope: DefaultPrivateCleanupScope(),
+	}, now); err != nil || !saved {
+		t.Fatalf("save initial settings=%t err=%v", saved, err)
+	}
+	for i, category := range []string{"broadcast", "menu"} {
+		dueAt := now.Add(300 * time.Second)
+		if err := store.RecordPrivateChatMessage(ctx, PrivateChatMessage{
+			OperatorUserID: userID, ChatID: userID, MessageID: int64(95000 + i),
+			Direction: "outgoing", Category: category, CleanupAfterSeconds: 300,
+			DueAt: &dueAt, CreatedAt: now,
+		}); err != nil {
+			t.Fatalf("record %s message: %v", category, err)
+		}
+	}
+	if saved, err := store.SetBroadcastOperatorPrivateCleanupSettings(ctx, userID, PrivateCleanupSettings{
+		Enabled: true, BotDeleteAfter: 60, Scope: "broadcast",
+	}, now.Add(10*time.Second)); err != nil || !saved {
+		t.Fatalf("save narrowed settings=%t err=%v", saved, err)
+	}
+	var broadcastDue time.Time
+	var menuDeleted *time.Time
+	if err := store.pool.QueryRow(ctx, `SELECT due_at FROM private_chat_messages WHERE chat_id=$1 AND message_id=95000`, userID).Scan(&broadcastDue); err != nil {
+		t.Fatalf("read broadcast due: %v", err)
+	}
+	if !broadcastDue.Equal(now.Add(60 * time.Second)) {
+		t.Fatalf("broadcast due = %v, want %v", broadcastDue, now.Add(60*time.Second))
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT deleted_at FROM private_chat_messages WHERE chat_id=$1 AND message_id=95001`, userID).Scan(&menuDeleted); err != nil {
+		t.Fatalf("read menu deleted: %v", err)
+	}
+	if menuDeleted == nil {
+		t.Fatal("excluded menu message should be closed instead of retried")
+	}
+}
+
 func TestPostgresStoreBasicFlow(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {

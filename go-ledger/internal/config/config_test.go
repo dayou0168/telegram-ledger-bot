@@ -149,6 +149,7 @@ func TestLoadOutboxRetentionDefaultsAndEnv(t *testing.T) {
 	t.Setenv("BOT_OUTBOX_SENT_RETENTION_HOURS", "")
 	t.Setenv("BOT_OUTBOX_FAILED_RETENTION_HOURS", "")
 	t.Setenv("BOT_OUTBOX_STATS_WINDOW_HOURS", "")
+	t.Setenv("BOT_BROADCAST_DELIVERY_RETENTION_HOURS", "")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
@@ -162,10 +163,14 @@ func TestLoadOutboxRetentionDefaultsAndEnv(t *testing.T) {
 	if got := cfg.OutboxStatsWindow.Hours(); got != 72 {
 		t.Fatalf("OutboxStatsWindow = %.0f hours, want 72", got)
 	}
+	if got := cfg.BroadcastDeliveryRetention.Hours(); got != 168 {
+		t.Fatalf("BroadcastDeliveryRetention = %.0f hours, want 168", got)
+	}
 
 	t.Setenv("BOT_OUTBOX_SENT_RETENTION_HOURS", "24")
 	t.Setenv("BOT_OUTBOX_FAILED_RETENTION_HOURS", "168")
 	t.Setenv("BOT_OUTBOX_STATS_WINDOW_HOURS", "12")
+	t.Setenv("BOT_BROADCAST_DELIVERY_RETENTION_HOURS", "240")
 	cfg, err = Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
@@ -178,5 +183,8 @@ func TestLoadOutboxRetentionDefaultsAndEnv(t *testing.T) {
 	}
 	if got := cfg.OutboxStatsWindow.Hours(); got != 12 {
 		t.Fatalf("OutboxStatsWindow env = %.0f hours, want 12", got)
+	}
+	if got := cfg.BroadcastDeliveryRetention.Hours(); got != 240 {
+		t.Fatalf("BroadcastDeliveryRetention env = %.0f hours, want 240", got)
 	}
 }

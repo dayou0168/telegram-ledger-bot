@@ -3,6 +3,7 @@ package adminweb
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -419,7 +420,8 @@ func TestAdminTemplateRendersReadableBroadcastManagement(t *testing.T) {
 			{ChatID: -1001, Title: "出款群", UpdatedAt: time.Date(2026, 7, 6, 14, 24, 0, 0, time.UTC)},
 			{ChatID: -1002, Title: "扫码群引导", UpdatedAt: time.Date(2026, 7, 6, 14, 24, 0, 0, time.UTC)},
 		},
-		BGroups: []storage.BroadcastGroup{{Name: "出款", ChatIDs: []int64{-1001}, ChatNames: []string{"出款群"}}},
+		BGroups:              []storage.BroadcastGroup{{Name: "出款", ChatIDs: []int64{-1001}, ChatNames: []string{"出款群"}}},
+		BroadcastMemberships: []storage.BroadcastGroup{{Name: "出款", ChatIDs: []int64{-1001}, ChatNames: []string{"出款群"}}},
 		BOperators: []storage.GlobalOperator{{
 			UserID:                              7611260151,
 			Level:                               "primary",
@@ -448,6 +450,11 @@ func TestAdminTemplateRendersReadableBroadcastManagement(t *testing.T) {
 			Target:    "chat",
 			ChatID:    -1002,
 			GrantedBy: 0,
+		}},
+		PermissionFilterData: []storage.BroadcastPermission{{
+			UserID: 7611260151, Target: "group", GroupName: "出款",
+		}, {
+			UserID: 7611260151, Target: "chat", ChatID: -1002,
 		}},
 		ChatNames: map[int64]string{-1001: "出款群", -1002: "扫码群引导"},
 		WatchTargets: []storage.WatchTarget{{
@@ -622,6 +629,31 @@ func TestOutboxStatusRejectsOperator(t *testing.T) {
 	s.outboxStatus(rec, req)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusForbidden)
+	}
+}
+
+func TestAdminListPaginationAndSearch(t *testing.T) {
+	groups := make([]storage.Group, 0, 125)
+	for i := 0; i < 125; i++ {
+		groups = append(groups, storage.Group{ChatID: int64(-100000 - i), Title: fmt.Sprintf("结算群 %03d", i)})
+	}
+	page, pager := pageAdminGroups(groups, adminListFilters{GroupPage: 2})
+	if len(page) != adminListPageSize || pager.ItemFrom != 51 || pager.ItemTo != 100 || !pager.HasPrev || !pager.HasNext {
+		t.Fatalf("page 2 = len %d pager %+v", len(page), pager)
+	}
+	page, pager = pageAdminGroups(groups, adminListFilters{GroupQuery: "结算群 124", GroupPage: 99})
+	if len(page) != 1 || page[0].Title != "结算群 124" || pager.Page != 1 || pager.Total != 1 {
+		t.Fatalf("searched page = %+v pager %+v", page, pager)
+	}
+}
+
+func TestAdminListURLPreservesIndependentFilters(t *testing.T) {
+	filters := adminListFilters{GroupQuery: "财务", GroupPage: 2, BroadcastQuery: "夜班", BroadcastPage: 3}
+	got := adminListURL(filters, "groups", 3)
+	for _, want := range []string{"groups_q=%E8%B4%A2%E5%8A%A1", "groups_page=3", "broadcast_q=%E5%A4%9C%E7%8F%AD", "broadcast_page=3"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("pagination URL %q missing %q", got, want)
+		}
 	}
 }
 

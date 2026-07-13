@@ -61,10 +61,22 @@ func (b *Bot) cleanupNotificationOutbox(ctx context.Context) {
 	stats, err := b.store.CleanupNotificationOutbox(ctx, now.Add(-sentRetention), now.Add(-failedRetention))
 	if err != nil {
 		log.Printf("cleanup notification outbox: %v", err)
-		return
-	}
-	if stats.SentDeleted > 0 || stats.FailedDeleted > 0 {
+	} else if stats.SentDeleted > 0 || stats.FailedDeleted > 0 {
 		log.Printf("cleanup notification outbox: sent=%d failed=%d", stats.SentDeleted, stats.FailedDeleted)
+	}
+	deliveryRetention := b.cfg.BroadcastDeliveryRetention
+	if deliveryRetention <= 0 {
+		deliveryRetention = 168 * time.Hour
+	}
+	if deleted, err := b.store.CleanupBroadcastDeliveries(ctx, now.Add(-deliveryRetention)); err != nil {
+		log.Printf("cleanup broadcast deliveries: %v", err)
+	} else if deleted > 0 {
+		log.Printf("cleanup broadcast deliveries: deleted=%d", deleted)
+	}
+	if deleted, err := b.store.CleanupLedgerClearTickets(ctx, now.Add(-24*time.Hour)); err != nil {
+		log.Printf("cleanup ledger clear tickets: %v", err)
+	} else if deleted > 0 {
+		log.Printf("cleanup ledger clear tickets: deleted=%d", deleted)
 	}
 }
 
@@ -108,7 +120,7 @@ func (b *Bot) sendOutboxNotification(ctx context.Context, item storage.Notificat
 		return
 	}
 	priority := outboxSendPriority(item.Priority)
-	message, err, sendMetrics := b.sendOutboxText(ctx, priority, item.ChatID, text, opts)
+	message, err, sendMetrics := b.sendOutboxText(ctx, priority, item.Kind, item.ChatID, text, opts)
 	if item.Kind == "chain" {
 		logChainOutboxSendTiming(item, priority, renderDuration, sendMetrics, err)
 	}
@@ -125,7 +137,7 @@ func (b *Bot) sendOutboxNotification(ctx context.Context, item storage.Notificat
 	}
 }
 
-func (b *Bot) sendOutboxText(ctx context.Context, priority sendPriority, chatID int64, text string, opts map[string]any) (telegram.Message, error, telegramSendMetrics) {
+func (b *Bot) sendOutboxText(ctx context.Context, priority sendPriority, kind string, chatID int64, text string, opts map[string]any) (telegram.Message, error, telegramSendMetrics) {
 	done := measurePerfStage(ctx, "send_enqueue")
 	defer done()
 	var msg telegram.Message
@@ -137,7 +149,7 @@ func (b *Bot) sendOutboxText(ctx context.Context, priority sendPriority, chatID 
 		err = errTelegramSendGatewayNotConfigured
 	}
 	if err == nil {
-		b.recordOutgoingPrivateChatMessage(ctx, msg, "outgoing")
+		b.recordOutgoingPrivateChatMessageCategory(ctx, msg, "outgoing", privateCleanupCategoryForKind(kind))
 	}
 	return msg, err, metrics
 }

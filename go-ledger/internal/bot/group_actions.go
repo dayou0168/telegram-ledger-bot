@@ -55,12 +55,14 @@ func (b *Bot) handleNotifyAll(ctx context.Context, msg telegram.Message, user st
 	} else if !ok {
 		return b.enqueueReplyText(ctx, sendPriorityNormal, "notify_all_denied", msg.Chat.ID, msg.MessageID, "没有通知所有人权限。", nil, time.Now().In(b.loc))
 	}
-	b.notifyAllInChatAsync(ctx, msg.Chat.ID, msg.MessageID)
-	return nil
+	if b.notifyAllInChatAsync(ctx, msg.Chat.ID, msg.MessageID) {
+		return nil
+	}
+	return b.enqueueReplyText(ctx, sendPriorityLow, "notify_all_queue_full", msg.Chat.ID, msg.MessageID, "通知所有人未发送：发送队列繁忙，请稍后重试。", nil, time.Now().In(b.loc))
 }
 
-func (b *Bot) notifyAllInChatAsync(ctx context.Context, chatID, replyTo int64) {
-	b.notifyPool.Submit(func(jobCtx context.Context) {
+func (b *Bot) notifyAllInChatAsync(ctx context.Context, chatID, replyTo int64) bool {
+	return b.notifyPool.Submit(func(jobCtx context.Context) {
 		users, err := b.store.ListUsersForMention(jobCtx, chatID, 500)
 		if err != nil {
 			log.Printf("list users for mention: %v", err)

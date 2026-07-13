@@ -113,6 +113,11 @@ type ReplyKeyboardMarkup struct {
 	OneTimeKeyboard bool               `json:"one_time_keyboard"`
 }
 
+type ReplyKeyboardRemove struct {
+	RemoveKeyboard bool `json:"remove_keyboard"`
+	Selective      bool `json:"selective,omitempty"`
+}
+
 type KeyboardButton struct {
 	Text         string                      `json:"text"`
 	RequestUsers *KeyboardButtonRequestUsers `json:"request_users,omitempty"`

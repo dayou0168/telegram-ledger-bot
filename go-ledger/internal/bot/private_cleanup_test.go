@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -32,5 +33,22 @@ func TestPrivateCleanupMessageSchedule(t *testing.T) {
 	}, storage.PrivateCleanupSettings{})
 	if seconds != 0 || dueAt != nil {
 		t.Fatalf("message without delay should wait for daily cleanup only: seconds=%d dueAt=%v", seconds, dueAt)
+	}
+}
+
+func TestPrivateCleanupScopeCategories(t *testing.T) {
+	for kind, want := range map[string]string{
+		"broadcast_menu":         "broadcast",
+		"broadcast_result":       "broadcast",
+		"broadcast_reply_notice": "quick_reply",
+		"quick_reply_failed":     "quick_reply",
+		"private_menu":           "menu",
+	} {
+		if got := privateCleanupCategoryForKind(kind); got != want {
+			t.Errorf("category %q = %q, want %q", kind, got, want)
+		}
+	}
+	if got := privateCleanupCategoryFromContext(withPrivateCleanupCategory(context.Background(), "quick_reply")); got != "quick_reply" {
+		t.Fatalf("context category = %q", got)
 	}
 }

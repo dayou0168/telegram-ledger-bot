@@ -108,6 +108,7 @@ BOT_BROADCAST_THREADS=4
 BOT_QUERY_THREADS=4
 BOT_NOTIFICATION_THREADS=6
 BOT_QUEUE_SIZE=4096
+BOT_BROADCAST_DELIVERY_RETENTION_HOURS=168
 ```
 
 这些值是最大并发上限，不是长期占用。Go 版功能池会按队列压力自动扩容，空闲 30 秒自动缩回；少量群活跃时，空闲资源会用于异步回执、缓存预热、链上索引和账单摘要预计算，而不是让账本队列等待慢 HTTP。

@@ -17,3 +17,19 @@ func TestPrivateChatMessageDoesNotStoreContent(t *testing.T) {
 		}
 	}
 }
+
+func TestPrivateCleanupScopesAreCanonicalAndExtensible(t *testing.T) {
+	settings := NormalizePrivateCleanupSettings(PrivateCleanupSettings{
+		Enabled: true,
+		Scope:   "menu,broadcast,menu,unknown",
+	})
+	if settings.Scope != "broadcast,menu" {
+		t.Fatalf("normalized scope = %q", settings.Scope)
+	}
+	if !PrivateCleanupScopeIncludes(settings.Scope, "broadcast") || !PrivateCleanupScopeIncludes(settings.Scope, "menu") {
+		t.Fatal("selected scopes should be enabled")
+	}
+	if PrivateCleanupScopeIncludes(settings.Scope, "quick_reply") || PrivateCleanupScopeIncludes(settings.Scope, "private") {
+		t.Fatal("unselected or legacy categories should not be enabled")
+	}
+}

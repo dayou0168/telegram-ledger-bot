@@ -19,7 +19,7 @@ func (b *Bot) notifyBroadcastReplyAsync(ctx context.Context, msg telegram.Messag
 	}
 	chatID := msg.Chat.ID
 	replyMessageID := msg.ReplyTo.MessageID
-	b.notifyPool.Submit(func(jobCtx context.Context) {
+	job := func(jobCtx context.Context) {
 		delivery, ok, err := b.store.FindBroadcastDeliveryByTarget(jobCtx, chatID, replyMessageID)
 		if err != nil {
 			log.Printf("find broadcast delivery: %v", err)
@@ -28,13 +28,11 @@ func (b *Bot) notifyBroadcastReplyAsync(ctx context.Context, msg telegram.Messag
 		if !ok || delivery.OperatorUserID == 0 {
 			return
 		}
-		b.tryReplaceBroadcastDelivery(jobCtx, delivery)
+		delivery = b.tryReplaceBroadcastDelivery(jobCtx, delivery)
 		text := formatBroadcastReplyNotice(msg, user, delivery)
-		keyboard := telegram.InlineKeyboardMarkup{InlineKeyboard: [][]telegram.InlineKeyboardButton{
-			{{Text: "快速回复", CallbackData: "br:q:" + formatID(delivery.ID)}},
-			replyLinkButtons(msg, delivery),
-		}}
+		operatorCanReply := b.canQuickReplyDelivery(jobCtx, delivery.OperatorUserID, delivery)
 		for recipient := range b.broadcastReplyRecipients(delivery.OperatorUserID) {
+			keyboard := broadcastReplyKeyboard(msg, delivery, recipient == delivery.OperatorUserID && operatorCanReply)
 			if err := b.enqueueReliableText(jobCtx, sendPriorityNormal, "broadcast_reply_notice", fmt.Sprintf("broadcast_reply_notice:%d:%d:%d", recipient, chatID, msg.MessageID), recipient, text, map[string]any{
 				"parse_mode":   "HTML",
 				"reply_markup": keyboard,
@@ -42,10 +40,14 @@ func (b *Bot) notifyBroadcastReplyAsync(ctx context.Context, msg telegram.Messag
 				log.Printf("enqueue broadcast reply notice: %v", err)
 			}
 		}
-	})
+	}
+	if !b.notifyPool.Submit(job) {
+		job(ctx)
+	}
 }
 
 func (b *Bot) handleBroadcastReplyCallback(ctx context.Context, cb telegram.CallbackQuery) error {
+	ctx = withPrivateCleanupCategory(ctx, "quick_reply")
 	if !strings.HasPrefix(cb.Data, "br:q:") {
 		return b.tg.AnswerCallback(ctx, cb.ID, "")
 	}
@@ -57,7 +59,7 @@ func (b *Bot) handleBroadcastReplyCallback(ctx context.Context, cb telegram.Call
 	if err != nil {
 		return err
 	}
-	if !ok || delivery.OperatorUserID != cb.From.ID {
+	if !ok || !b.canQuickReplyDelivery(ctx, cb.From.ID, delivery) {
 		return b.tg.AnswerCallback(ctx, cb.ID, "通知已失效")
 	}
 	quickState := privateState{
@@ -87,6 +89,7 @@ func (b *Bot) handleBroadcastReplyCallback(ctx context.Context, cb telegram.Call
 }
 
 func (b *Bot) handleQuickReplyMaterial(ctx context.Context, msg telegram.Message, user storage.User, state privateState) error {
+	ctx = withPrivateCleanupCategory(ctx, "quick_reply")
 	if isQuickReplyStatusText(msg.Text) {
 		b.deleteMessageBestEffort(ctx, msg.Chat.ID, msg.MessageID)
 		return nil
@@ -100,17 +103,47 @@ func (b *Bot) handleQuickReplyMaterial(ctx context.Context, msg telegram.Message
 		b.privateStates.Delete(formatID(user.ID))
 		return b.enqueueReplyText(ctx, sendPriorityNormal, "quick_reply_lost", msg.Chat.ID, msg.MessageID, "快速回复目标已失效，请重新点回复通知。", nil, time.Now().In(b.loc))
 	}
-	b.notifyPool.Submit(func(sendCtx context.Context) {
+	job := func(sendCtx context.Context) {
 		if _, err := b.copyMessage(sendCtx, targetChatID, msg.Chat.ID, msg.MessageID, map[string]any{"reply_to_message_id": replyTo}); err != nil {
 			log.Printf("send quick reply: %v", err)
 			_ = b.enqueueReplyText(sendCtx, sendPriorityNormal, "quick_reply_failed", msg.Chat.ID, msg.MessageID, "快速回复发送失败："+err.Error(), nil, time.Now().In(b.loc))
 			return
 		}
-	})
+	}
+	if !b.notifyPool.Submit(job) {
+		return b.enqueueReplyText(ctx, sendPriorityNormal, "quick_reply_queue_full", msg.Chat.ID, msg.MessageID, "快速回复发送失败：发送队列繁忙，请稍后重试。", nil, time.Now().In(b.loc))
+	}
 	return nil
 }
 
+func (b *Bot) canQuickReplyDelivery(ctx context.Context, userID int64, delivery storage.BroadcastDelivery) bool {
+	if userID <= 0 || delivery.OperatorUserID != userID || !b.canUseBroadcast(ctx, userID) {
+		return false
+	}
+	allowed, err := b.store.ListAllowedBroadcastChats(ctx, userID, b.perms.HasGlobalBroadcastAccess(userID))
+	if err != nil {
+		log.Printf("check quick reply target permission %d: %v", userID, err)
+		return false
+	}
+	for _, group := range allowed {
+		if group.ChatID == delivery.TargetChatID {
+			return true
+		}
+	}
+	return false
+}
+
+func broadcastReplyKeyboard(msg telegram.Message, delivery storage.BroadcastDelivery, quickReply bool) telegram.InlineKeyboardMarkup {
+	rows := make([][]telegram.InlineKeyboardButton, 0, 2)
+	if quickReply {
+		rows = append(rows, []telegram.InlineKeyboardButton{{Text: "快速回复", CallbackData: "br:q:" + formatID(delivery.ID)}})
+	}
+	rows = append(rows, replyLinkButtons(msg, delivery))
+	return telegram.InlineKeyboardMarkup{InlineKeyboard: rows}
+}
+
 func (b *Bot) exitQuickReply(ctx context.Context, msg telegram.Message, user storage.User, state privateState) error {
+	ctx = withPrivateCleanupCategory(ctx, "quick_reply")
 	b.deleteMessageBestEffort(ctx, msg.Chat.ID, msg.MessageID)
 	if restored, ok := quickReplyReturnState(state); ok {
 		b.privateStates.Set(formatID(user.ID), restored)
