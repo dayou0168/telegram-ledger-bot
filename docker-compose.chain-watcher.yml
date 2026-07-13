@@ -1,4 +1,4 @@
-# v2.4.3 watcher 发布候选模板；仅在显式发布 workflow 成功后用于生产升级。
+# v2.4.4 watcher 发布候选模板；仅在显式发布 workflow 成功后用于生产升级。
 #
 # 宝塔多机器人部署：
 # 1. 先创建外部网络：docker network create ledger-chain-net
@@ -6,7 +6,7 @@
 # 3. 本 Compose 项目包含两个服务/两个容器：chain-postgres 和 ledger-chain-watcher。
 #    不建议把 PostgreSQL 和 watcher 放进同一个容器，分容器更利于数据卷持久化、
 #    升级、备份、健康检查和故障隔离；宝塔里仍然是一套项目，可一起启动/停止。
-# 4. 每个 Go v2.4.3 机器人实例加入 ledger-chain-net。
+# 4. 每个 Go v2.4.4 机器人实例加入 ledger-chain-net。
 # 5. 机器人使用 CHAIN_WATCHER_URL=http://ledger-chain-watcher:8090、
 #    CHAIN_WATCHER_BOT_ID 和 CHAIN_WATCHER_SECRET 接入。
 # 6. 默认使用 Docker json-file 日志上限 max-size=20m/max-file=5，单容器约 100MB。
@@ -36,7 +36,7 @@ services:
       retries: 10
 
   ledger-chain-watcher:
-    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.3
+    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.4
     container_name: ledger-chain-watcher
     restart: unless-stopped
     logging:
