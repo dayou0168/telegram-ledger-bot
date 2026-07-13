@@ -59,6 +59,8 @@ type Bot struct {
 	fallbackNextPoll      atomic.Int64
 	fallbackBackoff       atomic.Int32
 	fallbackExpandRunning atomic.Bool
+	globalOperatorLookup  func(context.Context, int64) (permissions.UserCapabilities, bool, error)
+	groupOperatorLookup   func(context.Context, int64, int64) (bool, error)
 }
 
 func New(cfg config.Config, store *storage.Store, tg *telegram.Client, tronClient *tron.Client, p2pClient *p2p.Client, fallbackStores ...*storage.Store) *Bot {
@@ -632,16 +634,14 @@ func (b *Bot) canInvite(ctx context.Context, userID int64) (bool, error) {
 	if b.perms.CanInviteBot(userID, permissions.UserCapabilities{}) {
 		return true, nil
 	}
-	level, ok, err := b.store.GetGlobalOperatorLevel(ctx, userID)
+	caps, ok, err := b.globalOperatorCapabilities(ctx, userID)
 	if err != nil {
 		return false, err
 	}
 	if !ok {
 		return false, nil
 	}
-	return b.perms.CanInviteBot(userID, permissions.UserCapabilities{
-		GlobalOperatorLevel: level,
-	}), nil
+	return b.perms.CanInviteBot(userID, caps), nil
 }
 
 func (b *Bot) isHost(userID int64) bool {

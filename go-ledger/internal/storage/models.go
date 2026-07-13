@@ -9,25 +9,26 @@ type User struct {
 }
 
 type Group struct {
-	ChatID              int64
-	Title               string
-	Active              bool
-	ActiveDayKey        string
-	ActiveExpiresDayKey string
-	BusinessOpen        bool
-	OwnerUserID         int64
-	DepositRate         string
-	PayoutRate          string
-	DepositExchangeRate string
-	PayoutExchangeRate  string
-	ExchangeRateSource  string
-	ExchangeRateRank    int
-	ExchangeRateOffset  string
-	FeeRate             string
-	CutoffHour          int
-	AllMembersCanRecord bool
-	CreatedAt           time.Time
-	UpdatedAt           time.Time
+	ChatID                int64
+	Title                 string
+	Active                bool
+	ActiveDayKey          string
+	ActiveExpiresDayKey   string
+	ActivePeriodStartedAt time.Time
+	BusinessOpen          bool
+	OwnerUserID           int64
+	DepositRate           string
+	PayoutRate            string
+	DepositExchangeRate   string
+	PayoutExchangeRate    string
+	ExchangeRateSource    string
+	ExchangeRateRank      int
+	ExchangeRateOffset    string
+	FeeRate               string
+	CutoffHour            int
+	AllMembersCanRecord   bool
+	CreatedAt             time.Time
+	UpdatedAt             time.Time
 }
 
 type BroadcastGroup struct {
@@ -37,22 +38,6 @@ type BroadcastGroup struct {
 	CreatedBy int64
 	CreatedAt time.Time
 	UpdatedAt time.Time
-}
-
-type BroadcastOperator struct {
-	UserID                              int64
-	Status                              string
-	Remark                              string
-	CreatedBy                           int64
-	PrivateCleanupEnabled               bool
-	PrivateCleanupTime                  string
-	PrivateCleanupLastRunDate           string
-	PrivateCleanupBotDeleteAfterSeconds int
-	PrivateCleanupIncomingEnabled       bool
-	PrivateCleanupIncomingAfterSeconds  int
-	PrivateCleanupScope                 string
-	CreatedAt                           time.Time
-	UpdatedAt                           time.Time
 }
 
 type GlobalOperator struct {
@@ -73,6 +58,20 @@ type GlobalOperator struct {
 	PrivateCleanupIncomingAfterSeconds  int
 	PrivateCleanupScope                 string
 	UpdatedAt                           time.Time
+}
+
+type PermissionAuditEvent struct {
+	ID            int64
+	ActorUserID   int64
+	SubjectType   string
+	SubjectUserID int64
+	Action        string
+	Level         string
+	ParentUserID  int64
+	TargetType    string
+	ChatID        int64
+	GroupName     string
+	CreatedAt     time.Time
 }
 
 type BroadcastPermission struct {

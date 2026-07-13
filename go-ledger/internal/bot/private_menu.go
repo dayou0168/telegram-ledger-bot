@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/adminauth"
-	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/permissions"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/telegram"
 )
@@ -96,11 +95,11 @@ func (b *Bot) adminRoleForUser(ctx context.Context, userID int64) (string, bool,
 	if b.perms.IsDefaultOperator(userID) {
 		return adminauth.RoleDefaultOperator, true, nil
 	}
-	level, ok, err := b.store.GetGlobalOperatorLevel(ctx, userID)
+	caps, ok, err := b.globalOperatorCapabilities(ctx, userID)
 	if err != nil {
 		return "", false, err
 	}
-	if b.perms.CanUsePrivateGlobalFeatures(userID, permissions.UserCapabilities{GlobalOperatorLevel: level}) && ok {
+	if ok && b.perms.CanUsePrivateGlobalFeatures(userID, caps) {
 		return adminauth.RoleOperator, true, nil
 	}
 	return "", false, nil

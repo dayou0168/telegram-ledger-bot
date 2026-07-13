@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/permissions"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/telegram"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/tron"
@@ -20,18 +19,12 @@ func (b *Bot) hasUnlimitedAddressWatch(ctx context.Context, userID int64) bool {
 	if b.perms.HasGlobalAddressWatchAccess(userID) {
 		return true
 	}
-	key := addressWatchPrivilegeCacheKey(userID)
-	if value, ok := b.operatorCache.Get(key); ok {
-		return value
-	}
-	level, ok, err := b.store.GetGlobalOperatorLevel(ctx, userID)
+	caps, ok, err := b.globalOperatorCapabilities(ctx, userID)
 	if err != nil {
 		log.Printf("check address watch global operator %d: %v", userID, err)
 		return false
 	}
-	value := ok && b.perms.CanUsePrivateGlobalFeatures(userID, permissions.UserCapabilities{GlobalOperatorLevel: level})
-	b.operatorCache.Set(key, value)
-	return value
+	return ok && b.perms.CanUsePrivateGlobalFeatures(userID, caps)
 }
 
 func (b *Bot) sendAddressWatchMenu(ctx context.Context, chatID, ownerID, replyTo int64) error {

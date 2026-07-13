@@ -108,13 +108,14 @@ func TestBillHistoryTriggerUsesButtonFont(t *testing.T) {
 }
 
 func TestAdminGlobalManagementIsHostOnly(t *testing.T) {
-	if !adminCanManageGlobal(adminauth.Session{UserID: 1001, Role: adminauth.RoleHost}) {
+	s := New(config.Config{HostUserID: 1001, DefaultOperatorIDs: map[int64]struct{}{2002: {}}}, nil)
+	if !s.adminCanManageGlobal(adminauth.Session{UserID: 1001, Role: adminauth.RoleHost}) {
 		t.Fatal("host should manage global admin modules")
 	}
-	if adminCanManageGlobal(adminauth.Session{UserID: 2002, Role: adminauth.RoleDefaultOperator}) {
+	if s.adminCanManageGlobal(adminauth.Session{UserID: 2002, Role: adminauth.RoleDefaultOperator}) {
 		t.Fatal("default operator should not receive global backend management")
 	}
-	if adminCanManageGlobal(adminauth.Session{UserID: 3003, Role: adminauth.RoleOperator}) {
+	if s.adminCanManageGlobal(adminauth.Session{UserID: 3003, Role: adminauth.RoleOperator}) {
 		t.Fatal("operator should not receive global backend management")
 	}
 }
@@ -209,11 +210,16 @@ func TestParseBroadcastPermissionFormValidatesInput(t *testing.T) {
 
 type testPermissionInvalidator struct {
 	broadcastUserID int64
+	allPermissions  bool
 	watchTargets    bool
 }
 
 func (i *testPermissionInvalidator) InvalidateBroadcastPermission(userID int64) {
 	i.broadcastUserID = userID
+}
+
+func (i *testPermissionInvalidator) InvalidateAllPermissionCaches() {
+	i.allPermissions = true
 }
 
 func (i *testPermissionInvalidator) InvalidateWatchTargets() {
@@ -225,10 +231,14 @@ func TestServerPermissionInvalidatorHooks(t *testing.T) {
 	s := New(config.Config{}, nil, invalidator)
 
 	s.invalidateBroadcastPermission(2002)
+	s.invalidateAllPermissionCaches()
 	s.invalidateWatchTargets()
 
 	if invalidator.broadcastUserID != 2002 {
 		t.Fatalf("broadcast invalidation user = %d, want 2002", invalidator.broadcastUserID)
+	}
+	if !invalidator.allPermissions {
+		t.Fatal("all permission caches invalidation hook was not called")
 	}
 	if !invalidator.watchTargets {
 		t.Fatal("watch target invalidation hook was not called")
@@ -338,9 +348,11 @@ func TestAdminTemplateRendersSearchableTallSavedGroups(t *testing.T) {
 func TestAdminTemplateRendersReadableBroadcastManagement(t *testing.T) {
 	var buf bytes.Buffer
 	data := pageData{
-		Version:         "2.3.0",
-		AdminRoleLabel:  "宿主",
-		CanManageGlobal: true,
+		Version:                       "2.3.0",
+		AdminRoleLabel:                "宿主",
+		CanManageGlobal:               true,
+		CanManageOperators:            true,
+		CanManageBroadcastPermissions: true,
 		Groups: []storage.Group{
 			{ChatID: -1001, Title: "出款群", UpdatedAt: time.Date(2026, 7, 6, 14, 24, 0, 0, time.UTC)},
 			{ChatID: -1002, Title: "扫码群引导", UpdatedAt: time.Date(2026, 7, 6, 14, 24, 0, 0, time.UTC)},
@@ -505,6 +517,37 @@ func TestAdminTemplateForOperatorOnlyRendersWatchTab(t *testing.T) {
 	for _, blocked := range []string{`data-admin-tab-target="groups"`, `data-admin-tab-target="broadcast"`, `data-admin-tab-target="permissions"`, `data-admin-tab-target="outbox"`, `data-admin-tab-target="replace"`, `发送网关 / Outbox 状态`, `广播权限`, `广播替换`} {
 		if strings.Contains(html, blocked) {
 			t.Fatalf("operator admin page should not render global module %q", blocked)
+		}
+	}
+}
+
+func TestAdminTemplateForPrimaryRendersOnlyDelegatedPermissionTools(t *testing.T) {
+	var buf bytes.Buffer
+	data := pageData{
+		Version:                       "2.4.2",
+		AdminRoleLabel:                "一级操作人",
+		CanManageOperators:            true,
+		CanManageBroadcastPermissions: true,
+		BOperators: []storage.GlobalOperator{{
+			UserID:       3004,
+			Level:        "secondary",
+			Status:       "active",
+			ParentUserID: 3003,
+			Remark:       "own secondary",
+		}},
+	}
+	if err := adminTemplate.Execute(&buf, data); err != nil {
+		t.Fatal(err)
+	}
+	html := buf.String()
+	for _, want := range []string{`data-admin-tab-target="permissions"`, `action="/admin/operator/save"`, `action="/admin/permission/grant"`, `data-admin-tab-target="watch"`} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("primary admin page missing %q", want)
+		}
+	}
+	for _, blocked := range []string{`data-admin-tab-target="groups"`, `data-admin-tab-target="broadcast"`, `data-admin-tab-target="replace"`} {
+		if strings.Contains(html, blocked) {
+			t.Fatalf("primary admin page exposed host module %q", blocked)
 		}
 	}
 }

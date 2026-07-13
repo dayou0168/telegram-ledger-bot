@@ -97,6 +97,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			active BOOLEAN NOT NULL DEFAULT FALSE,
 			active_day_key TEXT NOT NULL DEFAULT '',
 			active_expires_day_key TEXT NOT NULL DEFAULT '',
+			active_period_started_at TIMESTAMPTZ NOT NULL DEFAULT '1970-01-01 00:00:00+00',
 			business_open BOOLEAN NOT NULL DEFAULT TRUE,
 			owner_user_id BIGINT NOT NULL DEFAULT 0,
 			deposit_rate TEXT NOT NULL DEFAULT '0',
@@ -120,6 +121,16 @@ func (s *Store) migrate(ctx context.Context) error {
 			WHERE chat_id < 0`,
 		`ALTER TABLE groups ADD COLUMN IF NOT EXISTS active_day_key TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE groups ADD COLUMN IF NOT EXISTS active_expires_day_key TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE groups ADD COLUMN IF NOT EXISTS active_period_started_at TIMESTAMPTZ NOT NULL DEFAULT '1970-01-01 00:00:00+00'`,
+		`WITH migration AS (
+			INSERT INTO schema_migrations(version, applied_at)
+			VALUES('2.4.2-active-period-start', NOW())
+			ON CONFLICT(version) DO NOTHING
+			RETURNING 1
+		)
+		UPDATE groups g
+		SET active_period_started_at=CASE WHEN g.active THEN NOW() ELSE '1970-01-01 00:00:00+00'::timestamptz END
+		FROM migration`,
 		`ALTER TABLE groups ADD COLUMN IF NOT EXISTS exchange_rate_source TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE groups ADD COLUMN IF NOT EXISTS exchange_rate_rank INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE groups ADD COLUMN IF NOT EXISTS exchange_rate_offset TEXT NOT NULL DEFAULT ''`,
@@ -179,6 +190,10 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_broadcast_operators_cleanup
 			ON broadcast_operators(private_cleanup_enabled, private_cleanup_time, user_id)
 			WHERE status='active'`,
+		`INSERT INTO schema_migrations(version, applied_at)
+			SELECT '2.4.2-global-operators-table-preexisting', NOW()
+			WHERE to_regclass('global_operators') IS NOT NULL
+			ON CONFLICT(version) DO NOTHING`,
 		`CREATE TABLE IF NOT EXISTS global_operators (
 			user_id BIGINT PRIMARY KEY,
 			level TEXT NOT NULL,
@@ -196,17 +211,139 @@ func (s *Store) migrate(ctx context.Context) error {
 			ON global_operators(level, status, user_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_global_operators_parent_status
 			ON global_operators(parent_user_id, status, user_id)`,
-		`INSERT INTO global_operators(user_id, level, status, parent_user_id, created_by, created_at, remark)
-			SELECT user_id,
-				CASE WHEN created_by = 0 THEN 'primary' ELSE 'secondary' END,
+		`WITH migration AS (
+			INSERT INTO schema_migrations(version, applied_at)
+			VALUES('2.4.2-global-operators-backfill-once', NOW())
+			ON CONFLICT(version) DO NOTHING
+			RETURNING 1
+		)
+		INSERT INTO global_operators(user_id, level, status, parent_user_id, created_by, created_at, remark)
+			SELECT b.user_id,
+				CASE WHEN b.created_by = 0 THEN 'primary' ELSE 'secondary' END,
 				'active',
-				NULLIF(created_by, 0),
-				created_by,
-				created_at,
-				remark
-			FROM broadcast_operators
-			WHERE status='active'
+				NULLIF(b.created_by, 0),
+				b.created_by,
+				b.created_at,
+				b.remark
+			FROM broadcast_operators b
+			CROSS JOIN migration
+			WHERE b.status='active'
+			  AND NOT EXISTS (
+				SELECT 1 FROM schema_migrations
+				WHERE version='2.4.2-global-operators-table-preexisting'
+			  )
 			ON CONFLICT(user_id) DO NOTHING`,
+		`CREATE TABLE IF NOT EXISTS permission_audit_events (
+			id BIGSERIAL PRIMARY KEY,
+			actor_user_id BIGINT NOT NULL DEFAULT 0,
+			subject_type TEXT NOT NULL,
+			subject_user_id BIGINT NOT NULL DEFAULT 0,
+			action TEXT NOT NULL,
+			level TEXT NOT NULL DEFAULT '',
+			parent_user_id BIGINT,
+			target_type TEXT NOT NULL DEFAULT '',
+			chat_id BIGINT NOT NULL DEFAULT 0,
+			group_name TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_permission_audit_subject
+			ON permission_audit_events(subject_type, subject_user_id, created_at DESC, id DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_permission_audit_actor
+			ON permission_audit_events(actor_user_id, created_at DESC, id DESC)`,
+		`CREATE OR REPLACE FUNCTION reject_permission_audit_mutation() RETURNS trigger AS $$
+		BEGIN
+			RAISE EXCEPTION 'permission audit events are immutable';
+		END;
+		$$ LANGUAGE plpgsql`,
+		`DROP TRIGGER IF EXISTS trg_permission_audit_immutable ON permission_audit_events`,
+		`CREATE TRIGGER trg_permission_audit_immutable
+			BEFORE UPDATE OR DELETE ON permission_audit_events
+			FOR EACH ROW EXECUTE FUNCTION reject_permission_audit_mutation()`,
+		`DO $$
+		BEGIN
+			IF NOT EXISTS (
+				SELECT 1 FROM schema_migrations WHERE version='2.4.2-global-operators-safety'
+			) THEN
+				UPDATE global_operators
+				SET level='primary', parent_user_id=NULL, status='disabled',
+					disabled_at=COALESCE(disabled_at, NOW())
+				WHERE level NOT IN ('primary', 'secondary');
+
+				UPDATE global_operators
+				SET status='disabled', disabled_at=COALESCE(disabled_at, NOW())
+				WHERE status NOT IN ('active', 'disabled');
+
+				UPDATE global_operators SET parent_user_id=NULL WHERE level='primary';
+
+				UPDATE global_operators child
+				SET level='primary', parent_user_id=NULL, status='disabled',
+					disabled_at=COALESCE(child.disabled_at, NOW())
+				WHERE child.level='secondary'
+				  AND NOT EXISTS (
+					SELECT 1 FROM global_operators parent
+					WHERE parent.user_id=child.parent_user_id
+					  AND parent.level='primary'
+					  AND parent.status='active'
+				  );
+
+				UPDATE broadcast_operators b
+				SET status='disabled', updated_at=NOW()
+				WHERE EXISTS (
+					SELECT 1 FROM global_operators g
+					WHERE g.user_id=b.user_id AND g.status='disabled'
+				);
+				INSERT INTO schema_migrations(version, applied_at)
+				VALUES('2.4.2-global-operators-safety', NOW());
+			END IF;
+		END $$`,
+		`DO $$
+		BEGIN
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='global_operators_level_check') THEN
+				ALTER TABLE global_operators ADD CONSTRAINT global_operators_level_check
+					CHECK (level IN ('primary', 'secondary'));
+			END IF;
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='global_operators_status_check') THEN
+				ALTER TABLE global_operators ADD CONSTRAINT global_operators_status_check
+					CHECK (status IN ('active', 'disabled'));
+			END IF;
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='global_operators_parent_shape_check') THEN
+				ALTER TABLE global_operators ADD CONSTRAINT global_operators_parent_shape_check
+					CHECK ((level='primary' AND parent_user_id IS NULL) OR (level='secondary' AND parent_user_id IS NOT NULL));
+			END IF;
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='global_operators_parent_fkey') THEN
+				ALTER TABLE global_operators ADD CONSTRAINT global_operators_parent_fkey
+					FOREIGN KEY(parent_user_id) REFERENCES global_operators(user_id) ON DELETE RESTRICT;
+			END IF;
+		END $$`,
+		`CREATE OR REPLACE FUNCTION validate_global_operator_parent() RETURNS trigger AS $$
+		BEGIN
+			IF NEW.level='primary' AND NEW.parent_user_id IS NOT NULL THEN
+				RAISE EXCEPTION 'primary global operator cannot have a parent';
+			END IF;
+			IF NEW.level='secondary' AND NEW.status='active' AND NOT EXISTS (
+				SELECT 1 FROM global_operators parent
+				WHERE parent.user_id=NEW.parent_user_id
+				  AND parent.level='primary'
+				  AND parent.status='active'
+			) THEN
+				RAISE EXCEPTION 'active secondary requires an active primary parent';
+			END IF;
+			IF TG_OP='UPDATE' AND OLD.level='primary' AND OLD.status='active'
+			   AND (NEW.level<>'primary' OR NEW.status<>'active') AND EXISTS (
+				SELECT 1 FROM global_operators child
+				WHERE child.parent_user_id=OLD.user_id
+				  AND child.level='secondary'
+				  AND child.status='active'
+			) THEN
+				RAISE EXCEPTION 'active primary still has active secondary operators';
+			END IF;
+			RETURN NEW;
+		END;
+		$$ LANGUAGE plpgsql`,
+		`DROP TRIGGER IF EXISTS trg_validate_global_operator_parent ON global_operators`,
+		`CREATE TRIGGER trg_validate_global_operator_parent
+			BEFORE INSERT OR UPDATE OF level, status, parent_user_id ON global_operators
+			FOR EACH ROW EXECUTE FUNCTION validate_global_operator_parent()`,
 		`CREATE TABLE IF NOT EXISTS private_chat_messages (
 			id BIGSERIAL PRIMARY KEY,
 			operator_user_id BIGINT NOT NULL,
@@ -265,6 +402,37 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_broadcast_permissions_group
 			ON broadcast_operator_permissions(user_id, target, group_name)
 			WHERE target = 'group'`,
+		`WITH migration AS (
+			INSERT INTO schema_migrations(version, applied_at)
+			VALUES('2.4.2-disabled-global-operator-permissions', NOW())
+			ON CONFLICT(version) DO NOTHING
+			RETURNING 1
+		)
+		DELETE FROM broadcast_operator_permissions p
+		USING migration
+		WHERE NOT EXISTS (
+			SELECT 1 FROM global_operators g
+			WHERE g.user_id=p.user_id AND g.status='active' AND g.level IN ('primary', 'secondary')
+		)
+		OR p.target NOT IN ('chat', 'group')
+		OR (p.target='chat' AND (p.chat_id=0 OR p.group_name<>''))
+		OR (p.target='group' AND (p.chat_id<>0 OR p.group_name=''))`,
+		`DO $$
+		BEGIN
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='broadcast_permissions_target_check') THEN
+				ALTER TABLE broadcast_operator_permissions ADD CONSTRAINT broadcast_permissions_target_check
+					CHECK (target IN ('chat', 'group'));
+			END IF;
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='broadcast_permissions_shape_check') THEN
+				ALTER TABLE broadcast_operator_permissions ADD CONSTRAINT broadcast_permissions_shape_check
+					CHECK ((target='chat' AND chat_id<>0 AND group_name='') OR
+					       (target='group' AND chat_id=0 AND group_name<>''));
+			END IF;
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='broadcast_permissions_user_fkey') THEN
+				ALTER TABLE broadcast_operator_permissions ADD CONSTRAINT broadcast_permissions_user_fkey
+					FOREIGN KEY(user_id) REFERENCES global_operators(user_id) ON DELETE CASCADE;
+			END IF;
+		END $$`,
 		`CREATE TABLE IF NOT EXISTS admin_login_tickets (
 			token_hash TEXT PRIMARY KEY,
 			user_id BIGINT NOT NULL,
@@ -640,6 +808,11 @@ func (s *Store) migrate(ctx context.Context) error {
 		ON CONFLICT(version) DO NOTHING`); err != nil {
 		return fmt.Errorf("record schema migration: %w", err)
 	}
+	if _, err := s.pool.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
+		VALUES('2.4.2', NOW())
+		ON CONFLICT(version) DO NOTHING`); err != nil {
+		return fmt.Errorf("record schema migration: %w", err)
+	}
 	return nil
 }
 
@@ -704,7 +877,7 @@ func (s *Store) GetUser(ctx context.Context, chatID, userID int64) (User, bool, 
 }
 
 func (s *Store) GetGroup(ctx context.Context, chatID int64) (Group, error) {
-	row := s.pool.QueryRow(ctx, `SELECT chat_id, title, active, active_day_key, active_expires_day_key, business_open, owner_user_id,
+	row := s.pool.QueryRow(ctx, `SELECT chat_id, title, active, active_day_key, active_expires_day_key, active_period_started_at, business_open, owner_user_id,
 		deposit_rate, payout_rate, deposit_exchange_rate, payout_exchange_rate,
 		exchange_rate_source, exchange_rate_rank, exchange_rate_offset, fee_rate,
 		cutoff_hour, all_members_can_record, created_at, updated_at
@@ -713,7 +886,7 @@ func (s *Store) GetGroup(ctx context.Context, chatID int64) (Group, error) {
 }
 
 func (s *Store) ListGroups(ctx context.Context) ([]Group, error) {
-	rows, err := s.pool.Query(ctx, `SELECT chat_id, title, active, active_day_key, active_expires_day_key, business_open, owner_user_id,
+	rows, err := s.pool.Query(ctx, `SELECT chat_id, title, active, active_day_key, active_expires_day_key, active_period_started_at, business_open, owner_user_id,
 		deposit_rate, payout_rate, deposit_exchange_rate, payout_exchange_rate,
 		exchange_rate_source, exchange_rate_rank, exchange_rate_offset, fee_rate,
 		cutoff_hour, all_members_can_record, created_at, updated_at
@@ -737,7 +910,7 @@ func (s *Store) ListGroups(ctx context.Context) ([]Group, error) {
 
 func scanGroup(scanner recordScanner) (Group, error) {
 	var g Group
-	err := scanner.Scan(&g.ChatID, &g.Title, &g.Active, &g.ActiveDayKey, &g.ActiveExpiresDayKey, &g.BusinessOpen, &g.OwnerUserID,
+	err := scanner.Scan(&g.ChatID, &g.Title, &g.Active, &g.ActiveDayKey, &g.ActiveExpiresDayKey, &g.ActivePeriodStartedAt, &g.BusinessOpen, &g.OwnerUserID,
 		&g.DepositRate, &g.PayoutRate, &g.DepositExchangeRate, &g.PayoutExchangeRate,
 		&g.ExchangeRateSource, &g.ExchangeRateRank, &g.ExchangeRateOffset, &g.FeeRate,
 		&g.CutoffHour, &g.AllMembersCanRecord, &g.CreatedAt, &g.UpdatedAt)
@@ -757,7 +930,16 @@ func (s *Store) SetGroupActivePeriod(ctx context.Context, chatID int64, active b
 		activeDayKey = ""
 		activeExpiresDayKey = ""
 	}
-	_, err := s.pool.Exec(ctx, `UPDATE groups SET active=$1, active_day_key=$2, active_expires_day_key=$3, updated_at=$4 WHERE chat_id=$5`,
+	_, err := s.pool.Exec(ctx, `UPDATE groups SET
+		active=$1,
+		active_day_key=$2,
+		active_expires_day_key=$3,
+		active_period_started_at=CASE
+			WHEN $1 AND (NOT active OR active_day_key<>$2 OR active_period_started_at='1970-01-01 00:00:00+00'::timestamptz) THEN $4
+			WHEN NOT $1 THEN '1970-01-01 00:00:00+00'::timestamptz
+			ELSE active_period_started_at
+		END,
+		updated_at=$4 WHERE chat_id=$5`,
 		active, activeDayKey, activeExpiresDayKey, now, chatID)
 	return err
 }
@@ -767,7 +949,13 @@ func (s *Store) SetGroupCutoffState(ctx context.Context, chatID int64, cutoffHou
 		activeDayKey = ""
 		activeExpiresDayKey = ""
 	}
-	_, err := s.pool.Exec(ctx, `UPDATE groups SET cutoff_hour=$1, active=$2, active_day_key=$3, active_expires_day_key=$4, updated_at=$5 WHERE chat_id=$6`,
+	_, err := s.pool.Exec(ctx, `UPDATE groups SET cutoff_hour=$1, active=$2, active_day_key=$3, active_expires_day_key=$4,
+		active_period_started_at=CASE
+			WHEN $2 AND active_period_started_at<='1970-01-01 00:00:00+00'::timestamptz THEN $5
+			WHEN NOT $2 THEN '1970-01-01 00:00:00+00'::timestamptz
+			ELSE active_period_started_at
+		END,
+		updated_at=$5 WHERE chat_id=$6`,
 		cutoffHour, active, activeDayKey, activeExpiresDayKey, now, chatID)
 	return err
 }
@@ -860,16 +1048,6 @@ func (s *Store) IsOperator(ctx context.Context, chatID, userID int64) (bool, err
 	return err == nil, err
 }
 
-func (s *Store) IsAnyOperator(ctx context.Context, userID int64) (bool, error) {
-	row := s.pool.QueryRow(ctx, `SELECT 1 FROM operators WHERE user_id=$1 LIMIT 1`, userID)
-	var one int
-	err := row.Scan(&one)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
-	}
-	return err == nil, err
-}
-
 func (s *Store) IsOwner(ctx context.Context, chatID, userID int64) (bool, error) {
 	row := s.pool.QueryRow(ctx, `SELECT 1 FROM groups WHERE chat_id=$1 AND owner_user_id=$2 LIMIT 1`, chatID, userID)
 	var one int
@@ -926,16 +1104,6 @@ func (s *Store) ListUsersForMention(ctx context.Context, chatID int64, limit int
 	return users, rows.Err()
 }
 
-func (s *Store) IsBroadcastOperator(ctx context.Context, userID int64) (bool, error) {
-	row := s.pool.QueryRow(ctx, `SELECT 1 FROM broadcast_operators WHERE user_id=$1 AND status='active' LIMIT 1`, userID)
-	var one int
-	err := row.Scan(&one)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
-	}
-	return err == nil, err
-}
-
 func normalizeGlobalOperatorLevel(level string) (string, error) {
 	level = strings.TrimSpace(level)
 	switch level {
@@ -947,7 +1115,8 @@ func normalizeGlobalOperatorLevel(level string) (string, error) {
 }
 
 func (s *Store) IsGlobalOperator(ctx context.Context, userID int64) (bool, error) {
-	row := s.pool.QueryRow(ctx, `SELECT 1 FROM global_operators WHERE user_id=$1 AND status='active' LIMIT 1`, userID)
+	row := s.pool.QueryRow(ctx, `SELECT 1 FROM global_operators
+		WHERE user_id=$1 AND status='active' AND level IN ('primary', 'secondary') LIMIT 1`, userID)
 	var one int
 	err := row.Scan(&one)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -957,13 +1126,62 @@ func (s *Store) IsGlobalOperator(ctx context.Context, userID int64) (bool, error
 }
 
 func (s *Store) GetGlobalOperatorLevel(ctx context.Context, userID int64) (string, bool, error) {
-	row := s.pool.QueryRow(ctx, `SELECT level FROM global_operators WHERE user_id=$1 AND status='active' LIMIT 1`, userID)
+	row := s.pool.QueryRow(ctx, `SELECT level FROM global_operators
+		WHERE user_id=$1 AND status='active' AND level IN ('primary', 'secondary') LIMIT 1`, userID)
 	var level string
 	err := row.Scan(&level)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", false, nil
 	}
 	return level, err == nil, err
+}
+
+func (s *Store) GetGlobalOperator(ctx context.Context, userID int64) (GlobalOperator, bool, error) {
+	row := s.pool.QueryRow(ctx, `SELECT user_id, level, status, COALESCE(parent_user_id, 0),
+		remark, created_by, created_at, COALESCE(disabled_by, 0), disabled_at
+		FROM global_operators WHERE user_id=$1`, userID)
+	var op GlobalOperator
+	var disabledAt pgtype.Timestamptz
+	if err := row.Scan(&op.UserID, &op.Level, &op.Status, &op.ParentUserID, &op.Remark,
+		&op.CreatedBy, &op.CreatedAt, &op.DisabledBy, &disabledAt); errors.Is(err, pgx.ErrNoRows) {
+		return GlobalOperator{}, false, nil
+	} else if err != nil {
+		return GlobalOperator{}, false, err
+	}
+	if disabledAt.Valid {
+		t := disabledAt.Time
+		op.DisabledAt = &t
+	}
+	return op, true, nil
+}
+
+func validateGlobalOperatorParent(ctx context.Context, tx pgx.Tx, userID int64, level string, parentUserID int64) error {
+	if level == "primary" {
+		if parentUserID != 0 {
+			return errors.New("primary global operator cannot have a parent")
+		}
+		return nil
+	}
+	if parentUserID <= 0 || parentUserID == userID {
+		return errors.New("secondary global operator requires a different active primary parent")
+	}
+	var one int
+	err := tx.QueryRow(ctx, `SELECT 1 FROM global_operators
+		WHERE user_id=$1 AND level='primary' AND status='active' LIMIT 1`, parentUserID).Scan(&one)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return errors.New("secondary global operator parent is not an active primary")
+	}
+	return err
+}
+
+func insertPermissionAudit(ctx context.Context, tx pgx.Tx, event PermissionAuditEvent) error {
+	_, err := tx.Exec(ctx, `INSERT INTO permission_audit_events(
+		actor_user_id, subject_type, subject_user_id, action, level, parent_user_id,
+		target_type, chat_id, group_name, created_at
+	) VALUES($1, $2, $3, $4, $5, NULLIF($6, 0), $7, $8, $9, $10)`,
+		event.ActorUserID, event.SubjectType, event.SubjectUserID, event.Action, event.Level,
+		event.ParentUserID, event.TargetType, event.ChatID, event.GroupName, event.CreatedAt)
+	return err
 }
 
 func (s *Store) UpsertGlobalOperator(ctx context.Context, userID int64, level string, parentUserID, createdBy int64, remark string, now time.Time) error {
@@ -980,6 +1198,18 @@ func (s *Store) UpsertGlobalOperator(ctx context.Context, userID int64, level st
 		return err
 	}
 	defer rollback(ctx, tx)
+	if err := validateGlobalOperatorParent(ctx, tx, userID, level, parentUserID); err != nil {
+		return err
+	}
+	var oldLevel, oldStatus string
+	var oldParentUserID int64
+	err = tx.QueryRow(ctx, `SELECT level, status, COALESCE(parent_user_id, 0)
+		FROM global_operators WHERE user_id=$1 FOR UPDATE`, userID).
+		Scan(&oldLevel, &oldStatus, &oldParentUserID)
+	exists := err == nil
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
 	if _, err := tx.Exec(ctx, `INSERT INTO global_operators(user_id, level, status, parent_user_id, created_by, created_at, remark)
 		VALUES($1, $2, 'active', NULLIF($3, 0), $4, $5, $6)
 		ON CONFLICT(user_id) DO UPDATE SET
@@ -998,6 +1228,38 @@ func (s *Store) UpsertGlobalOperator(ctx context.Context, userID int64, level st
 		userID, createdBy, remark, now, now); err != nil {
 		return err
 	}
+	action := "created"
+	if exists && oldStatus == "disabled" {
+		action = "reenabled"
+	} else if exists && oldLevel != level {
+		action = "level_changed"
+	} else if exists && oldParentUserID != parentUserID {
+		action = "parent_changed"
+	} else if exists {
+		action = "updated"
+	}
+	if err := insertPermissionAudit(ctx, tx, PermissionAuditEvent{
+		ActorUserID: createdBy, SubjectType: "global_operator", SubjectUserID: userID,
+		Action: action, Level: level, ParentUserID: parentUserID, CreatedAt: now,
+	}); err != nil {
+		return err
+	}
+	if exists && oldStatus == "disabled" && oldLevel != level {
+		if err := insertPermissionAudit(ctx, tx, PermissionAuditEvent{
+			ActorUserID: createdBy, SubjectType: "global_operator", SubjectUserID: userID,
+			Action: "level_changed", Level: level, ParentUserID: parentUserID, CreatedAt: now,
+		}); err != nil {
+			return err
+		}
+	}
+	if exists && oldStatus == "disabled" && oldParentUserID != parentUserID {
+		if err := insertPermissionAudit(ctx, tx, PermissionAuditEvent{
+			ActorUserID: createdBy, SubjectType: "global_operator", SubjectUserID: userID,
+			Action: "parent_changed", Level: level, ParentUserID: parentUserID, CreatedAt: now,
+		}); err != nil {
+			return err
+		}
+	}
 	return tx.Commit(ctx)
 }
 
@@ -1007,6 +1269,56 @@ func (s *Store) DisableGlobalOperator(ctx context.Context, userID, disabledBy in
 		return false, err
 	}
 	defer rollback(ctx, tx)
+	var level string
+	var parentUserID int64
+	err = tx.QueryRow(ctx, `SELECT level, COALESCE(parent_user_id, 0) FROM global_operators
+		WHERE user_id=$1 AND status='active' FOR UPDATE`, userID).Scan(&level, &parentUserID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, tx.Commit(ctx)
+	}
+	if err != nil {
+		return false, err
+	}
+	if level == "primary" {
+		rows, err := tx.Query(ctx, `SELECT user_id FROM global_operators
+			WHERE parent_user_id=$1 AND level='secondary' AND status='active'
+			ORDER BY user_id FOR UPDATE`, userID)
+		if err != nil {
+			return false, err
+		}
+		var childIDs []int64
+		for rows.Next() {
+			var childID int64
+			if err := rows.Scan(&childID); err != nil {
+				rows.Close()
+				return false, err
+			}
+			childIDs = append(childIDs, childID)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return false, err
+		}
+		rows.Close()
+		for _, childID := range childIDs {
+			if _, err := tx.Exec(ctx, `UPDATE global_operators
+				SET status='disabled', disabled_by=$1, disabled_at=$2 WHERE user_id=$3`, disabledBy, now, childID); err != nil {
+				return false, err
+			}
+			if _, err := tx.Exec(ctx, `UPDATE broadcast_operators SET status='disabled', updated_at=$1 WHERE user_id=$2`, now, childID); err != nil {
+				return false, err
+			}
+			if _, err := tx.Exec(ctx, `DELETE FROM broadcast_operator_permissions WHERE user_id=$1`, childID); err != nil {
+				return false, err
+			}
+			if err := insertPermissionAudit(ctx, tx, PermissionAuditEvent{
+				ActorUserID: disabledBy, SubjectType: "global_operator", SubjectUserID: childID,
+				Action: "disabled", Level: "secondary", ParentUserID: userID, CreatedAt: now,
+			}); err != nil {
+				return false, err
+			}
+		}
+	}
 	tag, err := tx.Exec(ctx, `UPDATE global_operators
 		SET status='disabled', disabled_by=$1, disabled_at=$2
 		WHERE user_id=$3 AND status <> 'disabled'`, disabledBy, now, userID)
@@ -1015,6 +1327,15 @@ func (s *Store) DisableGlobalOperator(ctx context.Context, userID, disabledBy in
 	}
 	if _, err := tx.Exec(ctx, `UPDATE broadcast_operators SET status='disabled', updated_at=$1 WHERE user_id=$2 AND status <> 'disabled'`,
 		now, userID); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM broadcast_operator_permissions WHERE user_id=$1`, userID); err != nil {
+		return false, err
+	}
+	if err := insertPermissionAudit(ctx, tx, PermissionAuditEvent{
+		ActorUserID: disabledBy, SubjectType: "global_operator", SubjectUserID: userID,
+		Action: "disabled", Level: level, ParentUserID: parentUserID, CreatedAt: now,
+	}); err != nil {
 		return false, err
 	}
 	return tag.RowsAffected() > 0, tx.Commit(ctx)
@@ -1072,55 +1393,30 @@ func (s *Store) ListGlobalOperators(ctx context.Context) ([]GlobalOperator, erro
 	return operators, rows.Err()
 }
 
-func (s *Store) UpsertBroadcastOperator(ctx context.Context, userID, createdBy int64, remark string, now time.Time) error {
-	_, err := s.pool.Exec(ctx, `INSERT INTO broadcast_operators(user_id, status, created_by, remark, created_at, updated_at)
-		VALUES($1, 'active', $2, $3, $4, $5)
-		ON CONFLICT(user_id) DO UPDATE SET status='active', remark=excluded.remark, updated_at=excluded.updated_at`,
-		userID, createdBy, remark, now, now)
-	return err
-}
-
-func (s *Store) DisableBroadcastOperator(ctx context.Context, userID int64, now time.Time) (bool, error) {
-	tag, err := s.pool.Exec(ctx, `UPDATE broadcast_operators SET status='disabled', updated_at=$1 WHERE user_id=$2 AND status <> 'disabled'`,
-		now, userID)
-	return tag.RowsAffected() > 0, err
-}
-
-func (s *Store) ListBroadcastOperators(ctx context.Context) ([]BroadcastOperator, error) {
-	rows, err := s.pool.Query(ctx, `SELECT user_id, status, remark, created_by,
-			private_cleanup_enabled, private_cleanup_time, private_cleanup_last_run_date,
-			private_cleanup_bot_after_seconds, private_cleanup_incoming_enabled,
-			private_cleanup_incoming_after_seconds, private_cleanup_scope,
-			created_at, updated_at
-		FROM broadcast_operators
-		ORDER BY status ASC, updated_at DESC, user_id ASC`)
+func (s *Store) ListPermissionAuditEvents(ctx context.Context, subjectUserID int64, limit int) ([]PermissionAuditEvent, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	rows, err := s.pool.Query(ctx, `SELECT id, actor_user_id, subject_type, subject_user_id,
+		action, level, COALESCE(parent_user_id, 0), target_type, chat_id, group_name, created_at
+		FROM permission_audit_events
+		WHERE $1=0 OR subject_user_id=$1
+		ORDER BY created_at DESC, id DESC LIMIT $2`, subjectUserID, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var operators []BroadcastOperator
+	events := make([]PermissionAuditEvent, 0, limit)
 	for rows.Next() {
-		var op BroadcastOperator
-		if err := rows.Scan(
-			&op.UserID,
-			&op.Status,
-			&op.Remark,
-			&op.CreatedBy,
-			&op.PrivateCleanupEnabled,
-			&op.PrivateCleanupTime,
-			&op.PrivateCleanupLastRunDate,
-			&op.PrivateCleanupBotDeleteAfterSeconds,
-			&op.PrivateCleanupIncomingEnabled,
-			&op.PrivateCleanupIncomingAfterSeconds,
-			&op.PrivateCleanupScope,
-			&op.CreatedAt,
-			&op.UpdatedAt,
-		); err != nil {
+		var event PermissionAuditEvent
+		if err := rows.Scan(&event.ID, &event.ActorUserID, &event.SubjectType, &event.SubjectUserID,
+			&event.Action, &event.Level, &event.ParentUserID, &event.TargetType, &event.ChatID,
+			&event.GroupName, &event.CreatedAt); err != nil {
 			return nil, err
 		}
-		operators = append(operators, op)
+		events = append(events, event)
 	}
-	return operators, rows.Err()
+	return events, rows.Err()
 }
 
 func (s *Store) SetBroadcastOperatorPrivateCleanup(ctx context.Context, userID int64, enabled bool, cleanupTime string, lastRunDate string, now time.Time) (bool, error) {
@@ -1148,7 +1444,12 @@ func (s *Store) SetBroadcastOperatorPrivateCleanupSettings(ctx context.Context, 
 			private_cleanup_incoming_after_seconds=$6,
 			private_cleanup_scope=$7,
 			updated_at=$8
-		WHERE user_id=$9`,
+		WHERE user_id=$9
+		  AND status='active'
+		  AND EXISTS (
+			SELECT 1 FROM global_operators g
+			WHERE g.user_id=$9 AND g.status='active' AND g.level IN ('primary', 'secondary')
+		  )`,
 		settings.Enabled,
 		settings.DailyTime,
 		settings.DailyLastRunDate,
@@ -1182,14 +1483,17 @@ func (s *Store) SetBroadcastOperatorPrivateCleanupSettings(ctx context.Context, 
 
 func (s *Store) IsPrivateCleanupEnabled(ctx context.Context, userID int64) (bool, error) {
 	row := s.pool.QueryRow(ctx, `SELECT 1
-		FROM broadcast_operators
-		WHERE user_id=$1
-		  AND status='active'
-		  AND private_cleanup_enabled=TRUE
+		FROM broadcast_operators b
+		JOIN global_operators g ON g.user_id=b.user_id
+		WHERE b.user_id=$1
+		  AND b.status='active'
+		  AND g.status='active'
+		  AND g.level IN ('primary', 'secondary')
+		  AND b.private_cleanup_enabled=TRUE
 		  AND (
-			private_cleanup_time <> ''
-			OR private_cleanup_bot_after_seconds > 0
-			OR private_cleanup_incoming_enabled=TRUE
+			b.private_cleanup_time <> ''
+			OR b.private_cleanup_bot_after_seconds > 0
+			OR b.private_cleanup_incoming_enabled=TRUE
 		  )
 		LIMIT 1`, userID)
 	var one int
@@ -1204,8 +1508,10 @@ func (s *Store) GetPrivateCleanupSettings(ctx context.Context, userID int64) (Pr
 	row := s.pool.QueryRow(ctx, `SELECT private_cleanup_enabled, private_cleanup_time, private_cleanup_last_run_date,
 			private_cleanup_bot_after_seconds, private_cleanup_incoming_enabled,
 			private_cleanup_incoming_after_seconds, private_cleanup_scope
-		FROM broadcast_operators
-		WHERE user_id=$1 AND status='active'
+		FROM broadcast_operators b
+		JOIN global_operators g ON g.user_id=b.user_id
+		WHERE b.user_id=$1 AND b.status='active'
+		  AND g.status='active' AND g.level IN ('primary', 'secondary')
 		LIMIT 1`, userID)
 	var settings PrivateCleanupSettings
 	err := row.Scan(
@@ -1257,13 +1563,16 @@ func (s *Store) PurgePrivateChatMessages(ctx context.Context, cutoff time.Time) 
 }
 
 func (s *Store) ListDuePrivateCleanupTargets(ctx context.Context, nowMinutes int, today string) ([]PrivateCleanupTarget, error) {
-	rows, err := s.pool.Query(ctx, `SELECT user_id, private_cleanup_time
-		FROM broadcast_operators
-		WHERE status='active'
-		  AND private_cleanup_enabled=TRUE
-		  AND private_cleanup_time <> ''
-		  AND private_cleanup_last_run_date <> $1
-		ORDER BY user_id ASC`, strings.TrimSpace(today))
+	rows, err := s.pool.Query(ctx, `SELECT b.user_id, b.private_cleanup_time
+		FROM broadcast_operators b
+		JOIN global_operators g ON g.user_id=b.user_id
+		WHERE b.status='active'
+		  AND g.status='active'
+		  AND g.level IN ('primary', 'secondary')
+		  AND b.private_cleanup_enabled=TRUE
+		  AND b.private_cleanup_time <> ''
+		  AND b.private_cleanup_last_run_date <> $1
+		ORDER BY b.user_id ASC`, strings.TrimSpace(today))
 	if err != nil {
 		return nil, err
 	}
@@ -1575,7 +1884,7 @@ func (s *Store) ListBroadcastGroups(ctx context.Context) ([]BroadcastGroup, erro
 }
 
 func (s *Store) ListBroadcastGroupChats(ctx context.Context, name string) ([]Group, error) {
-	rows, err := s.pool.Query(ctx, `SELECT g.chat_id, g.title, g.active, g.active_day_key, g.active_expires_day_key, g.business_open, g.owner_user_id,
+	rows, err := s.pool.Query(ctx, `SELECT g.chat_id, g.title, g.active, g.active_day_key, g.active_expires_day_key, g.active_period_started_at, g.business_open, g.owner_user_id,
 		g.deposit_rate, g.payout_rate, g.deposit_exchange_rate, g.payout_exchange_rate,
 		g.exchange_rate_source, g.exchange_rate_rank, g.exchange_rate_offset, g.fee_rate,
 		g.cutoff_hour, g.all_members_can_record, g.created_at, g.updated_at
@@ -1612,27 +1921,108 @@ func (s *Store) AddBroadcastPermission(ctx context.Context, userID int64, target
 		return errors.New("broadcast permission user is not an active global operator")
 	}
 	if target == "chat" {
+		if chatID == 0 {
+			return errors.New("broadcast permission chat is empty")
+		}
 		groupName = ""
 	} else {
+		if groupName == "" {
+			return errors.New("broadcast permission group is empty")
+		}
 		chatID = 0
 	}
-	_, err = s.pool.Exec(ctx, `INSERT INTO broadcast_operator_permissions(user_id, target, chat_id, group_name, granted_by, created_at)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer rollback(ctx, tx)
+	tag, err := tx.Exec(ctx, `INSERT INTO broadcast_operator_permissions(user_id, target, chat_id, group_name, granted_by, created_at)
 		VALUES($1, $2, $3, $4, $5, $6)
 		ON CONFLICT DO NOTHING`, userID, target, chatID, groupName, grantedBy, now)
-	return err
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() > 0 {
+		if err := insertPermissionAudit(ctx, tx, PermissionAuditEvent{
+			ActorUserID: grantedBy, SubjectType: "broadcast_permission", SubjectUserID: userID,
+			Action: "granted", TargetType: target, ChatID: chatID, GroupName: groupName, CreatedAt: now,
+		}); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
 }
 
-func (s *Store) RemoveBroadcastPermission(ctx context.Context, userID int64, target string, chatID int64, groupName string) (bool, error) {
+func (s *Store) RemoveBroadcastPermission(ctx context.Context, userID int64, target string, chatID int64, groupName string, revokedBy int64, now time.Time) (bool, error) {
 	target = strings.TrimSpace(target)
 	groupName = strings.TrimSpace(groupName)
 	if target == "chat" {
+		if chatID == 0 {
+			return false, errors.New("broadcast permission chat is empty")
+		}
 		groupName = ""
-	} else {
+	} else if target == "group" {
+		if groupName == "" {
+			return false, errors.New("broadcast permission group is empty")
+		}
 		chatID = 0
+	} else {
+		return false, errors.New("invalid broadcast permission target")
 	}
-	tag, err := s.pool.Exec(ctx, `DELETE FROM broadcast_operator_permissions
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer rollback(ctx, tx)
+	tag, err := tx.Exec(ctx, `DELETE FROM broadcast_operator_permissions
 		WHERE user_id=$1 AND target=$2 AND chat_id=$3 AND group_name=$4`, userID, target, chatID, groupName)
-	return tag.RowsAffected() > 0, err
+	if err != nil {
+		return false, err
+	}
+	if tag.RowsAffected() > 0 {
+		if err := insertPermissionAudit(ctx, tx, PermissionAuditEvent{
+			ActorUserID: revokedBy, SubjectType: "broadcast_permission", SubjectUserID: userID,
+			Action: "revoked", TargetType: target, ChatID: chatID, GroupName: groupName, CreatedAt: now,
+		}); err != nil {
+			return false, err
+		}
+	}
+	return tag.RowsAffected() > 0, tx.Commit(ctx)
+}
+
+func (s *Store) HasBroadcastPermissionScope(ctx context.Context, userID int64, target string, chatID int64, groupName string) (bool, error) {
+	target = strings.TrimSpace(target)
+	groupName = strings.TrimSpace(groupName)
+	var row pgx.Row
+	switch target {
+	case "group":
+		if groupName == "" {
+			return false, nil
+		}
+		row = s.pool.QueryRow(ctx, `SELECT 1 FROM broadcast_operator_permissions
+			WHERE user_id=$1 AND target='group' AND group_name=$2 LIMIT 1`, userID, groupName)
+	case "chat":
+		if chatID == 0 {
+			return false, nil
+		}
+		row = s.pool.QueryRow(ctx, `SELECT 1
+			FROM broadcast_operator_permissions p
+			WHERE p.user_id=$1 AND (
+				(p.target='chat' AND p.chat_id=$2)
+				OR (p.target='group' AND EXISTS (
+					SELECT 1 FROM broadcast_group_chats bgc
+					WHERE bgc.group_name=p.group_name AND bgc.chat_id=$2
+				))
+			) LIMIT 1`, userID, chatID)
+	default:
+		return false, nil
+	}
+	var one int
+	err := row.Scan(&one)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 func (s *Store) ListBroadcastPermissions(ctx context.Context) ([]BroadcastPermission, error) {
@@ -1658,7 +2048,7 @@ func (s *Store) ListAllowedBroadcastChats(ctx context.Context, userID int64, all
 	if all {
 		return s.ListGroups(ctx)
 	}
-	rows, err := s.pool.Query(ctx, `SELECT DISTINCT g.chat_id, g.title, g.active, g.active_day_key, g.active_expires_day_key, g.business_open, g.owner_user_id,
+	rows, err := s.pool.Query(ctx, `SELECT DISTINCT g.chat_id, g.title, g.active, g.active_day_key, g.active_expires_day_key, g.active_period_started_at, g.business_open, g.owner_user_id,
 		g.deposit_rate, g.payout_rate, g.deposit_exchange_rate, g.payout_exchange_rate,
 		g.exchange_rate_source, g.exchange_rate_rank, g.exchange_rate_offset, g.fee_rate,
 		g.cutoff_hour, g.all_members_can_record, g.created_at, g.updated_at

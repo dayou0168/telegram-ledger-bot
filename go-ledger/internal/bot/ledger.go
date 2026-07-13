@@ -21,7 +21,11 @@ const (
 const cutoffDisabledHour = -1
 
 func (b *Bot) startAccounting(ctx context.Context, msg telegram.Message, user storage.User, now time.Time) error {
-	if !b.perms.HasGlobalLedgerAccess(user.ID) {
+	globalAccess, err := b.hasGlobalLedgerAccess(ctx, user.ID)
+	if err != nil {
+		return err
+	}
+	if !globalAccess {
 		ok, err := b.isGroupOperator(ctx, msg.Chat.ID, user.ID)
 		if err != nil {
 			return err
@@ -236,6 +240,20 @@ func (b *Bot) handleUndo(ctx context.Context, msg telegram.Message, user storage
 	if !ok {
 		return b.enqueueLedgerTraceText(ctx, sendPriorityNormal, "ledger_undo_not_found", msg.Chat.ID, msg.MessageID, "没有找到可撤销的记录。", nil, now)
 	}
+	group, err := b.getGroupCached(ctx, msg.Chat.ID)
+	if err != nil {
+		return err
+	}
+	allowed, err := b.canUseLedgerForUndo(ctx, group, user.ID)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return b.enqueueLedgerTraceText(ctx, sendPriorityNormal, "ledger_undo_permission_denied", msg.Chat.ID, msg.MessageID, ledgerPermissionDeniedText, nil, now)
+	}
+	if !recordInCurrentLedgerPeriod(group, record.DayKey, record.CreatedAt, now) {
+		return b.enqueueLedgerTraceText(ctx, sendPriorityNormal, "ledger_undo_period_closed", msg.Chat.ID, msg.MessageID, "只能撤销当前有效账期的记录，上一账期已经封账。", nil, now)
+	}
 	if record.ActorUserID != user.ID {
 		manager, err := b.canManageGroup(ctx, msg.Chat.ID, user.ID)
 		if err != nil {
@@ -262,6 +280,14 @@ func (b *Bot) handleUndo(ctx context.Context, msg telegram.Message, user storage
 		prefix = "已撤销下发"
 	}
 	return b.sendBill(ctx, msg.Chat.ID, msg.MessageID, now, prefix)
+}
+
+func recordInCurrentLedgerPeriod(group storage.Group, recordDayKey string, recordCreatedAt time.Time, now time.Time) bool {
+	return groupAccountingActive(group, now) &&
+		recordDayKey != "" &&
+		recordDayKey == currentLedgerDayKey(group, now) &&
+		!group.ActivePeriodStartedAt.IsZero() &&
+		!recordCreatedAt.Before(group.ActivePeriodStartedAt)
 }
 
 func (b *Bot) handleOperatorCommand(ctx context.Context, msg telegram.Message, user storage.User, text string, now time.Time) error {
@@ -488,21 +514,53 @@ func (b *Bot) isGroupOperator(ctx context.Context, chatID, userID int64) (bool, 
 }
 
 func (b *Bot) canUseLedger(ctx context.Context, chatID, userID int64) (bool, error) {
-	if b.perms.HasGlobalLedgerAccess(userID) {
+	globalAccess, err := b.hasGlobalLedgerAccess(ctx, userID)
+	if err != nil {
+		return false, err
+	}
+	if globalAccess {
 		return true, nil
 	}
 	return b.isGroupOperator(ctx, chatID, userID)
 }
 
 func (b *Bot) canUseLedgerWithGroup(ctx context.Context, group storage.Group, userID int64) (bool, error) {
-	if group.AllMembersCanRecord || b.perms.HasGlobalLedgerAccess(userID) {
+	if group.AllMembersCanRecord {
+		return true, nil
+	}
+	globalAccess, err := b.hasGlobalLedgerAccess(ctx, userID)
+	if err != nil {
+		return false, err
+	}
+	if globalAccess {
 		return true, nil
 	}
 	return b.isGroupOperator(ctx, group.ChatID, userID)
 }
 
+func (b *Bot) canUseLedgerForUndo(ctx context.Context, group storage.Group, userID int64) (bool, error) {
+	if group.AllMembersCanRecord {
+		return true, nil
+	}
+	globalAccess, err := b.hasGlobalLedgerAccess(ctx, userID)
+	if err != nil {
+		return false, err
+	}
+	if globalAccess {
+		return true, nil
+	}
+	if b.groupOperatorLookup != nil {
+		return b.groupOperatorLookup(ctx, group.ChatID, userID)
+	}
+	return b.store.IsOperator(ctx, group.ChatID, userID)
+}
+
 func (b *Bot) canManageGroup(ctx context.Context, chatID, userID int64) (bool, error) {
-	if b.perms.CanManageAnyGroup(userID) {
+	globalAccess, err := b.hasGlobalLedgerAccess(ctx, userID)
+	if err != nil {
+		return false, err
+	}
+	if globalAccess {
 		return true, nil
 	}
 	done := measurePerfStage(ctx, "permission")

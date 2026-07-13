@@ -95,3 +95,60 @@ func TestPolicyPrivateGlobalFeaturesUseGlobalOperatorCapabilities(t *testing.T) 
 		t.Fatal("ordinary user should not use private global features")
 	}
 }
+
+func TestPolicyGlobalOperatorsUseLedgerWithoutElevatingSingleGroupOperators(t *testing.T) {
+	p := NewPolicy(1001, map[int64]struct{}{2002: {}})
+
+	for _, caps := range []UserCapabilities{
+		{GlobalOperatorLevel: "primary"},
+		{GlobalOperatorLevel: "secondary", ParentUserID: 3003},
+	} {
+		if !p.CanUseLedger(4004, caps) {
+			t.Fatalf("global operator should use ledger: %+v", caps)
+		}
+	}
+	if p.CanUseLedger(5005, UserCapabilities{}) {
+		t.Fatal("single-group capability must not be inferred as global ledger access")
+	}
+}
+
+func TestPolicyGlobalOperatorDelegationBoundaries(t *testing.T) {
+	p := NewPolicy(1001, map[int64]struct{}{2002: {}})
+	primary := UserCapabilities{GlobalOperatorLevel: "primary"}
+	secondary := UserCapabilities{GlobalOperatorLevel: "secondary", ParentUserID: 3003}
+
+	if !p.CanCreateGlobalOperator(1001, UserCapabilities{}, "primary") || !p.CanCreateGlobalOperator(1001, UserCapabilities{}, "secondary") {
+		t.Fatal("host should create primary and secondary operators")
+	}
+	if p.CanCreateGlobalOperator(2002, UserCapabilities{}, "primary") || p.CanCreateGlobalOperator(2002, UserCapabilities{}, "secondary") {
+		t.Fatal("default operator should not create database global operators")
+	}
+	if p.CanCreateGlobalOperator(3003, primary, "primary") || !p.CanCreateGlobalOperator(3003, primary, "secondary") {
+		t.Fatal("primary should only create secondary operators")
+	}
+	if p.CanCreateGlobalOperator(4004, secondary, "secondary") {
+		t.Fatal("secondary should not delegate")
+	}
+	if !p.CanDisableGlobalOperator(3003, primary, "secondary", 3003) {
+		t.Fatal("primary should disable its own secondary")
+	}
+	if p.CanDisableGlobalOperator(3003, primary, "secondary", 9999) || p.CanDisableGlobalOperator(3003, primary, "primary", 0) {
+		t.Fatal("primary should not disable unrelated or primary operators")
+	}
+}
+
+func TestPolicyBroadcastPermissionManagers(t *testing.T) {
+	p := NewPolicy(1001, map[int64]struct{}{2002: {}})
+	if !p.CanManageBroadcastPermissions(1001, UserCapabilities{}) || !p.CanManageAllBroadcastPermissions(1001) {
+		t.Fatal("host should manage all broadcast permissions")
+	}
+	if !p.CanManageBroadcastPermissions(2002, UserCapabilities{}) || !p.CanManageAllBroadcastPermissions(2002) {
+		t.Fatal("default operator should manage all broadcast permissions")
+	}
+	if !p.CanManageBroadcastPermissions(3003, UserCapabilities{GlobalOperatorLevel: "primary"}) || p.CanManageAllBroadcastPermissions(3003) {
+		t.Fatal("primary should manage only delegated broadcast permissions")
+	}
+	if p.CanManageBroadcastPermissions(4004, UserCapabilities{GlobalOperatorLevel: "secondary"}) {
+		t.Fatal("secondary should not grant broadcast permissions")
+	}
+}

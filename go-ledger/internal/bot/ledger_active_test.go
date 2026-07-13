@@ -159,3 +159,70 @@ func TestOpenBillQueryDoesNotRequireWritePermissionWhenAccountingActive(t *testi
 		t.Fatal("open bill query should be allowed without write permission when accounting is active")
 	}
 }
+
+func TestUndoOnlyAllowsCurrentActiveLedgerPeriod(t *testing.T) {
+	loc := time.FixedZone("Asia/Shanghai", 8*3600)
+	now := time.Date(2026, 7, 11, 23, 59, 0, 0, loc)
+	group := storage.Group{
+		Active:                true,
+		ActiveDayKey:          "2026-07-11",
+		ActiveExpiresDayKey:   "2026-07-11",
+		ActivePeriodStartedAt: now.Add(-time.Hour),
+		CutoffHour:            0,
+	}
+	if !recordInCurrentLedgerPeriod(group, "2026-07-11", now.Add(-time.Minute), now) {
+		t.Fatal("current active period should be undoable")
+	}
+	if recordInCurrentLedgerPeriod(group, "2026-07-10", now.Add(-time.Minute), now) {
+		t.Fatal("previous period should not be undoable")
+	}
+	afterCutoff := time.Date(2026, 7, 12, 0, 0, 0, 0, loc)
+	if recordInCurrentLedgerPeriod(group, "2026-07-11", now.Add(-time.Minute), afterCutoff) {
+		t.Fatal("period should close exactly at cutoff")
+	}
+	group.ActiveDayKey = "2026-07-12"
+	group.ActiveExpiresDayKey = "2026-07-12"
+	group.ActivePeriodStartedAt = afterCutoff
+	if recordInCurrentLedgerPeriod(group, "2026-07-11", now.Add(-time.Minute), afterCutoff) {
+		t.Fatal("starting a new period must not reopen the prior period")
+	}
+}
+
+func TestUndoWithDisabledCutoffUsesContinuousActiveDayKey(t *testing.T) {
+	loc := time.FixedZone("Asia/Shanghai", 8*3600)
+	group := storage.Group{
+		Active:                true,
+		ActiveDayKey:          "2026-07-01",
+		ActivePeriodStartedAt: time.Date(2026, 7, 1, 8, 0, 0, 0, loc),
+		CutoffHour:            cutoffDisabledHour,
+	}
+	later := time.Date(2026, 7, 20, 12, 0, 0, 0, loc)
+	if !recordInCurrentLedgerPeriod(group, "2026-07-01", later.Add(-time.Hour), later) {
+		t.Fatal("disabled cutoff should preserve the continuous active period")
+	}
+	if recordInCurrentLedgerPeriod(group, "2026-06-30", later.Add(-time.Hour), later) {
+		t.Fatal("a different saved period must remain closed")
+	}
+	group.Active = false
+	group.ActiveDayKey = ""
+	if recordInCurrentLedgerPeriod(group, "2026-07-01", later.Add(-time.Hour), later) {
+		t.Fatal("stopped or saved period must not allow undo")
+	}
+}
+
+func TestUndoRejectsRecordFromEarlierContinuousPeriodWithSameDayKey(t *testing.T) {
+	loc := time.FixedZone("Asia/Shanghai", 8*3600)
+	periodStart := time.Date(2026, 7, 11, 15, 0, 0, 0, loc)
+	group := storage.Group{
+		Active:                true,
+		ActiveDayKey:          "2026-07-11",
+		ActivePeriodStartedAt: periodStart,
+		CutoffHour:            cutoffDisabledHour,
+	}
+	if recordInCurrentLedgerPeriod(group, "2026-07-11", periodStart.Add(-time.Minute), periodStart.Add(time.Hour)) {
+		t.Fatal("same day key from an earlier closed continuous period must remain sealed")
+	}
+	if !recordInCurrentLedgerPeriod(group, "2026-07-11", periodStart.Add(time.Minute), periodStart.Add(time.Hour)) {
+		t.Fatal("record from the current continuous period should be undoable")
+	}
+}

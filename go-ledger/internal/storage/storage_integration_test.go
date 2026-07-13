@@ -61,13 +61,6 @@ func TestPostgresStoreBasicFlow(t *testing.T) {
 	if !ok {
 		t.Fatalf("owner should also be operator")
 	}
-	ok, err = store.IsAnyOperator(ctx, userID)
-	if err != nil {
-		t.Fatalf("is any operator: %v", err)
-	}
-	if !ok {
-		t.Fatalf("owner should be found by any-operator lookup")
-	}
 	ok, err = store.IsGlobalOperator(ctx, userID)
 	if err != nil {
 		t.Fatalf("is global operator before grant: %v", err)
@@ -90,9 +83,25 @@ func TestPostgresStoreBasicFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get active group: %v", err)
 	}
-	if !group.Active || group.ActiveDayKey != "2026-07-06" || group.ActiveExpiresDayKey != "2026-07-06" {
+	if !group.Active || group.ActiveDayKey != "2026-07-06" || group.ActiveExpiresDayKey != "2026-07-06" || group.ActivePeriodStartedAt.IsZero() {
 		t.Fatalf("active period not persisted: %+v", group)
 	}
+	firstPeriodStart := group.ActivePeriodStartedAt
+	if err := store.SetGroupActive(ctx, chatID, false, "", now.Add(time.Second)); err != nil {
+		t.Fatalf("stop active period: %v", err)
+	}
+	restartAt := now.Add(2 * time.Second)
+	if err := store.SetGroupActivePeriod(ctx, chatID, true, "2026-07-06", "2026-07-06", restartAt); err != nil {
+		t.Fatalf("restart active period: %v", err)
+	}
+	group, err = store.GetGroup(ctx, chatID)
+	if err != nil {
+		t.Fatalf("get restarted group: %v", err)
+	}
+	if !group.ActivePeriodStartedAt.After(firstPeriodStart) {
+		t.Fatalf("restarted period did not advance start time: %v <= %v", group.ActivePeriodStartedAt, firstPeriodStart)
+	}
+	now = restartAt
 
 	recordID, err := store.InsertRecord(ctx, Record{
 		ChatID:          chatID,
@@ -216,6 +225,46 @@ func TestPostgresStoreBasicFlow(t *testing.T) {
 	if !foundGlobalOperator {
 		t.Fatal("global operator should be listed")
 	}
+	secondaryUserID := userID + 1
+	if err := store.UpsertGlobalOperator(ctx, secondaryUserID, "secondary", userID, userID, "secondary operator", now); err != nil {
+		t.Fatalf("upsert secondary global operator: %v", err)
+	}
+	secondary, ok, err := store.GetGlobalOperator(ctx, secondaryUserID)
+	if err != nil || !ok || secondary.ParentUserID != userID || secondary.Level != "secondary" {
+		t.Fatalf("secondary operator = %+v, %v, %v", secondary, ok, err)
+	}
+	if err := store.UpsertGlobalOperator(ctx, secondaryUserID+1, "secondary", userID+999, userID, "invalid parent", now); err == nil {
+		t.Fatal("secondary with inactive or missing primary parent should fail")
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO global_operators(user_id, level, status, created_by, created_at)
+		VALUES($1, 'invalid', 'active', 0, $2)`, secondaryUserID+2, now); err == nil {
+		t.Fatal("database should reject invalid global operator level")
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO global_operators(user_id, level, status, created_by, created_at)
+		VALUES($1, 'primary', 'unknown', 0, $2)`, secondaryUserID+20, now); err == nil {
+		t.Fatal("database should reject invalid global operator status")
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO global_operators(user_id, level, status, created_by, created_at)
+		VALUES($1, 'secondary', 'active', 0, $2)`, secondaryUserID+21, now); err == nil {
+		t.Fatal("database should reject secondary without parent")
+	}
+	if err := store.AddBroadcastPermission(ctx, secondaryUserID, "chat", chatID, "", userID, now); err != nil {
+		t.Fatalf("add secondary broadcast permission: %v", err)
+	}
+	if allowed, err := store.HasBroadcastPermissionScope(ctx, userID, "chat", chatID, ""); err != nil || !allowed {
+		t.Fatalf("primary broadcast scope = %v, %v", allowed, err)
+	}
+	legacyUserID := secondaryUserID + 3
+	if _, err := store.pool.Exec(ctx, `INSERT INTO broadcast_operators(user_id, status, created_by, remark, created_at, updated_at)
+		VALUES($1, 'active', 0, 'late legacy row', $2, $2)`, legacyUserID, now); err != nil {
+		t.Fatalf("insert late legacy broadcast operator: %v", err)
+	}
+	if err := store.migrate(ctx); err != nil {
+		t.Fatalf("rerun migrate: %v", err)
+	}
+	if ok, err := store.IsGlobalOperator(ctx, legacyUserID); err != nil || ok {
+		t.Fatalf("one-time migration re-created legacy identity: %v, %v", ok, err)
+	}
 	cleanupMinutes := now.In(time.FixedZone("Asia/Shanghai", 8*3600)).Hour()*60 + now.In(time.FixedZone("Asia/Shanghai", 8*3600)).Minute()
 	cleanupTime := time.Date(2000, 1, 1, cleanupMinutes/60, cleanupMinutes%60, 0, 0, time.UTC).Format("15:04")
 	saved, err := store.SetBroadcastOperatorPrivateCleanup(ctx, userID, true, cleanupTime, "", now)
@@ -316,6 +365,49 @@ func TestPostgresStoreBasicFlow(t *testing.T) {
 	}
 	if ok {
 		t.Fatal("disabled global operator should not be active")
+	}
+	if ok, err := store.IsGlobalOperator(ctx, secondaryUserID); err != nil || ok {
+		t.Fatalf("secondary should be disabled with primary: %v, %v", ok, err)
+	}
+	permissions, err := store.ListBroadcastPermissions(ctx)
+	if err != nil {
+		t.Fatalf("list permissions after disable: %v", err)
+	}
+	for _, permission := range permissions {
+		if permission.UserID == userID || permission.UserID == secondaryUserID {
+			t.Fatalf("disabled operator retained broadcast permission: %+v", permission)
+		}
+	}
+	if err := store.UpsertGlobalOperator(ctx, userID, "primary", 0, 9999, "reenabled primary", now.Add(time.Second)); err != nil {
+		t.Fatalf("reenable primary: %v", err)
+	}
+	permissions, err = store.ListBroadcastPermissions(ctx)
+	if err != nil {
+		t.Fatalf("list permissions after reenable: %v", err)
+	}
+	for _, permission := range permissions {
+		if permission.UserID == userID {
+			t.Fatalf("reenable restored old broadcast permission: %+v", permission)
+		}
+	}
+	auditEvents, err := store.ListPermissionAuditEvents(ctx, userID, 20)
+	if err != nil {
+		t.Fatalf("list permission audit: %v", err)
+	}
+	actions := map[string]bool{}
+	for _, event := range auditEvents {
+		actions[event.Action] = true
+	}
+	for _, action := range []string{"created", "disabled", "reenabled"} {
+		if !actions[action] {
+			t.Fatalf("permission audit missing %q: %+v", action, auditEvents)
+		}
+	}
+	if len(auditEvents) == 0 {
+		t.Fatal("permission audit should not be empty")
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE permission_audit_events SET action='tampered' WHERE id=$1`, auditEvents[0].ID); err == nil {
+		t.Fatal("permission audit event should be immutable")
 	}
 
 	inserted, err := store.RecordChainNotification(ctx, userID, address, "txhash-"+time.Now().Format("150405.000000000"), "income", now.UnixMilli(), now)

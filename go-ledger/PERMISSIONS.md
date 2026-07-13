@@ -1,136 +1,79 @@
-# Go Ledger Bot v2.3 Permissions
+# Go Ledger Bot v2.4.2 Permissions
 
-本文件是 Go v2.3 权限体系的源头说明。记账核心、共享链上监听、广播后台、部署运维和总控发布线程都应以这里为准，不在各自模块里临时发明权限规则。
+This file is the source of truth for Telegram user permissions in the Go/PostgreSQL runtime. Business modules must use `internal/permissions` and the storage capability helpers instead of reading host/default configuration or legacy operator tables directly.
 
-## 当前基线
+## Identities
 
-- `BOT_HOST_USER_ID` 是唯一宿主，代表系统最终所有者。
-- `DEFAULT_OPERATOR_USER_IDS` 是维护程序的人在部署配置中写入的默认操作人。
-- 为兼容旧行为，当前代码把宿主和默认操作人统一视为全局特权用户。
-- 广播和记账是一体机器人能力，同一个 Bot 实例不能被拆成“广播实例”和“记账实例”两套产品。
-- 同一个 Bot 实例内，广播/转发数据和记账数据使用同一个机器人 PostgreSQL 数据库。共享 `ledger-chain-watcher` 可以使用单独数据库，但它只负责链上数据入口和事件投递。
-- 单群记账操作员仍在 `operators` 表，只管理本群记账和本群设置。
-- 广播操作员仍在 `broadcast_operators` 表，广播目标授权仍在 `broadcast_operator_permissions` 表。
-- 业务模块不得直接读取 `cfg.HostUserID` 或 `cfg.DefaultOperatorIDs` 判断权限；统一调用 `internal/permissions` 暴露的 policy/helper。
+- `BOT_HOST_USER_ID` is the only host and the only identity with complete backend administration.
+- `DEFAULT_OPERATOR_USER_IDS` are maintenance-configured global privileged identities. They are not stored in PostgreSQL and cannot create or disable database global operators.
+- Active `global_operators.level=primary` and `global_operators.level=secondary` are database global operators.
+- Rows in `operators` are single-group ledger operators. They never grant invite, private backend, broadcast, global settings, or unlimited address-watch capability.
+- `broadcast_operators` only carries backward-compatible private-cleanup settings. It is not a permission source.
 
-## 决策
+## Global Operator Tree
 
-### 默认操作人不永远等同宿主
+- A primary has no parent.
+- An active secondary must reference an active primary through `parent_user_id`.
+- The host can create or disable primary and secondary operators. A host-created secondary must still select an active primary parent.
+- A primary can create, update, re-enable, or disable only its own secondary operators.
+- A secondary cannot delegate.
+- Disabling a primary also disables its active secondaries.
+- Disable removes the affected operators' broadcast target permissions. Re-enable does not restore them.
 
-当前 v2.3 兼容阶段，默认操作人拥有全局记账、全局广播、地址监听和邀请机器人等能力。
+Database checks, a self-reference foreign key, and a parent-validation trigger enforce these invariants independently of the web form.
 
-长期规则上，默认操作人不是宿主。宿主是唯一根身份，默认操作人是宿主预配置的全局委托身份。后续一旦进入可配置权限阶段，应允许把默认操作人的能力拆成显式 scope，而不是继续把默认操作人写死为宿主等价身份。
+## Ledger Permissions
 
-落地要求：
+The host, default operators, and active primary/secondary global operators can execute the complete ledger command set in a group where they issue the command. This includes start, stop, record, undo, rate and exchange-rate settings, and ledger clearing.
 
-- `Policy.IsHost` 只表示唯一宿主。
-- `Policy.IsPrivileged` 只表示当前兼容阶段的全局特权集合。
-- 新增能力时，不直接复用 `IsHost` 或散读 env；应新增清晰的能力方法，例如 `CanManageGlobalOperators`、`CanGrantBroadcastPermission`。
+A single-group operator can execute ledger commands only in rows where `(chat_id, user_id)` exists in `operators`. Removing that row removes current ledger permission. Single-group ownership and operator management remain group-scoped and do not create global capability.
 
-### 授权树按域分开存储
+`+0` and the open-bill query remain readable by ordinary group members under the existing ledger query rules; this does not grant write permission.
 
-记账权限和广播权限继续按域分离。这里的“分离”只表示权限域、授权目标和表结构分离，不表示拆成两个 Bot 实例，也不表示同一个 Bot 使用两个业务数据库。
+## Undo Period Boundary
 
-它们的目标和风险不同：记账权限绑定单群账本，广播权限绑定可投递目标群或广播分组，强行合并会让授权边界变模糊。
+Undo requires both current ledger permission and a record in the current active ledger period:
 
-统一的是权限判断入口和术语，不是数据库表强合并：
+- The record `day_key` must equal `currentLedgerDayKey(group, now)`.
+- The group must still be active for that period.
+- At the configured cutoff, the previous period is sealed for every identity, including host/default/global operators and the original recorder.
+- Starting a new period never reopens a previous `day_key`.
+- With cutoff disabled, the same active `active_day_key` remains one continuous period. Stopping or otherwise closing that period prevents undo until a new period is started, and prior `day_key` records remain sealed.
+- Undo performs a direct current-permission database check rather than using the single-group operator TTL cache.
 
-- 记账域：沿用 `operators`，后续增加授权树字段。
-- 广播域：沿用 `broadcast_operators` 和 `broadcast_operator_permissions`，后续增加授权树字段。
-- 地址监听：当前跟随全局特权用户和广播操作员；后续应拆成单独 scope，避免“能广播”天然等于“能监听地址”。
+## Invite And Private Capabilities
 
-同一个 Bot 的这些表必须落在同一个 `DATABASE_URL` 指向的机器人数据库中；共享链上 watcher 的数据库边界由 `CHAIN_WATCHER_DATABASE_URL` 管理，不承载机器人侧记账/广播权限。
+The host, default operators, and active primary/secondary global operators can invite the bot. Single-group operators and ordinary users cannot.
 
-### 群默认不记账，开始只激活当前业务日
+The same global identities can use private global features. A disabled or invalid global operator cannot create a Telegram admin ticket and an existing signed operator session is rejected on its next request.
 
-群被机器人加入或被广播触达时，默认只保存群资料、支持广播投递和广播回复通知，不自动开启记账。
+## Broadcast Delegation
 
-需要记账的群，必须由宿主、默认操作人、一级操作人或下级操作人发送 `开始`，开启该群当前业务日记账。非操作人发送 `开始` 只回复：
+- Host/default identities may grant or revoke broadcast group/chat scopes for any active global operator without a parent-scope restriction.
+- A primary may grant or revoke scopes only for its own active secondaries.
+- A primary may grant a group only when it has that exact group scope.
+- A primary may grant a chat when it has that chat directly or through one of its group scopes.
+- A secondary cannot grant or revoke broadcast scopes.
+- `broadcast_operator_permissions.user_id` always references a `global_operators.user_id`.
 
-```text
-没有操作权限。请管理员添加操作员。
-```
+## Address Watch And Backend
 
-`开始` 只对当前业务日有效。业务日由群配置的 `cutoff_hour` 计算，当前代码用 `active_day_key` 保存本次激活的业务日。到该群日切时间后，即使 `active=true` 仍应因为 `active_day_key != businessDayKey(now, cutoff_hour)` 被视为未开始；下一业务日必须重新发送 `开始` 才能继续记账。
+Ordinary private users may manage up to `ADDRESS_WATCH_FREE_LIMIT` active addresses. Host/default and active primary/secondary global operators are unlimited. Single-group operators use the ordinary-user limit unless they also hold a global identity.
 
-例：日切 `00:00` 时，`2026-07-09` 账单只覆盖 `2026-07-09 00:00:00` 到 `2026-07-09 23:59:59`。`2026-07-10 00:00:00` 以后要记账，必须重新发送 `开始`。
+The host can see all backend address watches. Default/global operators see only their own watches. Ordinary users cannot enter the backend.
 
-日切只让当前业务日记账激活失效，不清空、不重置费率、汇率、操作员、广播分组、广播授权或转发回复通知配置。
+Host-only backend modules remain host-only. Default operators can manage unrestricted broadcast permission assignments. A primary can access only its own secondary-management and delegated broadcast-permission views.
 
-建议的后续字段：
+## Disable, Cache, Migration, And Audit
 
-```sql
-ALTER TABLE operators
-  ADD COLUMN parent_user_id BIGINT NOT NULL DEFAULT 0,
-  ADD COLUMN level INT NOT NULL DEFAULT 1,
-  ADD COLUMN can_delegate BOOLEAN NOT NULL DEFAULT FALSE;
+Global operator checks for invite, backend, ledger, broadcast entry, and unlimited address watches read current PostgreSQL state. They do not rely on the 10-second operator cache. Global changes also clear same-process permission state immediately.
 
-ALTER TABLE broadcast_operators
-  ADD COLUMN parent_user_id BIGINT NOT NULL DEFAULT 0,
-  ADD COLUMN level INT NOT NULL DEFAULT 1,
-  ADD COLUMN can_delegate BOOLEAN NOT NULL DEFAULT FALSE;
-```
+The 10-second `BOT_OPERATOR_CACHE_TTL_SECONDS` boundary remains only for ordinary single-group operator checks across multiple bot processes. Same-process add/remove actively invalidates it. Undo bypasses it entirely.
 
-其中 `parent_user_id` 记录直接授权人，`level=1` 表示一级操作人，`level=2` 表示下级操作人。现有数据迁移时默认视为一级操作人，且默认不可再授权，避免旧数据突然扩大权限。
+The legacy active-`broadcast_operators` backfill is a strictly one-time migration and is skipped when upgrading a database that already had `global_operators`. Repeated startup cannot recreate a removed identity.
 
-### 下级默认不可再授权
+`permission_audit_events` is append-only and records global-operator create/update/level/parent/re-enable/disable actions and broadcast grant/revoke actions with actor, subject, scope, and timestamp.
 
-授权链默认只允许两层：
+## Module Boundary
 
-- 宿主和默认操作人可以创建一级操作人。
-- 一级操作人只有在 `can_delegate=true` 时，才能创建下级操作人。
-- 下级操作人默认不能继续授权。
-
-若以后确实需要多级代理，应通过 `can_delegate` 和最大深度显式打开，并且只能把自己已拥有的目标和能力子集授予下级。
-
-任何授权操作必须满足：
-
-- 授权人当前有效。
-- 被授权 scope 属于授权人自己拥有的 scope 子集。
-- 被授权目标属于授权人自己拥有的目标子集。
-- 不能授权宿主身份。
-- 不能通过下级权限覆盖宿主或默认操作人的全局权限。
-
-### 后台使用 Telegram UID 角色，保留后台 token 兜底
-
-当前后台支持两种入口：
-
-- 私聊机器人点击 `后台管理` 生成 5 分钟有效的一次性登录链接，链接消耗后写入签名 cookie。
-- 直接打开 `/admin/login` 可输入 `ADMIN_WEB_TOKEN`，作为宿主紧急入口和维护入口。
-
-UID 角色来自统一 policy：
-
-- 宿主：后台最高权限，可管理全局权限和所有业务。
-- 默认操作人：兼容阶段仍有全局机器人业务权限；后台全局管理暂只给宿主，后续按显式 scope 限制。
-- 广播操作员：可以进入后台，但只能看和执行已授权的广播目标；地址监听页只显示自己的监听地址。
-- 普通用户：不能进入后台，但可以在私聊地址监听面板管理自己的监听地址。
-
-后台写操作必须按 UID 权限判断；只有 `ADMIN_WEB_TOKEN` 入口创建的宿主会话可以作为维护兜底。
-
-### 地址监听普通用户上限
-
-普通用户允许在私聊中使用地址监听，但默认最多只能保留 2 个 active 地址，由 `ADDRESS_WATCH_FREE_LIMIT` 控制。宿主、默认操作人和启用中的广播操作人不受这个数量限制。
-
-后台地址监听页按角色过滤：宿主看到全部监听地址；默认操作人和广播操作人只看到自己的监听地址；普通用户没有后台入口。
-
-## 当前代码状态
-
-`internal/permissions.Policy` 已经承接 env 权限，并提供这些兼容阶段能力：
-
-- `CanInviteBot`
-- `HasGlobalLedgerAccess`
-- `HasGlobalBroadcastAccess`
-- `HasGlobalAddressWatchAccess`
-- `CanManageAnyGroup`
-
-后续模块接入时，应先在 `internal/permissions` 增加语义化方法，再由 bot、后台或 worker 调用。不要在业务代码里写 `userID == cfg.HostUserID` 或遍历 `cfg.DefaultOperatorIDs`。
-
-## 同步给其他线程的口径
-
-短期同步口径：
-
-宿主和默认操作人在 Go v2.3 兼容阶段都是全局特权用户；单群记账操作员和广播操作员仍按各自表限制范围；所有新判断必须走 `internal/permissions`。共享 `ledger-chain-watcher` 只处理链上数据入口和事件投递，不改变机器人侧权限判断。
-
-长期同步口径：
-
-宿主是唯一根身份，默认操作人只是预配置的全局委托身份。记账和广播权限不合并表，只合并 policy/helper 入口。一级/下级授权树按域存储，下级默认不可再授权，所有授权只能授予自己已有能力和目标的子集。
+`ledger-chain-watcher` does not own Telegram user permissions. Ledger core, bot invite handling, private menus, broadcast, address watch, and admin web must consume the centralized policy and PostgreSQL capability layer. New capabilities must be added there before business modules use them.

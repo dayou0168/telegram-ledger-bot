@@ -1,12 +1,13 @@
 package permissions
 
 type Policy struct {
-	HostUserID         int64
-	DefaultOperatorIDs map[int64]struct{}
+	hostUserID         int64
+	defaultOperatorIDs map[int64]struct{}
 }
 
 type UserCapabilities struct {
 	GlobalOperatorLevel string
+	ParentUserID        int64
 }
 
 func NewPolicy(hostUserID int64, defaultOperatorIDs map[int64]struct{}) Policy {
@@ -17,20 +18,24 @@ func NewPolicy(hostUserID int64, defaultOperatorIDs map[int64]struct{}) Policy {
 		}
 	}
 	return Policy{
-		HostUserID:         hostUserID,
-		DefaultOperatorIDs: ids,
+		hostUserID:         hostUserID,
+		defaultOperatorIDs: ids,
 	}
 }
 
+func (p Policy) HostUserID() int64 {
+	return p.hostUserID
+}
+
 func (p Policy) IsHost(userID int64) bool {
-	return p.HostUserID != 0 && userID == p.HostUserID
+	return p.hostUserID != 0 && userID == p.hostUserID
 }
 
 func (p Policy) IsDefaultOperator(userID int64) bool {
 	if userID == 0 {
 		return false
 	}
-	_, ok := p.DefaultOperatorIDs[userID]
+	_, ok := p.defaultOperatorIDs[userID]
 	return ok
 }
 
@@ -39,11 +44,11 @@ func (p Policy) IsPrivileged(userID int64) bool {
 }
 
 func (p Policy) PrivilegedUserIDs() []int64 {
-	ids := make([]int64, 0, len(p.DefaultOperatorIDs)+1)
-	if p.HostUserID != 0 {
-		ids = append(ids, p.HostUserID)
+	ids := make([]int64, 0, len(p.defaultOperatorIDs)+1)
+	if p.hostUserID != 0 {
+		ids = append(ids, p.hostUserID)
 	}
-	for id := range p.DefaultOperatorIDs {
+	for id := range p.defaultOperatorIDs {
 		if id != 0 {
 			ids = append(ids, id)
 		}
@@ -57,6 +62,36 @@ func (p Policy) CanInviteBot(userID int64, caps UserCapabilities) bool {
 
 func (p Policy) CanUsePrivateGlobalFeatures(userID int64, caps UserCapabilities) bool {
 	return p.IsPrivileged(userID) || caps.IsGlobalOperator()
+}
+
+func (p Policy) CanUseLedger(userID int64, caps UserCapabilities) bool {
+	return p.IsPrivileged(userID) || caps.IsGlobalOperator()
+}
+
+func (p Policy) CanCreateGlobalOperator(userID int64, caps UserCapabilities, targetLevel string) bool {
+	if p.IsHost(userID) {
+		return targetLevel == "primary" || targetLevel == "secondary"
+	}
+	return caps.GlobalOperatorLevel == "primary" && targetLevel == "secondary"
+}
+
+func (p Policy) CanDisableGlobalOperator(userID int64, caps UserCapabilities, targetLevel string, targetParentUserID int64) bool {
+	if p.IsHost(userID) {
+		return targetLevel == "primary" || targetLevel == "secondary"
+	}
+	return caps.GlobalOperatorLevel == "primary" && targetLevel == "secondary" && targetParentUserID == userID
+}
+
+func (p Policy) CanManageBroadcastPermissions(userID int64, caps UserCapabilities) bool {
+	return p.IsPrivileged(userID) || caps.GlobalOperatorLevel == "primary"
+}
+
+func (p Policy) CanManageAllBroadcastPermissions(userID int64) bool {
+	return p.IsPrivileged(userID)
+}
+
+func (p Policy) CanManageGlobalAdmin(userID int64) bool {
+	return p.IsHost(userID)
 }
 
 func (caps UserCapabilities) IsGlobalOperator() bool {

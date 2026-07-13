@@ -18,6 +18,7 @@ import (
 
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/adminauth"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/config"
+	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/permissions"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
 	"github.com/xuri/excelize/v2"
 )
@@ -29,12 +30,14 @@ type adminContextKey struct{}
 type Server struct {
 	cfg         config.Config
 	store       *storage.Store
+	perms       permissions.Policy
 	invalidator PermissionCacheInvalidator
 	stats       SendGatewayStatsProvider
 }
 
 type PermissionCacheInvalidator interface {
 	InvalidateBroadcastPermission(userID int64)
+	InvalidateAllPermissionCaches()
 	InvalidateWatchTargets()
 }
 
@@ -43,21 +46,23 @@ type SendGatewayStatsProvider interface {
 }
 
 type pageData struct {
-	Version         string
-	TokenUnset      bool
-	Message         string
-	Groups          []storage.Group
-	BGroups         []storage.BroadcastGroup
-	BOperators      []storage.GlobalOperator
-	Permissions     []storage.BroadcastPermission
-	Replace         storage.BroadcastReplaceSetting
-	WatchTargets    []storage.WatchTarget
-	AdminUserID     int64
-	AdminRole       string
-	AdminRoleLabel  string
-	CanManageGlobal bool
-	ChatNames       map[int64]string
-	OpLabels        map[int64]string
+	Version                       string
+	TokenUnset                    bool
+	Message                       string
+	Groups                        []storage.Group
+	BGroups                       []storage.BroadcastGroup
+	BOperators                    []storage.GlobalOperator
+	Permissions                   []storage.BroadcastPermission
+	Replace                       storage.BroadcastReplaceSetting
+	WatchTargets                  []storage.WatchTarget
+	AdminUserID                   int64
+	AdminRole                     string
+	AdminRoleLabel                string
+	CanManageGlobal               bool
+	CanManageOperators            bool
+	CanManageBroadcastPermissions bool
+	ChatNames                     map[int64]string
+	OpLabels                      map[int64]string
 }
 
 type outboxStatusResponse struct {
@@ -132,7 +137,11 @@ type billRateStat struct {
 }
 
 func New(cfg config.Config, store *storage.Store, invalidator ...PermissionCacheInvalidator) *Server {
-	s := &Server{cfg: cfg, store: store}
+	s := &Server{
+		cfg:   cfg,
+		store: store,
+		perms: permissions.NewPolicy(cfg.HostUserID, cfg.DefaultOperatorIDs),
+	}
 	if len(invalidator) > 0 {
 		s.invalidator = invalidator[0]
 		if stats, ok := any(invalidator[0]).(SendGatewayStatsProvider); ok {
@@ -186,7 +195,7 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) outboxStatus(w http.ResponseWriter, r *http.Request) {
-	if !requireGlobalAdmin(w, r) {
+	if !s.requireGlobalAdmin(w, r) {
 		return
 	}
 	statsWindow := s.cfg.OutboxStatsWindow
@@ -376,12 +385,13 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		renderLogin(w, false, "密码不正确")
 		return
 	}
-	if s.cfg.HostUserID <= 0 {
+	hostUserID := s.perms.HostUserID()
+	if hostUserID <= 0 {
 		renderLogin(w, s.cfg.AdminWebToken == "", "未配置宿主 UID，无法创建后台会话")
 		return
 	}
 	s.setAdminCookie(w, adminauth.Session{
-		UserID:    s.cfg.HostUserID,
+		UserID:    hostUserID,
 		Role:      adminauth.RoleHost,
 		ExpiresAt: time.Now().Add(adminauth.SessionTTL),
 	})
@@ -480,18 +490,20 @@ func (s *Server) adminSessionFromRequest(r *http.Request) (adminauth.Session, bo
 func (s *Server) adminSessionAllowed(ctx context.Context, session adminauth.Session) (bool, error) {
 	switch session.Role {
 	case adminauth.RoleHost:
-		return s.cfg.HostUserID > 0 && session.UserID == s.cfg.HostUserID, nil
+		return s.perms.IsHost(session.UserID), nil
 	case adminauth.RoleDefaultOperator:
-		if session.UserID <= 0 {
-			return false, nil
-		}
-		_, ok := s.cfg.DefaultOperatorIDs[session.UserID]
-		return ok, nil
+		return s.perms.IsDefaultOperator(session.UserID), nil
 	case adminauth.RoleOperator:
 		if session.UserID <= 0 {
 			return false, nil
 		}
-		return s.store.IsGlobalOperator(ctx, session.UserID)
+		level, ok, err := s.store.GetGlobalOperatorLevel(ctx, session.UserID)
+		if err != nil || !ok {
+			return false, err
+		}
+		return s.perms.CanUsePrivateGlobalFeatures(session.UserID, permissions.UserCapabilities{
+			GlobalOperatorLevel: level,
+		}), nil
 	default:
 		return false, nil
 	}
@@ -520,12 +532,26 @@ func adminSessionFromContext(ctx context.Context) adminauth.Session {
 	return adminauth.Session{}
 }
 
-func adminCanManageGlobal(session adminauth.Session) bool {
-	return adminauth.IsHost(session.Role)
+func (s *Server) sessionCapabilities(ctx context.Context, session adminauth.Session) (permissions.UserCapabilities, error) {
+	if session.Role != adminauth.RoleOperator {
+		return permissions.UserCapabilities{}, nil
+	}
+	op, ok, err := s.store.GetGlobalOperator(ctx, session.UserID)
+	if err != nil || !ok || op.Status != "active" {
+		return permissions.UserCapabilities{}, err
+	}
+	return permissions.UserCapabilities{
+		GlobalOperatorLevel: op.Level,
+		ParentUserID:        op.ParentUserID,
+	}, nil
 }
 
-func requireGlobalAdmin(w http.ResponseWriter, r *http.Request) bool {
-	if adminCanManageGlobal(adminSessionFromContext(r.Context())) {
+func (s *Server) adminCanManageGlobal(session adminauth.Session) bool {
+	return adminauth.IsHost(session.Role) && s.perms.CanManageGlobalAdmin(session.UserID)
+}
+
+func (s *Server) requireGlobalAdmin(w http.ResponseWriter, r *http.Request) bool {
+	if s.adminCanManageGlobal(adminSessionFromContext(r.Context())) {
 		return true
 	}
 	http.Error(w, "没有后台管理权限", http.StatusForbidden)
@@ -543,6 +569,12 @@ func requirePost(w http.ResponseWriter, r *http.Request) bool {
 func (s *Server) invalidateBroadcastPermission(userID int64) {
 	if s.invalidator != nil {
 		s.invalidator.InvalidateBroadcastPermission(userID)
+	}
+}
+
+func (s *Server) invalidateAllPermissionCaches() {
+	if s.invalidator != nil {
+		s.invalidator.InvalidateAllPermissionCaches()
 	}
 }
 
@@ -594,7 +626,7 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) saveGroup(w http.ResponseWriter, r *http.Request) {
-	if !requireGlobalAdmin(w, r) {
+	if !s.requireGlobalAdmin(w, r) {
 		return
 	}
 	if !requirePost(w, r) {
@@ -617,7 +649,7 @@ func (s *Server) saveGroup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deleteGroup(w http.ResponseWriter, r *http.Request) {
-	if !requireGlobalAdmin(w, r) {
+	if !s.requireGlobalAdmin(w, r) {
 		return
 	}
 	if !requirePost(w, r) {
@@ -653,7 +685,7 @@ func (s *Server) removeGroupChats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) changeGroupChats(w http.ResponseWriter, r *http.Request, add bool) {
-	if !requireGlobalAdmin(w, r) {
+	if !s.requireGlobalAdmin(w, r) {
 		return
 	}
 	if !requirePost(w, r) {
@@ -691,10 +723,35 @@ func (s *Server) changeGroupChats(w http.ResponseWriter, r *http.Request, add bo
 	redirectMsg(w, r, fmt.Sprintf("已%s %d 个群", action, count))
 }
 
-func (s *Server) saveOperator(w http.ResponseWriter, r *http.Request) {
-	if !requireGlobalAdmin(w, r) {
-		return
+func (s *Server) operatorActorCapabilities(ctx context.Context, session adminauth.Session) (permissions.UserCapabilities, error) {
+	if session.Role == adminauth.RoleHost || session.Role == adminauth.RoleDefaultOperator {
+		return permissions.UserCapabilities{}, nil
 	}
+	return s.sessionCapabilities(ctx, session)
+}
+
+func (s *Server) canMutateBroadcastPermission(ctx context.Context, session adminauth.Session, subjectUserID int64, target string, chatID int64, groupName string, granting bool) (bool, error) {
+	caps, err := s.operatorActorCapabilities(ctx, session)
+	if err != nil || !s.perms.CanManageBroadcastPermissions(session.UserID, caps) {
+		return false, err
+	}
+	subject, ok, err := s.store.GetGlobalOperator(ctx, subjectUserID)
+	if err != nil || !ok || subject.Status != "active" {
+		return false, err
+	}
+	if s.perms.CanManageAllBroadcastPermissions(session.UserID) {
+		return true, nil
+	}
+	if subject.Level != "secondary" || subject.ParentUserID != session.UserID {
+		return false, nil
+	}
+	if !granting {
+		return true, nil
+	}
+	return s.store.HasBroadcastPermissionScope(ctx, session.UserID, target, chatID, groupName)
+}
+
+func (s *Server) saveOperator(w http.ResponseWriter, r *http.Request) {
 	if !requirePost(w, r) {
 		return
 	}
@@ -716,18 +773,44 @@ func (s *Server) saveOperator(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	session := adminSessionFromContext(r.Context())
-	if err := s.store.UpsertGlobalOperator(r.Context(), userID, level, 0, session.UserID, r.FormValue("remark"), time.Now()); err != nil {
+	caps, err := s.operatorActorCapabilities(r.Context(), session)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.invalidateBroadcastPermission(userID)
+	if !s.perms.CanCreateGlobalOperator(session.UserID, caps, level) || s.perms.IsPrivileged(userID) {
+		http.Error(w, "no permission to grant global operator", http.StatusForbidden)
+		return
+	}
+	parentUserID := int64(0)
+	if level == "secondary" {
+		if s.perms.IsHost(session.UserID) {
+			var parentOK bool
+			parentUserID, parentOK = parsePositiveFormID(r, "parent_user_id")
+			if !parentOK {
+				redirectMsg(w, r, "secondary operator requires a primary parent")
+				return
+			}
+		} else {
+			parentUserID = session.UserID
+		}
+	}
+	if existing, exists, err := s.store.GetGlobalOperator(r.Context(), userID); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	} else if exists && !s.perms.IsHost(session.UserID) && (existing.Level != "secondary" || existing.ParentUserID != session.UserID) {
+		http.Error(w, "primary can only update its own secondary operators", http.StatusForbidden)
+		return
+	}
+	if err := s.store.UpsertGlobalOperator(r.Context(), userID, level, parentUserID, session.UserID, r.FormValue("remark"), time.Now()); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.invalidateAllPermissionCaches()
 	redirectMsg(w, r, "操作人已保存")
 }
 
 func (s *Server) disableOperator(w http.ResponseWriter, r *http.Request) {
-	if !requireGlobalAdmin(w, r) {
-		return
-	}
 	if !requirePost(w, r) {
 		return
 	}
@@ -741,17 +824,31 @@ func (s *Server) disableOperator(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	session := adminSessionFromContext(r.Context())
-	_, err := s.store.DisableGlobalOperator(r.Context(), userID, session.UserID, time.Now())
+	caps, err := s.operatorActorCapabilities(r.Context(), session)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.invalidateBroadcastPermission(userID)
+	target, exists, err := s.store.GetGlobalOperator(r.Context(), userID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !exists || !s.perms.CanDisableGlobalOperator(session.UserID, caps, target.Level, target.ParentUserID) {
+		http.Error(w, "no permission to disable global operator", http.StatusForbidden)
+		return
+	}
+	_, err = s.store.DisableGlobalOperator(r.Context(), userID, session.UserID, time.Now())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.invalidateAllPermissionCaches()
 	redirectMsg(w, r, "操作人已禁用")
 }
 
 func (s *Server) saveOperatorCleanup(w http.ResponseWriter, r *http.Request) {
-	if !requireGlobalAdmin(w, r) {
+	if !s.requireGlobalAdmin(w, r) {
 		return
 	}
 	if !requirePost(w, r) {
@@ -841,9 +938,6 @@ func (s *Server) saveOperatorCleanup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) grantPermission(w http.ResponseWriter, r *http.Request) {
-	if !requireGlobalAdmin(w, r) {
-		return
-	}
 	if !requirePost(w, r) {
 		return
 	}
@@ -854,6 +948,16 @@ func (s *Server) grantPermission(w http.ResponseWriter, r *http.Request) {
 	userID, target, chatID, groupName, message, ok := parseBroadcastPermissionForm(r)
 	if !ok {
 		redirectMsg(w, r, message)
+		return
+	}
+	session := adminSessionFromContext(r.Context())
+	allowed, err := s.canMutateBroadcastPermission(r.Context(), session, userID, target, chatID, groupName, true)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !allowed {
+		http.Error(w, "broadcast grant exceeds actor scope", http.StatusForbidden)
 		return
 	}
 	if ok, err := s.store.IsGlobalOperator(r.Context(), userID); err != nil {
@@ -863,7 +967,7 @@ func (s *Server) grantPermission(w http.ResponseWriter, r *http.Request) {
 		redirectMsg(w, r, "操作人不存在或已禁用")
 		return
 	}
-	if err := s.store.AddBroadcastPermission(r.Context(), userID, target, chatID, groupName, 0, time.Now()); err != nil {
+	if err := s.store.AddBroadcastPermission(r.Context(), userID, target, chatID, groupName, session.UserID, time.Now()); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -872,9 +976,6 @@ func (s *Server) grantPermission(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) revokePermission(w http.ResponseWriter, r *http.Request) {
-	if !requireGlobalAdmin(w, r) {
-		return
-	}
 	if !requirePost(w, r) {
 		return
 	}
@@ -887,7 +988,17 @@ func (s *Server) revokePermission(w http.ResponseWriter, r *http.Request) {
 		redirectMsg(w, r, message)
 		return
 	}
-	_, err := s.store.RemoveBroadcastPermission(r.Context(), userID, target, chatID, groupName)
+	session := adminSessionFromContext(r.Context())
+	allowed, err := s.canMutateBroadcastPermission(r.Context(), session, userID, target, chatID, groupName, false)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !allowed {
+		http.Error(w, "no permission to revoke broadcast scope", http.StatusForbidden)
+		return
+	}
+	_, err = s.store.RemoveBroadcastPermission(r.Context(), userID, target, chatID, groupName, session.UserID, time.Now())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -972,7 +1083,7 @@ func (s *Server) watchFormIdentity(w http.ResponseWriter, r *http.Request, sessi
 }
 
 func (s *Server) saveReplace(w http.ResponseWriter, r *http.Request) {
-	if !requireGlobalAdmin(w, r) {
+	if !s.requireGlobalAdmin(w, r) {
 		return
 	}
 	if !requirePost(w, r) {
@@ -1015,16 +1126,21 @@ func (s *Server) saveReplace(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) loadPageData(ctx context.Context, message string, session adminauth.Session) (pageData, error) {
-	canManageGlobal := adminCanManageGlobal(session)
+	caps, err := s.operatorActorCapabilities(ctx, session)
+	if err != nil {
+		return pageData{}, err
+	}
+	canManageGlobal := s.adminCanManageGlobal(session)
+	canManageOperators := s.perms.CanCreateGlobalOperator(session.UserID, caps, "secondary")
+	canManageBroadcastPermissions := s.perms.CanManageBroadcastPermissions(session.UserID, caps)
 	var (
 		groups      []storage.Group
 		bgroups     []storage.BroadcastGroup
 		operators   []storage.GlobalOperator
 		permissions []storage.BroadcastPermission
 		replace     storage.BroadcastReplaceSetting
-		err         error
 	)
-	if canManageGlobal {
+	if canManageGlobal || canManageBroadcastPermissions {
 		groups, err = s.store.ListGroups(ctx)
 		if err != nil {
 			return pageData{}, err
@@ -1041,13 +1157,48 @@ func (s *Server) loadPageData(ctx context.Context, message string, session admin
 		if err != nil {
 			return pageData{}, err
 		}
+	}
+	if canManageGlobal {
 		replace, err = s.store.GetBroadcastReplaceSetting(ctx)
 		if err != nil {
 			return pageData{}, err
 		}
+	} else if caps.GlobalOperatorLevel == "primary" {
+		managed := make([]storage.GlobalOperator, 0, len(operators))
+		managedIDs := map[int64]struct{}{}
+		for _, op := range operators {
+			if op.Level == "secondary" && op.ParentUserID == session.UserID {
+				managed = append(managed, op)
+				managedIDs[op.UserID] = struct{}{}
+			}
+		}
+		allPermissions := permissions
+		permissions = permissions[:0]
+		allowedGroups := map[string]struct{}{}
+		for _, permission := range allPermissions {
+			if permission.UserID == session.UserID && permission.Target == "group" {
+				allowedGroups[permission.GroupName] = struct{}{}
+			}
+			if _, ok := managedIDs[permission.UserID]; ok {
+				permissions = append(permissions, permission)
+			}
+		}
+		operators = managed
+		allowedChats, err := s.store.ListAllowedBroadcastChats(ctx, session.UserID, false)
+		if err != nil {
+			return pageData{}, err
+		}
+		groups = allowedChats
+		filteredGroups := make([]storage.BroadcastGroup, 0, len(bgroups))
+		for _, group := range bgroups {
+			if _, ok := allowedGroups[group.Name]; ok {
+				filteredGroups = append(filteredGroups, group)
+			}
+		}
+		bgroups = filteredGroups
 	}
 	var watchTargets []storage.WatchTarget
-	if adminauth.IsHost(session.Role) {
+	if s.perms.IsHost(session.UserID) {
 		watchTargets, err = s.store.ListWatchTargets(ctx)
 	} else {
 		watchTargets, err = s.store.ListWatchTargetsForOwner(ctx, session.UserID)
@@ -1064,21 +1215,23 @@ func (s *Server) loadPageData(ctx context.Context, message string, session admin
 		opLabels[op.UserID] = operatorLabel(op)
 	}
 	return pageData{
-		Version:         config.Version,
-		TokenUnset:      s.cfg.AdminWebToken == "",
-		Message:         message,
-		Groups:          groups,
-		BGroups:         bgroups,
-		BOperators:      operators,
-		Permissions:     permissions,
-		Replace:         replace,
-		WatchTargets:    watchTargets,
-		AdminUserID:     session.UserID,
-		AdminRole:       session.Role,
-		AdminRoleLabel:  adminauth.RoleLabel(session.Role),
-		CanManageGlobal: canManageGlobal,
-		ChatNames:       chatNames,
-		OpLabels:        opLabels,
+		Version:                       config.Version,
+		TokenUnset:                    s.cfg.AdminWebToken == "",
+		Message:                       message,
+		Groups:                        groups,
+		BGroups:                       bgroups,
+		BOperators:                    operators,
+		Permissions:                   permissions,
+		Replace:                       replace,
+		WatchTargets:                  watchTargets,
+		AdminUserID:                   session.UserID,
+		AdminRole:                     session.Role,
+		AdminRoleLabel:                adminauth.RoleLabel(session.Role),
+		CanManageGlobal:               canManageGlobal,
+		CanManageOperators:            canManageOperators,
+		CanManageBroadcastPermissions: canManageBroadcastPermissions,
+		ChatNames:                     chatNames,
+		OpLabels:                      opLabels,
 	}, nil
 }
 
@@ -1217,6 +1370,12 @@ func operatorLevelLabel(level string) string {
 }
 
 func operatorSourceLabel(op storage.GlobalOperator, labels map[int64]string) string {
+	if op.Level == "secondary" && op.ParentUserID > 0 {
+		if label := labels[op.ParentUserID]; label != "" {
+			return label
+		}
+		return "一级授权人 " + maskedUserID(op.ParentUserID)
+	}
 	if op.CreatedBy == 0 {
 		return "后台管理"
 	}
@@ -2212,7 +2371,7 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 </head>
 <body><main class="wrap">
 <section class="top">
-<div><div class="brand">Telegram 记账机器人</div><div class="title">后台管理</div><div class="sub">Go v{{.Version}} · {{.AdminRoleLabel}} · {{if .CanManageGlobal}}群组、广播分组、操作人、地址监听和权限{{else}}地址监听{{end}}</div></div>
+<div><div class="brand">Telegram 记账机器人</div><div class="title">后台管理</div><div class="sub">Go v{{.Version}} · {{.AdminRoleLabel}} · {{if or .CanManageGlobal .CanManageOperators .CanManageBroadcastPermissions}}操作人、广播权限和地址监听{{else}}地址监听{{end}}</div></div>
 <div class="actions"><a class="btn secondary" href="/admin">刷新</a><a class="btn secondary" href="/admin/logout">退出</a></div>
 </section>
 {{if .TokenUnset}}<div class="warn">当前没有配置 ADMIN_WEB_TOKEN，公网部署请先设置后台密码。</div>{{end}}
@@ -2221,9 +2380,11 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 {{if .CanManageGlobal}}
 <button class="tab-btn active" type="button" data-admin-tab-target="groups">已保存群组</button>
 <button class="tab-btn" type="button" data-admin-tab-target="broadcast">广播分组</button>
-<button class="tab-btn" type="button" data-admin-tab-target="permissions">权限/操作人</button>
 {{end}}
-<button class="tab-btn {{if not .CanManageGlobal}}active{{end}}" type="button" data-admin-tab-target="watch">地址监听</button>
+{{if or .CanManageOperators .CanManageBroadcastPermissions}}
+<button class="tab-btn {{if not .CanManageGlobal}}active{{end}}" type="button" data-admin-tab-target="permissions">权限/操作人</button>
+{{end}}
+<button class="tab-btn {{if not (or .CanManageGlobal .CanManageOperators .CanManageBroadcastPermissions)}}active{{end}}" type="button" data-admin-tab-target="watch">地址监听</button>
 {{if .CanManageGlobal}}
 <button class="tab-btn" type="button" data-admin-tab-target="replace">广播替换</button>
 {{end}}
@@ -2240,12 +2401,15 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 </tbody></table></div>
 </div>
 
-<div class="card tab-card" data-admin-tab="permissions">
+{{end}}
+{{if .CanManageOperators}}
+<div class="card tab-card {{if not .CanManageGlobal}}active{{end}}" data-admin-tab="permissions">
 <h2>一级 / 下级操作人</h2>
 <p class="hint">宿主和默认操作人来自环境配置；这里添加的是全局一级/下级操作人，可邀请机器人、进入后台和使用授权广播范围。页面不直接显示 UID，保存时仍按 UID 精确处理。</p>
 <form method="post" action="/admin/operator/save" class="row">
 <input name="user_id" placeholder="操作人 UID">
 <select name="level"><option value="primary">一级操作人</option><option value="secondary">下级操作人</option></select>
+<select name="parent_user_id"><option value="">下级的一级授权人</option>{{range .BOperators}}{{if and (eq .Level "primary") (eq .Status "active")}}<option value="{{.UserID}}">{{operatorLabel .}}</option>{{end}}{{end}}</select>
 <input name="remark" placeholder="备注，可选">
 <button class="btn" type="submit">保存</button>
 </form>
@@ -2254,6 +2418,8 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 </tbody></table></div>
 </div>
 
+{{end}}
+{{if .CanManageGlobal}}
 <div class="card wide tab-card" data-admin-tab="broadcast">
 <h2>广播分组</h2>
 <p class="hint">先创建分组，再用下方多选框批量添加或移除群组。页面显示群名，数据库仍用群 ID 去重。</p>
@@ -2288,14 +2454,16 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 </tbody></table></div>
 </div>
 
-<div class="card wide tab-card" data-admin-tab="permissions">
+{{end}}
+{{if .CanManageBroadcastPermissions}}
+<div class="card wide tab-card {{if not .CanManageGlobal}}active{{end}}" data-admin-tab="permissions">
 <h2>广播权限</h2>
 <p class="hint">给普通广播操作人授权分组或单群。授权后，私聊机器人选择群发、分组广播或单群发送时只会看到允许的目标。</p>
 <div class="permission-panels">
 <div class="permission-panel">
 <div class="section-title">授权广播目标</div>
 <form method="post" action="/admin/permission/grant" class="permission-form" data-mode="grant">
-<label class="field-stack"><span class="field-label">操作人</span><select class="permission-user-select" name="user_id">{{range .BOperators}}<option value="{{.UserID}}">{{operatorLabel .}}</option>{{end}}</select></label>
+<label class="field-stack"><span class="field-label">操作人</span><select class="permission-user-select" name="user_id">{{range .BOperators}}{{if eq .Status "active"}}<option value="{{.UserID}}">{{operatorLabel .}}</option>{{end}}{{end}}</select></label>
 <label class="field-stack"><span class="field-label">权限类型</span><select class="target-type" name="target"><option value="group">分组</option><option value="chat">单群</option></select></label>
 <label class="field-stack target-group"><span class="field-label">选择分组</span><select class="permission-group-select" name="group_name">{{range .BGroups}}<option value="{{.Name}}" data-users="{{permissionGroupUsers .Name $.Permissions}}">{{.Name}}</option>{{end}}</select></label>
 <label class="field-stack target-chat"><span class="field-label">选择单群</span><select class="permission-chat-select" name="chat_id">{{range .Groups}}<option value="{{.ChatID}}" data-users="{{permissionChatUsers . $.Permissions}}">{{chatLabel .}}</option>{{end}}</select></label>
@@ -2305,7 +2473,7 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 <div class="permission-panel">
 <div class="section-title">取消广播权限</div>
 <form method="post" action="/admin/permission/revoke" class="permission-form" data-mode="revoke">
-<label class="field-stack"><span class="field-label">操作人</span><select class="permission-user-select" name="user_id">{{range .BOperators}}<option value="{{.UserID}}">{{operatorLabel .}}</option>{{end}}</select></label>
+<label class="field-stack"><span class="field-label">操作人</span><select class="permission-user-select" name="user_id">{{range .BOperators}}{{if eq .Status "active"}}<option value="{{.UserID}}">{{operatorLabel .}}</option>{{end}}{{end}}</select></label>
 <label class="field-stack"><span class="field-label">权限类型</span><select class="target-type" name="target"><option value="group">分组</option><option value="chat">单群</option></select></label>
 <label class="field-stack target-group"><span class="field-label">选择分组</span><select class="permission-group-select" name="group_name">{{range .BGroups}}<option value="{{.Name}}" data-users="{{permissionGroupUsers .Name $.Permissions}}">{{.Name}}</option>{{end}}</select></label>
 <label class="field-stack target-chat"><span class="field-label">选择单群</span><select class="permission-chat-select" name="chat_id">{{range .Groups}}<option value="{{.ChatID}}" data-users="{{permissionChatUsers . $.Permissions}}">{{chatLabel .}}</option>{{end}}</select></label>
@@ -2320,7 +2488,7 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 
 {{end}}
 
-<div class="card wide tab-card {{if not .CanManageGlobal}}active{{end}}" data-admin-tab="watch">
+<div class="card wide tab-card {{if not (or .CanManageGlobal .CanManageOperators .CanManageBroadcastPermissions)}}active{{end}}" data-admin-tab="watch">
 <h2>地址监听</h2>
 <p class="hint">宿主可查看全部监听地址；一级操作人和操作人只显示自己监听的地址。普通用户不能进入后台，只能在私聊机器人里管理自己的监听地址。</p>
 {{if .WatchTargets}}
