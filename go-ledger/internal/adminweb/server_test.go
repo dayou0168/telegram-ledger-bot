@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -332,6 +333,90 @@ func TestNormalizeCleanupTime(t *testing.T) {
 	}
 }
 
+func TestNormalizeCleanupTimeParts(t *testing.T) {
+	valid := []struct {
+		hour   string
+		minute string
+		want   string
+	}{
+		{hour: "0", minute: "0", want: "00:00"},
+		{hour: "00", minute: "00", want: "00:00"},
+		{hour: "23", minute: "59", want: "23:59"},
+		{hour: " 8 ", minute: " 5 ", want: "08:05"},
+		{hour: "", minute: "", want: ""},
+	}
+	for _, tc := range valid {
+		got, ok := normalizeCleanupTimeParts(tc.hour, tc.minute)
+		if !ok || got != tc.want {
+			t.Errorf("normalizeCleanupTimeParts(%q,%q) = %q,%t; want %q,true", tc.hour, tc.minute, got, ok, tc.want)
+		}
+	}
+	invalid := [][2]string{
+		{"8", ""}, {"", "30"}, {"-1", "0"}, {"24", "0"},
+		{"0", "60"}, {"hour", "0"}, {"0", "minute"}, {"+1", "0"},
+	}
+	for _, tc := range invalid {
+		if got, ok := normalizeCleanupTimeParts(tc[0], tc[1]); ok {
+			t.Errorf("normalizeCleanupTimeParts(%q,%q) = %q,true; want invalid", tc[0], tc[1], got)
+		}
+	}
+}
+
+func TestCleanupTimePartsRefillExistingHHMM(t *testing.T) {
+	for raw, want := range map[string][2]string{
+		"08:30": {"8", "30"},
+		"00:00": {"0", "0"},
+		"23:59": {"23", "59"},
+		"":      {"", ""},
+	} {
+		if got := cleanupTimeHour(raw); got != want[0] {
+			t.Errorf("cleanupTimeHour(%q) = %q, want %q", raw, got, want[0])
+		}
+		if got := cleanupTimeMinute(raw); got != want[1] {
+			t.Errorf("cleanupTimeMinute(%q) = %q, want %q", raw, got, want[1])
+		}
+	}
+}
+
+func TestSaveOperatorCleanupRejectsInvalidSplitTimeBeforeStorage(t *testing.T) {
+	s := New(config.Config{HostUserID: 1001}, nil)
+	for _, tc := range []struct {
+		name   string
+		hour   string
+		minute string
+	}{
+		{name: "hour only", hour: "8"},
+		{name: "minute only", minute: "30"},
+		{name: "negative", hour: "-1", minute: "0"},
+		{name: "hour overflow", hour: "24", minute: "0"},
+		{name: "minute overflow", hour: "0", minute: "60"},
+		{name: "non numeric", hour: "x", minute: "0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			form := url.Values{
+				"user_id":          {"1001"},
+				"enabled":          {"1"},
+				"cleanup_hour":     {tc.hour},
+				"cleanup_minute":   {tc.minute},
+				"bot_delete_after": {"300"},
+				"scope":            {"broadcast"},
+			}
+			req := httptest.NewRequest(http.MethodPost, "/admin/operator/cleanup", strings.NewReader(form.Encode()))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req = req.WithContext(context.WithValue(req.Context(), adminContextKey{}, adminauth.Session{UserID: 1001, Role: adminauth.RoleHost}))
+			rec := httptest.NewRecorder()
+			s.saveOperatorCleanup(rec, req)
+			if rec.Code != http.StatusSeeOther {
+				t.Fatalf("status = %d, want %d", rec.Code, http.StatusSeeOther)
+			}
+			location, _ := url.QueryUnescape(rec.Header().Get("Location"))
+			if !strings.Contains(location, "小时为 0-23") {
+				t.Fatalf("redirect = %q, want split-time validation message", location)
+			}
+		})
+	}
+}
+
 func TestNormalizeCleanupDelay(t *testing.T) {
 	cases := []struct {
 		preset string
@@ -495,14 +580,17 @@ func TestAdminTemplateRendersReadableBroadcastManagement(t *testing.T) {
 		`取消广播权限`,
 		`私聊清空`,
 		`action="/admin/operator/cleanup"`,
-		`class="cleanup-form"`,
+		`class="cleanup-dialog"`,
+		`class="btn mini secondary cleanup-open"`,
 		`name="bot_delete_after"`,
 		`name="incoming_enabled"`,
 		`name="incoming_delete_after"`,
+		`name="cleanup_hour" min="0" max="23" step="1" inputmode="numeric" placeholder="00" value="8"`,
+		`name="cleanup_minute" min="0" max="59" step="1" inputmode="numeric" placeholder="00" value="30"`,
+		`清空/关闭时间`,
 		`bot提示 5分钟后`,
 		`用户临时消息 45秒后`,
 		`只处理该操作人与机器人私聊`,
-		`value="08:30"`,
 		`data-mode="add"`,
 		`data-mode="remove"`,
 		`class="member-group-select"`,
@@ -525,6 +613,7 @@ func TestAdminTemplateRendersReadableBroadcastManagement(t *testing.T) {
 		`2026-07-06 15:30`,
 		`后台管理`,
 		`document.querySelectorAll('.permission-form')`,
+		`document.querySelectorAll('.cleanup-open')`,
 		`localStorage.setItem('ledger-admin-tab',name)`,
 	}
 	for _, want := range wants {
@@ -560,6 +649,46 @@ func TestAdminTemplateRendersReadableBroadcastManagement(t *testing.T) {
 	}
 	if strings.Contains(html, `data-admin-tab-target="outbox"`) || strings.Contains(html, `发送网关 / Outbox 状态`) {
 		t.Fatal("admin main page should not render a permanent global outbox status tab")
+	}
+	operatorTableStart := strings.Index(html, `<th>私聊清空</th>`)
+	operatorTableEnd := -1
+	if operatorTableStart >= 0 {
+		if relativeEnd := strings.Index(html[operatorTableStart:], `</tbody></table></div>`); relativeEnd >= 0 {
+			operatorTableEnd = operatorTableStart + relativeEnd
+		}
+	}
+	cleanupDialogStart := strings.Index(html, `<dialog class="cleanup-dialog"`)
+	if operatorTableStart < 0 || operatorTableEnd < 0 || cleanupDialogStart < 0 || cleanupDialogStart < operatorTableEnd {
+		t.Fatal("cleanup dialog should render outside the operator table")
+	}
+	if strings.Contains(html[operatorTableStart:operatorTableEnd], `action="/admin/operator/cleanup"`) {
+		t.Fatal("operator table cell should not contain the full cleanup form")
+	}
+}
+
+func TestAdminSearchBarsAndCleanupDialogResponsiveCSS(t *testing.T) {
+	for _, want := range []string{
+		`.table-tools input[type=search]{flex:1 1 0;width:auto;min-width:0}`,
+		`.table-tools .btn{flex:0 0 auto;width:auto;min-width:68px`,
+		`@media(max-width:420px)`,
+		`.cleanup-dialog-body{padding:16px 18px;overflow:auto;display:grid;grid-template-columns:repeat(2,minmax(0,1fr))`,
+		`.cleanup-dialog-body{grid-template-columns:1fr}`,
+		`.cleanup-dialog-actions{position:sticky;bottom:0`,
+	} {
+		if !strings.Contains(adminHTML, want) {
+			t.Fatalf("admin responsive CSS missing %q", want)
+		}
+	}
+	if strings.Contains(adminHTML, `.table-tools .btn{width:100%`) {
+		t.Fatal("mobile search button must not take the full row width")
+	}
+	if count := strings.Count(adminHTML, `class="table-tools"`); count < 6 {
+		t.Fatalf("search toolbar coverage = %d, want all admin list/search modules", count)
+	}
+	for _, field := range []string{`name="groups_q"`, `name="operators_q"`, `name="broadcast_q"`, `name="permissions_q"`} {
+		if !strings.Contains(adminHTML, field) {
+			t.Fatalf("admin search toolbar missing %s", field)
+		}
 	}
 }
 
