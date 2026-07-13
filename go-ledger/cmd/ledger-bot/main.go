@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/adminweb"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/bot"
@@ -30,6 +31,14 @@ func main() {
 		log.Fatalf("open storage: %v", err)
 	}
 	defer db.Close()
+	repair, err := db.NormalizeGlobalOperatorHierarchy(ctx, cfg.HostUserID, cfg.DefaultOperatorIDs, time.Now())
+	if err != nil {
+		log.Fatalf("normalize global operator hierarchy: %v", err)
+	}
+	if repair.Changed() > 0 {
+		log.Printf("global operator hierarchy normalized: primary=%d secondary=%d recovered=%d quarantined=%d env_detached=%d",
+			repair.PrimaryNormalized, repair.SecondaryNormalized, repair.Recovered, repair.Quarantined, repair.EnvDetached)
+	}
 	var fallbackDB *storage.Store
 	if cfg.SharedFallbackEnabled() {
 		fallbackDB, err = storage.OpenExisting(ctx, cfg.BotFallbackSharedDatabaseURL)
