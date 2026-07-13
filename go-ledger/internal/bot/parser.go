@@ -218,10 +218,8 @@ func parseUndoKind(text string) (string, bool) {
 
 func parseClearScope(text string) (string, bool) {
 	switch strings.TrimSpace(text) {
-	case "清除今日账单", "删除账单", "清除账单":
-		return "today", true
-	case "清除全部账单", "删除全部账单":
-		return "all", true
+	case "清除当前账期", "清除今日账单", "删除账单", "清除账单":
+		return "current", true
 	default:
 		return "", false
 	}

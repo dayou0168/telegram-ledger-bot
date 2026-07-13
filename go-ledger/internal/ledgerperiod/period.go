@@ -1,0 +1,55 @@
+package ledgerperiod
+
+import (
+	"time"
+
+	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
+)
+
+const CutoffDisabledHour = -1
+
+func BusinessDayKey(now time.Time, cutoffHour int) string {
+	if cutoffHour < 0 || cutoffHour > 23 {
+		cutoffHour = 0
+	}
+	return now.Add(-time.Duration(cutoffHour) * time.Hour).Format("2006-01-02")
+}
+
+func AccountingActive(group storage.Group, now time.Time) bool {
+	if !group.Active || group.ActiveDayKey == "" {
+		return false
+	}
+	if group.CutoffHour == CutoffDisabledHour {
+		return true
+	}
+	expiresDayKey := group.ActiveExpiresDayKey
+	if expiresDayKey == "" {
+		expiresDayKey = group.ActiveDayKey
+	}
+	return expiresDayKey == BusinessDayKey(now, group.CutoffHour)
+}
+
+func ExpiresDayKey(now time.Time, cutoffHour int) string {
+	if cutoffHour == CutoffDisabledHour {
+		return ""
+	}
+	return BusinessDayKey(now, cutoffHour)
+}
+
+func StartDayKey(group storage.Group, now time.Time) string {
+	return BusinessDayKey(now, group.CutoffHour)
+}
+
+func CurrentDayKey(group storage.Group, now time.Time) string {
+	if AccountingActive(group, now) {
+		return group.ActiveDayKey
+	}
+	return BusinessDayKey(now, group.CutoffHour)
+}
+
+func StateAfterCutoffSetting(group storage.Group, cutoffHour int, now time.Time) (bool, string, string) {
+	if !AccountingActive(group, now) {
+		return false, "", ""
+	}
+	return true, CurrentDayKey(group, now), ExpiresDayKey(now, cutoffHour)
+}

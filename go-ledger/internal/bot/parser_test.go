@@ -166,11 +166,13 @@ func TestParseTRXAddressQuery(t *testing.T) {
 }
 
 func TestParseClearScope(t *testing.T) {
-	if scope, ok := parseClearScope("清除今日账单"); !ok || scope != "today" {
-		t.Fatalf("today clear parse = %q %v", scope, ok)
+	for _, command := range []string{"清除当前账期", "清除今日账单", "删除账单", "清除账单"} {
+		if scope, ok := parseClearScope(command); !ok || scope != "current" {
+			t.Fatalf("current period clear parse for %q = %q %v", command, scope, ok)
+		}
 	}
-	if scope, ok := parseClearScope("删除全部账单"); !ok || scope != "all" {
-		t.Fatalf("all clear parse = %q %v", scope, ok)
+	if _, ok := parseClearScope("删除全部账单"); ok {
+		t.Fatal("all-record deletion command must stay closed")
 	}
 	if _, ok := parseClearScope("删除昨天账单"); ok {
 		t.Fatal("unexpected clear scope")

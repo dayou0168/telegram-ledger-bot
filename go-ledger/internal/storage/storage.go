@@ -494,6 +494,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_records_chat_day_active
 			ON records(chat_id, day_key, id)
 			WHERE deleted_at IS NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_records_chat_day_created_active
+			ON records(chat_id, day_key, created_at, id)
+			WHERE deleted_at IS NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_records_chat_active_id
 			ON records(chat_id, id DESC)
 			WHERE deleted_at IS NULL`,
@@ -995,12 +998,6 @@ func (s *Store) SetGroupRealtimeExchangeRate(ctx context.Context, chatID int64, 
 			updated_at=$5
 		WHERE chat_id=$6`,
 		rate, source, rank, offset, now, chatID)
-	return err
-}
-
-func (s *Store) SetGroupCutoffHour(ctx context.Context, chatID int64, cutoffHour int, now time.Time) error {
-	_, err := s.pool.Exec(ctx, `UPDATE groups SET cutoff_hour=$1, updated_at=$2 WHERE chat_id=$3`,
-		cutoffHour, now, chatID)
 	return err
 }
 
@@ -2203,25 +2200,139 @@ func (s *Store) GetRecord(ctx context.Context, recordID int64) (Record, bool, er
 	return record, true, nil
 }
 
-func (s *Store) ListRecordsForDay(ctx context.Context, chatID int64, dayKey string) ([]Record, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id, chat_id, day_key, kind, currency, amount, rate, fee_rate, result_usdt,
-		subject_user_id, subject_name, actor_user_id, actor_name, source_message_id, bot_message_id, remark, created_at, deleted_at
-		FROM records
-		WHERE chat_id=$1 AND day_key=$2 AND deleted_at IS NULL
-		ORDER BY id ASC`, chatID, dayKey)
+const recordSelectColumns = `id, chat_id, day_key, kind, currency, amount, rate, fee_rate, result_usdt,
+	subject_user_id, subject_name, actor_user_id, actor_name, source_message_id, bot_message_id, remark, created_at, deleted_at`
+
+func (s *Store) ListRecordsForDayPage(ctx context.Context, chatID int64, dayKey string, filter RecordFilter, beforeID, afterID int64, limit int) (RecordPage, error) {
+	if limit < 1 {
+		limit = 100
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	where, args := recordPageWhere(chatID, dayKey, filter)
+	ascending := afterID > 0
+	if beforeID > 0 {
+		args = append(args, beforeID)
+		where += fmt.Sprintf(" AND id < $%d", len(args))
+	} else if afterID > 0 {
+		args = append(args, afterID)
+		where += fmt.Sprintf(" AND id > $%d", len(args))
+	}
+	args = append(args, limit+1)
+	order := "DESC"
+	if ascending {
+		order = "ASC"
+	}
+	rows, err := s.pool.Query(ctx, `SELECT `+recordSelectColumns+`
+		FROM records WHERE `+where+`
+		ORDER BY id `+order+`
+		LIMIT $`+strconv.Itoa(len(args)), args...)
 	if err != nil {
-		return nil, err
+		return RecordPage{}, err
 	}
 	defer rows.Close()
-	var records []Record
+	records := make([]Record, 0, limit+1)
 	for rows.Next() {
-		record, err := scanRecord(rows)
-		if err != nil {
-			return nil, err
+		record, scanErr := scanRecord(rows)
+		if scanErr != nil {
+			return RecordPage{}, scanErr
 		}
 		records = append(records, record)
 	}
-	return records, rows.Err()
+	if err := rows.Err(); err != nil {
+		return RecordPage{}, err
+	}
+	hasExtra := len(records) > limit
+	if hasExtra {
+		records = records[:limit]
+	}
+	if !ascending {
+		reverseRecords(records)
+	}
+	return RecordPage{
+		Records:  records,
+		HasOlder: !ascending && hasExtra || ascending,
+		HasNewer: ascending && hasExtra || beforeID > 0,
+	}, nil
+}
+
+func (s *Store) WalkRecordsForDay(ctx context.Context, chatID int64, dayKey string, filter RecordFilter, batchSize int, visit func([]Record) error) error {
+	if batchSize < 1 || batchSize > 1000 {
+		batchSize = 500
+	}
+	var afterID int64
+	for {
+		where, args := recordPageWhere(chatID, dayKey, filter)
+		args = append(args, afterID)
+		where += fmt.Sprintf(" AND id > $%d", len(args))
+		args = append(args, batchSize)
+		rows, err := s.pool.Query(ctx, `SELECT `+recordSelectColumns+`
+			FROM records WHERE `+where+`
+			ORDER BY id ASC
+			LIMIT $`+strconv.Itoa(len(args)), args...)
+		if err != nil {
+			return err
+		}
+		batch := make([]Record, 0, batchSize)
+		for rows.Next() {
+			record, scanErr := scanRecord(rows)
+			if scanErr != nil {
+				rows.Close()
+				return scanErr
+			}
+			batch = append(batch, record)
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return err
+		}
+		if len(batch) == 0 {
+			return nil
+		}
+		if err := visit(batch); err != nil {
+			return err
+		}
+		afterID = batch[len(batch)-1].ID
+		if len(batch) < batchSize {
+			return nil
+		}
+	}
+}
+
+func recordPageWhere(chatID int64, dayKey string, filter RecordFilter) (string, []any) {
+	where := "chat_id=$1 AND day_key=$2 AND deleted_at IS NULL"
+	args := []any{chatID, dayKey}
+	if kind := strings.TrimSpace(filter.Kind); kind != "" {
+		args = append(args, kind)
+		where += fmt.Sprintf(" AND kind=$%d", len(args))
+	}
+	query := strings.TrimSpace(filter.Query)
+	if query == "" {
+		return where, args
+	}
+	args = append(args, "%"+strings.ToLower(query)+"%")
+	placeholder := "$" + strconv.Itoa(len(args))
+	switch strings.ToLower(strings.TrimSpace(filter.Field)) {
+	case "subject":
+		where += " AND lower(COALESCE(NULLIF(subject_name,''), actor_name)) LIKE " + placeholder
+	case "actor":
+		where += " AND lower(actor_name) LIKE " + placeholder
+	case "remark":
+		where += " AND lower(remark) LIKE " + placeholder
+	case "amount":
+		where += " AND lower(concat_ws(' ', amount, rate, fee_rate, result_usdt, currency)) LIKE " + placeholder
+	default:
+		where += " AND lower(concat_ws(' ', kind, currency, amount, rate, fee_rate, result_usdt, subject_name, actor_name, remark, created_at::text)) LIKE " + placeholder
+	}
+	return where, args
+}
+
+func reverseRecords(records []Record) {
+	for left, right := 0, len(records)-1; left < right; left, right = left+1, right-1 {
+		records[left], records[right] = records[right], records[left]
+	}
 }
 
 func (s *Store) GetBillSummaryForDay(ctx context.Context, chatID int64, dayKey string, recentLimit int) (BillSummaryData, error) {
@@ -2336,15 +2447,16 @@ func (s *Store) SoftDeleteRecord(ctx context.Context, chatID, recordID int64, no
 	return tag.RowsAffected() > 0, err
 }
 
-func (s *Store) SoftDeleteRecordsForDay(ctx context.Context, chatID int64, dayKey string, now time.Time) (int64, error) {
-	tag, err := s.pool.Exec(ctx, `UPDATE records SET deleted_at=$1
-		WHERE chat_id=$2 AND day_key=$3 AND deleted_at IS NULL`, now, chatID, dayKey)
-	return tag.RowsAffected(), err
+func (s *Store) CountRecordsForPeriod(ctx context.Context, chatID int64, dayKey string, startedAt time.Time) (int64, error) {
+	var count int64
+	err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM records
+		WHERE chat_id=$1 AND day_key=$2 AND created_at >= $3 AND deleted_at IS NULL`, chatID, dayKey, startedAt).Scan(&count)
+	return count, err
 }
 
-func (s *Store) SoftDeleteAllRecords(ctx context.Context, chatID int64, now time.Time) (int64, error) {
+func (s *Store) SoftDeleteRecordsForPeriod(ctx context.Context, chatID int64, dayKey string, startedAt, now time.Time) (int64, error) {
 	tag, err := s.pool.Exec(ctx, `UPDATE records SET deleted_at=$1
-		WHERE chat_id=$2 AND deleted_at IS NULL`, now, chatID)
+		WHERE chat_id=$2 AND day_key=$3 AND created_at >= $4 AND deleted_at IS NULL`, now, chatID, dayKey, startedAt)
 	return tag.RowsAffected(), err
 }
 

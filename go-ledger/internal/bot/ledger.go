@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/ledgerperiod"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/telegram"
 )
@@ -18,7 +19,7 @@ const (
 	ledgerInactiveText         = "当前未开始记账，请先发送“开始”。"
 )
 
-const cutoffDisabledHour = -1
+const cutoffDisabledHour = ledgerperiod.CutoffDisabledHour
 
 func (b *Bot) startAccounting(ctx context.Context, msg telegram.Message, user storage.User, now time.Time) error {
 	globalAccess, err := b.hasGlobalLedgerAccess(ctx, user.ID)
@@ -157,17 +158,7 @@ func ledgerSubjectFromMessage(msg telegram.Message, actor storage.User) storage.
 }
 
 func groupAccountingActive(group storage.Group, now time.Time) bool {
-	if !group.Active || group.ActiveDayKey == "" {
-		return false
-	}
-	if group.CutoffHour == cutoffDisabledHour {
-		return true
-	}
-	activeExpiresDayKey := group.ActiveExpiresDayKey
-	if activeExpiresDayKey == "" {
-		activeExpiresDayKey = group.ActiveDayKey
-	}
-	return activeExpiresDayKey == businessDayKey(now, group.CutoffHour)
+	return ledgerperiod.AccountingActive(group, now)
 }
 
 func (b *Bot) guardAccountingStarted(ctx context.Context, msg telegram.Message, user storage.User, group storage.Group, now time.Time, dedupeKind string) (bool, error) {
@@ -576,35 +567,21 @@ func feeFactor(feeRate *big.Rat) *big.Rat {
 }
 
 func businessDayKey(now time.Time, cutoffHour int) string {
-	if cutoffHour < 0 || cutoffHour > 23 {
-		cutoffHour = 0
-	}
-	shifted := now.Add(-time.Duration(cutoffHour) * time.Hour)
-	return shifted.Format("2006-01-02")
+	return ledgerperiod.BusinessDayKey(now, cutoffHour)
 }
 
 func cutoffExpiresDayKey(now time.Time, cutoffHour int) string {
-	if cutoffHour == cutoffDisabledHour {
-		return ""
-	}
-	return businessDayKey(now, cutoffHour)
+	return ledgerperiod.ExpiresDayKey(now, cutoffHour)
 }
 
 func startLedgerDayKey(group storage.Group, now time.Time) string {
-	return businessDayKey(now, group.CutoffHour)
+	return ledgerperiod.StartDayKey(group, now)
 }
 
 func currentLedgerDayKey(group storage.Group, now time.Time) string {
-	if groupAccountingActive(group, now) {
-		return group.ActiveDayKey
-	}
-	return businessDayKey(now, group.CutoffHour)
+	return ledgerperiod.CurrentDayKey(group, now)
 }
 
 func cutoffStateAfterSetting(group storage.Group, cutoffHour int, now time.Time) (bool, string, string) {
-	if !groupAccountingActive(group, now) {
-		return false, "", ""
-	}
-	activeDayKey := currentLedgerDayKey(group, now)
-	return true, activeDayKey, cutoffExpiresDayKey(now, cutoffHour)
+	return ledgerperiod.StateAfterCutoffSetting(group, cutoffHour, now)
 }

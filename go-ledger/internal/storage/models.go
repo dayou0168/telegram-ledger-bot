@@ -168,6 +168,18 @@ type BillSummaryData struct {
 	Summary RecordDaySummary
 }
 
+type RecordFilter struct {
+	Field string
+	Query string
+	Kind  string
+}
+
+type RecordPage struct {
+	Records  []Record
+	HasOlder bool
+	HasNewer bool
+}
+
 type Operator struct {
 	ChatID      int64
 	UserID      int64

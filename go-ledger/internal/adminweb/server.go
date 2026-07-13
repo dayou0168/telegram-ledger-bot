@@ -1,7 +1,6 @@
 package adminweb
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -18,6 +17,7 @@ import (
 
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/adminauth"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/config"
+	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/ledgerperiod"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/permissions"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
 	"github.com/xuri/excelize/v2"
@@ -76,18 +76,20 @@ type outboxStatusResponse struct {
 }
 
 type billData struct {
-	Group        storage.Group
-	DayKey       string
-	TitleDay     string
-	Summary      billSummary
-	HistoryLinks []billHistoryLink
-	TodayPath    string
-	PrevPath     string
-	NextPath     string
-	FilterSuffix string
-	DownloadPath string
-	Query        string
-	Field        string
+	Group         storage.Group
+	DayKey        string
+	TitleDay      string
+	Summary       billSummary
+	HistoryLinks  []billHistoryLink
+	TodayPath     string
+	PrevPath      string
+	NextPath      string
+	NewerPagePath string
+	OlderPagePath string
+	FilterSuffix  string
+	DownloadPath  string
+	Query         string
+	Field         string
 }
 
 type billSummary struct {
@@ -244,16 +246,28 @@ func (s *Server) bill(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "账单不存在", http.StatusNotFound)
 		return
 	}
-	records, err := s.store.ListRecordsForDay(r.Context(), chatID, dayKey)
+	query := billQueryText(r)
+	field := billQueryField(r)
+	filter := storage.RecordFilter{Field: field, Query: query}
+	if action == "download" {
+		s.downloadBill(w, r, group, dayKey, filter)
+		return
+	}
+	beforeID := positiveInt64(r.URL.Query().Get("before"))
+	afterID := positiveInt64(r.URL.Query().Get("after"))
+	page, err := s.store.ListRecordsForDayPage(r.Context(), chatID, dayKey, filter, beforeID, afterID, 100)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	query := billQueryText(r)
-	field := billQueryField(r)
-	records = filterBillRecords(records, query, field)
-	if action == "download" {
-		s.downloadBill(w, group, dayKey, records)
+	accumulator := newBillAccumulator(group, false)
+	if err := s.store.WalkRecordsForDay(r.Context(), chatID, dayKey, filter, 500, func(records []storage.Record) error {
+		for _, record := range records {
+			accumulator.Add(record)
+		}
+		return nil
+	}); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	days, err := s.store.ListBillDays(r.Context(), chatID)
@@ -261,21 +275,37 @@ func (s *Server) bill(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	summary := summarizeBill(group, records)
+	summary := accumulator.Summary()
+	for _, record := range page.Records {
+		if record.Kind == "deposit" {
+			summary.Deposits = append(summary.Deposits, record)
+		} else if record.Kind == "payout" {
+			summary.Payouts = append(summary.Payouts, record)
+		}
+	}
+	var newerPagePath, olderPagePath string
+	if len(page.Records) > 0 && page.HasNewer {
+		newerPagePath = billCursorPath(chatID, dayKey, field, query, "after", page.Records[len(page.Records)-1].ID)
+	}
+	if len(page.Records) > 0 && page.HasOlder {
+		olderPagePath = billCursorPath(chatID, dayKey, field, query, "before", page.Records[0].ID)
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := billTemplate.Execute(w, billData{
-		Group:        group,
-		DayKey:       dayKey,
-		TitleDay:     dayKey,
-		Summary:      summary,
-		HistoryLinks: buildBillHistoryLinks(chatID, days, dayKey, field, query, 30),
-		TodayPath:    billPath(chatID, s.currentBillDay(group)) + billFilterSuffix(field, query),
-		PrevPath:     billPath(chatID, addDay(dayKey, -1)) + billFilterSuffix(field, query),
-		NextPath:     billPath(chatID, addDay(dayKey, 1)) + billFilterSuffix(field, query),
-		FilterSuffix: billFilterSuffix(field, query),
-		DownloadPath: billDownloadPath(chatID, dayKey, field, query),
-		Query:        query,
-		Field:        field,
+		Group:         group,
+		DayKey:        dayKey,
+		TitleDay:      dayKey,
+		Summary:       summary,
+		HistoryLinks:  buildBillHistoryLinks(chatID, days, dayKey, field, query, 30),
+		TodayPath:     billPath(chatID, s.currentBillDay(group)) + billFilterSuffix(field, query),
+		PrevPath:      billPath(chatID, addDay(dayKey, -1)) + billFilterSuffix(field, query),
+		NextPath:      billPath(chatID, addDay(dayKey, 1)) + billFilterSuffix(field, query),
+		NewerPagePath: newerPagePath,
+		OlderPagePath: olderPagePath,
+		FilterSuffix:  billFilterSuffix(field, query),
+		DownloadPath:  billDownloadPath(chatID, dayKey, field, query),
+		Query:         query,
+		Field:         field,
 	}); err != nil {
 		log.Printf("render bill: %v", err)
 	}
@@ -318,46 +348,22 @@ func (s *Server) currentBillDay(group storage.Group) string {
 		loc = time.FixedZone("Asia/Shanghai", 8*3600)
 	}
 	now := time.Now().In(loc)
-	if adminGroupAccountingActive(group, now) {
-		return group.ActiveDayKey
-	}
-	cutoff := group.CutoffHour
-	if cutoff < 0 || cutoff > 23 {
-		cutoff = 0
-	}
-	return now.Add(-time.Duration(cutoff) * time.Hour).Format("2006-01-02")
+	return ledgerperiod.CurrentDayKey(group, now)
 }
 
-func adminGroupAccountingActive(group storage.Group, now time.Time) bool {
-	if !group.Active || group.ActiveDayKey == "" {
-		return false
-	}
-	if group.CutoffHour == -1 {
-		return true
-	}
-	cutoff := group.CutoffHour
-	if cutoff < 0 || cutoff > 23 {
-		cutoff = 0
-	}
-	expiresDayKey := group.ActiveExpiresDayKey
-	if expiresDayKey == "" {
-		expiresDayKey = group.ActiveDayKey
-	}
-	return expiresDayKey == now.Add(-time.Duration(cutoff)*time.Hour).Format("2006-01-02")
-}
-
-func (s *Server) downloadBill(w http.ResponseWriter, group storage.Group, dayKey string, records []storage.Record) {
-	data, err := buildBillXLSX(group, dayKey, records)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+func (s *Server) downloadBill(w http.ResponseWriter, r *http.Request, group storage.Group, dayKey string, filter storage.RecordFilter) {
 	fileName := fmt.Sprintf("账单_%s_%s.xlsx", dayKey, safeFileName(group.Title, "ledger"))
 	fallback := fmt.Sprintf("ledger_%s.xlsx", strings.ReplaceAll(dayKey, "-", ""))
 	w.Header().Set("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q; filename*=UTF-8''%s", fallback, url.PathEscape(fileName)))
-	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
-	_, _ = w.Write(data)
+	walker := func(kind string, visit func([]storage.Record) error) error {
+		kindFilter := filter
+		kindFilter.Kind = kind
+		return s.store.WalkRecordsForDay(r.Context(), group.ChatID, dayKey, kindFilter, 500, visit)
+	}
+	if err := writeBillXLSX(group, dayKey, walker, w); err != nil {
+		log.Printf("stream bill xlsx: %v", err)
+	}
 }
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
@@ -1466,6 +1472,32 @@ func billDownloadPath(chatID int64, dayKey, field, query string) string {
 	return billPath(chatID, dayKey) + "/download" + billFilterSuffix(field, query)
 }
 
+func billCursorPath(chatID int64, dayKey, field, query, cursor string, id int64) string {
+	values := url.Values{}
+	if normalized := normalizedBillField(field); normalized != "all" {
+		values.Set("field", normalized)
+	}
+	if strings.TrimSpace(query) != "" {
+		values.Set("q", strings.TrimSpace(query))
+	}
+	if id > 0 && (cursor == "before" || cursor == "after") {
+		values.Set(cursor, strconv.FormatInt(id, 10))
+	}
+	encoded := values.Encode()
+	if encoded == "" {
+		return billPath(chatID, dayKey)
+	}
+	return billPath(chatID, dayKey) + "?" + encoded
+}
+
+func positiveInt64(raw string) int64 {
+	value, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	if err != nil || value <= 0 {
+		return 0
+	}
+	return value
+}
+
 func billFilterSuffix(field, query string) string {
 	query = strings.TrimSpace(query)
 	field = normalizedBillField(field)
@@ -1532,10 +1564,28 @@ func buildBillHistoryLinks(chatID int64, days []string, currentDay, field, query
 	return links
 }
 
-func buildBillXLSX(group storage.Group, dayKey string, records []storage.Record) ([]byte, error) {
-	summary := summarizeBill(group, records)
-	depositSummary := summarizeBill(group, summary.Deposits)
-	payoutSummary := summarizeBill(group, summary.Payouts)
+type billRecordWalker func(kind string, visit func([]storage.Record) error) error
+
+func writeBillXLSX(group storage.Group, dayKey string, walk billRecordWalker, output io.Writer) error {
+	accumulator := newBillAccumulator(group, false)
+	depositAccumulator := newBillAccumulator(group, false)
+	payoutAccumulator := newBillAccumulator(group, false)
+	if err := walk("", func(records []storage.Record) error {
+		for _, record := range records {
+			accumulator.Add(record)
+			if record.Kind == "deposit" {
+				depositAccumulator.Add(record)
+			} else if record.Kind == "payout" {
+				payoutAccumulator.Add(record)
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	summary := accumulator.Summary()
+	depositSummary := depositAccumulator.Summary()
+	payoutSummary := payoutAccumulator.Summary()
 	file := excelize.NewFile()
 	defer func() { _ = file.Close() }()
 	sheet := "账单"
@@ -1565,28 +1615,55 @@ func buildBillXLSX(group storage.Group, dayKey string, records []storage.Record)
 			{Type: "bottom", Color: "E5EDF5", Style: 1},
 		},
 	})
+	stream, err := file.NewStreamWriter(sheet)
+	if err != nil {
+		return err
+	}
+	for _, width := range []struct {
+		min, max int
+		value    float64
+	}{{1, 1, 10}, {2, 2, 16}, {3, 3, 18}, {4, 4, 28}, {5, 5, 16}, {6, 6, 24}, {7, 8, 28}} {
+		if err := stream.SetColWidth(width.min, width.max, width.value); err != nil {
+			return err
+		}
+	}
 	row := 1
+	var writeErr error
 	addTitle := func(text string) {
+		if writeErr != nil {
+			return
+		}
 		start, _ := excelize.CoordinatesToCellName(1, row)
 		end, _ := excelize.CoordinatesToCellName(8, row)
-		_ = file.MergeCell(sheet, start, end)
-		_ = file.SetCellValue(sheet, start, text)
-		_ = file.SetCellStyle(sheet, start, end, titleStyle)
-		row++
-	}
-	addRow := func(values ...any) {
-		for col, value := range values {
-			cell, _ := excelize.CoordinatesToCellName(col+1, row)
-			_ = file.SetCellValue(sheet, cell, value)
-			_ = file.SetCellStyle(sheet, cell, cell, cellStyle)
+		writeErr = stream.SetRow(start, []interface{}{excelize.Cell{StyleID: titleStyle, Value: text}})
+		if writeErr == nil {
+			writeErr = stream.MergeCell(start, end)
 		}
 		row++
 	}
+	addRow := func(values ...any) {
+		if writeErr != nil {
+			return
+		}
+		cells := make([]interface{}, len(values))
+		for i, value := range values {
+			cells[i] = excelize.Cell{StyleID: cellStyle, Value: value}
+		}
+		start, _ := excelize.CoordinatesToCellName(1, row)
+		writeErr = stream.SetRow(start, cells)
+		row++
+	}
 	addHeader := func(values ...any) {
-		addRow(values...)
-		start, _ := excelize.CoordinatesToCellName(1, row-1)
-		end, _ := excelize.CoordinatesToCellName(len(values), row-1)
-		_ = file.SetCellStyle(sheet, start, end, headerStyle)
+		if writeErr != nil {
+			return
+		}
+		cells := make([]interface{}, len(values))
+		for i, value := range values {
+			cells[i] = excelize.Cell{StyleID: headerStyle, Value: value}
+		}
+		start, _ := excelize.CoordinatesToCellName(1, row)
+		writeErr = stream.SetRow(start, cells)
+		row++
 	}
 	addEmpty := func() {
 		row++
@@ -1594,10 +1671,17 @@ func buildBillXLSX(group storage.Group, dayKey string, records []storage.Record)
 
 	addTitle(fmt.Sprintf("%s  %s  【%s】", dayKey, weekdayLabel(dayKey), group.Title))
 	addEmpty()
-	addTitle(fmt.Sprintf("入款：%d笔", len(summary.Deposits)))
+	addTitle(fmt.Sprintf("入款：%d笔", summary.DepositCount))
 	addHeader("序号", "时间", "金额", "应下发", "应下发(U)", "转账人", "回复人", "操作人")
-	for i, record := range summary.Deposits {
-		addRow(i+1, billExcelTime(record.CreatedAt), billNumber(record.Amount, 2), billAmount(record), billNumber(record.ResultUSDT, 2), record.Remark, recordSubjectName(record), recordActorName(record))
+	depositIndex := 0
+	if err := walk("deposit", func(records []storage.Record) error {
+		for _, record := range records {
+			depositIndex++
+			addRow(depositIndex, billExcelTime(record.CreatedAt), billNumber(record.Amount, 2), billAmount(record), billNumber(record.ResultUSDT, 2), record.Remark, recordSubjectName(record), recordActorName(record))
+		}
+		return writeErr
+	}); err != nil {
+		return err
 	}
 	addEmpty()
 	addPeopleXLSXSection(addTitle, addHeader, addRow, "入款回复人小计", depositSummary.SubjectStats, true)
@@ -1610,10 +1694,17 @@ func buildBillXLSX(group storage.Group, dayKey string, records []storage.Record)
 		addRow(item.Rate, item.AmountCNY, item.AmountUSDT+" U")
 	}
 	addEmpty()
-	addTitle(fmt.Sprintf("下发：%d笔", len(summary.Payouts)))
+	addTitle(fmt.Sprintf("下发：%d笔", summary.PayoutCount))
 	addHeader("序号", "时间", "金额", "回复人", "操作人")
-	for i, record := range summary.Payouts {
-		addRow(i+1, billExcelTime(record.CreatedAt), billAmount(record), recordSubjectName(record), recordActorName(record))
+	payoutIndex := 0
+	if err := walk("payout", func(records []storage.Record) error {
+		for _, record := range records {
+			payoutIndex++
+			addRow(payoutIndex, billExcelTime(record.CreatedAt), billAmount(record), recordSubjectName(record), recordActorName(record))
+		}
+		return writeErr
+	}); err != nil {
+		return err
 	}
 	addEmpty()
 	addPeopleXLSXSection(addTitle, addHeader, addRow, "下发回复人小计", payoutSummary.SubjectStats, false)
@@ -1625,18 +1716,13 @@ func buildBillXLSX(group storage.Group, dayKey string, records []storage.Record)
 	addRow("应下发：", summary.TotalDepositNetCNY+"  |  "+summary.TotalDepositNetUSDT+" U")
 	addRow("已下发：", summary.TotalPayoutCNY+"  |  "+summary.TotalPayoutUSDT+" U")
 	addRow("未下发：", summary.BalanceCNY+"  |  "+summary.BalanceUSDT+" U")
-	_ = file.SetColWidth(sheet, "A", "A", 10)
-	_ = file.SetColWidth(sheet, "B", "B", 16)
-	_ = file.SetColWidth(sheet, "C", "C", 18)
-	_ = file.SetColWidth(sheet, "D", "D", 28)
-	_ = file.SetColWidth(sheet, "E", "E", 16)
-	_ = file.SetColWidth(sheet, "F", "F", 24)
-	_ = file.SetColWidth(sheet, "G", "H", 28)
-	var buf bytes.Buffer
-	if err := file.Write(&buf); err != nil {
-		return nil, err
+	if writeErr != nil {
+		return writeErr
 	}
-	return buf.Bytes(), nil
+	if err := stream.Flush(); err != nil {
+		return err
+	}
+	return file.Write(output)
 }
 
 func addPeopleXLSXSection(
@@ -1714,6 +1800,41 @@ func billAmount(record storage.Record) string {
 	return amount + "/" + rate + "=" + result + "U"
 }
 
+func billAmountHTML(record storage.Record) template.HTML {
+	display := billAmount(record)
+	link := originalRecordMessageURL(record)
+	if link == "" {
+		return template.HTML(template.HTMLEscapeString(display))
+	}
+	amount := billNumber(record.Amount, 2)
+	if strings.EqualFold(record.Currency, "USDT") {
+		amount += "U"
+	}
+	remainder := strings.TrimPrefix(display, amount)
+	return template.HTML(`<a class="message-link copyable" href="` + template.HTMLEscapeString(link) + `">` +
+		template.HTMLEscapeString(amount) + `</a>` + template.HTMLEscapeString(remainder))
+}
+
+func recordSubjectHTML(record storage.Record) template.HTML {
+	name := template.HTMLEscapeString(recordSubjectName(record))
+	link := originalRecordMessageURL(record)
+	if link == "" {
+		return template.HTML(name)
+	}
+	return template.HTML(`<a class="message-link" href="` + template.HTMLEscapeString(link) + `">` + name + `</a>`)
+}
+
+func originalRecordMessageURL(record storage.Record) string {
+	if record.SourceMessageID <= 0 {
+		return ""
+	}
+	rawChatID := strconv.FormatInt(record.ChatID, 10)
+	if !strings.HasPrefix(rawChatID, "-100") || len(rawChatID) <= 4 {
+		return ""
+	}
+	return "https://t.me/c/" + strings.TrimPrefix(rawChatID, "-100") + "/" + strconv.FormatInt(record.SourceMessageID, 10)
+}
+
 func billKind(kind string) string {
 	if kind == "payout" {
 		return "下发"
@@ -1722,75 +1843,106 @@ func billKind(kind string) string {
 }
 
 func summarizeBill(group storage.Group, records []storage.Record) billSummary {
-	summary := billSummary{
-		ExchangeRate: billExchangeRateDisplay(group),
-		FeeRate:      group.FeeRate,
-	}
-	totalDepositCNY := newBillRat()
-	totalDepositGrossUSDT := newBillRat()
-	totalDepositNetCNY := newBillRat()
-	totalDepositNetUSDT := newBillRat()
-	totalPayoutCNY := newBillRat()
-	totalPayoutUSDT := newBillRat()
-	commissionCNY := newBillRat()
-	subjectStats := map[string]*billPeopleStatAccumulator{}
-	actorStats := map[string]*billPeopleStatAccumulator{}
-	remarkStats := map[string]*billPeopleStatAccumulator{}
-	rateStats := map[string]*billRateAccumulator{}
+	accumulator := newBillAccumulator(group, true)
 	for _, record := range records {
-		switch record.Kind {
-		case "deposit":
-			summary.Deposits = append(summary.Deposits, record)
-			amountCNY := recordCNYAmount(record)
-			grossUSDT := recordGrossUSDT(record)
-			netUSDT := recordResultUSDT(record)
-			rate := recordRateRat(record)
-			netCNY := mulBillRat(netUSDT, rate)
-			totalDepositCNY.Add(totalDepositCNY, amountCNY)
-			totalDepositGrossUSDT.Add(totalDepositGrossUSDT, grossUSDT)
-			totalDepositNetCNY.Add(totalDepositNetCNY, netCNY)
-			totalDepositNetUSDT.Add(totalDepositNetUSDT, netUSDT)
-			commission := new(big.Rat).Sub(grossUSDT, netUSDT)
-			commissionCNY.Add(commissionCNY, mulBillRat(commission, rate))
-			addPeopleDeposit(subjectStats, recordSubjectName(record), amountCNY, grossUSDT, netCNY, netUSDT)
-			addPeopleDeposit(actorStats, recordActorName(record), amountCNY, grossUSDT, netCNY, netUSDT)
-			addPeopleDeposit(remarkStats, record.Remark, amountCNY, grossUSDT, netCNY, netUSDT)
-			rateKey := formatBillRat(rate, 4)
-			item := rateStats[rateKey]
-			if item == nil {
-				item = &billRateAccumulator{rate: rateKey, amountCNY: newBillRat(), amountUSDT: newBillRat()}
-				rateStats[rateKey] = item
-			}
-			item.amountCNY.Add(item.amountCNY, amountCNY)
-			item.amountUSDT.Add(item.amountUSDT, grossUSDT)
-		case "payout":
-			summary.Payouts = append(summary.Payouts, record)
-			amountCNY := recordCNYAmount(record)
-			amountUSDT := recordResultUSDT(record)
-			totalPayoutCNY.Add(totalPayoutCNY, amountCNY)
-			totalPayoutUSDT.Add(totalPayoutUSDT, amountUSDT)
-			addPeoplePayout(subjectStats, recordSubjectName(record), amountCNY, amountUSDT)
-			addPeoplePayout(actorStats, recordActorName(record), amountCNY, amountUSDT)
-			addPeoplePayout(remarkStats, record.Remark, amountCNY, amountUSDT)
-		}
+		accumulator.Add(record)
 	}
-	balanceCNY := new(big.Rat).Sub(totalDepositNetCNY, totalPayoutCNY)
-	balanceUSDT := new(big.Rat).Sub(totalDepositNetUSDT, totalPayoutUSDT)
-	summary.DepositCount = len(summary.Deposits)
-	summary.PayoutCount = len(summary.Payouts)
-	summary.TotalDepositCNY = formatBillRat(totalDepositCNY, 2)
-	summary.TotalDepositGrossUSDT = formatBillRat(totalDepositGrossUSDT, 2)
-	summary.TotalDepositNetCNY = formatBillRat(totalDepositNetCNY, 2)
-	summary.TotalDepositNetUSDT = formatBillRat(totalDepositNetUSDT, 2)
-	summary.TotalPayoutCNY = formatBillRat(totalPayoutCNY, 2)
-	summary.TotalPayoutUSDT = formatBillRat(totalPayoutUSDT, 2)
-	summary.BalanceCNY = formatBillRat(balanceCNY, 2)
-	summary.BalanceUSDT = formatBillRat(balanceUSDT, 2)
-	summary.CommissionCNY = formatBillRat(commissionCNY, 2)
-	summary.SubjectStats = buildPeopleStats(subjectStats)
-	summary.ActorStats = buildPeopleStats(actorStats)
-	summary.RemarkStats = buildPeopleStats(remarkStats)
-	summary.RateStats = buildRateStats(rateStats)
+	return accumulator.Summary()
+}
+
+type billAccumulator struct {
+	summary               billSummary
+	keepRecords           bool
+	totalDepositCNY       *big.Rat
+	totalDepositGrossUSDT *big.Rat
+	totalDepositNetCNY    *big.Rat
+	totalDepositNetUSDT   *big.Rat
+	totalPayoutCNY        *big.Rat
+	totalPayoutUSDT       *big.Rat
+	commissionCNY         *big.Rat
+	subjectStats          map[string]*billPeopleStatAccumulator
+	actorStats            map[string]*billPeopleStatAccumulator
+	remarkStats           map[string]*billPeopleStatAccumulator
+	rateStats             map[string]*billRateAccumulator
+}
+
+func newBillAccumulator(group storage.Group, keepRecords bool) *billAccumulator {
+	return &billAccumulator{
+		summary:               billSummary{ExchangeRate: billExchangeRateDisplay(group), FeeRate: group.FeeRate},
+		keepRecords:           keepRecords,
+		totalDepositCNY:       newBillRat(),
+		totalDepositGrossUSDT: newBillRat(),
+		totalDepositNetCNY:    newBillRat(),
+		totalDepositNetUSDT:   newBillRat(),
+		totalPayoutCNY:        newBillRat(),
+		totalPayoutUSDT:       newBillRat(),
+		commissionCNY:         newBillRat(),
+		subjectStats:          map[string]*billPeopleStatAccumulator{},
+		actorStats:            map[string]*billPeopleStatAccumulator{},
+		remarkStats:           map[string]*billPeopleStatAccumulator{},
+		rateStats:             map[string]*billRateAccumulator{},
+	}
+}
+
+func (a *billAccumulator) Add(record storage.Record) {
+	switch record.Kind {
+	case "deposit":
+		a.summary.DepositCount++
+		if a.keepRecords {
+			a.summary.Deposits = append(a.summary.Deposits, record)
+		}
+		amountCNY := recordCNYAmount(record)
+		grossUSDT := recordGrossUSDT(record)
+		netUSDT := recordResultUSDT(record)
+		rate := recordRateRat(record)
+		netCNY := mulBillRat(netUSDT, rate)
+		a.totalDepositCNY.Add(a.totalDepositCNY, amountCNY)
+		a.totalDepositGrossUSDT.Add(a.totalDepositGrossUSDT, grossUSDT)
+		a.totalDepositNetCNY.Add(a.totalDepositNetCNY, netCNY)
+		a.totalDepositNetUSDT.Add(a.totalDepositNetUSDT, netUSDT)
+		commission := new(big.Rat).Sub(grossUSDT, netUSDT)
+		a.commissionCNY.Add(a.commissionCNY, mulBillRat(commission, rate))
+		addPeopleDeposit(a.subjectStats, recordSubjectName(record), amountCNY, grossUSDT, netCNY, netUSDT)
+		addPeopleDeposit(a.actorStats, recordActorName(record), amountCNY, grossUSDT, netCNY, netUSDT)
+		addPeopleDeposit(a.remarkStats, record.Remark, amountCNY, grossUSDT, netCNY, netUSDT)
+		rateKey := formatBillRat(rate, 4)
+		item := a.rateStats[rateKey]
+		if item == nil {
+			item = &billRateAccumulator{rate: rateKey, amountCNY: newBillRat(), amountUSDT: newBillRat()}
+			a.rateStats[rateKey] = item
+		}
+		item.amountCNY.Add(item.amountCNY, amountCNY)
+		item.amountUSDT.Add(item.amountUSDT, grossUSDT)
+	case "payout":
+		a.summary.PayoutCount++
+		if a.keepRecords {
+			a.summary.Payouts = append(a.summary.Payouts, record)
+		}
+		amountCNY := recordCNYAmount(record)
+		amountUSDT := recordResultUSDT(record)
+		a.totalPayoutCNY.Add(a.totalPayoutCNY, amountCNY)
+		a.totalPayoutUSDT.Add(a.totalPayoutUSDT, amountUSDT)
+		addPeoplePayout(a.subjectStats, recordSubjectName(record), amountCNY, amountUSDT)
+		addPeoplePayout(a.actorStats, recordActorName(record), amountCNY, amountUSDT)
+		addPeoplePayout(a.remarkStats, record.Remark, amountCNY, amountUSDT)
+	}
+}
+
+func (a *billAccumulator) Summary() billSummary {
+	summary := a.summary
+	summary.TotalDepositCNY = formatBillRat(a.totalDepositCNY, 2)
+	summary.TotalDepositGrossUSDT = formatBillRat(a.totalDepositGrossUSDT, 2)
+	summary.TotalDepositNetCNY = formatBillRat(a.totalDepositNetCNY, 2)
+	summary.TotalDepositNetUSDT = formatBillRat(a.totalDepositNetUSDT, 2)
+	summary.TotalPayoutCNY = formatBillRat(a.totalPayoutCNY, 2)
+	summary.TotalPayoutUSDT = formatBillRat(a.totalPayoutUSDT, 2)
+	summary.BalanceCNY = formatBillRat(new(big.Rat).Sub(a.totalDepositNetCNY, a.totalPayoutCNY), 2)
+	summary.BalanceUSDT = formatBillRat(new(big.Rat).Sub(a.totalDepositNetUSDT, a.totalPayoutUSDT), 2)
+	summary.CommissionCNY = formatBillRat(a.commissionCNY, 2)
+	summary.SubjectStats = buildPeopleStats(a.subjectStats)
+	summary.ActorStats = buildPeopleStats(a.actorStats)
+	summary.RemarkStats = buildPeopleStats(a.remarkStats)
+	summary.RateStats = buildRateStats(a.rateStats)
 	if summary.FeeRate == "" {
 		summary.FeeRate = "0"
 	}
@@ -2296,11 +2448,13 @@ var adminTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
 var loginTemplate = template.Must(template.New("login").Parse(loginHTML))
 
 var billTemplate = template.Must(template.New("bill").Funcs(template.FuncMap{
-	"billAmount":    billAmount,
-	"billKind":      billKind,
-	"billTime":      billDisplayTime,
-	"recordSubject": recordSubjectName,
-	"recordActor":   recordActorName,
+	"billAmount":        billAmount,
+	"billAmountHTML":    billAmountHTML,
+	"billKind":          billKind,
+	"billTime":          billDisplayTime,
+	"recordSubject":     recordSubjectName,
+	"recordSubjectHTML": recordSubjectHTML,
+	"recordActor":       recordActorName,
 }).Parse(billHTML))
 
 const loginHTML = `<!doctype html>
@@ -2655,7 +2809,7 @@ const billHTML = `<!doctype html>
 .summary-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin-bottom:18px}.summary-card{min-height:78px;padding:15px 16px;background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:var(--shadow)}.summary-card span{display:block;margin-bottom:8px;color:var(--muted);font-size:13px}.summary-card strong{display:block;color:var(--text);font-size:19px;line-height:1.25;overflow-wrap:anywhere}
 .bill-search{display:flex;justify-content:center;gap:8px;width:100%;padding:12px 14px;margin:0 0 26px}.bill-search input[type=text]{flex:1 1 360px;min-width:0;height:34px;border-radius:6px;border:1px solid var(--line);padding:0 10px;background:#fff}.bill-search select{flex:0 0 130px;height:34px;border-radius:6px;border:1px solid var(--line);background:#fff}.bill-search button{flex:0 0 86px;height:34px;border-radius:6px;background:var(--blue);color:#fff;border:0;cursor:pointer;font-weight:700}.bill-search button:hover{background:var(--blue-dark)}
 .panel{width:100%;margin:0;padding:0;background:transparent;border:0;box-shadow:none}.box{margin:0;padding:20px;width:100%;border-top:5px solid #efdca9}.box-primary{border-left:1px solid var(--line)}.box-header{display:block;padding-bottom:12px;border-bottom:1px solid var(--line-soft);margin-bottom:8px}.box-title{display:inline-block;margin:0;font-size:22px;font-weight:bold;line-height:1.2}.box-body{padding:0}.table-wrap{overflow-x:auto}
-table{width:100%;max-width:100%;border-collapse:collapse;table-layout:fixed}td{padding:10px 8px!important;overflow-wrap:anywhere;white-space:normal;text-align:center;vertical-align:middle;border:1px solid var(--line-soft)}.records thead td,.records .table-head td{font-weight:800;color:#172336;background:var(--panel-soft)}.records td:first-child{white-space:nowrap}.records tbody tr:hover td{background:#fbfdff}.col-time{width:14%}.col-amount{width:24%}.col-rate{width:22%}.col-actor{width:24%}.col-note{width:16%}.copyable{cursor:pointer;border-bottom:1px dotted #94a3b8}.empty{color:var(--muted);text-align:center;padding:18px 0!important}
+table{width:100%;max-width:100%;border-collapse:collapse;table-layout:fixed}td{padding:10px 8px!important;overflow-wrap:anywhere;white-space:normal;text-align:center;vertical-align:middle;border:1px solid var(--line-soft)}.records thead td,.records .table-head td{font-weight:800;color:#172336;background:var(--panel-soft)}.records td:first-child{white-space:nowrap}.records tbody tr:hover td{background:#fbfdff}.col-time{width:14%}.col-amount{width:24%}.col-rate{width:22%}.col-actor{width:24%}.col-note{width:16%}.copyable{cursor:pointer;border-bottom:1px dotted #94a3b8}.message-link{color:#1677d2}.empty{color:var(--muted);text-align:center;padding:18px 0!important}
 .footer-note{display:flex;gap:18px;flex-wrap:wrap;margin-top:14px;color:var(--muted);font-size:14px}.footer-note strong{color:var(--text)}
 @media(max-width:920px){.content-wrapper{padding:20px 16px 28px}.bill-toolbar{align-items:stretch;flex-direction:column}.toolbar-actions{justify-content:flex-start}.summary-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:640px){body{font-size:13px}.bill-heading h1{font-size:24px}.summary-grid{grid-template-columns:1fr}.summary-card{min-height:68px}.box{padding:14px 10px;margin-bottom:12px}.box-title{font-size:18px}.bill-search{flex-direction:column;margin-bottom:16px}.bill-search input[type=text],.bill-search select,.bill-search button{width:100%;flex:auto}.toolbar-actions .btn,.history-menu,.history-trigger{width:100%}.history-dropdown{left:0;right:0}.records{min-width:760px}}
@@ -2668,6 +2822,8 @@ table{width:100%;max-width:100%;border-collapse:collapse;table-layout:fixed}td{p
 <a class="btn" href="{{.TodayPath}}">今日</a>
 <a class="btn" href="{{.PrevPath}}">上一天</a>
 <a class="btn" href="{{.NextPath}}">下一天</a>
+{{if .NewerPagePath}}<a class="btn" href="{{.NewerPagePath}}">上一页</a>{{end}}
+{{if .OlderPagePath}}<a class="btn" href="{{.OlderPagePath}}">下一页</a>{{end}}
 <span class="history-menu"><button type="button" class="btn history-trigger">历史账单⌄</button><span class="history-dropdown">{{range .HistoryLinks}}<a class="{{if .Active}}active{{end}}" href="{{.URL}}">{{.Label}}</a>{{else}}<span class="history-empty">无历史账单</span>{{end}}</span></span>
 <a class="btn" href="{{.DownloadPath}}">下载账单</a>
 </nav>
@@ -2692,8 +2848,8 @@ table{width:100%;max-width:100%;border-collapse:collapse;table-layout:fixed}td{p
 <button type="submit">搜索</button>
 </form>
 <section class="content">
-<section class="panel"><div class="box box-primary"><div class="box-header"><h3 class="box-title">入款 (<span>{{.Summary.DepositCount}}</span>笔)</h3></div><div class="box-body"><div class="table-wrap"><table class="records"><colgroup><col class="col-time"><col class="col-amount"><col class="col-rate"><col class="col-actor"><col class="col-note"></colgroup><thead><tr><td>时间</td><td>金额</td><td>标记人</td><td>操作人</td><td>备注</td></tr></thead><tbody>{{range .Summary.Deposits}}<tr><td>{{billTime .CreatedAt}}</td><td><span class="copyable">{{billAmount .}}</span></td><td>{{recordSubject .}}</td><td>{{recordActor .}}</td><td>{{.Remark}}</td></tr>{{else}}<tr><td colspan="5" class="empty">暂无记录</td></tr>{{end}}</tbody></table></div></div></div></section>
-<section class="panel"><div class="box box-primary"><div class="box-header"><h3 class="box-title">下发 (<span>{{.Summary.PayoutCount}}</span>笔)</h3></div><div class="box-body"><div class="table-wrap"><table class="records"><colgroup><col class="col-time"><col class="col-amount"><col class="col-rate"><col class="col-actor"><col class="col-note"></colgroup><thead><tr><td>时间</td><td>金额</td><td>标记人</td><td>操作人</td><td>备注</td></tr></thead><tbody>{{range .Summary.Payouts}}<tr><td>{{billTime .CreatedAt}}</td><td><span class="copyable">{{billAmount .}}</span></td><td>{{recordSubject .}}</td><td>{{recordActor .}}</td><td>{{.Remark}}</td></tr>{{else}}<tr><td colspan="5" class="empty">暂无记录</td></tr>{{end}}</tbody></table></div></div></div></section>
+<section class="panel"><div class="box box-primary"><div class="box-header"><h3 class="box-title">入款 (<span>{{.Summary.DepositCount}}</span>笔)</h3></div><div class="box-body"><div class="table-wrap"><table class="records"><colgroup><col class="col-time"><col class="col-amount"><col class="col-rate"><col class="col-actor"><col class="col-note"></colgroup><thead><tr><td>时间</td><td>金额</td><td>标记人</td><td>操作人</td><td>备注</td></tr></thead><tbody>{{range .Summary.Deposits}}<tr><td>{{billTime .CreatedAt}}</td><td>{{billAmountHTML .}}</td><td>{{recordSubjectHTML .}}</td><td>{{recordActor .}}</td><td>{{.Remark}}</td></tr>{{else}}<tr><td colspan="5" class="empty">暂无记录</td></tr>{{end}}</tbody></table></div></div></div></section>
+<section class="panel"><div class="box box-primary"><div class="box-header"><h3 class="box-title">下发 (<span>{{.Summary.PayoutCount}}</span>笔)</h3></div><div class="box-body"><div class="table-wrap"><table class="records"><colgroup><col class="col-time"><col class="col-amount"><col class="col-rate"><col class="col-actor"><col class="col-note"></colgroup><thead><tr><td>时间</td><td>金额</td><td>标记人</td><td>操作人</td><td>备注</td></tr></thead><tbody>{{range .Summary.Payouts}}<tr><td>{{billTime .CreatedAt}}</td><td>{{billAmountHTML .}}</td><td>{{recordSubjectHTML .}}</td><td>{{recordActor .}}</td><td>{{.Remark}}</td></tr>{{else}}<tr><td colspan="5" class="empty">暂无记录</td></tr>{{end}}</tbody></table></div></div></div></section>
 <section class="panel"><div class="box box-primary"><div class="box-header"><h3 class="box-title">统计（按标记人） ({{len .Summary.SubjectStats}} 人)</h3></div><div class="box-body"><div class="table-wrap"><table class="records"><tbody><tr class="table-head"><td>用户名</td><td>入款</td><td>已下发</td><td>未下发</td></tr>{{range .Summary.SubjectStats}}<tr><td>{{.Name}} ({{.Count}} 笔)</td><td><span class="copyable">{{.InCNY}}</span>/<span class="copyable">{{.InUSDT}}</span>U</td><td><span class="copyable">{{.OutCNY}}</span>/<span class="copyable">{{.OutUSDT}}</span>U</td><td><span class="copyable">{{.BalanceCNY}}</span>/<span class="copyable">{{.BalanceUSDT}}</span>U</td></tr>{{else}}<tr><td colspan="4" class="empty">暂无统计</td></tr>{{end}}</tbody></table></div></div></div></section>
 <section class="panel"><div class="box box-primary"><div class="box-header"><h3 class="box-title">统计（按操作人） ({{len .Summary.ActorStats}} 人)</h3></div><div class="box-body"><div class="table-wrap"><table class="records"><tbody><tr class="table-head"><td>用户名</td><td>入款</td><td>已下发</td><td>未下发</td></tr>{{range .Summary.ActorStats}}<tr><td>{{.Name}} ({{.Count}} 笔)</td><td><span class="copyable">{{.InCNY}}</span>/<span class="copyable">{{.InUSDT}}</span>U</td><td><span class="copyable">{{.OutCNY}}</span>/<span class="copyable">{{.OutUSDT}}</span>U</td><td><span class="copyable">{{.BalanceCNY}}</span>/<span class="copyable">{{.BalanceUSDT}}</span>U</td></tr>{{else}}<tr><td colspan="4" class="empty">暂无统计</td></tr>{{end}}</tbody></table></div></div></div></section>
 <section class="panel"><div class="box box-primary"><div class="box-header"><h3 class="box-title">统计（按备注） ({{len .Summary.RemarkStats}} 人)</h3></div><div class="box-body"><div class="table-wrap"><table class="records"><tbody><tr class="table-head"><td>用户名</td><td>入款</td><td>已下发</td><td>未下发</td></tr>{{range .Summary.RemarkStats}}<tr><td>{{.Name}} ({{.Count}} 笔)</td><td><span class="copyable">{{.InCNY}}</span>/<span class="copyable">{{.InUSDT}}</span>U</td><td><span class="copyable">{{.OutCNY}}</span>/<span class="copyable">{{.OutUSDT}}</span>U</td><td><span class="copyable">{{.BalanceCNY}}</span>/<span class="copyable">{{.BalanceUSDT}}</span>U</td></tr>{{else}}<tr><td colspan="4" class="empty">暂无统计</td></tr>{{end}}</tbody></table></div></div></div></section>

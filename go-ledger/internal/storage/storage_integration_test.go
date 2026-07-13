@@ -419,6 +419,74 @@ func TestPostgresStoreBasicFlow(t *testing.T) {
 	}
 }
 
+func TestPostgresRecordKeysetAndCurrentPeriodClear(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	store, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	chatID := -910000000000 - now.UnixNano()%1000000
+	dayKey := "2026-07-12"
+	periodStart := now.Add(-time.Minute)
+	for i := 0; i < 7; i++ {
+		createdAt := periodStart.Add(time.Duration(i) * time.Second)
+		if i == 0 {
+			createdAt = periodStart.Add(-time.Minute)
+		}
+		_, err := store.InsertRecord(ctx, Record{
+			ChatID: chatID, DayKey: dayKey, Kind: "deposit", Currency: "CNY",
+			Amount: fmt.Sprintf("%d", i+1), Rate: "1", FeeRate: "0", ResultUSDT: fmt.Sprintf("%d", i+1),
+			ActorUserID: 1, ActorName: "actor", SubjectName: "subject", CreatedAt: createdAt,
+		})
+		if err != nil {
+			t.Fatalf("insert record %d: %v", i, err)
+		}
+	}
+
+	newest, err := store.ListRecordsForDayPage(ctx, chatID, dayKey, RecordFilter{}, 0, 0, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(newest.Records) != 3 || !newest.HasOlder || newest.HasNewer {
+		t.Fatalf("newest page = %+v", newest)
+	}
+	older, err := store.ListRecordsForDayPage(ctx, chatID, dayKey, RecordFilter{}, newest.Records[0].ID, 0, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(older.Records) != 3 || !older.HasOlder || !older.HasNewer || older.Records[2].ID >= newest.Records[0].ID {
+		t.Fatalf("older page = %+v", older)
+	}
+	newerAgain, err := store.ListRecordsForDayPage(ctx, chatID, dayKey, RecordFilter{}, 0, older.Records[len(older.Records)-1].ID, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(newerAgain.Records) != 3 || newerAgain.Records[0].ID != newest.Records[0].ID {
+		t.Fatalf("newer page did not return adjacent records: %+v", newerAgain)
+	}
+
+	count, err := store.CountRecordsForPeriod(ctx, chatID, dayKey, periodStart)
+	if err != nil || count != 6 {
+		t.Fatalf("current period count = %d, err = %v", count, err)
+	}
+	deleted, err := store.SoftDeleteRecordsForPeriod(ctx, chatID, dayKey, periodStart, now.Add(time.Minute))
+	if err != nil || deleted != 6 {
+		t.Fatalf("current period deleted = %d, err = %v", deleted, err)
+	}
+	remaining, err := store.ListRecordsForDayPage(ctx, chatID, dayKey, RecordFilter{}, 0, 0, 10)
+	if err != nil || len(remaining.Records) != 1 {
+		t.Fatalf("records from earlier period should remain: %d, err = %v", len(remaining.Records), err)
+	}
+}
+
 func TestChainWatcherConcurrentSourcesCreateOneDelivery(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {

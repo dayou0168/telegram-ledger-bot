@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,14 +17,26 @@ func (b *Bot) handleClearLedgerRequest(ctx context.Context, msg telegram.Message
 	} else if !ok {
 		return b.enqueueLedgerTraceText(ctx, sendPriorityNormal, "clear_ledger_denied", msg.Chat.ID, msg.MessageID, "没有清除账单权限。", nil, time.Now().In(b.loc))
 	}
-	title := "确认清除今日账单？"
-	desc := "只会清除当前群当前业务日的账单，群配置、汇率、费率不变。"
-	if scope == "all" {
-		title = "确认清除全部账单？"
-		desc = "会清除当前群所有账单记录，群配置、汇率、费率不变。"
+	if scope != "current" {
+		return nil
 	}
+	now := time.Now().In(b.loc)
+	group, err := b.getGroupCached(ctx, msg.Chat.ID)
+	if err != nil {
+		return err
+	}
+	if !groupAccountingActive(group, now) || group.ActivePeriodStartedAt.IsZero() {
+		return b.enqueueLedgerTraceText(ctx, sendPriorityNormal, "clear_ledger_inactive", msg.Chat.ID, msg.MessageID, ledgerInactiveText, nil, now)
+	}
+	count, err := b.store.CountRecordsForPeriod(ctx, msg.Chat.ID, group.ActiveDayKey, group.ActivePeriodStartedAt)
+	if err != nil {
+		return err
+	}
+	title := "确认清除当前账期？"
+	desc := fmt.Sprintf("账期起止：%s 至 %s\n记录数：%d 条\n此操作不可恢复，只清除当前账期，群配置、汇率和费率不变。",
+		formatLedgerPeriodTime(group.ActivePeriodStartedAt, b.loc), formatLedgerPeriodTime(now, b.loc), count)
 	keyboard := telegram.InlineKeyboardMarkup{InlineKeyboard: [][]telegram.InlineKeyboardButton{
-		{{Text: "确认清除", CallbackData: "clear:" + scope}, {Text: "取消", CallbackData: "clear:cancel"}},
+		{{Text: "确认清除当前账期", CallbackData: fmt.Sprintf("clear:current:%d", group.ActivePeriodStartedAt.Unix())}, {Text: "取消", CallbackData: "clear:cancel"}},
 	}}
 	return b.enqueueLedgerSuccessText(ctx, sendPriorityNormal, "clear_ledger_confirm", msg.Chat.ID, msg.MessageID, title+"\n"+desc, map[string]any{
 		"reply_markup": keyboard,
@@ -40,8 +53,12 @@ func (b *Bot) handleClearLedgerCallback(ctx context.Context, cb telegram.Callbac
 		}
 		return b.enqueueLedgerSuccessText(ctx, sendPriorityNormal, "clear_ledger_cancel", cb.Message.Chat.ID, cb.Message.MessageID, "已取消清除账单。", nil, time.Now().In(b.loc))
 	}
-	scope := strings.TrimPrefix(cb.Data, "clear:")
-	if scope != "today" && scope != "all" {
+	parts := strings.Split(cb.Data, ":")
+	if len(parts) != 3 || parts[0] != "clear" || parts[1] != "current" {
+		return b.tg.AnswerCallback(ctx, cb.ID, "操作无效")
+	}
+	confirmedStart, parseErr := strconv.ParseInt(parts[2], 10, 64)
+	if parseErr != nil || confirmedStart <= 0 {
 		return b.tg.AnswerCallback(ctx, cb.ID, "操作无效")
 	}
 	if ok, err := b.canUseLedger(ctx, cb.Message.Chat.ID, cb.From.ID); err != nil {
@@ -50,37 +67,34 @@ func (b *Bot) handleClearLedgerCallback(ctx context.Context, cb telegram.Callbac
 		return b.tg.AnswerCallback(ctx, cb.ID, "没有清除账单权限")
 	}
 	now := time.Now().In(b.loc)
-	var count int64
-	var err error
-	var clearedDayKey string
-	if scope == "today" {
-		group, getErr := b.getGroupCached(ctx, cb.Message.Chat.ID)
-		if getErr != nil {
-			return getErr
-		}
-		clearedDayKey = currentLedgerDayKey(group, now)
-		doneDelete := measurePerfStage(ctx, "db_record_delete")
-		count, err = b.store.SoftDeleteRecordsForDay(ctx, cb.Message.Chat.ID, clearedDayKey, now)
-		doneDelete()
-	} else {
-		doneDelete := measurePerfStage(ctx, "db_record_delete")
-		count, err = b.store.SoftDeleteAllRecords(ctx, cb.Message.Chat.ID, now)
-		doneDelete()
-	}
+	group, err := b.getGroupCached(ctx, cb.Message.Chat.ID)
 	if err != nil {
 		return err
 	}
-	if scope == "today" {
-		b.invalidateBillSummaryCache(cb.Message.Chat.ID, clearedDayKey)
-	} else {
-		b.clearBillSummaryCache()
+	if !groupAccountingActive(group, now) || group.ActivePeriodStartedAt.IsZero() {
+		return b.tg.AnswerCallback(ctx, cb.ID, "当前没有有效账期")
 	}
+	if group.ActivePeriodStartedAt.Unix() != confirmedStart {
+		return b.tg.AnswerCallback(ctx, cb.ID, "账期已变化，请重新确认")
+	}
+	clearedDayKey := group.ActiveDayKey
+	doneDelete := measurePerfStage(ctx, "db_record_delete")
+	count, err := b.store.SoftDeleteRecordsForPeriod(ctx, cb.Message.Chat.ID, clearedDayKey, group.ActivePeriodStartedAt, now)
+	doneDelete()
+	if err != nil {
+		return err
+	}
+	b.invalidateBillSummaryCache(cb.Message.Chat.ID, clearedDayKey)
 	if err := b.tg.AnswerCallback(ctx, cb.ID, "已清除"); err != nil {
 		return err
 	}
 	text := fmt.Sprintf("清除完成：已清除 %d 条记录。", count)
-	if scope == "today" {
-		return b.sendBill(ctx, cb.Message.Chat.ID, cb.Message.MessageID, now, text)
+	return b.sendBill(ctx, cb.Message.Chat.ID, cb.Message.MessageID, now, text)
+}
+
+func formatLedgerPeriodTime(value time.Time, loc *time.Location) string {
+	if loc != nil {
+		value = value.In(loc)
 	}
-	return b.enqueueLedgerSuccessText(ctx, sendPriorityNormal, "clear_ledger_done", cb.Message.Chat.ID, cb.Message.MessageID, text, nil, now)
+	return value.Format("2006-01-02 15:04:05")
 }

@@ -12,6 +12,7 @@ import (
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/adminauth"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/config"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
+	"github.com/xuri/excelize/v2"
 )
 
 func TestBillExchangeRateDisplay(t *testing.T) {
@@ -104,6 +105,67 @@ func TestBillHistoryTriggerUsesButtonFont(t *testing.T) {
 	}
 	if !strings.Contains(billHTML, ".history-trigger{cursor:pointer;font-family:inherit;font-size:14px;font-weight:600") {
 		t.Fatal("history trigger should match toolbar button typography")
+	}
+}
+
+func TestBillRecordLinksOnlyAmountAndSubject(t *testing.T) {
+	record := storage.Record{
+		ChatID:          -1003720457420,
+		SourceMessageID: 1234,
+		Amount:          "666",
+		Rate:            "10",
+		FeeRate:         "0",
+		ResultUSDT:      "66.6",
+		Currency:        "CNY",
+		Kind:            "deposit",
+		SubjectName:     "新一",
+	}
+	amount := string(billAmountHTML(record))
+	if !strings.Contains(amount, `>666</a>/10=66.6U`) || strings.Count(amount, `href=`) != 1 {
+		t.Fatalf("amount link should exclude formula remainder: %s", amount)
+	}
+	subject := string(recordSubjectHTML(record))
+	if !strings.Contains(subject, `>新一</a>`) || !strings.Contains(subject, `https://t.me/c/3720457420/1234`) {
+		t.Fatalf("subject link = %s", subject)
+	}
+	record.SourceMessageID = 0
+	if strings.Contains(string(billAmountHTML(record)), "<a") || strings.Contains(string(recordSubjectHTML(record)), "<a") {
+		t.Fatal("record without a valid source message must render as plain text")
+	}
+}
+
+func TestBillCursorPathPreservesFilter(t *testing.T) {
+	got := billCursorPath(-1001, "2026-07-12", "subject", "新一", "before", 900)
+	for _, want := range []string{"/b/-1001/20260712?", "before=900", "field=subject", "q="} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("cursor path %q missing %q", got, want)
+		}
+	}
+}
+
+func TestWriteBillXLSXConsumesBatches(t *testing.T) {
+	var calls []string
+	walker := func(kind string, visit func([]storage.Record) error) error {
+		calls = append(calls, kind)
+		if kind == "payout" {
+			return nil
+		}
+		return visit([]storage.Record{{ID: 1, Kind: "deposit", Currency: "CNY", Amount: "10", Rate: "1", ResultUSDT: "10"}})
+	}
+	var output bytes.Buffer
+	if err := writeBillXLSX(storage.Group{Title: "test", DepositExchangeRate: "1"}, "2026-07-12", walker, &output); err != nil {
+		t.Fatal(err)
+	}
+	if output.Len() == 0 || len(calls) != 3 || calls[0] != "" || calls[1] != "deposit" || calls[2] != "payout" {
+		t.Fatalf("walker calls = %v, output bytes = %d", calls, output.Len())
+	}
+	file, err := excelize.OpenReader(bytes.NewReader(output.Bytes()))
+	if err != nil {
+		t.Fatalf("open streamed workbook: %v", err)
+	}
+	defer func() { _ = file.Close() }()
+	if value, err := file.GetCellValue("账单", "A3"); err != nil || value != "入款：1笔" {
+		t.Fatalf("streamed workbook A3 = %q, err = %v", value, err)
 	}
 }
 

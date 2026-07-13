@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/permissions"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/telegram"
 )
@@ -157,6 +158,43 @@ func TestOpenBillQueryDoesNotRequireWritePermissionWhenAccountingActive(t *testi
 	}
 	if !ok {
 		t.Fatal("open bill query should be allowed without write permission when accounting is active")
+	}
+}
+
+func TestNonOperatorStartAndStopStaySilent(t *testing.T) {
+	b := &Bot{
+		operatorCache: newTTLCache[bool](time.Minute),
+		globalOperatorLookup: func(context.Context, int64) (permissions.UserCapabilities, bool, error) {
+			return permissions.UserCapabilities{}, false, nil
+		},
+		groupOperatorLookup: func(context.Context, int64, int64) (bool, error) { return false, nil },
+	}
+	msg := telegram.Message{Chat: telegram.Chat{ID: -1001}, MessageID: 10}
+	user := storage.User{ID: 2002}
+	b.operatorCache.Set(ledgerPermissionCacheKey(msg.Chat.ID, user.ID), false)
+	if err := b.startAccounting(context.Background(), msg, user, time.Now()); err != nil {
+		t.Fatalf("non-operator start should be silent, got %v", err)
+	}
+	if err := b.stopAccounting(context.Background(), msg, user, time.Now()); err != nil {
+		t.Fatalf("non-operator stop should be silent, got %v", err)
+	}
+}
+
+func TestLedgerWritePermissionRejectsOrdinaryMember(t *testing.T) {
+	b := &Bot{
+		operatorCache: newTTLCache[bool](time.Minute),
+		globalOperatorLookup: func(context.Context, int64) (permissions.UserCapabilities, bool, error) {
+			return permissions.UserCapabilities{}, false, nil
+		},
+		groupOperatorLookup: func(context.Context, int64, int64) (bool, error) { return false, nil },
+	}
+	b.operatorCache.Set(ledgerPermissionCacheKey(-1001, 2002), false)
+	allowed, err := b.canUseLedgerWithGroup(context.Background(), storage.Group{ChatID: -1001}, 2002)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allowed {
+		t.Fatal("ordinary member must not receive ledger write permission")
 	}
 }
 
