@@ -11,7 +11,7 @@ import (
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/tron"
 )
 
-const Version = "2.4.1"
+const Version = "2.4.2"
 
 type Config struct {
 	TelegramBotToken string
@@ -254,6 +254,8 @@ type ChainWatcherConfig struct {
 	TronAPIKeys             []string
 	USDTContract            string
 	PollInterval            time.Duration
+	MainScanTimeout         time.Duration
+	MainMaxInflight         int
 	GlobalPages             int
 	GlobalExpandPageLimit   int
 	CatchupInterval         time.Duration
@@ -290,6 +292,8 @@ func LoadChainWatcher() (ChainWatcherConfig, error) {
 		TronAPIKeys:             parseListEnv(os.Getenv("CHAIN_WATCHER_TRONSCAN_API_KEYS")),
 		USDTContract:            env("TRON_USDT_CONTRACT", "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"),
 		PollInterval:            secondsEnv("CHAIN_WATCHER_SOURCE_POLL_SECONDS", 1),
+		MainScanTimeout:         millisEnv("CHAIN_WATCHER_MAIN_SCAN_TIMEOUT_MS", 3000),
+		MainMaxInflight:         intEnv("CHAIN_WATCHER_MAIN_MAX_INFLIGHT_ROUNDS", 3),
 		GlobalPages:             intEnv("CHAIN_WATCHER_GLOBAL_SCAN_PAGES", intEnv("TRONSCAN_GLOBAL_SCAN_PAGES", 3)),
 		GlobalExpandPageLimit:   intEnv("CHAIN_WATCHER_GLOBAL_EXPAND_PAGE_LIMIT", 20),
 		CatchupInterval:         secondsEnv("CHAIN_WATCHER_CATCHUP_STATE_INTERVAL_SECONDS", 30),
@@ -319,6 +323,15 @@ func LoadChainWatcher() (ChainWatcherConfig, error) {
 	}
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = time.Second
+	}
+	if cfg.MainScanTimeout < time.Second {
+		cfg.MainScanTimeout = 3 * time.Second
+	}
+	if cfg.MainMaxInflight < 1 {
+		cfg.MainMaxInflight = 1
+	}
+	if cfg.MainMaxInflight > 3 {
+		cfg.MainMaxInflight = 3
 	}
 	if cfg.GlobalPages < 1 {
 		cfg.GlobalPages = 1

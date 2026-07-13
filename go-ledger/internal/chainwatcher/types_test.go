@@ -91,3 +91,21 @@ func TestSameTransactionDifferentEventIndexesRemainDistinct(t *testing.T) {
 		t.Fatal("different events in one tx collapsed to one delivery")
 	}
 }
+
+func TestNewSubscriptionBaselineDoesNotReplayOlderTransfer(t *testing.T) {
+	transfer := tron.Transfer{
+		Hash: "baseline-tx", From: "TA", To: "TB", Value: "1000000",
+		TokenAddress: "TR7", TokenDecimals: 6, BlockTimestamp: 1_000,
+	}
+	sub := storage.ChainWatcherSubscription{
+		BotID: "bot", ChatID: 1, OwnerUserID: 1, Address: "TB",
+		WatchIncome: true, Active: true, BaselineTimestamp: 1_001,
+	}
+	if matches := MatchTransfer(transfer, []storage.ChainWatcherSubscription{sub}); len(matches) != 0 {
+		t.Fatalf("pre-baseline transfer matched: %#v", matches)
+	}
+	transfer.BlockTimestamp = sub.BaselineTimestamp
+	if matches := MatchTransfer(transfer, []storage.ChainWatcherSubscription{sub}); len(matches) != 1 {
+		t.Fatalf("transfer at baseline matches = %d, want 1", len(matches))
+	}
+}

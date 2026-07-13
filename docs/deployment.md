@@ -1,6 +1,6 @@
-# Telegram 记账机器人 Go v2.4.1 部署运维
+# Telegram 记账机器人 Go 部署运维
 
-当前发布目标是 Go v2.4.1。生产部署使用 GHCR 预构建镜像、PostgreSQL 和共享链上监听服务 `ledger-chain-watcher`。服务器上不需要源码构建作为默认路径。
+当前已发布版本是 Go v2.4.1；本文同时记录尚未发布的 v2.4.2 watcher 配置兼容项。生产部署使用 GHCR 预构建镜像、PostgreSQL 和共享链上监听服务 `ledger-chain-watcher`。服务器上不需要源码构建作为默认路径。
 
 ## 部署基线
 
@@ -72,6 +72,8 @@ CHAIN_WATCHER_TRONSCAN_API_KEYS: "key1,key2,key3"
 CHAIN_WATCHER_TRONSCAN_API_KEY: ""
 CHAIN_WATCHER_TRON_API_KEY: ""
 CHAIN_WATCHER_SOURCE_POLL_SECONDS: "1"
+CHAIN_WATCHER_MAIN_SCAN_TIMEOUT_MS: "3000"
+CHAIN_WATCHER_MAIN_MAX_INFLIGHT_ROUNDS: "3"
 CHAIN_WATCHER_GLOBAL_SCAN_PAGES: "3"
 CHAIN_WATCHER_GLOBAL_EXPAND_PAGE_LIMIT: "20"
 CHAIN_WATCHER_CATCHUP_ENABLED: "true"
@@ -88,13 +90,13 @@ CHAIN_WATCHER_LOOKBACK_SECONDS: "600"
 
 `CHAIN_WATCHER_TRONSCAN_API_KEYS` 只用于首次填充 watcher Key 注册表；旧单 Key 配置继续兼容。注册表最多保存 10 个 Key，禁用项也占槽；之后可通过受 `CHAIN_WATCHER_ADMIN_TOKEN` 保护的 `/v1/admin/keys*` 接口热增删、启停和立即复检。第 11 个 Key 会明确拒绝。
 
-watcher 是唯一主扫描中心：每秒以同一个 cutoff 并行读取 P1-P3，并以稳定 event identity 检查上一轮锚点。锚点缺失时 P4-P20 在独立 worker 扩页，不阻塞下一秒热头；仍缺失才置位持久化全局 catch-up。catch-up 只在明确缺口时从 cursor 查询封闭时间窗口，完整落库后推进，safe head 默认落后实时头部 2 秒。逐地址轮询默认关闭，地址数只影响内存 hash 匹配。
+watcher 是唯一主扫描中心：每秒以同一个 cutoff 并行读取 P1-P3，独立 API deadline 默认 3000ms，并允许最多 3 个有界在途轮次。成功页立即持久化，失败页生成精确 gap；锚点缺失时 P4-P20 由高优先 gap worker 扩页，低优先时间窗 catch-up 临近下一秒实时 deadline 时让路。cursor 只在封闭窗口完整落库后推进，safe head 默认落后实时头部 2 秒。逐地址轮询默认关闭，地址数只影响内存 hash 匹配。
 
 每个 bot 必须设置唯一且稳定的 `BOT_FALLBACK_INSTANCE_ID`，并把 `BOT_FALLBACK_SHARED_DATABASE_URL` 指向 watcher 的共享 PostgreSQL。缺少任一项时公共 fallback 会明确进入 DEGRADED，不会退回每 bot 逐地址扫描。正常状态下公共无 Key通道完全不发请求；只有 watcher 连续异常 3 秒后，跨 bot 的共享 lease 才选出一个 leader 接管。
 
 每 Key 独立限制 5 requests/sec；UTC 日计数持久化但不设置本地软停或硬停，只用于最少用量调度和容量观测。401/403 首次 suspect、5 秒独立探测，连续两次认证失败才 invalid；invalid 每 30 分钟探测，连续两次成功恢复。429 尊重 `Retry-After`，无头按 60/120/300/900/3600 秒退避；明确 daily exhausted 在北京时间 08:00 后探测。5xx/timeout 按 1/2/4/8/15/30 秒退避。Key 密文使用 AES-256-GCM；首次部署执行 `openssl rand -base64 32`，把结果仅写入 watcher 的受限 env，丢失该密钥将无法解密已注册 Key。
 
-`/healthz` 只表示进程存活，Docker/systemd 健康检查继续用它；`/readyz` 表示链源是否可用，`/status` 用于排障，包含最近全局扫描成功时间、最近错误、429 backoff、pending/delivering、最老 pending 和 retention 清理统计。`global`/`address` 会显示 `api_wait_ms`、`api_fetch_ms`、`parse_ms`、`match_ms`、`write_ms`、`api_call_count`、`page_count`、`overlap_skipped` 和最近 5 轮摘要。bot 自动 fallback 读取 ready 状态，不把“没有新交易”当成故障。
+`/healthz` 只表示进程存活，Docker/systemd 健康检查继续用它；`/readyz` 综合链源新鲜度、连续 watermark 和未闭合 gap，cursor=0 时返回 `catchup_lag_unknown=true` 而不是伪装 lag=0。`/status` 受 `CHAIN_WATCHER_ADMIN_TOKEN` Bearer 鉴权，显示 round/in-flight、API/parse/match/write 分段耗时、精确 gap、Key 状态、pending/delivering 和最近 5 轮摘要；分钟聚合及完成 gap 明细保留 72 小时。
 
 自动热备要求所有 bot 配置同一个 `BOT_FALLBACK_SHARED_DATABASE_URL`；PostgreSQL lease 保证只有一个实例执行无 Key 全局扫描，其他 bot 只领取共享 matched events。恢复时进入 RECOVERING，私有 Key 池补齐 watermark，连续 ready/claim 成功且 lag 归零后才释放 leader lease。没有共享 DSN 时明确 DEGRADED，不启动旧本机扫描。
 
@@ -258,6 +260,8 @@ CHAIN_WATCHER_TRONSCAN_API_KEYS=key1,key2,key3
 CHAIN_WATCHER_TRONSCAN_API_KEY=
 CHAIN_WATCHER_TRON_API_KEY=
 CHAIN_WATCHER_SOURCE_POLL_SECONDS=1
+CHAIN_WATCHER_MAIN_SCAN_TIMEOUT_MS=3000
+CHAIN_WATCHER_MAIN_MAX_INFLIGHT_ROUNDS=3
 CHAIN_WATCHER_GLOBAL_SCAN_PAGES=3
 CHAIN_WATCHER_GLOBAL_EXPAND_PAGE_LIMIT=20
 CHAIN_WATCHER_CATCHUP_ENABLED=true
@@ -476,7 +480,7 @@ ADMIN_WEB_TOKEN
 机器人内网访问: http://ledger-chain-watcher:8090
 进程健康检查: /healthz
 链源就绪检查: /readyz
-排障状态: /status
+排障状态: /status（需要 Authorization: Bearer $CHAIN_WATCHER_ADMIN_TOKEN）
 公网端口: 不开放
 ```
 
@@ -660,7 +664,7 @@ curl -I https://bot.example.com/admin
 ```bash
 docker exec ledger-bot-go wget -qO- http://ledger-chain-watcher:8090/healthz
 docker exec ledger-bot-go wget -qO- http://ledger-chain-watcher:8090/readyz
-docker exec ledger-bot-go wget -qO- http://ledger-chain-watcher:8090/status
+docker exec ledger-chain-watcher wget --header="Authorization: Bearer $CHAIN_WATCHER_ADMIN_TOKEN" -qO- http://127.0.0.1:8090/status
 ```
 
 如果网页打不开，优先检查 `PUBLIC_BILL_BASE_URL` 是否带 `https://`，宝塔反代目标端口是否正确，以及 Cloudflare SSL 模式是否正确。

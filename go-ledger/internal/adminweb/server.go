@@ -1115,7 +1115,7 @@ func (s *Server) saveWatchTarget(w http.ResponseWriter, r *http.Request) {
 	target.Label = strings.TrimSpace(r.FormValue("label"))
 	target.WatchIncome = r.FormValue("watch_income") == "1"
 	target.WatchExpense = r.FormValue("watch_expense") == "1"
-	target.NotifyTRX = r.FormValue("notify_trx") == "1"
+	target.NotifyTRX = false
 	target.MinNotifyAmount = normalizeAdminMinAmount(r.FormValue("min_notify_amount"))
 	if _, err := s.store.UpdateWatchTarget(r.Context(), target, time.Now()); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -2809,7 +2809,7 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 .pill{display:inline-block;border:1px solid #d5e1ec;background:#f7fafc;border-radius:999px;padding:3px 9px;color:#40566f}
 .actions{display:flex;gap:8px;flex-wrap:wrap}.mini{height:32px;padding:0 10px}
 .toolbar-forms{display:grid;grid-template-columns:repeat(3,minmax(240px,1fr));gap:12px;margin-bottom:14px}.inline-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px}.cleanup-box{text-align:left;min-width:260px}.cleanup-box summary{cursor:pointer;font-weight:800;color:var(--navy)}.cleanup-summary{display:block;margin-top:4px;color:var(--muted);font-size:12px;line-height:1.35}.cleanup-form{display:grid;grid-template-columns:130px minmax(120px,1fr) minmax(84px,.5fr) minmax(84px,.5fr);gap:7px;align-items:end;margin-top:10px}.cleanup-form .wide{grid-column:1/-1}.cleanup-form select,.cleanup-form input{min-height:32px;height:32px;padding:4px 7px}.cleanup-scopes{display:flex;gap:14px;align-items:center;border:1px solid #dce5ef;border-radius:6px;padding:7px 10px}.cleanup-scopes label{display:flex;gap:5px;align-items:center}.cleanup-scopes input{min-height:auto;height:auto}.cleanup-note{grid-column:1/-1;color:var(--muted);font-size:12px;line-height:1.45}.section-title{margin:4px 0 8px;font-size:15px;font-weight:800;color:#243852}.member-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:14px}.member-form{border:1px solid #dce5ef;background:var(--soft);border-radius:8px;padding:12px;min-width:0}.member-form select{width:100%;margin-bottom:8px}.member-form select[multiple]{height:220px;min-height:220px;background:#fff}.group-name-list{max-width:760px;text-align:left;line-height:1.65}.permission-panels{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:14px}.permission-panel{border:1px solid #dce5ef;background:var(--soft);border-radius:8px;padding:12px;min-width:0}.permission-panel form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;align-items:end}.permission-panel .btn{grid-column:1/-1;justify-self:start;min-width:180px}.permission-table td:first-child,.operator-name{text-align:left}.field-label{display:block;margin:0 0 5px;color:var(--muted);font-size:12px;font-weight:700}.field-stack{min-width:0}.field-stack select{width:100%}.field-stack.disabled{opacity:.45}
-.watch-panel{max-height:620px;overflow:auto;border:1px solid #dce5ef;border-radius:8px;background:#fff}.watch-panel form{margin:0}.watch-head,.watch-row{display:grid;grid-template-columns:minmax(130px,.7fr) minmax(330px,1.6fr) minmax(150px,.7fr) repeat(3,88px) minmax(110px,.5fr) auto auto;gap:8px;align-items:center}.watch-head{position:sticky;top:0;z-index:1;background:#f4f7fb;font-weight:800;padding:10px;border-bottom:1px solid #dce5ef;text-align:center}.watch-row{padding:10px;border-bottom:1px solid #e7eef6}.watch-row:last-child{border-bottom:0}.watch-row code{word-break:break-all;color:#173f82}.watch-row .owner{font-weight:700}.watch-row .latest{color:var(--muted);font-size:12px}.watch-check{display:flex;gap:5px;align-items:center;justify-content:center}.watch-check input{min-height:auto}.watch-row .btn{height:34px;min-width:64px;padding:0 10px}.watch-empty{border:1px dashed #cbd8e8;border-radius:8px;padding:22px;text-align:center;color:var(--muted);background:var(--soft)}
+.watch-panel{max-height:620px;overflow:auto;border:1px solid #dce5ef;border-radius:8px;background:#fff}.watch-panel form{margin:0}.watch-head,.watch-row{display:grid;grid-template-columns:minmax(130px,.7fr) minmax(330px,1.6fr) minmax(150px,.7fr) repeat(2,88px) minmax(110px,.5fr) auto auto;gap:8px;align-items:center}.watch-head{position:sticky;top:0;z-index:1;background:#f4f7fb;font-weight:800;padding:10px;border-bottom:1px solid #dce5ef;text-align:center}.watch-row{padding:10px;border-bottom:1px solid #e7eef6}.watch-row:last-child{border-bottom:0}.watch-row code{word-break:break-all;color:#173f82}.watch-row .owner{font-weight:700}.watch-row .latest{color:var(--muted);font-size:12px}.watch-check{display:flex;gap:5px;align-items:center;justify-content:center}.watch-check input{min-height:auto}.watch-row .btn{height:34px;min-width:64px;padding:0 10px}.watch-empty{border:1px dashed #cbd8e8;border-radius:8px;padding:22px;text-align:center;color:var(--muted);background:var(--soft)}
 @media(max-width:900px){.top{align-items:flex-start;flex-direction:column}.row,.row.two,.toolbar-forms,.member-grid,.permission-panels,.permission-panel form,.cleanup-form{grid-template-columns:1fr}.watch-head{display:none}.watch-row{grid-template-columns:1fr}.btn{width:100%}}
 </style>
 </head>
@@ -2951,7 +2951,7 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 <p class="hint">宿主可查看全部监听地址；一级操作人和操作人只显示自己监听的地址。普通用户不能进入后台，只能在私聊机器人里管理自己的监听地址。</p>
 {{if .WatchTargets}}
 <div class="watch-panel">
-<div class="watch-head"><div>所属用户</div><div>地址</div><div>备注</div><div>收入</div><div>支出</div><div>TRX</div><div>最小提醒</div><div>保存</div><div>删除</div></div>
+<div class="watch-head"><div>所属用户</div><div>地址</div><div>备注</div><div>收入</div><div>支出</div><div>最小提醒</div><div>保存</div><div>删除</div></div>
 {{range $i,$w := .WatchTargets}}
 <form id="watch-save-{{$i}}" method="post" action="/admin/watch/save">
 <input type="hidden" name="owner_user_id" value="{{$w.OwnerUserID}}">
@@ -2967,7 +2967,6 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 <input form="watch-save-{{$i}}" name="label" value="{{$w.Label}}" placeholder="备注">
 <label class="watch-check"><input form="watch-save-{{$i}}" type="checkbox" name="watch_income" value="1" {{if $w.WatchIncome}}checked{{end}}>收入</label>
 <label class="watch-check"><input form="watch-save-{{$i}}" type="checkbox" name="watch_expense" value="1" {{if $w.WatchExpense}}checked{{end}}>支出</label>
-<label class="watch-check"><input form="watch-save-{{$i}}" type="checkbox" name="notify_trx" value="1" {{if $w.NotifyTRX}}checked{{end}}>TRX</label>
 <input form="watch-save-{{$i}}" name="min_notify_amount" value="{{$w.MinNotifyAmount}}" placeholder="USDT">
 <button class="btn mini" form="watch-save-{{$i}}" type="submit">保存</button>
 <button class="btn mini secondary" form="watch-remove-{{$i}}" type="submit">删除</button>

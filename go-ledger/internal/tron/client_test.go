@@ -164,3 +164,27 @@ func TestThreeHeadPagesShareOneCutoff(t *testing.T) {
 		}
 	}
 }
+
+func TestGlobalFetchReturnsSuccessfulPagesWhenOnePageFails(t *testing.T) {
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := r.URL.Query().Get("start")
+		if start == "50" {
+			http.Error(w, "temporary upstream failure", http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprintf(w, `{"token_transfers":[{"transaction_id":"tx-%s","event_index":0,"from_address":"A","to_address":"B","quant":"1","block_ts":1000,"tokenInfo":{"tokenId":"TR7"}}]}`, start)
+	}))
+	defer api.Close()
+
+	client := NewClientWithKeys(api.URL, []string{"k1", "k2", "k3", "k4", "k5"}, 2*time.Second, KeyPoolOptions{})
+	result, err := client.FetchGlobalUSDTTransfersAtWithMetrics(context.Background(), "TR7", 1, 2_000, 3)
+	if err == nil {
+		t.Fatal("page failure should be returned")
+	}
+	if len(result.Transfers) != 2 || len(result.SuccessfulPages) != 2 || len(result.FailedPages) != 1 {
+		t.Fatalf("partial result = transfers:%d successful:%v failed:%v", len(result.Transfers), result.SuccessfulPages, result.FailedPages)
+	}
+	if result.FailedPages[0].Page != 1 {
+		t.Fatalf("failed page = %d, want 1", result.FailedPages[0].Page)
+	}
+}

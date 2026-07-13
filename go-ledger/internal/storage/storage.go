@@ -548,6 +548,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			notify_trx BOOLEAN NOT NULL DEFAULT TRUE,
 			min_notify_amount TEXT NOT NULL DEFAULT '0',
 			active BOOLEAN NOT NULL DEFAULT TRUE,
+			baseline_timestamp BIGINT NOT NULL DEFAULT 0,
 			created_at TIMESTAMPTZ NOT NULL,
 			updated_at TIMESTAMPTZ NOT NULL,
 			PRIMARY KEY(owner_user_id, address)
@@ -556,6 +557,10 @@ func (s *Store) migrate(ctx context.Context) error {
 		`ALTER TABLE address_watches ADD COLUMN IF NOT EXISTS watch_expense BOOLEAN NOT NULL DEFAULT TRUE`,
 		`ALTER TABLE address_watches ADD COLUMN IF NOT EXISTS notify_trx BOOLEAN NOT NULL DEFAULT TRUE`,
 		`ALTER TABLE address_watches ADD COLUMN IF NOT EXISTS min_notify_amount TEXT NOT NULL DEFAULT '0'`,
+		`ALTER TABLE address_watches ADD COLUMN IF NOT EXISTS baseline_timestamp BIGINT NOT NULL DEFAULT 0`,
+		`UPDATE address_watches
+			SET baseline_timestamp=(EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT
+			WHERE baseline_timestamp=0`,
 		`CREATE INDEX IF NOT EXISTS idx_address_watches_active
 			ON address_watches(active, owner_user_id, address)`,
 		`CREATE INDEX IF NOT EXISTS idx_address_watches_owner_active
@@ -594,8 +599,22 @@ func (s *Store) migrate(ctx context.Context) error {
 		)`,
 		`ALTER TABLE chain_notifications ADD COLUMN IF NOT EXISTS event_id TEXT NOT NULL DEFAULT ''`,
 		`UPDATE chain_notifications SET event_id=tx_hash WHERE event_id=''`,
-		`ALTER TABLE chain_notifications DROP CONSTRAINT IF EXISTS chain_notifications_pkey`,
-		`ALTER TABLE chain_notifications ADD PRIMARY KEY(owner_user_id, address, event_id, direction)`,
+		`DO $$
+		BEGIN
+			IF NOT EXISTS (SELECT 1 FROM schema_migrations WHERE version='2.4.2-chain-notifications-event-pk') THEN
+				IF NOT EXISTS (
+					SELECT 1 FROM pg_constraint
+					WHERE conrelid='chain_notifications'::regclass
+					  AND contype='p'
+					  AND pg_get_constraintdef(oid) LIKE '%event_id%'
+				) THEN
+					ALTER TABLE chain_notifications DROP CONSTRAINT IF EXISTS chain_notifications_pkey;
+					ALTER TABLE chain_notifications ADD PRIMARY KEY(owner_user_id, address, event_id, direction);
+				END IF;
+				INSERT INTO schema_migrations(version, applied_at)
+				VALUES('2.4.2-chain-notifications-event-pk', NOW());
+			END IF;
+		END $$`,
 		`CREATE INDEX IF NOT EXISTS idx_chain_notifications_latest
 			ON chain_notifications(owner_user_id, address, block_timestamp DESC)`,
 		`CREATE TABLE IF NOT EXISTS chain_watcher_bots (
@@ -681,6 +700,49 @@ func (s *Store) migrate(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_fallback_lease_expiry
 			ON chain_watcher_fallback_lease(lease_until)`,
+		`CREATE TABLE IF NOT EXISTS chain_watcher_gap_tasks (
+			id BIGSERIAL PRIMARY KEY,
+			kind TEXT NOT NULL,
+			source TEXT NOT NULL,
+			priority INTEGER NOT NULL DEFAULT 10,
+			reason TEXT NOT NULL DEFAULT '',
+			from_timestamp BIGINT NOT NULL,
+			to_timestamp BIGINT NOT NULL,
+			start_page INTEGER NOT NULL DEFAULT 0,
+			end_page INTEGER NOT NULL DEFAULT 0,
+			next_page INTEGER NOT NULL DEFAULT 0,
+			anchor_event_id TEXT NOT NULL DEFAULT '',
+			head_event_id TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT 'pending',
+			lease_owner TEXT NOT NULL DEFAULT '',
+			lease_generation BIGINT NOT NULL DEFAULT 0,
+			lease_until TIMESTAMPTZ,
+			attempts INTEGER NOT NULL DEFAULT 0,
+			last_error TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL,
+			updated_at TIMESTAMPTZ NOT NULL,
+			completed_at TIMESTAMPTZ,
+			UNIQUE(kind, source, from_timestamp, to_timestamp, start_page, end_page, anchor_event_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_gap_claim
+			ON chain_watcher_gap_tasks(priority, from_timestamp, id)
+			WHERE status IN ('pending','leased')`,
+		`ALTER TABLE chain_watcher_gap_tasks ADD COLUMN IF NOT EXISTS head_event_id TEXT NOT NULL DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_gap_retention
+			ON chain_watcher_gap_tasks(updated_at)`,
+		`CREATE TABLE IF NOT EXISTS chain_watcher_metric_minutes (
+			bucket_at TIMESTAMPTZ NOT NULL,
+			lane TEXT NOT NULL,
+			success_count BIGINT NOT NULL DEFAULT 0,
+			error_count BIGINT NOT NULL DEFAULT 0,
+			request_count BIGINT NOT NULL DEFAULT 0,
+			api_ms BIGINT NOT NULL DEFAULT 0,
+			parse_ms BIGINT NOT NULL DEFAULT 0,
+			match_ms BIGINT NOT NULL DEFAULT 0,
+			write_ms BIGINT NOT NULL DEFAULT 0,
+			overlap_count BIGINT NOT NULL DEFAULT 0,
+			PRIMARY KEY(bucket_at, lane)
+		)`,
 		`CREATE TABLE IF NOT EXISTS chain_watcher_subscriptions (
 			bot_id TEXT NOT NULL,
 			chat_id BIGINT NOT NULL DEFAULT 0,
@@ -691,12 +753,14 @@ func (s *Store) migrate(ctx context.Context) error {
 			watch_expense BOOLEAN NOT NULL DEFAULT TRUE,
 			notify_trx BOOLEAN NOT NULL DEFAULT TRUE,
 			min_notify_amount TEXT NOT NULL DEFAULT '0',
+			baseline_timestamp BIGINT NOT NULL DEFAULT 0,
 			active BOOLEAN NOT NULL DEFAULT TRUE,
 			created_at TIMESTAMPTZ NOT NULL,
 			updated_at TIMESTAMPTZ NOT NULL,
 			PRIMARY KEY(bot_id, chat_id, owner_user_id, address)
 		)`,
 		`ALTER TABLE chain_watcher_subscriptions ADD COLUMN IF NOT EXISTS chat_id BIGINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE chain_watcher_subscriptions ADD COLUMN IF NOT EXISTS baseline_timestamp BIGINT NOT NULL DEFAULT 0`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_chain_watcher_subscriptions_identity
 			ON chain_watcher_subscriptions(bot_id, chat_id, owner_user_id, address)`,
 		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_subscriptions_active_address
@@ -2767,11 +2831,11 @@ func (s *Store) SoftDeleteRecordsForPeriod(ctx context.Context, chatID int64, da
 func (s *Store) ListWatchTargets(ctx context.Context) ([]WatchTarget, error) {
 	rows, err := s.pool.Query(ctx, `SELECT w.owner_user_id, w.address, w.label,
 		w.watch_income, w.watch_expense, w.notify_trx, w.min_notify_amount,
-		COALESCE(MAX(n.block_timestamp), 0)
+			COALESCE(MAX(n.block_timestamp), 0), w.baseline_timestamp
 		FROM address_watches w
 		LEFT JOIN chain_notifications n ON n.owner_user_id = w.owner_user_id AND n.address = w.address
 		WHERE w.active = TRUE
-		GROUP BY w.owner_user_id, w.address, w.label, w.watch_income, w.watch_expense, w.notify_trx, w.min_notify_amount
+		GROUP BY w.owner_user_id, w.address, w.label, w.watch_income, w.watch_expense, w.notify_trx, w.min_notify_amount, w.baseline_timestamp
 		ORDER BY w.owner_user_id ASC, w.address ASC`)
 	if err != nil {
 		return nil, err
@@ -2780,7 +2844,7 @@ func (s *Store) ListWatchTargets(ctx context.Context) ([]WatchTarget, error) {
 	var targets []WatchTarget
 	for rows.Next() {
 		var t WatchTarget
-		if err := rows.Scan(&t.OwnerUserID, &t.Address, &t.Label, &t.WatchIncome, &t.WatchExpense, &t.NotifyTRX, &t.MinNotifyAmount, &t.LatestTimestamp); err != nil {
+		if err := rows.Scan(&t.OwnerUserID, &t.Address, &t.Label, &t.WatchIncome, &t.WatchExpense, &t.NotifyTRX, &t.MinNotifyAmount, &t.LatestTimestamp, &t.BaselineTimestamp); err != nil {
 			return nil, err
 		}
 		targets = append(targets, t)
@@ -2791,11 +2855,11 @@ func (s *Store) ListWatchTargets(ctx context.Context) ([]WatchTarget, error) {
 func (s *Store) ListWatchTargetsForOwner(ctx context.Context, owner int64) ([]WatchTarget, error) {
 	rows, err := s.pool.Query(ctx, `SELECT w.owner_user_id, w.address, w.label,
 		w.watch_income, w.watch_expense, w.notify_trx, w.min_notify_amount,
-		COALESCE(MAX(n.block_timestamp), 0)
+			COALESCE(MAX(n.block_timestamp), 0), w.baseline_timestamp
 		FROM address_watches w
 		LEFT JOIN chain_notifications n ON n.owner_user_id = w.owner_user_id AND n.address = w.address
 		WHERE w.active = TRUE AND w.owner_user_id=$1
-		GROUP BY w.owner_user_id, w.address, w.label, w.watch_income, w.watch_expense, w.notify_trx, w.min_notify_amount
+		GROUP BY w.owner_user_id, w.address, w.label, w.watch_income, w.watch_expense, w.notify_trx, w.min_notify_amount, w.baseline_timestamp, w.updated_at
 		ORDER BY w.updated_at DESC, w.address ASC`, owner)
 	if err != nil {
 		return nil, err
@@ -2804,7 +2868,7 @@ func (s *Store) ListWatchTargetsForOwner(ctx context.Context, owner int64) ([]Wa
 	var targets []WatchTarget
 	for rows.Next() {
 		var t WatchTarget
-		if err := rows.Scan(&t.OwnerUserID, &t.Address, &t.Label, &t.WatchIncome, &t.WatchExpense, &t.NotifyTRX, &t.MinNotifyAmount, &t.LatestTimestamp); err != nil {
+		if err := rows.Scan(&t.OwnerUserID, &t.Address, &t.Label, &t.WatchIncome, &t.WatchExpense, &t.NotifyTRX, &t.MinNotifyAmount, &t.LatestTimestamp, &t.BaselineTimestamp); err != nil {
 			return nil, err
 		}
 		targets = append(targets, t)
@@ -2851,32 +2915,39 @@ func (s *Store) SaveWatchSettings(ctx context.Context, settings WatchSettings, n
 
 func (s *Store) AddWatch(ctx context.Context, owner int64, address, label string, now time.Time) error {
 	_, err := s.pool.Exec(ctx, `INSERT INTO address_watches(
-			owner_user_id, address, label, watch_income, watch_expense, notify_trx, min_notify_amount, active, created_at, updated_at
+			owner_user_id, address, label, watch_income, watch_expense, notify_trx, min_notify_amount, active, baseline_timestamp, created_at, updated_at
 		)
 		SELECT $1, $2, $3,
 			COALESCE(s.watch_income, TRUE),
 			COALESCE(s.watch_expense, TRUE),
 			COALESCE(s.notify_trx, TRUE),
 			COALESCE(s.min_notify_amount, '0'),
-			TRUE, $4, $5
+			TRUE, $4, $5, $5
 		FROM (SELECT 1) seed
 		LEFT JOIN address_watch_settings s ON s.owner_user_id=$1
-		ON CONFLICT(owner_user_id, address) DO UPDATE SET label=excluded.label, active=TRUE, updated_at=excluded.updated_at`,
-		owner, address, label, now, now)
+		ON CONFLICT(owner_user_id, address) DO UPDATE SET
+			label=excluded.label,
+			active=TRUE,
+			baseline_timestamp=CASE
+				WHEN address_watches.active THEN address_watches.baseline_timestamp
+				ELSE excluded.baseline_timestamp
+			END,
+			updated_at=excluded.updated_at`,
+		owner, address, label, now.UnixMilli(), now)
 	return err
 }
 
 func (s *Store) GetWatchTarget(ctx context.Context, owner int64, address string) (WatchTarget, bool, error) {
 	row := s.pool.QueryRow(ctx, `SELECT w.owner_user_id, w.address, w.label,
 		w.watch_income, w.watch_expense, w.notify_trx, w.min_notify_amount,
-		COALESCE(MAX(n.block_timestamp), 0)
+			COALESCE(MAX(n.block_timestamp), 0), w.baseline_timestamp
 		FROM address_watches w
 		LEFT JOIN chain_notifications n ON n.owner_user_id = w.owner_user_id AND n.address = w.address
 		WHERE w.active = TRUE AND w.owner_user_id=$1 AND w.address=$2
-		GROUP BY w.owner_user_id, w.address, w.label, w.watch_income, w.watch_expense, w.notify_trx, w.min_notify_amount`,
+		GROUP BY w.owner_user_id, w.address, w.label, w.watch_income, w.watch_expense, w.notify_trx, w.min_notify_amount, w.baseline_timestamp`,
 		owner, address)
 	var target WatchTarget
-	err := row.Scan(&target.OwnerUserID, &target.Address, &target.Label, &target.WatchIncome, &target.WatchExpense, &target.NotifyTRX, &target.MinNotifyAmount, &target.LatestTimestamp)
+	err := row.Scan(&target.OwnerUserID, &target.Address, &target.Label, &target.WatchIncome, &target.WatchExpense, &target.NotifyTRX, &target.MinNotifyAmount, &target.LatestTimestamp, &target.BaselineTimestamp)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return WatchTarget{}, false, nil
 	}
@@ -3343,17 +3414,21 @@ func (s *Store) UpsertChainWatcherSubscription(ctx context.Context, sub ChainWat
 	}
 	_, err := s.pool.Exec(ctx, `INSERT INTO chain_watcher_subscriptions(
 			bot_id, chat_id, owner_user_id, address, label, watch_income, watch_expense, notify_trx, min_notify_amount,
-			active, created_at, updated_at
-		) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE, $10, $10)
+			baseline_timestamp, active, created_at, updated_at
+		) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE, $11, $11)
 		ON CONFLICT(bot_id, chat_id, owner_user_id, address) DO UPDATE SET
 			label=excluded.label,
 			watch_income=excluded.watch_income,
 			watch_expense=excluded.watch_expense,
 			notify_trx=excluded.notify_trx,
 			min_notify_amount=excluded.min_notify_amount,
+			baseline_timestamp=CASE
+				WHEN chain_watcher_subscriptions.active THEN chain_watcher_subscriptions.baseline_timestamp
+				ELSE excluded.baseline_timestamp
+			END,
 			active=TRUE,
 			updated_at=excluded.updated_at`,
-		sub.BotID, sub.ChatID, sub.OwnerUserID, sub.Address, sub.Label, sub.WatchIncome, sub.WatchExpense, sub.NotifyTRX, sub.MinNotifyAmount, now)
+		sub.BotID, sub.ChatID, sub.OwnerUserID, sub.Address, sub.Label, sub.WatchIncome, sub.WatchExpense, sub.NotifyTRX, sub.MinNotifyAmount, sub.BaselineTimestamp, now)
 	return err
 }
 
@@ -3397,17 +3472,18 @@ func (s *Store) ReplaceChainWatcherSubscriptions(ctx context.Context, botID stri
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO chain_watcher_subscriptions(
 				bot_id, chat_id, owner_user_id, address, label, watch_income, watch_expense, notify_trx, min_notify_amount,
-				active, created_at, updated_at
-			) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE, $10, $10)
+				baseline_timestamp, active, created_at, updated_at
+			) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE, $11, $11)
 			ON CONFLICT(bot_id, chat_id, owner_user_id, address) DO UPDATE SET
 				label=excluded.label,
 				watch_income=excluded.watch_income,
 				watch_expense=excluded.watch_expense,
 				notify_trx=excluded.notify_trx,
 				min_notify_amount=excluded.min_notify_amount,
+				baseline_timestamp=chain_watcher_subscriptions.baseline_timestamp,
 				active=TRUE,
 				updated_at=excluded.updated_at`,
-			sub.BotID, sub.ChatID, sub.OwnerUserID, sub.Address, sub.Label, sub.WatchIncome, sub.WatchExpense, sub.NotifyTRX, sub.MinNotifyAmount, now); err != nil {
+			sub.BotID, sub.ChatID, sub.OwnerUserID, sub.Address, sub.Label, sub.WatchIncome, sub.WatchExpense, sub.NotifyTRX, sub.MinNotifyAmount, sub.BaselineTimestamp, now); err != nil {
 			return err
 		}
 	}
@@ -3416,7 +3492,7 @@ func (s *Store) ReplaceChainWatcherSubscriptions(ctx context.Context, botID stri
 
 func (s *Store) ListChainWatcherSubscriptions(ctx context.Context) ([]ChainWatcherSubscription, error) {
 	rows, err := s.pool.Query(ctx, `SELECT bot_id, chat_id, owner_user_id, address, label,
-		watch_income, watch_expense, notify_trx, min_notify_amount, active, updated_at
+		watch_income, watch_expense, notify_trx, min_notify_amount, baseline_timestamp, active, updated_at
 		FROM chain_watcher_subscriptions
 		WHERE active=TRUE
 		ORDER BY address, bot_id, owner_user_id`)
@@ -3427,7 +3503,7 @@ func (s *Store) ListChainWatcherSubscriptions(ctx context.Context) ([]ChainWatch
 	var out []ChainWatcherSubscription
 	for rows.Next() {
 		var sub ChainWatcherSubscription
-		if err := rows.Scan(&sub.BotID, &sub.ChatID, &sub.OwnerUserID, &sub.Address, &sub.Label, &sub.WatchIncome, &sub.WatchExpense, &sub.NotifyTRX, &sub.MinNotifyAmount, &sub.Active, &sub.UpdatedAt); err != nil {
+		if err := rows.Scan(&sub.BotID, &sub.ChatID, &sub.OwnerUserID, &sub.Address, &sub.Label, &sub.WatchIncome, &sub.WatchExpense, &sub.NotifyTRX, &sub.MinNotifyAmount, &sub.BaselineTimestamp, &sub.Active, &sub.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, sub)
@@ -3770,6 +3846,237 @@ func (s *Store) GetChainWatcherWatermark(ctx context.Context) (ChainWatcherWater
 	return watermark, err
 }
 
+func (s *Store) EnqueueChainWatcherGap(ctx context.Context, task ChainWatcherGapTask, now time.Time) (int64, error) {
+	if task.Kind == "" || task.Source == "" || task.ToTimestamp <= task.FromTimestamp {
+		return 0, errors.New("invalid chain watcher gap task")
+	}
+	if task.Priority == 0 && task.Kind == "window" {
+		task.Priority = 10
+	}
+	if task.EndPage < task.StartPage {
+		task.EndPage = task.StartPage
+	}
+	if task.NextPage < task.StartPage {
+		task.NextPage = task.StartPage
+	}
+	var id int64
+	err := s.pool.QueryRow(ctx, `INSERT INTO chain_watcher_gap_tasks(
+		kind, source, priority, reason, from_timestamp, to_timestamp,
+		start_page, end_page, next_page, anchor_event_id, head_event_id, status, created_at, updated_at
+	) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'pending',$12,$12)
+	ON CONFLICT(kind, source, from_timestamp, to_timestamp, start_page, end_page, anchor_event_id)
+	DO UPDATE SET priority=LEAST(chain_watcher_gap_tasks.priority, excluded.priority),
+		reason=excluded.reason,
+		status=CASE WHEN chain_watcher_gap_tasks.status='completed' THEN 'pending' ELSE chain_watcher_gap_tasks.status END,
+		next_page=CASE WHEN chain_watcher_gap_tasks.status='completed' THEN excluded.next_page ELSE chain_watcher_gap_tasks.next_page END,
+		head_event_id=CASE WHEN chain_watcher_gap_tasks.status='completed' THEN excluded.head_event_id ELSE chain_watcher_gap_tasks.head_event_id END,
+		lease_owner=CASE WHEN chain_watcher_gap_tasks.status='completed' THEN '' ELSE chain_watcher_gap_tasks.lease_owner END,
+		lease_until=CASE WHEN chain_watcher_gap_tasks.status='completed' THEN NULL ELSE chain_watcher_gap_tasks.lease_until END,
+		completed_at=CASE WHEN chain_watcher_gap_tasks.status='completed' THEN NULL ELSE chain_watcher_gap_tasks.completed_at END,
+		updated_at=excluded.updated_at
+	RETURNING id`, task.Kind, task.Source, task.Priority, task.Reason,
+		task.FromTimestamp, task.ToTimestamp, task.StartPage, task.EndPage,
+		task.NextPage, task.AnchorEventID, task.HeadEventID, now).Scan(&id)
+	return id, err
+}
+
+func (s *Store) ClaimChainWatcherGap(ctx context.Context, owner, workerClass string, lease time.Duration, now time.Time) (ChainWatcherGapTask, bool, error) {
+	if lease <= 0 {
+		lease = 15 * time.Second
+	}
+	fallback := workerClass == "fallback"
+	row := s.pool.QueryRow(ctx, `WITH candidate AS (
+		SELECT id FROM chain_watcher_gap_tasks
+		WHERE (status='pending' OR (status='leased' AND lease_until <= $1))
+		  AND ((NOT $2) OR source='fallback')
+		ORDER BY priority ASC, from_timestamp ASC, id ASC
+		LIMIT 1 FOR UPDATE SKIP LOCKED
+	)
+	UPDATE chain_watcher_gap_tasks g SET status='leased', lease_owner=$3,
+		lease_generation=g.lease_generation+1, lease_until=$1+($4 * interval '1 second'),
+		attempts=g.attempts+1, updated_at=$1
+	FROM candidate WHERE g.id=candidate.id
+	RETURNING g.id,g.kind,g.source,g.priority,g.reason,g.from_timestamp,g.to_timestamp,
+		g.start_page,g.end_page,g.next_page,g.anchor_event_id,g.head_event_id,g.status,g.lease_owner,
+		g.lease_generation,g.lease_until,g.attempts,g.last_error,g.created_at,g.updated_at`,
+		now, fallback, owner, lease.Seconds())
+	var task ChainWatcherGapTask
+	err := row.Scan(&task.ID, &task.Kind, &task.Source, &task.Priority, &task.Reason,
+		&task.FromTimestamp, &task.ToTimestamp, &task.StartPage, &task.EndPage,
+		&task.NextPage, &task.AnchorEventID, &task.HeadEventID, &task.Status, &task.LeaseOwner,
+		&task.LeaseGeneration, &task.LeaseUntil, &task.Attempts, &task.LastError,
+		&task.CreatedAt, &task.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return task, false, nil
+	}
+	return task, err == nil, err
+}
+
+func (s *Store) AdvanceChainWatcherGapPage(ctx context.Context, id, generation int64, owner string, nextPage int, lease time.Duration, now time.Time) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `UPDATE chain_watcher_gap_tasks SET next_page=$4,
+		lease_until=$5+($6 * interval '1 second'), updated_at=$5
+		WHERE id=$1 AND lease_generation=$2 AND lease_owner=$3 AND status='leased'`,
+		id, generation, owner, nextPage, now, lease.Seconds())
+	return tag.RowsAffected() == 1, err
+}
+
+func (s *Store) YieldChainWatcherGap(ctx context.Context, id, generation int64, owner string, nextPage int, lastError string, now time.Time) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `UPDATE chain_watcher_gap_tasks SET next_page=$4,
+		status='pending',lease_owner='',lease_until=NULL,last_error=$5,updated_at=$6
+		WHERE id=$1 AND lease_generation=$2 AND lease_owner=$3 AND status='leased'`,
+		id, generation, owner, nextPage, lastError, now)
+	return tag.RowsAffected() == 1, err
+}
+
+func (s *Store) SplitChainWatcherGapWindow(ctx context.Context, task ChainWatcherGapTask, middle int64, now time.Time) (bool, error) {
+	if middle <= task.FromTimestamp || middle >= task.ToTimestamp {
+		return false, errors.New("invalid gap split point")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer rollback(ctx, tx)
+	tag, err := tx.Exec(ctx, `UPDATE chain_watcher_gap_tasks SET to_timestamp=$4,
+		status='pending', lease_owner='', lease_until=NULL, updated_at=$5
+		WHERE id=$1 AND lease_generation=$2 AND lease_owner=$3 AND status='leased'`,
+		task.ID, task.LeaseGeneration, task.LeaseOwner, middle, now)
+	if err != nil || tag.RowsAffected() != 1 {
+		return false, err
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO chain_watcher_gap_tasks(
+		kind,source,priority,reason,from_timestamp,to_timestamp,start_page,end_page,
+		next_page,anchor_event_id,head_event_id,status,created_at,updated_at
+	) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$7,$9,$10,'pending',$11,$11)
+	ON CONFLICT(kind,source,from_timestamp,to_timestamp,start_page,end_page,anchor_event_id)
+	DO UPDATE SET priority=LEAST(chain_watcher_gap_tasks.priority,excluded.priority),
+		status=CASE WHEN chain_watcher_gap_tasks.status='completed' THEN 'pending' ELSE chain_watcher_gap_tasks.status END,
+		next_page=CASE WHEN chain_watcher_gap_tasks.status='completed' THEN excluded.next_page ELSE chain_watcher_gap_tasks.next_page END,
+		head_event_id=CASE WHEN chain_watcher_gap_tasks.status='completed' THEN excluded.head_event_id ELSE chain_watcher_gap_tasks.head_event_id END,
+		lease_owner=CASE WHEN chain_watcher_gap_tasks.status='completed' THEN '' ELSE chain_watcher_gap_tasks.lease_owner END,
+		lease_until=CASE WHEN chain_watcher_gap_tasks.status='completed' THEN NULL ELSE chain_watcher_gap_tasks.lease_until END,
+		completed_at=CASE WHEN chain_watcher_gap_tasks.status='completed' THEN NULL ELSE chain_watcher_gap_tasks.completed_at END,
+		updated_at=excluded.updated_at`,
+		task.Kind, task.Source, task.Priority, task.Reason, middle, task.ToTimestamp,
+		task.StartPage, task.EndPage, task.AnchorEventID, task.HeadEventID, now)
+	if err != nil {
+		return false, err
+	}
+	return true, tx.Commit(ctx)
+}
+
+func (s *Store) CompleteChainWatcherGap(ctx context.Context, id, generation int64, owner string, now time.Time) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `UPDATE chain_watcher_gap_tasks SET status='completed',
+		lease_owner='',lease_until=NULL,completed_at=$4,updated_at=$4
+		WHERE id=$1 AND lease_generation=$2 AND lease_owner=$3 AND status='leased'`,
+		id, generation, owner, now)
+	return tag.RowsAffected() == 1, err
+}
+
+func (s *Store) ReleaseChainWatcherGap(ctx context.Context, id, generation int64, owner, lastError string, now time.Time) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `UPDATE chain_watcher_gap_tasks SET status='pending',
+		lease_owner='',lease_until=NULL,last_error=$4,updated_at=$5
+		WHERE id=$1 AND lease_generation=$2 AND lease_owner=$3 AND status='leased'`,
+		id, generation, owner, lastError, now)
+	return tag.RowsAffected() == 1, err
+}
+
+func (s *Store) ChainWatcherGapStats(ctx context.Context, now time.Time) (ChainWatcherGapStats, error) {
+	var stats ChainWatcherGapStats
+	err := s.pool.QueryRow(ctx, `SELECT
+		COUNT(*) FILTER (WHERE status='pending' OR (status='leased' AND lease_until <= $1)),
+		COUNT(*) FILTER (WHERE status='leased' AND lease_until > $1),
+		COALESCE(MIN(from_timestamp) FILTER (WHERE status IN ('pending','leased')),0)
+	FROM chain_watcher_gap_tasks WHERE status IN ('pending','leased')`, now).Scan(
+		&stats.PendingCount, &stats.LeasedCount, &stats.OldestFrom)
+	if stats.OldestFrom > 0 {
+		stats.OldestAgeMS = now.UnixMilli() - stats.OldestFrom
+		if stats.OldestAgeMS < 0 {
+			stats.OldestAgeMS = 0
+		}
+	}
+	return stats, err
+}
+
+func (s *Store) GetChainWatcherReadiness(ctx context.Context, now time.Time) (ChainWatcherReadiness, error) {
+	var state ChainWatcherReadiness
+	err := s.pool.QueryRow(ctx, `SELECT
+		COALESCE((SELECT global_watermark_timestamp FROM chain_watcher_runtime_state WHERE id=1),0),
+		COALESCE((SELECT realtime_watermark_timestamp FROM chain_watcher_runtime_state WHERE id=1),0),
+		COALESCE((SELECT catchup_required FROM chain_watcher_runtime_state WHERE id=1),FALSE),
+		(SELECT COUNT(*) FROM chain_watcher_gap_tasks
+			WHERE status='pending' OR (status='leased' AND lease_until <= $1)),
+		(SELECT COUNT(*) FROM chain_watcher_gap_tasks
+			WHERE status='leased' AND lease_until > $1),
+		(SELECT COUNT(DISTINCT address) FROM chain_watcher_subscriptions WHERE active=TRUE)`, now).Scan(
+		&state.CursorTimestamp, &state.RealtimeTimestamp, &state.CatchupRequired,
+		&state.OpenGapCount, &state.LeasedGapCount, &state.WatchAddressCount,
+	)
+	return state, err
+}
+
+func (s *Store) CountOpenChainWatcherGaps(ctx context.Context, source string, now time.Time) (int64, error) {
+	var count int64
+	err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM chain_watcher_gap_tasks
+		WHERE source=$1 AND status IN ('pending','leased')`, source).Scan(&count)
+	return count, err
+}
+
+func (s *Store) RecordChainWatcherMetricMinute(ctx context.Context, lane string, success bool, calls int, api, parse, match, write time.Duration, overlap int64, now time.Time) error {
+	bucket := now.UTC().Truncate(time.Minute)
+	successCount, errorCount := 0, 1
+	if success {
+		successCount, errorCount = 1, 0
+	}
+	_, err := s.pool.Exec(ctx, `INSERT INTO chain_watcher_metric_minutes(
+		bucket_at,lane,success_count,error_count,request_count,api_ms,parse_ms,match_ms,write_ms,overlap_count
+	) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+	ON CONFLICT(bucket_at,lane) DO UPDATE SET
+		success_count=chain_watcher_metric_minutes.success_count+excluded.success_count,
+		error_count=chain_watcher_metric_minutes.error_count+excluded.error_count,
+		request_count=chain_watcher_metric_minutes.request_count+excluded.request_count,
+		api_ms=chain_watcher_metric_minutes.api_ms+excluded.api_ms,
+		parse_ms=chain_watcher_metric_minutes.parse_ms+excluded.parse_ms,
+		match_ms=chain_watcher_metric_minutes.match_ms+excluded.match_ms,
+		write_ms=chain_watcher_metric_minutes.write_ms+excluded.write_ms,
+		overlap_count=chain_watcher_metric_minutes.overlap_count+excluded.overlap_count`,
+		bucket, lane, successCount, errorCount, calls, api.Milliseconds(), parse.Milliseconds(),
+		match.Milliseconds(), write.Milliseconds(), overlap)
+	return err
+}
+
+func (s *Store) RecordChainWatcherOverlapMinute(ctx context.Context, lane string, now time.Time) error {
+	bucket := now.UTC().Truncate(time.Minute)
+	_, err := s.pool.Exec(ctx, `INSERT INTO chain_watcher_metric_minutes(
+		bucket_at,lane,success_count,error_count,request_count,api_ms,parse_ms,match_ms,write_ms,overlap_count
+	) VALUES($1,$2,0,0,0,0,0,0,0,1)
+	ON CONFLICT(bucket_at,lane) DO UPDATE SET
+		overlap_count=chain_watcher_metric_minutes.overlap_count+1`, bucket, lane)
+	return err
+}
+
+func (s *Store) ChainWatcherMetricAggregates(ctx context.Context, since time.Time) ([]ChainWatcherMetricAggregate, error) {
+	rows, err := s.pool.Query(ctx, `SELECT lane,
+		SUM(success_count),SUM(error_count),SUM(request_count),SUM(api_ms),SUM(parse_ms),
+		SUM(match_ms),SUM(write_ms),SUM(overlap_count)
+		FROM chain_watcher_metric_minutes WHERE bucket_at >= $1
+		GROUP BY lane ORDER BY lane`, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var aggregates []ChainWatcherMetricAggregate
+	for rows.Next() {
+		var item ChainWatcherMetricAggregate
+		if err := rows.Scan(&item.Lane, &item.SuccessCount, &item.ErrorCount, &item.RequestCount,
+			&item.APIMS, &item.ParseMS, &item.MatchMS, &item.WriteMS, &item.OverlapCount); err != nil {
+			return nil, err
+		}
+		aggregates = append(aggregates, item)
+	}
+	return aggregates, rows.Err()
+}
+
 func (s *Store) AdvanceChainWatcherWatermark(ctx context.Context, timestamp int64, txHash, source string, now time.Time) error {
 	_, err := s.pool.Exec(ctx, `INSERT INTO chain_watcher_runtime_state(
 		id, global_watermark_timestamp, global_watermark_tx_hash, watermark_source, updated_at
@@ -4060,6 +4367,12 @@ func (s *Store) CleanupChainWatcherRetention(ctx context.Context, maxAge time.Du
 	}
 	stats.EventsDeleted = tag.RowsAffected()
 	if _, err := s.pool.Exec(ctx, `DELETE FROM chain_watcher_key_usage WHERE updated_at < $1`, now.Add(-72*time.Hour)); err != nil {
+		return stats, err
+	}
+	if _, err := s.pool.Exec(ctx, `DELETE FROM chain_watcher_metric_minutes WHERE bucket_at < $1`, now.Add(-72*time.Hour)); err != nil {
+		return stats, err
+	}
+	if _, err := s.pool.Exec(ctx, `DELETE FROM chain_watcher_gap_tasks WHERE status='completed' AND updated_at < $1`, now.Add(-72*time.Hour)); err != nil {
 		return stats, err
 	}
 	return stats, nil

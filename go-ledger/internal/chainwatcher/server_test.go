@@ -82,6 +82,93 @@ func TestGlobalScanOverlapIsCounted(t *testing.T) {
 	}
 }
 
+func TestGlobalScanAllowsAtMostThreeInflightRounds(t *testing.T) {
+	server := NewServer(config.ChainWatcherConfig{PollInterval: time.Second, MainMaxInflight: 3}, nil, nil)
+	for i := 0; i < 3; i++ {
+		if !server.tryStartScan("global") {
+			t.Fatalf("round %d was rejected before limit", i+1)
+		}
+	}
+	if server.tryStartScan("global") {
+		t.Fatal("fourth inflight round should be rejected")
+	}
+	if got := server.globalInflight(); got != 3 {
+		t.Fatalf("inflight rounds = %d, want 3", got)
+	}
+	server.finishScan("global")
+	if !server.tryStartScan("global") {
+		t.Fatal("new round should start after one slot is released")
+	}
+}
+
+func TestRoundIDIsVisibleInRecentStatus(t *testing.T) {
+	server := NewServer(config.ChainWatcherConfig{PollInterval: time.Second}, nil, nil)
+	server.status.recordScanSuccess("global", scanResult{RoundID: 42, APICallCount: 3}, time.Millisecond, time.Now())
+	status := server.statusResponse(contextWithoutCancel{}, time.Now())
+	if status.Global.RoundID != 42 || len(status.Global.Recent) != 1 || status.Global.Recent[0].RoundID != 42 {
+		t.Fatalf("round status = %+v", status.Global)
+	}
+}
+
+func TestOlderSlowRoundFailureDoesNotOverrideNewerSuccessReadiness(t *testing.T) {
+	now := time.Now()
+	server := NewServer(config.ChainWatcherConfig{PollInterval: time.Second}, nil, nil)
+	server.status.recordScanSuccess("global", scanResult{RoundID: 2}, time.Second, now)
+	server.status.recordScanError("global", context.DeadlineExceeded, time.Time{}, scanResult{RoundID: 1}, 3*time.Second, now.Add(time.Millisecond))
+	if ready := server.status.response(now.Add(time.Second), 5*time.Second, storage.ChainWatcherDeliveryStats{}).Ready; !ready {
+		t.Fatal("older failed round overrode newer successful round")
+	}
+	server.status.recordScanError("global", context.DeadlineExceeded, time.Time{}, scanResult{RoundID: 3}, 3*time.Second, now.Add(2*time.Millisecond))
+	if ready := server.status.response(now.Add(time.Second), 5*time.Second, storage.ChainWatcherDeliveryStats{}).Ready; ready {
+		t.Fatal("newer failed round should degrade readiness immediately")
+	}
+}
+
+func TestPartialMainScanCreatesOnlyExactFailedPageGaps(t *testing.T) {
+	tasks := failedPageGapTasks(scanResult{
+		MinTimestamp: 1000, CutoffTimestamp: 2000,
+		FailedPages: []tron.PageFailure{{Page: 1, Error: "timeout"}, {Page: 2, Error: "429"}},
+	})
+	if len(tasks) != 2 {
+		t.Fatalf("gap tasks = %d, want 2", len(tasks))
+	}
+	for index, task := range tasks {
+		wantPage := index + 1
+		if task.Kind != "page" || task.Priority != 0 || task.StartPage != wantPage || task.NextPage != wantPage || task.EndPage != wantPage+1 || task.FromTimestamp != 1000 || task.ToTimestamp != 2000 {
+			t.Fatalf("task %d = %+v", index, task)
+		}
+	}
+}
+
+func TestStatusRequiresAdminAuthentication(t *testing.T) {
+	server := NewServer(config.ChainWatcherConfig{AdminToken: "admin-token"}, nil, nil)
+	recorder := httptest.NewRecorder()
+	server.handleStatus(recorder, httptest.NewRequest(http.MethodGet, "/status", nil))
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated status code = %d, want 401", recorder.Code)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/status", nil)
+	request.Header.Set("Authorization", "Bearer admin-token")
+	recorder = httptest.NewRecorder()
+	server.handleStatus(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("authenticated status code = %d, want 200", recorder.Code)
+	}
+}
+
+func TestReadyResponseDoesNotExposeDetailedDiagnostics(t *testing.T) {
+	server := NewServer(config.ChainWatcherConfig{PollInterval: time.Second}, nil, nil)
+	server.status.recordScanSuccess("global", scanResult{RoundID: 7, PreviousAnchorID: "secret-anchor"}, time.Millisecond, time.Now())
+	recorder := httptest.NewRecorder()
+	server.handleReady(recorder, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	body := recorder.Body.String()
+	for _, forbidden := range []string{"tronscan_keys", "previous_anchor_id", "recent", "secret-anchor"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("ready response leaked %q: %s", forbidden, body)
+		}
+	}
+}
+
 func TestStatusIncludesSegmentTimingsAndAPICounts(t *testing.T) {
 	server := NewServer(config.ChainWatcherConfig{PollInterval: time.Second}, nil, nil)
 	server.status.recordScanSuccess("global", scanResult{
@@ -268,11 +355,12 @@ func TestExpandStartsAtPageFourAndFindsAnchor(t *testing.T) {
 
 func TestExpandTwentyPageLimitBecomesObservable(t *testing.T) {
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(25 * time.Millisecond)
 		writeFullTransferPageForExpand(w, r.URL.Query().Get("start"))
 	}))
 	defer api.Close()
 	keys := []string{"k1", "k2", "k3", "k4", "k5", "k6", "k7", "k8", "k9", "k10"}
-	client := tron.NewClientWithKeys(api.URL, keys, 2*time.Second, tron.KeyPoolOptions{})
+	client := tron.NewClientWithKeys(api.URL, keys, 2*time.Second, tron.KeyPoolOptions{CompensationMaxRPS: 50})
 	server := NewServer(config.ChainWatcherConfig{GlobalExpandPageLimit: 20, USDTContract: "TR7"}, nil, client)
 	server.subDirty = false
 	server.subByAddress = map[string][]storage.ChainWatcherSubscription{}

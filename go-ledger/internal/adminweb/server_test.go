@@ -37,6 +37,12 @@ func TestBillExchangeRateDisplay(t *testing.T) {
 	}
 }
 
+func TestAddressWatchAdminDoesNotAdvertiseUnsupportedTRXNotifications(t *testing.T) {
+	if strings.Contains(adminHTML, ">TRX<") || strings.Contains(adminHTML, "name=\"notify_trx\"") {
+		t.Fatal("address watch admin still exposes unsupported TRX notification controls")
+	}
+}
+
 func TestSummarizeBillIncludesSubjectAndRateStats(t *testing.T) {
 	group := storage.Group{DepositExchangeRate: "10", FeeRate: "3"}
 	records := []storage.Record{

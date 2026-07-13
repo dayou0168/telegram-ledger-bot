@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"strconv"
@@ -18,23 +19,23 @@ import (
 )
 
 type Server struct {
-	cfg            config.ChainWatcherConfig
-	store          *storage.Store
-	tron           *tron.Client
-	http           *http.Server
-	globalBackoff  apiBackoff
-	catchupBackoff apiBackoff
-	status         watcherStatus
-	scanMu         sync.Mutex
-	globalRunning  bool
-	catchupRunning bool
-	subMu          sync.RWMutex
-	subscriptions  []storage.ChainWatcherSubscription
-	subByAddress   map[string][]storage.ChainWatcherSubscription
-	subDirty       bool
-	catchupWake    chan struct{}
-	expandQueue    chan expandTask
-	expandRunning  bool
+	cfg                 config.ChainWatcherConfig
+	store               *storage.Store
+	tron                *tron.Client
+	http                *http.Server
+	globalBackoff       apiBackoff
+	status              watcherStatus
+	scanMu              sync.Mutex
+	globalRunning       int
+	catchupRunning      bool
+	globalRoundSeq      int64
+	lastGlobalScheduled time.Time
+	subMu               sync.RWMutex
+	subscriptions       []storage.ChainWatcherSubscription
+	subByAddress        map[string][]storage.ChainWatcherSubscription
+	subDirty            bool
+	gapWake             chan struct{}
+	gapOwner            string
 }
 
 type expandTask struct {
@@ -45,7 +46,10 @@ type expandTask struct {
 }
 
 func NewServer(cfg config.ChainWatcherConfig, store *storage.Store, tronClient *tron.Client) *Server {
-	s := &Server{cfg: cfg, store: store, tron: tronClient, subDirty: true, catchupWake: make(chan struct{}, 1), expandQueue: make(chan expandTask, 1)}
+	s := &Server{
+		cfg: cfg, store: store, tron: tronClient, subDirty: true,
+		gapWake: make(chan struct{}, 1), gapOwner: fmt.Sprintf("watcher-%d", time.Now().UnixNano()),
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/readyz", s.handleReady)
@@ -184,9 +188,8 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 	}
 	go s.globalLoop(ctx)
-	go s.expandLoop(ctx)
 	if s.cfg.CatchupEnabled {
-		go s.catchupLoop(ctx)
+		go s.gapLoop(ctx)
 	}
 	go s.cleanupLoop(ctx)
 	errCh := make(chan error, 1)
@@ -206,31 +209,6 @@ func (s *Server) Run(ctx context.Context) error {
 		return ctx.Err()
 	case err := <-errCh:
 		return err
-	}
-}
-
-func (s *Server) catchupLoop(ctx context.Context) {
-	phase := s.cfg.PollInterval / 2
-	if phase < 100*time.Millisecond {
-		phase = 100 * time.Millisecond
-	}
-	phaseTimer := time.NewTimer(phase)
-	select {
-	case <-ctx.Done():
-		phaseTimer.Stop()
-		return
-	case <-phaseTimer.C:
-	}
-	ticker := time.NewTicker(s.cfg.CatchupInterval)
-	defer ticker.Stop()
-	for {
-		s.startCatchupScan(ctx)
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		case <-s.catchupWake:
-		}
 	}
 }
 
@@ -273,27 +251,29 @@ func (s *Server) startGlobalScan(ctx context.Context) {
 	}
 	if !s.tryStartScan("global") {
 		s.status.recordScanOverlap("global")
+		s.recordOverlapMetric("global")
 		s.markCatchup(ctx, "realtime_overlap_skipped")
 		return
 	}
+	roundID := s.allocateGlobalRound(time.Now())
 	go func() {
 		defer s.finishScan("global")
-		deadline := s.cfg.PollInterval * 9 / 10
-		if deadline <= 0 {
-			deadline = 900 * time.Millisecond
-		}
-		scanCtx, cancel := context.WithTimeout(ctx, deadline)
-		defer cancel()
-		s.pollGlobalSafely(scanCtx)
+		s.pollGlobalSafely(ctx, roundID)
 	}()
 }
 
-func (s *Server) pollGlobalSafely(ctx context.Context) {
+func (s *Server) pollGlobalSafely(ctx context.Context, roundID int64) {
 	started := time.Now()
-	result, err := s.pollGlobalOnce(ctx)
+	result, err := s.pollGlobalOnce(ctx, roundID)
 	duration := time.Since(started)
 	if err != nil && !errors.Is(err, context.Canceled) {
+		s.enqueueFailedPageGaps(result)
 		s.markCatchup(ctx, "realtime_scan_failed")
+		s.recordMetric("global", false, result)
+		if s.status.isStaleOutcome("global", result.RoundID) {
+			s.status.recordHistoricalError("global", err, result, duration, time.Now())
+			return
+		}
 		if s.globalBackoff.record(err, time.Now()) {
 			s.status.recordScanError("global", err, s.globalBackoff.untilTime(), result, duration, time.Now())
 			log.Printf("chain watcher global scan rate limited: %v", err)
@@ -304,127 +284,296 @@ func (s *Server) pollGlobalSafely(ctx context.Context) {
 		return
 	}
 	s.globalBackoff.reset()
-	if result.CutoffTimestamp > 0 {
+	if result.CutoffTimestamp > 0 && len(result.FailedPages) == 0 {
 		anchor := result.HeadEventID
 		if anchor == "" {
 			anchor = result.PreviousAnchorID
 		}
-		if err := s.store.AdvanceChainWatcherRealtimeWatermark(ctx, result.CutoffTimestamp, anchor, time.Now()); err != nil {
+		dbCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := s.store.AdvanceChainWatcherRealtimeWatermark(dbCtx, result.CutoffTimestamp, anchor, time.Now()); err != nil {
 			s.status.recordScanError("global", err, time.Time{}, result, duration, time.Now())
 			log.Printf("chain watcher advance realtime watermark: %v", err)
 			return
 		}
 	}
 	s.status.recordScanSuccess("global", result, duration, time.Now())
+	watermarkCtx, watermarkCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	watermark, watermarkErr := s.store.GetChainWatcherWatermark(watermarkCtx)
+	watermarkCancel()
+	if watermarkErr == nil && watermark.Timestamp == 0 {
+		s.markCatchup(ctx, "startup_continuity_baseline")
+	}
 	if result.PreviousAnchorID != "" && !result.AnchorFound {
 		s.markCatchup(ctx, "realtime_anchor_missing")
-		s.enqueueExpand(expandTask{AnchorID: result.PreviousAnchorID, Cutoff: result.CutoffTimestamp, MinTimestamp: result.MinTimestamp, StartPage: s.cfg.GlobalPages})
+		s.enqueueExpandGap(result)
 	}
-	select {
-	case s.catchupWake <- struct{}{}:
-	default:
-	}
-}
-
-func (s *Server) startCatchupScan(ctx context.Context) {
-	now := time.Now()
-	if !s.catchupBackoff.ready(now) {
-		return
-	}
-	if !s.tryStartScan("catchup") {
-		s.status.recordScanOverlap("catchup")
-		return
-	}
-	go func() {
-		defer s.finishScan("catchup")
-		started := time.Now()
-		result, err := s.pollCatchupOnce(ctx)
-		duration := time.Since(started)
-		if err != nil && !errors.Is(err, context.Canceled) {
-			if tron.IsCompensationDeferred(err) {
-				s.status.recordCatchupDeferred("realtime_scan_priority")
-				return
-			}
-			backoffUntil := time.Time{}
-			if s.catchupBackoff.record(err, time.Now()) {
-				backoffUntil = s.catchupBackoff.untilTime()
-			}
-			s.status.recordScanError("catchup", err, backoffUntil, result, duration, time.Now())
-			return
-		}
-		s.catchupBackoff.reset()
-		s.status.recordScanSuccess("catchup", result, duration, time.Now())
-	}()
-}
-
-func (s *Server) pollCatchupOnce(ctx context.Context) (scanResult, error) {
-	var result scanResult
-	state, err := s.store.GetChainWatcherCatchupState(ctx)
-	if err != nil || !state.Required {
-		return result, err
-	}
-	_, byAddress, err := s.loadSubscriptions(ctx)
-	if err != nil || len(byAddress) == 0 {
-		return result, err
-	}
-	result.AddressCount = len(byAddress)
-	watermark, err := s.store.GetChainWatcherWatermark(ctx)
-	if err != nil {
-		return result, err
-	}
-	now := time.Now()
-	from := watermark.Timestamp
-	if from <= 0 {
-		from = now.Add(-s.cfg.Lookback).UnixMilli()
-	}
-	realtime, err := s.store.GetChainWatcherRealtimeWatermark(ctx)
-	if err != nil {
-		return result, err
-	}
-	target := realtime.Timestamp - s.cfg.CatchupOverlap.Milliseconds()
-	lag := time.Duration(target-from) * time.Millisecond
-	if lag < 0 {
-		lag = 0
-	}
-	s.tron.SetCompensationPressure(lag, s.cfg.CatchupTargetLag, s.cfg.CatchupMaxLag)
-	if from >= target {
-		_ = s.store.ClearChainWatcherCatchupRequired(ctx, time.Now())
-		return result, nil
-	}
-	to := from + s.cfg.CatchupWindow.Milliseconds()
-	if to > target {
-		to = target
-	}
-	budget := s.cfg.CatchupMaxRequests
-	advanced, scan, err := s.scanCatchupWindow(ctx, from, to, byAddress, &budget)
-	result.merge(scan)
-	if err != nil {
-		return result, err
-	}
-	if advanced > from {
-		if err := s.store.AdvanceChainWatcherWatermark(ctx, advanced, result.MaxEventID, "catchup", time.Now()); err != nil {
-			return result, err
-		}
-	}
-	if advanced >= target {
-		_ = s.store.ClearChainWatcherCatchupRequired(ctx, time.Now())
-	}
-	return result, nil
+	s.recordMetric("global", true, result)
 }
 
 func (s *Server) markCatchup(ctx context.Context, reason string) {
 	if s.store == nil {
 		return
 	}
-	markCtx, cancel := context.WithTimeout(ctx, time.Second)
+	markCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := s.store.MarkChainWatcherCatchupRequired(markCtx, reason, time.Now()); err != nil && !errors.Is(err, context.Canceled) {
+	now := time.Now()
+	if err := s.store.MarkChainWatcherCatchupRequired(markCtx, reason, now); err != nil && !errors.Is(err, context.Canceled) {
 		log.Printf("mark chain watcher catchup required: %v", err)
 	}
+	from := now.Add(-s.cfg.Lookback).UnixMilli()
+	if watermark, err := s.store.GetChainWatcherWatermark(markCtx); err == nil && watermark.Timestamp > 0 {
+		from = watermark.Timestamp
+	}
+	to := now.Add(-s.cfg.CatchupOverlap).UnixMilli()
+	if realtime, err := s.store.GetChainWatcherRealtimeWatermark(markCtx); err == nil && realtime.Timestamp > 0 {
+		to = realtime.Timestamp - s.cfg.CatchupOverlap.Milliseconds()
+	}
+	if to > from {
+		_, _ = s.store.EnqueueChainWatcherGap(markCtx, storage.ChainWatcherGapTask{
+			Kind: "window", Source: "watcher", Priority: 10, Reason: reason,
+			FromTimestamp: from, ToTimestamp: to,
+		}, now)
+	}
 	select {
-	case s.catchupWake <- struct{}{}:
+	case s.gapWake <- struct{}{}:
 	default:
 	}
+}
+
+func (s *Server) enqueueFailedPageGaps(result scanResult) {
+	if s.store == nil || len(result.FailedPages) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for _, task := range failedPageGapTasks(result) {
+		_, _ = s.store.EnqueueChainWatcherGap(ctx, task, time.Now())
+	}
+	select {
+	case s.gapWake <- struct{}{}:
+	default:
+	}
+}
+
+func failedPageGapTasks(result scanResult) []storage.ChainWatcherGapTask {
+	tasks := make([]storage.ChainWatcherGapTask, 0, len(result.FailedPages))
+	for _, failure := range result.FailedPages {
+		tasks = append(tasks, storage.ChainWatcherGapTask{
+			Kind: "page", Source: "watcher", Priority: 0, Reason: failure.Error,
+			FromTimestamp: result.MinTimestamp, ToTimestamp: result.CutoffTimestamp,
+			StartPage: failure.Page, EndPage: failure.Page + 1, NextPage: failure.Page,
+		})
+	}
+	return tasks
+}
+
+func (s *Server) enqueueExpandGap(result scanResult) {
+	if s.store == nil || result.CutoffTimestamp <= result.MinTimestamp {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, _ = s.store.EnqueueChainWatcherGap(ctx, storage.ChainWatcherGapTask{
+		Kind: "expand", Source: "watcher", Priority: 1, Reason: "anchor_missing",
+		FromTimestamp: result.MinTimestamp, ToTimestamp: result.CutoffTimestamp,
+		StartPage: s.cfg.GlobalPages, EndPage: s.cfg.GlobalExpandPageLimit,
+		NextPage: s.cfg.GlobalPages, AnchorEventID: result.PreviousAnchorID,
+	}, time.Now())
+	select {
+	case s.gapWake <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Server) gapLoop(ctx context.Context) {
+	interval := s.cfg.CatchupInterval
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		s.processOneGap(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		case <-s.gapWake:
+		}
+	}
+}
+
+func (s *Server) processOneGap(ctx context.Context) {
+	if !s.tryStartScan("catchup") {
+		s.status.recordScanOverlap("catchup")
+		s.recordOverlapMetric("catchup")
+		return
+	}
+	defer s.finishScan("catchup")
+	claimCtx, claimCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	task, ok, err := s.store.ClaimChainWatcherGap(claimCtx, s.gapOwner, "watcher", 15*time.Second, time.Now())
+	claimCancel()
+	if err != nil || !ok {
+		return
+	}
+	if task.Priority > 1 && s.shouldSkipCatchup(time.Now()) {
+		dbCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_, _ = s.store.ReleaseChainWatcherGap(dbCtx, task.ID, task.LeaseGeneration, task.LeaseOwner, "realtime_deadline_priority", time.Now())
+		cancel()
+		s.status.recordCatchupDeferred("realtime_deadline_priority")
+		s.wakeGapAfter(s.cfg.PollInterval)
+		return
+	}
+	started := time.Now()
+	result, processErr := s.processGapTask(ctx, task)
+	duration := time.Since(started)
+	lane := "catchup"
+	if task.Kind == "expand" || task.Kind == "page" {
+		lane = "expand"
+	}
+	if processErr != nil {
+		dbCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_, _ = s.store.ReleaseChainWatcherGap(dbCtx, task.ID, task.LeaseGeneration, task.LeaseOwner, processErr.Error(), time.Now())
+		cancel()
+		s.status.recordScanError(lane, processErr, time.Time{}, result, duration, time.Now())
+		s.recordMetric(lane, false, result)
+		s.wakeGapAfter(time.Second)
+		return
+	}
+	s.status.recordScanSuccess(lane, result, duration, time.Now())
+	s.recordMetric(lane, true, result)
+	clearCtx, clearCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer clearCancel()
+	if gaps, statsErr := s.store.ChainWatcherGapStats(clearCtx, time.Now()); statsErr == nil && gaps.PendingCount == 0 && gaps.LeasedCount == 0 {
+		_ = s.store.ClearChainWatcherCatchupRequired(clearCtx, time.Now())
+	} else if statsErr == nil && gaps.PendingCount > 0 {
+		s.wakeGap()
+	}
+}
+
+func (s *Server) wakeGap() {
+	select {
+	case s.gapWake <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Server) wakeGapAfter(delay time.Duration) {
+	if delay <= 0 {
+		delay = time.Second
+	}
+	time.AfterFunc(delay, s.wakeGap)
+}
+
+func (s *Server) processGapTask(ctx context.Context, task storage.ChainWatcherGapTask) (scanResult, error) {
+	var result scanResult
+	dbReadCtx, dbReadCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	_, byAddress, err := s.loadSubscriptions(dbReadCtx)
+	dbReadCancel()
+	if err != nil {
+		return result, err
+	}
+	page := task.NextPage
+	if page < task.StartPage {
+		page = task.StartPage
+	}
+	apiCtx, cancel := context.WithTimeout(ctx, s.cfg.MainScanTimeout)
+	fetch, fetchErr := s.tron.FetchGlobalUSDTTransfersRangeWithMetrics(apiCtx, s.cfg.USDTContract, task.FromTimestamp, task.ToTimestamp, page, 1)
+	cancel()
+	result.observeFetch(fetch.Metrics)
+	result.FailedPages = append(result.FailedPages, fetch.FailedPages...)
+	if fetchErr != nil {
+		return result, fetchErr
+	}
+	for _, transfer := range fetch.Transfers {
+		result.observeTransfer(transfer)
+		dbCtx, dbCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		matches, timings, matchErr := s.recordTransferMatchesSource(dbCtx, transfer, byAddress, task.Kind)
+		dbCancel()
+		if matchErr != nil {
+			return result, matchErr
+		}
+		result.TransferCount++
+		result.MatchCount += matches
+		result.MatchDuration += timings.MatchDuration
+		result.WriteDuration += timings.WriteDuration
+		if task.AnchorEventID != "" && EventID(transfer) == task.AnchorEventID {
+			result.AnchorFound = true
+		}
+	}
+	dbCtx, dbCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer dbCancel()
+	if task.Kind == "page" || result.AnchorFound {
+		_, err = s.store.CompleteChainWatcherGap(dbCtx, task.ID, task.LeaseGeneration, task.LeaseOwner, time.Now())
+		return result, err
+	}
+	fullPage := len(fetch.Transfers) >= 50
+	if task.Kind == "expand" {
+		next := page + 1
+		if fullPage && next < task.EndPage {
+			_, err = s.store.YieldChainWatcherGap(dbCtx, task.ID, task.LeaseGeneration, task.LeaseOwner, next, "", time.Now())
+			return result, err
+		}
+		_, err = s.store.CompleteChainWatcherGap(dbCtx, task.ID, task.LeaseGeneration, task.LeaseOwner, time.Now())
+		if err == nil {
+			_, err = s.store.EnqueueChainWatcherGap(dbCtx, storage.ChainWatcherGapTask{
+				Kind: "window", Source: "watcher", Priority: 2, Reason: "expand_anchor_not_found",
+				FromTimestamp: task.FromTimestamp, ToTimestamp: task.ToTimestamp,
+			}, time.Now())
+		}
+		return result, err
+	}
+	if fullPage {
+		next := page + 1
+		if next >= s.cfg.GlobalExpandPageLimit && task.ToTimestamp-task.FromTimestamp > 1 {
+			middle := task.FromTimestamp + (task.ToTimestamp-task.FromTimestamp)/2
+			_, err = s.store.SplitChainWatcherGapWindow(dbCtx, task, middle, time.Now())
+			return result, err
+		}
+		if next >= s.cfg.GlobalExpandPageLimit {
+			_, err = s.store.ReleaseChainWatcherGap(dbCtx, task.ID, task.LeaseGeneration, task.LeaseOwner, "page_limit_at_minimum_window", time.Now())
+			if err == nil {
+				err = errors.New("catchup page limit reached at minimum time window")
+			}
+			return result, err
+		}
+		_, err = s.store.YieldChainWatcherGap(dbCtx, task.ID, task.LeaseGeneration, task.LeaseOwner, next, "", time.Now())
+		return result, err
+	}
+	completed, err := s.store.CompleteChainWatcherGap(dbCtx, task.ID, task.LeaseGeneration, task.LeaseOwner, time.Now())
+	if err == nil && completed {
+		err = s.store.AdvanceChainWatcherWatermark(dbCtx, task.ToTimestamp, result.MaxEventID, task.Source, time.Now())
+		if err == nil && task.Source == "fallback" {
+			if open, countErr := s.store.CountOpenChainWatcherGaps(dbCtx, "fallback", time.Now()); countErr != nil {
+				err = countErr
+			} else if open == 0 {
+				err = s.store.AdvanceChainWatcherFallbackHead(dbCtx, task.ToTimestamp, task.HeadEventID, time.Now())
+			}
+		}
+	}
+	return result, err
+}
+
+func (s *Server) recordMetric(lane string, success bool, result scanResult) {
+	if s.store == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_ = s.store.RecordChainWatcherMetricMinute(ctx, lane, success, result.APICallCount,
+		result.APIFetchDuration, result.ParseDuration, result.MatchDuration, result.WriteDuration, 0, time.Now())
+}
+
+func (s *Server) recordOverlapMetric(lane string) {
+	if s.store == nil {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = s.store.RecordChainWatcherOverlapMinute(ctx, lane, time.Now())
+	}()
 }
 
 func (s *Server) scanCatchupWindow(ctx context.Context, from, to int64, byAddress map[string][]storage.ChainWatcherSubscription, budget *int) (int64, scanResult, error) {
@@ -474,18 +623,22 @@ func (s *Server) scanCatchupWindow(ctx context.Context, from, to int64, byAddres
 	return to, result, nil
 }
 
-func (s *Server) pollGlobalOnce(ctx context.Context) (scanResult, error) {
-	var result scanResult
-	subs, byAddress, err := s.loadSubscriptions(ctx)
+func (s *Server) pollGlobalOnce(ctx context.Context, roundID int64) (scanResult, error) {
+	result := scanResult{RoundID: roundID}
+	dbReadCtx, dbReadCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	subs, byAddress, err := s.loadSubscriptions(dbReadCtx)
 	if err != nil {
+		dbReadCancel()
 		return result, err
 	}
 	result.SubscriptionCount = len(subs)
 	if len(subs) == 0 {
+		dbReadCancel()
 		return result, nil
 	}
 	result.AddressCount = len(byAddress)
-	previous, err := s.store.GetChainWatcherRealtimeWatermark(ctx)
+	previous, err := s.store.GetChainWatcherRealtimeWatermark(dbReadCtx)
+	dbReadCancel()
 	if err != nil {
 		return result, err
 	}
@@ -495,18 +648,20 @@ func (s *Server) pollGlobalOnce(ctx context.Context) (scanResult, error) {
 	result.CutoffTimestamp = cutoff.UnixMilli()
 	minTimestamp := cutoff.Add(-s.cfg.Lookback).UnixMilli()
 	result.MinTimestamp = minTimestamp
-	fetch, err := s.tron.FetchGlobalUSDTTransfersAtWithMetrics(ctx, s.cfg.USDTContract, minTimestamp, result.CutoffTimestamp, s.cfg.GlobalPages)
-	if err != nil {
-		return result, err
-	}
+	apiCtx, cancel := context.WithTimeout(ctx, s.cfg.MainScanTimeout)
+	fetch, fetchErr := s.tron.FetchGlobalUSDTTransfersAtWithMetrics(apiCtx, s.cfg.USDTContract, minTimestamp, result.CutoffTimestamp, s.cfg.GlobalPages)
+	cancel()
 	result.observeFetch(fetch.Metrics)
+	result.FailedPages = append(result.FailedPages, fetch.FailedPages...)
 	result.observePageLimit(fetch.Metrics, s.cfg.GlobalPages, 50)
 	transfers := fetch.Transfers
 	result.TransferCount = len(transfers)
 	result.HeadEventID, result.AnchorFound = AnchorCoverage(transfers, result.PreviousAnchorID)
 	for _, transfer := range transfers {
 		result.observeTransfer(transfer)
-		matches, timings, err := s.recordTransferMatches(ctx, transfer, byAddress)
+		dbCtx, dbCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		matches, timings, err := s.recordTransferMatches(dbCtx, transfer, byAddress)
+		dbCancel()
 		if err != nil {
 			return result, err
 		}
@@ -514,50 +669,7 @@ func (s *Server) pollGlobalOnce(ctx context.Context) (scanResult, error) {
 		result.MatchDuration += timings.MatchDuration
 		result.WriteDuration += timings.WriteDuration
 	}
-	return result, nil
-}
-
-func (s *Server) enqueueExpand(task expandTask) {
-	select {
-	case s.expandQueue <- task:
-	default:
-		s.status.recordScanOverlap("expand")
-		s.markCatchup(context.Background(), "expand_queue_full")
-	}
-}
-
-func (s *Server) expandLoop(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case task := <-s.expandQueue:
-			s.pollExpandSafely(ctx, task)
-		}
-	}
-}
-
-func (s *Server) pollExpandSafely(ctx context.Context, task expandTask) {
-	started := time.Now()
-	result, err := s.pollExpandOnce(ctx, task)
-	duration := time.Since(started)
-	if err != nil {
-		s.markCatchup(ctx, "expand_failed")
-		s.status.recordScanError("expand", err, time.Time{}, result, duration, time.Now())
-		select {
-		case s.catchupWake <- struct{}{}:
-		default:
-		}
-		return
-	}
-	s.status.recordScanSuccess("expand", result, duration, time.Now())
-	if !result.AnchorFound {
-		s.markCatchup(ctx, "expand_anchor_not_found")
-		select {
-		case s.catchupWake <- struct{}{}:
-		default:
-		}
-	}
+	return result, fetchErr
 }
 
 func (s *Server) pollExpandOnce(ctx context.Context, task expandTask) (scanResult, error) {
@@ -618,6 +730,7 @@ func (s *Server) recordTransferMatchesSource(ctx context.Context, transfer tron.
 }
 
 type scanResult struct {
+	RoundID           int64
 	TransferCount     int
 	MatchCount        int
 	SubscriptionCount int
@@ -638,6 +751,7 @@ type scanResult struct {
 	ParseDuration     time.Duration
 	MatchDuration     time.Duration
 	WriteDuration     time.Duration
+	FailedPages       []tron.PageFailure
 }
 
 type recordTimings struct {
@@ -741,16 +855,12 @@ func (s *Server) shouldSkipCatchup(now time.Time) bool {
 		return false
 	}
 	s.scanMu.Lock()
-	globalRunning := s.globalRunning
+	lastScheduled := s.lastGlobalScheduled
 	s.scanMu.Unlock()
-	if globalRunning {
-		return true
-	}
-	global := s.status.snapshotScan("global", now)
-	if global.LastStartedAt == nil {
+	if lastScheduled.IsZero() {
 		return false
 	}
-	nextGlobal := global.LastStartedAt.Add(s.cfg.PollInterval)
+	nextGlobal := lastScheduled.Add(s.cfg.PollInterval)
 	guard := s.cfg.RequestInterval
 	if guard < 100*time.Millisecond {
 		guard = 100 * time.Millisecond
@@ -768,11 +878,23 @@ func (s *Server) tryStartScan(kind string) bool {
 		s.catchupRunning = true
 		return true
 	}
-	if s.globalRunning {
+	limit := s.cfg.MainMaxInflight
+	if limit < 1 {
+		limit = 1
+	}
+	if s.globalRunning >= limit {
 		return false
 	}
-	s.globalRunning = true
+	s.globalRunning++
 	return true
+}
+
+func (s *Server) allocateGlobalRound(now time.Time) int64 {
+	s.scanMu.Lock()
+	defer s.scanMu.Unlock()
+	s.globalRoundSeq++
+	s.lastGlobalScheduled = now
+	return s.globalRoundSeq
 }
 
 func (s *Server) finishScan(kind string) {
@@ -782,7 +904,15 @@ func (s *Server) finishScan(kind string) {
 		s.catchupRunning = false
 		return
 	}
-	s.globalRunning = false
+	if s.globalRunning > 0 {
+		s.globalRunning--
+	}
+}
+
+func (s *Server) globalInflight() int {
+	s.scanMu.Lock()
+	defer s.scanMu.Unlock()
+	return s.globalRunning
 }
 
 type apiBackoff struct {
@@ -857,10 +987,15 @@ type watcherStatus struct {
 }
 
 type scanStatus struct {
+	roundID            int64
+	latestOutcomeRound int64
+	latestOutcomeOK    bool
+	latestOutcomeAt    time.Time
 	lastStartedAt      time.Time
 	lastSuccessAt      time.Time
 	lastErrorAt        time.Time
 	lastError          string
+	lastErrorClass     string
 	lastDuration       time.Duration
 	backoffUntil       time.Time
 	lastBlockTimestamp int64
@@ -888,6 +1023,7 @@ type scanStatus struct {
 }
 
 type scanRound struct {
+	roundID          int64
 	startedAt        time.Time
 	success          bool
 	err              string
@@ -916,9 +1052,12 @@ func (s *watcherStatus) recordScanSuccess(kind string, result scanResult, durati
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	target := s.scan(kind)
+	target.recordOutcome(result.RoundID, true, now)
 	target.lastStartedAt = now.Add(-duration)
+	target.roundID = result.RoundID
 	target.lastSuccessAt = now
 	target.lastError = ""
+	target.lastErrorClass = ""
 	target.lastDuration = duration
 	target.backoffUntil = time.Time{}
 	target.scanCount++
@@ -947,6 +1086,7 @@ func (s *watcherStatus) recordScanSuccess(kind string, result scanResult, durati
 		target.lag = lag
 	}
 	target.appendRound(scanRound{
+		roundID:          result.RoundID,
 		startedAt:        target.lastStartedAt,
 		success:          true,
 		duration:         duration,
@@ -968,9 +1108,12 @@ func (s *watcherStatus) recordScanError(kind string, err error, backoffUntil tim
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	target := s.scan(kind)
+	target.recordOutcome(result.RoundID, false, now)
 	target.lastStartedAt = now.Add(-duration)
+	target.roundID = result.RoundID
 	target.lastErrorAt = now
 	target.lastError = err.Error()
+	target.lastErrorClass = classifyScanError(err)
 	target.lastDuration = duration
 	target.backoffUntil = backoffUntil
 	target.errorCount++
@@ -983,6 +1126,7 @@ func (s *watcherStatus) recordScanError(kind string, err error, backoffUntil tim
 	target.matchDuration = result.MatchDuration
 	target.writeDuration = result.WriteDuration
 	target.appendRound(scanRound{
+		roundID:          result.RoundID,
 		startedAt:        target.lastStartedAt,
 		success:          false,
 		err:              err.Error(),
@@ -1005,6 +1149,29 @@ func (s *watcherStatus) recordScanOverlap(kind string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.scan(kind).overlapSkipped++
+}
+
+func (s *watcherStatus) isStaleOutcome(kind string, roundID int64) bool {
+	if roundID <= 0 {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.scan(kind).latestOutcomeRound > roundID
+}
+
+func (s *watcherStatus) recordHistoricalError(kind string, err error, result scanResult, duration time.Duration, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	target := s.scan(kind)
+	target.errorCount++
+	target.appendRound(scanRound{
+		roundID: result.RoundID, startedAt: now.Add(-duration), success: false, err: err.Error(), duration: duration,
+		apiWaitDuration: result.APIWaitDuration, apiFetchDuration: result.APIFetchDuration,
+		parseDuration: result.ParseDuration, matchDuration: result.MatchDuration, writeDuration: result.WriteDuration,
+		transferCount: result.TransferCount, matchCount: result.MatchCount, addressCount: result.AddressCount,
+		apiCallCount: result.APICallCount, pageCount: result.PageCount, pageLimitReached: result.PageLimitReached,
+	})
 }
 
 func (s *watcherStatus) recordCleanup(stats storage.ChainWatcherCleanupStats, now time.Time) {
@@ -1078,10 +1245,12 @@ func (s scanStatus) response(now time.Time) ScanStatusResponse {
 		backoffRemaining = s.backoffUntil.Sub(now).Milliseconds()
 	}
 	return ScanStatusResponse{
+		RoundID:            s.roundID,
 		LastStartedAt:      timePtr(s.lastStartedAt),
 		LastSuccessAt:      timePtr(s.lastSuccessAt),
 		LastErrorAt:        timePtr(s.lastErrorAt),
 		LastError:          s.lastError,
+		LastErrorClass:     s.lastErrorClass,
 		LastDurationMS:     s.lastDuration.Milliseconds(),
 		BackoffUntil:       timePtr(s.backoffUntil),
 		BackoffRemainingMS: backoffRemaining,
@@ -1110,6 +1279,31 @@ func (s scanStatus) response(now time.Time) ScanStatusResponse {
 	}
 }
 
+func classifyScanError(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	var unavailable *tron.KeyPoolUnavailableError
+	if errors.As(err, &unavailable) {
+		return "all_keys_unavailable"
+	}
+	var httpErr *tron.HTTPError
+	if errors.As(err, &httpErr) {
+		switch {
+		case httpErr.StatusCode == http.StatusTooManyRequests:
+			return "upstream_429"
+		case httpErr.StatusCode == http.StatusUnauthorized || httpErr.StatusCode == http.StatusForbidden:
+			return "key_auth"
+		case httpErr.StatusCode >= 500:
+			return "upstream_5xx"
+		}
+	}
+	return "other"
+}
+
 func (s *scanStatus) appendRound(round scanRound) {
 	s.recent = append(s.recent, round)
 	if len(s.recent) > 5 {
@@ -1126,6 +1320,7 @@ func scanRoundResponses(rounds []scanRound) []ScanRoundResponse {
 	for i := len(rounds) - 1; i >= 0; i-- {
 		round := rounds[i]
 		out = append(out, ScanRoundResponse{
+			RoundID:          round.roundID,
 			StartedAt:        timePtr(round.startedAt),
 			Success:          round.success,
 			Error:            round.err,
@@ -1165,7 +1360,21 @@ func scanReady(status scanStatus, staleAfter time.Duration, now time.Time) bool 
 	if now.Sub(status.lastSuccessAt) > staleAfter {
 		return false
 	}
+	if !status.latestOutcomeAt.IsZero() {
+		return status.latestOutcomeOK
+	}
 	return status.backoffUntil.IsZero() || !status.backoffUntil.After(now)
+}
+
+func (s *scanStatus) recordOutcome(roundID int64, success bool, now time.Time) {
+	if roundID > 0 && s.latestOutcomeRound > roundID {
+		return
+	}
+	if roundID > 0 {
+		s.latestOutcomeRound = roundID
+	}
+	s.latestOutcomeOK = success
+	s.latestOutcomeAt = now
 }
 
 func deliveryResponse(stats storage.ChainWatcherDeliveryStats) DeliveryStatusResponse {
@@ -1189,15 +1398,56 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
-	status := s.statusResponse(r.Context(), time.Now())
-	if !status.Ready {
-		writeJSON(w, http.StatusServiceUnavailable, status)
+	response := s.readinessResponse(r.Context(), time.Now())
+	if !response.Ready {
+		writeJSON(w, http.StatusServiceUnavailable, response)
 		return
 	}
-	writeJSON(w, http.StatusOK, status)
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (s *Server) readinessResponse(ctx context.Context, now time.Time) ReadyStatusResponse {
+	base := s.status.response(now, s.sourceStaleAfter(), storage.ChainWatcherDeliveryStats{})
+	response := ReadyStatusResponse{Status: base.Status, Ready: base.Ready, Now: now}
+	if s.tron != nil && s.tron.KeyPoolStatus(now).AvailableCount == 0 {
+		response.Ready = false
+		response.Status = "DEGRADED/NO_KEYS"
+	}
+	if s.store == nil {
+		return response
+	}
+	dbCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+	state, err := s.store.GetChainWatcherReadiness(dbCtx, now)
+	cancel()
+	if err != nil {
+		response.Ready = false
+		response.Status = "degraded/readiness_db"
+		response.CatchupLagUnknown = true
+		return response
+	}
+	response.OpenGapCount = state.OpenGapCount
+	response.LeasedGapCount = state.LeasedGapCount
+	response.WatchAddressCount = state.WatchAddressCount
+	safeEnd := state.RealtimeTimestamp - s.cfg.CatchupOverlap.Milliseconds()
+	if state.CursorTimestamp == 0 {
+		response.CatchupLagUnknown = true
+	} else if safeEnd > state.CursorTimestamp {
+		response.CatchupLagSeconds = (safeEnd - state.CursorTimestamp) / 1000
+	}
+	response.ContinuityReady = state.WatchAddressCount == 0 || (state.CursorTimestamp > 0 && !state.CatchupRequired && state.OpenGapCount == 0 && state.LeasedGapCount == 0)
+	if !response.ContinuityReady {
+		response.Ready = false
+		if response.Status == "ready" {
+			response.Status = "degraded/continuity"
+		}
+	}
+	return response
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeAdmin(w, r) {
+		return
+	}
 	writeJSON(w, http.StatusOK, s.statusResponse(r.Context(), time.Now()))
 }
 
@@ -1212,6 +1462,8 @@ func (s *Server) statusResponse(ctx context.Context, now time.Time) StatusRespon
 		}
 	}
 	response := s.status.response(now, s.sourceStaleAfter(), delivery)
+	response.MainInflightRounds = s.globalInflight()
+	response.MainInflightLimit = s.cfg.MainMaxInflight
 	if s.tron != nil {
 		response.TronscanKeys = s.tron.KeyPoolStatus(now)
 		if response.TronscanKeys.AvailableCount == 0 {
@@ -1220,6 +1472,16 @@ func (s *Server) statusResponse(ctx context.Context, now time.Time) StatusRespon
 		}
 	}
 	if s.store != nil {
+		if aggregates, err := s.store.ChainWatcherMetricAggregates(ctx, now.Add(-72*time.Hour)); err == nil {
+			response.Metrics72H = make([]MetricAggregateResponse, 0, len(aggregates))
+			for _, item := range aggregates {
+				response.Metrics72H = append(response.Metrics72H, MetricAggregateResponse{
+					Lane: item.Lane, SuccessCount: item.SuccessCount, ErrorCount: item.ErrorCount,
+					RequestCount: item.RequestCount, APIMS: item.APIMS, ParseMS: item.ParseMS,
+					MatchMS: item.MatchMS, WriteMS: item.WriteMS, OverlapCount: item.OverlapCount,
+				})
+			}
+		}
 		var cursorTimestamp, realtimeTimestamp int64
 		if watermark, err := s.store.GetChainWatcherWatermark(ctx); err == nil {
 			cursorTimestamp = watermark.Timestamp
@@ -1232,6 +1494,9 @@ func (s *Server) statusResponse(ctx context.Context, now time.Time) StatusRespon
 			}
 			response.GlobalWatermark = WatermarkStatusResponse{Timestamp: watermark.Timestamp, EventID: shortHash(watermark.TxHash), Source: watermark.Source, UpdatedAt: timePtr(watermark.UpdatedAt), LagSeconds: lag}
 			response.CatchupLagSeconds = lag
+			if watermark.Timestamp == 0 {
+				response.CatchupLagUnknown = true
+			}
 		}
 		if realtime, err := s.store.GetChainWatcherRealtimeWatermark(ctx); err == nil {
 			realtimeTimestamp = realtime.Timestamp
@@ -1254,6 +1519,22 @@ func (s *Server) statusResponse(ctx context.Context, now time.Time) StatusRespon
 		if state, err := s.store.GetChainWatcherCatchupState(ctx); err == nil {
 			response.CatchupRequired, response.CatchupReason = state.Required, state.Reason
 		}
+		if gaps, err := s.store.ChainWatcherGapStats(ctx, now); err == nil {
+			response.OpenGapCount = gaps.PendingCount
+			response.LeasedGapCount = gaps.LeasedCount
+		}
+		subscriptionsKnown := false
+		if _, byAddress, err := s.loadSubscriptions(ctx); err == nil {
+			response.WatchAddressCount = len(byAddress)
+			subscriptionsKnown = true
+		}
+		response.ContinuityReady = subscriptionsKnown && (response.WatchAddressCount == 0 || (cursorTimestamp > 0 && response.OpenGapCount == 0 && response.LeasedGapCount == 0 && !response.CatchupRequired))
+		if !response.ContinuityReady {
+			response.Ready = false
+			if response.Status == "ready" {
+				response.Status = "degraded/continuity"
+			}
+		}
 		if response.TronscanKeys.CompensationBudgetRPS > 0 {
 			response.CatchupETASeconds = int64(float64(response.CatchupLagSeconds) / response.TronscanKeys.CompensationBudgetRPS)
 		}
@@ -1274,9 +1555,6 @@ func (s *Server) statusResponse(ctx context.Context, now time.Time) StatusRespon
 				CatchupRequests: lease.FallbackRequests, CatchupBudgetUsed: lease.CatchupBudgetUsed,
 				Recovering: lease.Mode == "RECOVERING", LeaseUntil: timePtr(lease.LeaseUntil),
 			}
-		}
-		if _, byAddress, err := s.loadSubscriptions(ctx); err == nil {
-			response.WatchAddressCount = len(byAddress)
 		}
 	}
 	return response

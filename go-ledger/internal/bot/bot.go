@@ -40,27 +40,27 @@ type Bot struct {
 	queryPool     *worker.Pool
 	notifyPool    *worker.Pool
 
-	groupTouchCache       *ttlCache[string]
-	groupCache            *ttlCache[storage.Group]
-	billSummaryCache      *ttlCache[storage.BillSummaryData]
-	userTouchCache        *ttlCache[string]
-	operatorCache         *ttlCache[bool]
-	watchTargetCache      *ttlCache[[]storage.WatchTarget]
-	fallbackSubCache      *ttlCache[[]storage.ChainWatcherSubscription]
-	rateBookCache         *ttlCache[[]p2p.OrderBookEntry]
-	rateBookState         rateBookState
-	privateStates         *ttlCache[privateState]
-	notificationWake      chan struct{}
-	telegramLimiter       *telegramRateLimiter
-	sendGateway           *telegramSendGateway
-	watchRunning          atomic.Bool
-	watcherFallback       *watcherFallbackController
-	watcherTiming         chainWatcherTimingStatus
-	fallbackNextPoll      atomic.Int64
-	fallbackBackoff       atomic.Int32
-	fallbackExpandRunning atomic.Bool
-	globalOperatorLookup  func(context.Context, int64) (permissions.UserCapabilities, bool, error)
-	groupOperatorLookup   func(context.Context, int64, int64) (bool, error)
+	groupTouchCache      *ttlCache[string]
+	groupCache           *ttlCache[storage.Group]
+	billSummaryCache     *ttlCache[storage.BillSummaryData]
+	userTouchCache       *ttlCache[string]
+	operatorCache        *ttlCache[bool]
+	watchTargetCache     *ttlCache[[]storage.WatchTarget]
+	fallbackSubCache     *ttlCache[[]storage.ChainWatcherSubscription]
+	rateBookCache        *ttlCache[[]p2p.OrderBookEntry]
+	rateBookState        rateBookState
+	privateStates        *ttlCache[privateState]
+	notificationWake     chan struct{}
+	telegramLimiter      *telegramRateLimiter
+	sendGateway          *telegramSendGateway
+	watchRunning         atomic.Bool
+	watcherFallback      *watcherFallbackController
+	watcherTiming        chainWatcherTimingStatus
+	fallbackNextPoll     atomic.Int64
+	fallbackBackoff      atomic.Int32
+	fallbackLeaderActive atomic.Bool
+	globalOperatorLookup func(context.Context, int64) (permissions.UserCapabilities, bool, error)
+	groupOperatorLookup  func(context.Context, int64, int64) (bool, error)
 }
 
 func New(cfg config.Config, store *storage.Store, tg *telegram.Client, tronClient *tron.Client, p2pClient *p2p.Client, fallbackStores ...*storage.Store) *Bot {

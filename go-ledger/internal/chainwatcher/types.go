@@ -13,15 +13,16 @@ import (
 )
 
 type SubscriptionRequest struct {
-	BotID           string `json:"bot_id,omitempty"`
-	ChatID          int64  `json:"chat_id"`
-	OwnerUserID     int64  `json:"owner_user_id"`
-	Address         string `json:"address"`
-	Label           string `json:"label"`
-	MinNotifyAmount string `json:"min_amount"`
-	WatchIncome     bool   `json:"watch_income"`
-	WatchExpense    bool   `json:"watch_expense"`
-	NotifyTRX       bool   `json:"notify_trx"`
+	BotID             string `json:"bot_id,omitempty"`
+	ChatID            int64  `json:"chat_id"`
+	OwnerUserID       int64  `json:"owner_user_id"`
+	Address           string `json:"address"`
+	Label             string `json:"label"`
+	MinNotifyAmount   string `json:"min_amount"`
+	WatchIncome       bool   `json:"watch_income"`
+	WatchExpense      bool   `json:"watch_expense"`
+	NotifyTRX         bool   `json:"notify_trx"`
+	BaselineTimestamp int64  `json:"baseline_timestamp"`
 }
 
 type SyncRequest struct {
@@ -46,27 +47,58 @@ type ClaimResponse struct {
 }
 
 type StatusResponse struct {
-	Status                string                  `json:"status"`
-	Ready                 bool                    `json:"ready"`
-	Now                   time.Time               `json:"now"`
-	StaleAfterMS          int64                   `json:"stale_after_ms"`
-	Global                ScanStatusResponse      `json:"global"`
-	Catchup               ScanStatusResponse      `json:"catchup"`
-	Expand                ScanStatusResponse      `json:"expand"`
-	Deliveries            DeliveryStatusResponse  `json:"deliveries"`
-	RetentionCleanup      CleanupStatusResponse   `json:"retention_cleanup"`
-	TronscanKeys          tron.KeyPoolStatus      `json:"tronscan_keys"`
-	GlobalWatermark       WatermarkStatusResponse `json:"global_watermark"`
-	RealtimeWatermark     WatermarkStatusResponse `json:"realtime_watermark"`
-	Fallback              FallbackStatusResponse  `json:"fallback"`
-	WatchAddressCount     int                     `json:"watch_address_count"`
-	CatchupDeferredReason string                  `json:"catchup_deferred_reason,omitempty"`
-	CatchupDeferredCount  int64                   `json:"catchup_deferred_count"`
-	CatchupLagSeconds     int64                   `json:"catchup_lag_seconds"`
-	CatchupRequired       bool                    `json:"catchup_required"`
-	CatchupReason         string                  `json:"catchup_reason,omitempty"`
-	CatchupSafeEnd        int64                   `json:"catchup_safe_end"`
-	CatchupETASeconds     int64                   `json:"catchup_eta_seconds"`
+	Status                string                    `json:"status"`
+	Ready                 bool                      `json:"ready"`
+	Now                   time.Time                 `json:"now"`
+	StaleAfterMS          int64                     `json:"stale_after_ms"`
+	Global                ScanStatusResponse        `json:"global"`
+	Catchup               ScanStatusResponse        `json:"catchup"`
+	Expand                ScanStatusResponse        `json:"expand"`
+	Deliveries            DeliveryStatusResponse    `json:"deliveries"`
+	RetentionCleanup      CleanupStatusResponse     `json:"retention_cleanup"`
+	TronscanKeys          tron.KeyPoolStatus        `json:"tronscan_keys"`
+	GlobalWatermark       WatermarkStatusResponse   `json:"global_watermark"`
+	RealtimeWatermark     WatermarkStatusResponse   `json:"realtime_watermark"`
+	Fallback              FallbackStatusResponse    `json:"fallback"`
+	WatchAddressCount     int                       `json:"watch_address_count"`
+	CatchupDeferredReason string                    `json:"catchup_deferred_reason,omitempty"`
+	CatchupDeferredCount  int64                     `json:"catchup_deferred_count"`
+	CatchupLagSeconds     int64                     `json:"catchup_lag_seconds"`
+	CatchupRequired       bool                      `json:"catchup_required"`
+	CatchupReason         string                    `json:"catchup_reason,omitempty"`
+	CatchupSafeEnd        int64                     `json:"catchup_safe_end"`
+	CatchupETASeconds     int64                     `json:"catchup_eta_seconds"`
+	CatchupLagUnknown     bool                      `json:"catchup_lag_unknown"`
+	ContinuityReady       bool                      `json:"continuity_ready"`
+	OpenGapCount          int64                     `json:"open_gap_count"`
+	LeasedGapCount        int64                     `json:"leased_gap_count"`
+	MainInflightRounds    int                       `json:"main_inflight_rounds"`
+	MainInflightLimit     int                       `json:"main_inflight_limit"`
+	Metrics72H            []MetricAggregateResponse `json:"metrics_72h,omitempty"`
+}
+
+type MetricAggregateResponse struct {
+	Lane         string `json:"lane"`
+	SuccessCount int64  `json:"success_count"`
+	ErrorCount   int64  `json:"error_count"`
+	RequestCount int64  `json:"request_count"`
+	APIMS        int64  `json:"api_ms"`
+	ParseMS      int64  `json:"parse_ms"`
+	MatchMS      int64  `json:"match_ms"`
+	WriteMS      int64  `json:"write_ms"`
+	OverlapCount int64  `json:"overlap_count"`
+}
+
+type ReadyStatusResponse struct {
+	Status            string    `json:"status"`
+	Ready             bool      `json:"ready"`
+	Now               time.Time `json:"now"`
+	CatchupLagSeconds int64     `json:"catchup_lag_seconds"`
+	CatchupLagUnknown bool      `json:"catchup_lag_unknown"`
+	ContinuityReady   bool      `json:"continuity_ready"`
+	OpenGapCount      int64     `json:"open_gap_count"`
+	LeasedGapCount    int64     `json:"leased_gap_count"`
+	WatchAddressCount int       `json:"watch_address_count"`
 }
 
 type WatermarkStatusResponse struct {
@@ -96,10 +128,12 @@ type FallbackStatusResponse struct {
 }
 
 type ScanStatusResponse struct {
+	RoundID            int64               `json:"round_id"`
 	LastStartedAt      *time.Time          `json:"last_started_at,omitempty"`
 	LastSuccessAt      *time.Time          `json:"last_success_at,omitempty"`
 	LastErrorAt        *time.Time          `json:"last_error_at,omitempty"`
 	LastError          string              `json:"last_error,omitempty"`
+	LastErrorClass     string              `json:"last_error_class,omitempty"`
 	LastDurationMS     int64               `json:"last_duration_ms"`
 	APIWaitMS          int64               `json:"api_wait_ms"`
 	APIFetchMS         int64               `json:"api_fetch_ms"`
@@ -128,6 +162,7 @@ type ScanStatusResponse struct {
 }
 
 type ScanRoundResponse struct {
+	RoundID          int64      `json:"round_id"`
 	StartedAt        *time.Time `json:"started_at,omitempty"`
 	Success          bool       `json:"success"`
 	Error            string     `json:"error,omitempty"`
@@ -234,6 +269,9 @@ func MatchTransfer(t tron.Transfer, subs []storage.ChainWatcherSubscription) []s
 		if !sub.Active {
 			continue
 		}
+		if sub.BaselineTimestamp > 0 && t.BlockTimestamp < sub.BaselineTimestamp {
+			continue
+		}
 		direction := ""
 		switch sub.Address {
 		case t.From:
@@ -296,16 +334,17 @@ func ToSubscription(botID string, req SubscriptionRequest) storage.ChainWatcherS
 		chatID = req.OwnerUserID
 	}
 	return storage.ChainWatcherSubscription{
-		BotID:           strings.TrimSpace(botID),
-		ChatID:          chatID,
-		OwnerUserID:     req.OwnerUserID,
-		Address:         strings.TrimSpace(req.Address),
-		Label:           strings.TrimSpace(req.Label),
-		WatchIncome:     req.WatchIncome,
-		WatchExpense:    req.WatchExpense,
-		NotifyTRX:       req.NotifyTRX,
-		MinNotifyAmount: minAmount,
-		Active:          true,
+		BotID:             strings.TrimSpace(botID),
+		ChatID:            chatID,
+		OwnerUserID:       req.OwnerUserID,
+		Address:           strings.TrimSpace(req.Address),
+		Label:             strings.TrimSpace(req.Label),
+		WatchIncome:       req.WatchIncome,
+		WatchExpense:      req.WatchExpense,
+		NotifyTRX:         req.NotifyTRX,
+		BaselineTimestamp: req.BaselineTimestamp,
+		MinNotifyAmount:   minAmount,
+		Active:            true,
 	}
 }
 

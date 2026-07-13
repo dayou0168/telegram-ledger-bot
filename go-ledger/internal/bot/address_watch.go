@@ -71,7 +71,7 @@ func (b *Bot) handleAddressWatchCallback(ctx context.Context, cb telegram.Callba
 			return err
 		}
 		return b.enqueueReliableText(ctx, sendPriorityNormal, "watch_min_prompt", fmt.Sprintf("watch_min_prompt:%d:%d:%d", chatID, cb.From.ID, now.UnixNano()), chatID, "请发送最小提醒金额，低于这个 USDT 金额不提醒。\n例如：10；发送 0 表示全部提醒。", nil, reliableMessageRef{}, now)
-	case cb.Data == "watch:income", cb.Data == "watch:expense", cb.Data == "watch:trx":
+	case cb.Data == "watch:income", cb.Data == "watch:expense":
 		return b.toggleAddressWatchSetting(ctx, cb, now)
 	case strings.HasPrefix(cb.Data, "watch:open:"):
 		address := strings.TrimPrefix(cb.Data, "watch:open:")
@@ -212,17 +212,11 @@ func (b *Bot) handleAddressWatchTargetCallback(ctx context.Context, cb telegram.
 		enabled := targetWatchEnabled(target)
 		target.WatchIncome = !enabled
 		target.WatchExpense = !enabled
-		if !enabled {
-			target.NotifyTRX = true
-		} else {
-			target.NotifyTRX = false
-		}
+		target.NotifyTRX = false
 	case "income":
 		target.WatchIncome = !target.WatchIncome
 	case "expense":
 		target.WatchExpense = !target.WatchExpense
-	case "trx":
-		target.NotifyTRX = !target.NotifyTRX
 	case "min":
 		b.privateStates.Set(formatID(cb.From.ID), privateState{Mode: "watch_target_min", WatchAddress: address, CreatedAt: now})
 		if err := b.tg.AnswerCallback(ctx, cb.ID, "请输入最小金额"); err != nil {
@@ -279,9 +273,6 @@ func (b *Bot) toggleAddressWatchSetting(ctx context.Context, cb telegram.Callbac
 	case "watch:expense":
 		settings.WatchExpense = !settings.WatchExpense
 		label = "支出提醒"
-	case "watch:trx":
-		settings.NotifyTRX = !settings.NotifyTRX
-		label = "TRX通知"
 	}
 	if err := b.store.SaveWatchSettings(ctx, settings, now); err != nil {
 		return err
@@ -422,9 +413,7 @@ func formatAddressWatchDetailText(target storage.WatchTarget) string {
 	out.WriteString(onOff(target.WatchIncome))
 	out.WriteString("  支出：")
 	out.WriteString(onOff(target.WatchExpense))
-	out.WriteString("\nTRX通知：")
-	out.WriteString(onOff(target.NotifyTRX))
-	out.WriteString("  最小提醒：")
+	out.WriteString("\n最小提醒：")
 	out.WriteString(target.MinNotifyAmount)
 	out.WriteString(" USDT")
 	return out.String()
@@ -453,7 +442,7 @@ func addressWatchDetailKeyboard(target storage.WatchTarget) [][]telegram.InlineK
 	return [][]telegram.InlineKeyboardButton{
 		{{Text: enabledAction, CallbackData: "watch:t:enabled:" + address}},
 		{{Text: "收入 " + onOff(target.WatchIncome), CallbackData: "watch:t:income:" + address}, {Text: "支出 " + onOff(target.WatchExpense), CallbackData: "watch:t:expense:" + address}},
-		{{Text: "TRX通知 " + onOff(target.NotifyTRX), CallbackData: "watch:t:trx:" + address}, {Text: "最小金额 " + target.MinNotifyAmount, CallbackData: "watch:t:min:" + address}},
+		{{Text: "最小金额 " + target.MinNotifyAmount, CallbackData: "watch:t:min:" + address}},
 		{{Text: "设置备注", CallbackData: "watch:t:label:" + address}, {Text: "删除地址", CallbackData: "watch:t:del:" + address}},
 		{{Text: "返回列表", CallbackData: "watch:t:back:" + address}},
 	}
@@ -477,7 +466,7 @@ func onOff(value bool) string {
 }
 
 func targetWatchEnabled(target storage.WatchTarget) bool {
-	return target.WatchIncome || target.WatchExpense || target.NotifyTRX
+	return target.WatchIncome || target.WatchExpense
 }
 
 func normalizeWatchLabel(text string) string {

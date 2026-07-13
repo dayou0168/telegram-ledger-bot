@@ -29,12 +29,14 @@ ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.1
 - Bot fallback is not the normal path. After sustained watcher failure, all bots compete for a PostgreSQL lease and only one shared no-key leader scans until the watcher has recovered and its watermark is caught up.
 - Shared no-key fallback requires the watcher PostgreSQL DSN and a unique stable `BOT_FALLBACK_INSTANCE_ID` per bot; there is no per-bot emergency scanner switch or fixed maximum active time.
 
-## v2.4.1 Watcher Configuration
+## v2.4.2 Candidate Watcher Configuration
 
 Expected watcher-side values:
 
 ```env
 CHAIN_WATCHER_SOURCE_POLL_SECONDS=1
+CHAIN_WATCHER_MAIN_SCAN_TIMEOUT_MS=3000
+CHAIN_WATCHER_MAIN_MAX_INFLIGHT_ROUNDS=3
 CHAIN_WATCHER_GLOBAL_SCAN_PAGES=3
 CHAIN_WATCHER_GLOBAL_EXPAND_PAGE_LIMIT=20
 CHAIN_WATCHER_CATCHUP_ENABLED=true
@@ -49,7 +51,7 @@ CHAIN_WATCHER_TRONSCAN_KEY_INTERVAL_MS=200
 CHAIN_WATCHER_KEY_ENCRYPTION_KEY=base64_encoded_32_byte_key
 ```
 
-The main scan always creates three page jobs per second. It assigns those jobs across an immutable snapshot of up to ten healthy keys and rotates page-to-key mapping between rounds. Global catch-up is watermark/window based and lower priority; per-address polling is disabled by default. Key registry, usage, and cooldown state are persisted in watcher PostgreSQL; `/status` exposes fingerprints and counters only.
+The main scan always creates three page jobs per second with an independent 3000ms API deadline and at most three in-flight rounds. Successful pages are committed even when another page fails; failures and missing anchors become fenced PostgreSQL gap tasks. High-priority page/anchor repair is separate from lower-priority watermark/window catch-up, and per-address polling is disabled by default. Key registry, usage, cooldown, cursor, and gap state are persisted; `/status` requires the admin Bearer token and exposes fingerprints only.
 
 Expected bot-side fallback values:
 
@@ -171,7 +173,7 @@ Recommended checks:
 systemctl is-active ledger-chain-watcher
 curl -fsS http://127.0.0.1:8090/healthz
 curl -fsS http://127.0.0.1:8090/readyz
-curl -fsS http://127.0.0.1:8090/status
+curl -fsS -H "Authorization: Bearer $CHAIN_WATCHER_ADMIN_TOKEN" http://127.0.0.1:8090/status
 docker exec zhuanfa-tianze-go wget -qO- http://host.docker.internal:8090/healthz
 docker exec zhuanfa-tianze-go wget -qO- http://host.docker.internal:8090/readyz
 journalctl -u ledger-chain-watcher --since "3 minutes ago" --no-pager

@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -121,17 +122,20 @@ func (b *Bot) sendOutboxNotification(ctx context.Context, item storage.Notificat
 	}
 	priority := outboxSendPriority(item.Priority)
 	message, err, sendMetrics := b.sendOutboxText(ctx, priority, item.Kind, item.ChatID, text, opts)
-	if item.Kind == "chain" {
-		logChainOutboxSendTiming(item, priority, renderDuration, sendMetrics, err)
-	}
 	now := time.Now().In(b.loc)
 	if err == nil {
+		if item.Kind == "chain" {
+			logChainOutboxSendTiming(item, priority, renderDuration, sendMetrics, 0, nil)
+		}
 		if err := b.store.MarkNotificationSent(ctx, item.ID, message.MessageID, now); err != nil {
 			log.Printf("mark notification sent %d: %v", item.ID, err)
 		}
 		return
 	}
 	delay := notificationRetryDelay(item.Attempts, err)
+	if item.Kind == "chain" {
+		logChainOutboxSendTiming(item, priority, renderDuration, sendMetrics, delay, err)
+	}
 	if err := b.store.MarkNotificationFailed(ctx, item.ID, err.Error(), now.Add(delay), now); err != nil {
 		log.Printf("mark notification failed %d: %v", item.ID, err)
 	}
@@ -154,14 +158,15 @@ func (b *Bot) sendOutboxText(ctx context.Context, priority sendPriority, kind st
 	return msg, err, metrics
 }
 
-func logChainOutboxSendTiming(item storage.NotificationOutbox, priority sendPriority, renderDuration time.Duration, metrics telegramSendMetrics, err error) {
+func logChainOutboxSendTiming(item storage.NotificationOutbox, priority sendPriority, renderDuration time.Duration, metrics telegramSendMetrics, outboxRetry time.Duration, err error) {
 	status := "sent"
 	if err != nil {
 		status = "failed"
 	}
 	log.Printf(
-		"chain outbox send timing: id=%d status=%s priority=%s render_ms=%d queue_wait_ms=%d rate_limit_ms=%d telegram_ms=%d retry_delay_ms=%d total_send_ms=%d attempts=%d",
+		"chain outbox send timing: id=%d trace=%s status=%s priority=%s render_ms=%d queue_wait_ms=%d rate_limit_ms=%d telegram_ms=%d telegram_retry_ms=%d outbox_retry_ms=%d total_send_ms=%d telegram_attempts=%d outbox_attempts=%d",
 		item.ID,
+		outboxTrace(item.DedupeKey),
 		status,
 		priority.String(),
 		renderDuration.Milliseconds(),
@@ -169,9 +174,16 @@ func logChainOutboxSendTiming(item storage.NotificationOutbox, priority sendPrio
 		metrics.RateLimitDuration.Milliseconds(),
 		metrics.OperationDuration.Milliseconds(),
 		metrics.RetryDelayDuration.Milliseconds(),
+		outboxRetry.Milliseconds(),
 		metrics.TotalDuration.Milliseconds(),
 		metrics.Attempts,
+		item.Attempts,
 	)
+}
+
+func outboxTrace(dedupeKey string) string {
+	sum := sha256.Sum256([]byte(dedupeKey))
+	return fmt.Sprintf("%x", sum[:6])
 }
 
 func (b *Bot) renderOutboxMessage(ctx context.Context, item storage.NotificationOutbox) (string, map[string]any, error) {

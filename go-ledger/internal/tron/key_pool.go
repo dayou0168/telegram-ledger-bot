@@ -21,6 +21,18 @@ const (
 
 var ErrCompensationDeferred = errors.New("tronscan compensation deferred")
 
+type KeyPoolUnavailableError struct {
+	Reason     string
+	RetryAfter time.Duration
+}
+
+func (e *KeyPoolUnavailableError) Error() string {
+	if e == nil || e.Reason == "" {
+		return "tronscan key pool unavailable"
+	}
+	return "tronscan key pool unavailable: " + e.Reason
+}
+
 type CompensationDeferredError struct{ Reason string }
 
 func (e *CompensationDeferredError) Error() string {
@@ -471,7 +483,7 @@ func (p *keyPool) lease(ctx context.Context, source RequestSource, excluded map[
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.resetBudgetDaysLocked(now)
-	if source == RequestSourceCompensation {
+	if source == RequestSourceCompensation || source == RequestSourceExpand {
 		if reason := p.takeCompensationTokenLocked(now); reason != "" {
 			p.lastCompDeferredReason = reason
 			return apiKeyLease{}, &CompensationDeferredError{Reason: reason}
@@ -540,7 +552,7 @@ func (p *keyPool) mainLeases(ctx context.Context, count int) ([]apiKeyLease, err
 		return p.keys[eligible[i]].todayRequests < p.keys[eligible[j]].todayRequests
 	})
 	if len(eligible) == 0 {
-		return nil, &HTTPError{StatusCode: 429, Body: "no eligible Tronscan API keys", RetryAfter: 30 * time.Second}
+		return nil, &KeyPoolUnavailableError{Reason: "no eligible keys", RetryAfter: 30 * time.Second}
 	}
 	p.nextMainAt = now.Add(p.pollInterval)
 	waves := (count + len(eligible) - 1) / len(eligible)
@@ -722,10 +734,10 @@ func (p *keyPool) reserve(ctx context.Context, lease apiKeyLease, source Request
 		p.resetBudgetDaysLocked(now)
 		stateIndex := p.stateIndexLocked(lease)
 		if stateIndex < 0 {
+			p.mu.Unlock()
 			if p.usageStore != nil && lease.fingerprint != "" {
 				record, allowed, reserveErr := p.usageStore.ReserveTronscanKeyRequest(ctx, lease.fingerprint, budgetDay(now, p.budgetZone), source, failover, 0, now)
 				_ = record
-				p.mu.Unlock()
 				if reserveErr != nil {
 					return time.Since(waitStarted), reserveErr
 				}
@@ -734,7 +746,6 @@ func (p *keyPool) reserve(ctx context.Context, lease apiKeyLease, source Request
 				}
 				return time.Since(waitStarted), nil
 			}
-			p.mu.Unlock()
 			return time.Since(waitStarted), fmt.Errorf("tronscan key lease %s is no longer registered", lease.fingerprint)
 		}
 		state := &p.keys[stateIndex]
@@ -755,18 +766,27 @@ func (p *keyPool) reserve(ctx context.Context, lease apiKeyLease, source Request
 			continue
 		}
 		if p.usageStore != nil {
-			record, allowed, err := p.usageStore.ReserveTronscanKeyRequest(ctx, state.fingerprint, state.budgetDay, source, failover, 0, now)
+			fingerprint := state.fingerprint
+			day := state.budgetDay
+			state.nextRequestAt = now.Add(p.minInterval)
+			p.mu.Unlock()
+			record, allowed, err := p.usageStore.ReserveTronscanKeyRequest(ctx, fingerprint, day, source, failover, 0, now)
 			if err != nil {
+				p.mu.Lock()
 				p.lastStoreError = err.Error()
 				p.mu.Unlock()
 				return time.Since(waitStarted), err
 			}
-			p.applyRecordLocked(state, record)
+			p.mu.Lock()
+			if current := p.stateIndexLocked(lease); current >= 0 {
+				p.applyRecordLocked(&p.keys[current], record)
+			}
 			p.lastStoreError = ""
+			p.mu.Unlock()
 			if !allowed {
-				p.mu.Unlock()
 				return time.Since(waitStarted), &HTTPError{StatusCode: 429, Body: "API key daily budget exhausted", RetryAfter: nextBudgetReset(now, p.budgetZone).Sub(now)}
 			}
+			return time.Since(waitStarted), nil
 		} else {
 			p.incrementSourceLocked(state, source, failover)
 		}
@@ -781,7 +801,7 @@ func (p *keyPool) incrementSourceLocked(state *apiKeyState, source RequestSource
 	switch source {
 	case RequestSourceMain:
 		state.mainRequests++
-	case RequestSourceCompensation:
+	case RequestSourceCompensation, RequestSourceExpand:
 		state.compRequests++
 	default:
 		state.otherRequests++
@@ -796,9 +816,9 @@ func (p *keyPool) report(ctx context.Context, lease apiKeyLease, status int, bod
 		return nil
 	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	stateIndex := p.stateIndexLocked(lease)
 	if stateIndex < 0 {
+		p.mu.Unlock()
 		if p.usageStore != nil && lease.fingerprint != "" && status != 0 {
 			_, err := p.usageStore.RecordTronscanKeyResult(ctx, lease.fingerprint, budgetDay(now, p.budgetZone), status, time.Time{}, time.Time{}, time.Time{})
 			return err
@@ -886,18 +906,41 @@ func (p *keyPool) report(ctx context.Context, lease apiKeyLease, status int, bod
 			state.nextProbeAt = state.cooldownUntil
 		}
 	}
+	fingerprint := state.fingerprint
+	day := state.budgetDay
+	last429At := state.last429At
+	cooldownUntil := state.cooldownUntil
+	disabledUntil := state.disabledUntil
+	p.mu.Unlock()
+
 	if p.usageStore != nil && status != 0 {
-		record, err := p.usageStore.RecordTronscanKeyResult(ctx, state.fingerprint, state.budgetDay, status, state.last429At, state.cooldownUntil, state.disabledUntil)
+		record, err := p.usageStore.RecordTronscanKeyResult(ctx, fingerprint, day, status, last429At, cooldownUntil, disabledUntil)
 		if err != nil {
+			p.mu.Lock()
 			p.lastStoreError = err.Error()
+			p.mu.Unlock()
 			return err
 		}
-		p.applyRecordLocked(state, record)
+		p.mu.Lock()
+		if current := p.stateIndexLocked(lease); current >= 0 {
+			p.applyRecordLocked(&p.keys[current], record)
+		}
 		p.lastStoreError = ""
+		p.mu.Unlock()
 	}
 	if p.registryStore != nil {
-		if err := p.registryStore.UpdateTronscanAPIKeyState(ctx, p.registryRecordLocked(state), now); err != nil {
+		p.mu.Lock()
+		current := p.stateIndexLocked(lease)
+		if current < 0 {
+			p.mu.Unlock()
+			return nil
+		}
+		record := p.registryRecordLocked(&p.keys[current])
+		p.mu.Unlock()
+		if err := p.registryStore.UpdateTronscanAPIKeyState(ctx, record, now); err != nil {
+			p.mu.Lock()
 			p.lastStoreError = err.Error()
+			p.mu.Unlock()
 			return err
 		}
 	}
@@ -929,7 +972,6 @@ func (p *keyPool) requestProbe(ctx context.Context, fingerprint string, enable b
 		return fmt.Errorf("tronscan key pool is not configured")
 	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	for index := range p.keys {
 		state := &p.keys[index]
 		if state.fingerprint != strings.TrimSpace(fingerprint) {
@@ -945,11 +987,14 @@ func (p *keyPool) requestProbe(ctx context.Context, fingerprint string, enable b
 		state.consecutiveFailures = 0
 		state.cooldownUntil = time.Time{}
 		state.nextProbeAt = p.now()
+		record := p.registryRecordLocked(state)
+		p.mu.Unlock()
 		if p.registryStore != nil {
-			return p.registryStore.UpdateTronscanAPIKeyState(ctx, p.registryRecordLocked(state), p.now())
+			return p.registryStore.UpdateTronscanAPIKeyState(ctx, record, p.now())
 		}
 		return nil
 	}
+	p.mu.Unlock()
 	return fmt.Errorf("tronscan API key %s was not found", strings.TrimSpace(fingerprint))
 }
 

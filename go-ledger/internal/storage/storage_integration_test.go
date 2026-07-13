@@ -834,3 +834,85 @@ func TestChainWatcherCursorSurvivesNewStoreInstance(t *testing.T) {
 		t.Fatalf("watermark after reopen = %+v, want %d/%s", watermark, timestamp, eventID)
 	}
 }
+
+func TestAddressWatchBaselineStartsAtRegistrationAndResetsAfterReactivation(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	store, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	owner := time.Now().UnixNano()
+	address := fmt.Sprintf("TBaseline%d", owner)
+	first := time.Now().UTC().Truncate(time.Millisecond)
+	if err := store.AddWatch(ctx, owner, address, "", first); err != nil {
+		t.Fatal(err)
+	}
+	target, ok, err := store.GetWatchTarget(ctx, owner, address)
+	if err != nil || !ok || target.BaselineTimestamp != first.UnixMilli() {
+		t.Fatalf("first baseline = %+v/%v/%v", target, ok, err)
+	}
+	if _, err := store.RemoveWatch(ctx, owner, address, first.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	second := first.Add(2 * time.Second)
+	if err := store.AddWatch(ctx, owner, address, "", second); err != nil {
+		t.Fatal(err)
+	}
+	target, ok, err = store.GetWatchTarget(ctx, owner, address)
+	if err != nil || !ok || target.BaselineTimestamp != second.UnixMilli() {
+		t.Fatalf("reactivated baseline = %+v/%v/%v", target, ok, err)
+	}
+}
+
+func TestChainWatcherGapLeaseFencingRejectsExpiredWorker(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	store, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now().UTC()
+	from := now.UnixMilli() + now.UnixNano()%1000
+	if _, err := store.EnqueueChainWatcherGap(ctx, ChainWatcherGapTask{
+		Kind: "window", Source: "watcher", Priority: 2,
+		FromTimestamp: from, ToTimestamp: from + 1000,
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+	first, ok, err := store.ClaimChainWatcherGap(ctx, "worker-a", "watcher", time.Second, now)
+	if err != nil || !ok {
+		t.Fatalf("first claim = %+v/%v/%v", first, ok, err)
+	}
+	second, ok, err := store.ClaimChainWatcherGap(ctx, "worker-b", "watcher", time.Second, now.Add(2*time.Second))
+	if err != nil || !ok || second.ID != first.ID || second.LeaseGeneration <= first.LeaseGeneration {
+		t.Fatalf("second claim = %+v/%v/%v", second, ok, err)
+	}
+	if completed, err := store.CompleteChainWatcherGap(ctx, first.ID, first.LeaseGeneration, first.LeaseOwner, now.Add(2*time.Second)); err != nil || completed {
+		t.Fatalf("expired worker completion = %v/%v", completed, err)
+	}
+	if completed, err := store.CompleteChainWatcherGap(ctx, second.ID, second.LeaseGeneration, second.LeaseOwner, now.Add(2*time.Second)); err != nil || !completed {
+		t.Fatalf("current worker completion = %v/%v", completed, err)
+	}
+	if _, err := store.EnqueueChainWatcherGap(ctx, ChainWatcherGapTask{
+		Kind: "window", Source: "watcher", Priority: 1,
+		FromTimestamp: from, ToTimestamp: from + 1000,
+	}, now.Add(3*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	reopened, ok, err := store.ClaimChainWatcherGap(ctx, "worker-c", "watcher", time.Second, now.Add(3*time.Second))
+	if err != nil || !ok || reopened.ID != first.ID || reopened.LeaseGeneration <= second.LeaseGeneration {
+		t.Fatalf("reopened completed gap = %+v/%v/%v", reopened, ok, err)
+	}
+	_, _ = store.CompleteChainWatcherGap(ctx, reopened.ID, reopened.LeaseGeneration, reopened.LeaseOwner, now.Add(3*time.Second))
+}

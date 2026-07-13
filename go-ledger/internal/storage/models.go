@@ -193,14 +193,15 @@ type Operator struct {
 }
 
 type WatchTarget struct {
-	OwnerUserID     int64
-	Address         string
-	Label           string
-	WatchIncome     bool
-	WatchExpense    bool
-	NotifyTRX       bool
-	MinNotifyAmount string
-	LatestTimestamp int64
+	OwnerUserID       int64
+	Address           string
+	Label             string
+	WatchIncome       bool
+	WatchExpense      bool
+	NotifyTRX         bool
+	MinNotifyAmount   string
+	LatestTimestamp   int64
+	BaselineTimestamp int64
 }
 
 type ChainWatcherBot struct {
@@ -212,17 +213,18 @@ type ChainWatcherBot struct {
 }
 
 type ChainWatcherSubscription struct {
-	BotID           string
-	ChatID          int64
-	OwnerUserID     int64
-	Address         string
-	Label           string
-	WatchIncome     bool
-	WatchExpense    bool
-	NotifyTRX       bool
-	MinNotifyAmount string
-	Active          bool
-	UpdatedAt       time.Time
+	BotID             string
+	ChatID            int64
+	OwnerUserID       int64
+	Address           string
+	Label             string
+	WatchIncome       bool
+	WatchExpense      bool
+	NotifyTRX         bool
+	MinNotifyAmount   string
+	Active            bool
+	UpdatedAt         time.Time
+	BaselineTimestamp int64
 }
 
 type ChainWatcherEvent struct {
@@ -289,6 +291,57 @@ type ChainWatcherCatchupState struct {
 	Required  bool
 	Reason    string
 	UpdatedAt time.Time
+}
+
+type ChainWatcherGapTask struct {
+	ID              int64
+	Kind            string
+	Source          string
+	Priority        int
+	Reason          string
+	FromTimestamp   int64
+	ToTimestamp     int64
+	StartPage       int
+	EndPage         int
+	NextPage        int
+	AnchorEventID   string
+	HeadEventID     string
+	Status          string
+	LeaseOwner      string
+	LeaseGeneration int64
+	LeaseUntil      time.Time
+	Attempts        int
+	LastError       string
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+}
+
+type ChainWatcherGapStats struct {
+	PendingCount int64
+	LeasedCount  int64
+	OldestFrom   int64
+	OldestAgeMS  int64
+}
+
+type ChainWatcherReadiness struct {
+	CursorTimestamp   int64
+	RealtimeTimestamp int64
+	CatchupRequired   bool
+	OpenGapCount      int64
+	LeasedGapCount    int64
+	WatchAddressCount int
+}
+
+type ChainWatcherMetricAggregate struct {
+	Lane         string
+	SuccessCount int64
+	ErrorCount   int64
+	RequestCount int64
+	APIMS        int64
+	ParseMS      int64
+	MatchMS      int64
+	WriteMS      int64
+	OverlapCount int64
 }
 
 type ChainWatcherFallbackLease struct {

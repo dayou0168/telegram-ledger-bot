@@ -10,6 +10,8 @@ import (
 func TestLoadChainWatcherDefaults(t *testing.T) {
 	t.Setenv("CHAIN_WATCHER_KEY_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 	t.Setenv("CHAIN_WATCHER_SOURCE_POLL_SECONDS", "")
+	t.Setenv("CHAIN_WATCHER_MAIN_SCAN_TIMEOUT_MS", "")
+	t.Setenv("CHAIN_WATCHER_MAIN_MAX_INFLIGHT_ROUNDS", "")
 	t.Setenv("CHAIN_WATCHER_GLOBAL_SCAN_PAGES", "")
 	t.Setenv("TRONSCAN_GLOBAL_SCAN_PAGES", "")
 	t.Setenv("CHAIN_WATCHER_TRON_REQUEST_INTERVAL_MS", "")
@@ -31,6 +33,9 @@ func TestLoadChainWatcherDefaults(t *testing.T) {
 	if cfg.GlobalPages != 3 {
 		t.Fatalf("GlobalPages = %d, want 3", cfg.GlobalPages)
 	}
+	if cfg.MainScanTimeout != 3*time.Second || cfg.MainMaxInflight != 3 {
+		t.Fatalf("main scan timeout/inflight = %v/%d, want 3s/3", cfg.MainScanTimeout, cfg.MainMaxInflight)
+	}
 	if cfg.GlobalExpandPageLimit != 20 || cfg.CatchupOverlap != 2*time.Second || cfg.CatchupInterval != 30*time.Second {
 		t.Fatalf("expand/catchup defaults = %d/%v/%v", cfg.GlobalExpandPageLimit, cfg.CatchupOverlap, cfg.CatchupInterval)
 	}
@@ -39,6 +44,18 @@ func TestLoadChainWatcherDefaults(t *testing.T) {
 	}
 	if cfg.BudgetTimezone != "UTC" {
 		t.Fatalf("budget timezone = %s, want UTC", cfg.BudgetTimezone)
+	}
+}
+
+func TestLoadChainWatcherClampsInflightRoundsToThree(t *testing.T) {
+	t.Setenv("CHAIN_WATCHER_KEY_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	t.Setenv("CHAIN_WATCHER_MAIN_MAX_INFLIGHT_ROUNDS", "99")
+	cfg, err := LoadChainWatcher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MainMaxInflight != 3 {
+		t.Fatalf("MainMaxInflight = %d, want 3", cfg.MainMaxInflight)
 	}
 }
 

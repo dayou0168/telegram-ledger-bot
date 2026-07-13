@@ -1,6 +1,6 @@
 # Telegram 群组记账机器人
 
-这是 Telegram 记账机器人 Go v2.4.1 主线，按群组使用，生产部署使用 PostgreSQL、GHCR 镜像和共享 `ledger-chain-watcher` 链上监听服务。
+这是 Telegram 记账机器人 Go/PostgreSQL 主线；当前工作树正在准备尚未发布的 v2.4.2 watcher 修复，现有生产镜像仍为 v2.4.1。生产部署使用 PostgreSQL、GHCR 镜像和共享 `ledger-chain-watcher` 链上监听服务。
 
 重装系统或换机器前后的当前状态交接见 [docs/reinstall-handoff.md](docs/reinstall-handoff.md)。
 
@@ -35,7 +35,7 @@
 - 群成员回复机器人投递出去的广播消息时，机器人会按发送任务记录通知原广播操作人和宿主。
 - 广播替换在后台管理中维护，可开启/关闭、直接上传替换图片或填写图片 URL/file_id，并设置替换文字；它只作用于单群发送被群成员回复后的原投递消息。
 - 群内直接发送单个 TRC20 地址时，首次出现会回复 USDT 防篡改核对图、创建时间、USDT/TRX 余额和验证次数；同一群后续再次发送相同地址，会回复验证次数、上次发送人和本次发送人。
-- 地址监听：普通用户私聊最多可监听 2 个 TRC20 地址；宿主、默认操作人、一级操作人和下级操作人不受这个数量限制。私聊点击 `🔔地址监听` 打开按钮面板，可按钮式设置地址、删除地址、设置备注、设置最小提醒金额；USDT 监听只支持 TRC20，收入/支出/TRX 通知可单独开关。
+- 地址监听：普通用户私聊最多可监听 2 个 TRC20 地址；只有宿主、`DEFAULT_OPERATOR_USER_IDS` 和 active `global_operators` 不受数量限制，单群 `operators` 不获得私聊全局资格。私聊点击 `🔔地址监听` 打开按钮面板，可设置地址、删除地址、备注、最小提醒金额以及 USDT 收入/支出方向。TRX 地址余额查询仍可用，但当前链源没有真实 TRX 事件通知，因此 UI 不展示 TRX 通知开关。
 - TRC20 USDT 交易提醒：收入显示出账地址和入账监听地址，支出显示出账监听地址和入账地址；地址可点按/长按复制，交易哈希可点击跳转 Tronscan。
 - 群内地址验证按单群单地址累计次数，不需要后台提前配置。
 - `查询Txxxx` 可查询 TRX 地址，返回 TRX/USDT 余额、创建时间、活跃时间、权限和最近 USDT 流水；私聊直接发送 T 地址也可以查询。
@@ -186,6 +186,8 @@ CHAIN_WATCHER_TRONSCAN_API_KEYS=key1,key2,key3
 CHAIN_WATCHER_TRONSCAN_API_KEY=
 CHAIN_WATCHER_TRON_API_KEY=
 CHAIN_WATCHER_SOURCE_POLL_SECONDS=1
+CHAIN_WATCHER_MAIN_SCAN_TIMEOUT_MS=3000
+CHAIN_WATCHER_MAIN_MAX_INFLIGHT_ROUNDS=3
 CHAIN_WATCHER_GLOBAL_SCAN_PAGES=3
 CHAIN_WATCHER_GLOBAL_EXPAND_PAGE_LIMIT=20
 CHAIN_WATCHER_CATCHUP_ENABLED=true
@@ -211,9 +213,11 @@ watcher 有两种部署模式：
 
 普通用户私聊点击 `🔔地址监听` 后，最多可添加 2 个监听地址；只有宿主、`DEFAULT_OPERATOR_USER_IDS` 和 active `global_operators` 不受数量限制，单群 `operators` 不获得该资格。面板按钮支持添加监听地址、设置备注和最小提醒金额。最小提醒金额表示小于这个数的 USDT 交易不提醒，设置 `0` 表示不限制。
 
-机器人保存监听地址、tx_hash 去重和 Telegram outbox；watcher 负责统一链上数据入口、统一解析、按多机器人订阅匹配和短期事件队列。机器人配置了 `CHAIN_WATCHER_URL`、`CHAIN_WATCHER_BOT_ID`、`CHAIN_WATCHER_SECRET` 后，默认停用本机地址监听轮询，改为注册订阅并每秒领取 watcher matched events。同一笔交易仍按 `owner + address + tx_hash + direction` 去重，不会重复提醒。
+机器人保存监听地址、event identity 去重和 Telegram outbox；watcher 负责统一链上数据入口、统一解析、按多机器人订阅匹配和短期事件队列。机器人配置了 `CHAIN_WATCHER_URL`、`CHAIN_WATCHER_BOT_ID`、`CHAIN_WATCHER_SECRET` 后，默认停用本机地址监听轮询，改为注册订阅并每秒领取 watcher matched events。事件身份优先使用 `tx_hash + event/log index + contract`，缺少 index 时使用稳定 fingerprint，支持同一交易内多个 Transfer 且不会因 realtime/catch-up/fallback 重叠而重复提醒。
 
-`/healthz` 只表示 watcher 进程存活；`/readyz` 和 `/status` 会暴露链源是否可用、最近全局扫描成功时间、429 backoff、pending/claim lag 和 retention 清理统计。`/status` 的 `global`/`address` 还包含最近扫描的 `api_wait_ms`、`api_fetch_ms`、`parse_ms`、`match_ms`、`write_ms`、`api_call_count`、`page_count`、`overlap_skipped` 和最近 5 轮摘要，便于判断延迟和 API 调用量。bot 自动 fallback 依据 `/readyz` 的链源状态，不把“没有新交易”误判为故障。
+`/healthz` 只表示 watcher 进程存活；`/readyz` 综合链源新鲜度、连续 watermark 和未闭合 gap，cursor 未建立时明确显示 `catchup_lag_unknown=true`。`/status` 受 `CHAIN_WATCHER_ADMIN_TOKEN` 保护，包含 round ID、最多 3 个在途主轮次、分段耗时、429/key 状态、pending/claim lag、gap 和 retention 统计；最近轮次明细有界保存，分钟聚合保留 72 小时。bot 自动 fallback 依据 `/readyz` 的链源状态，不把“没有新交易”误判为故障。
+
+主扫描仍固定每秒一轮、每轮最新 3 页。`CHAIN_WATCHER_MAIN_SCAN_TIMEOUT_MS=3000` 是独立 API deadline，不再由 1 秒轮询间隔乘系数推导；`CHAIN_WATCHER_MAIN_MAX_INFLIGHT_ROUNDS=3` 允许慢轮次有界流水并发。成功页会立即落库，失败页形成持久化、带 lease generation 的精确 gap；高优先扩页和低优先时间窗补偿不按监听地址发请求，低优先任务会给下一秒实时 deadline 让路。
 
 自动 fallback 使用 `PRIMARY -> FAILOVER_PENDING -> FALLBACK_ACTIVE -> RECOVERING` 状态机；watcher 连续异常 3 秒后，多个 bot 通过 PostgreSQL lease 只选出一个无 Key公共扫描 leader。leader 每轮同 cutoff 扫最新 3 页并使用共享锚点/事件幂等，429 时按 1/2/3/5/10 秒退避；不再按 600 秒强制停止。watcher 恢复并补齐共享 cursor，ready/claim 连续成功且 lag 归零后才释放 lease。未配置共享 DSN 时明确 DEGRADED，不会退回每 bot 逐地址扫描。
 

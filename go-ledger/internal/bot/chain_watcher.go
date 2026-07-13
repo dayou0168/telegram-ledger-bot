@@ -2,6 +2,8 @@ package bot
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -87,6 +89,17 @@ func (b *Bot) syncAllChainWatcherSubscriptions(ctx context.Context) {
 	}
 	if err := b.watcher.SyncSubscriptions(ctx, targets); err != nil {
 		log.Printf("sync chain watcher subscriptions: %v", err)
+		if b.fallbackStore != nil {
+			subs := make([]storage.ChainWatcherSubscription, 0, len(targets))
+			for _, target := range targets {
+				subs = append(subs, b.sharedSubscription(target))
+			}
+			if mirrorErr := b.fallbackStore.ReplaceChainWatcherSubscriptions(ctx, b.cfg.ChainWatcherBotID, subs, time.Now()); mirrorErr != nil {
+				log.Printf("mirror chain watcher subscriptions to shared fallback DB: %v", mirrorErr)
+				return
+			}
+			b.fallbackSubCache.Delete("all")
+		}
 	} else {
 		b.fallbackSubCache.Delete("all")
 	}
@@ -99,6 +112,13 @@ func (b *Bot) syncChainWatcherTargetAsync(ctx context.Context, target storage.Wa
 	b.dispatcher.Submit(ctx, "chain-watcher-sync", b.chainPool, func(jobCtx context.Context) {
 		if err := b.watcher.UpsertSubscription(jobCtx, target); err != nil {
 			log.Printf("sync chain watcher target %s: %v", target.Address, err)
+			if b.fallbackStore != nil {
+				if mirrorErr := b.fallbackStore.UpsertChainWatcherSubscription(jobCtx, b.sharedSubscription(target), time.Now()); mirrorErr != nil {
+					log.Printf("mirror chain watcher target %s to shared fallback DB: %v", target.Address, mirrorErr)
+					return
+				}
+				b.fallbackSubCache.Delete("all")
+			}
 		} else {
 			b.fallbackSubCache.Delete("all")
 		}
@@ -112,9 +132,24 @@ func (b *Bot) deleteChainWatcherSubscriptionAsync(ctx context.Context, owner int
 	b.dispatcher.Submit(ctx, "chain-watcher-sync", b.chainPool, func(jobCtx context.Context) {
 		if err := b.watcher.DeleteSubscription(jobCtx, owner, address); err != nil {
 			log.Printf("delete chain watcher target %s: %v", address, err)
+			if b.fallbackStore != nil {
+				if mirrorErr := b.fallbackStore.RemoveChainWatcherSubscription(jobCtx, b.cfg.ChainWatcherBotID, owner, owner, address, time.Now()); mirrorErr != nil {
+					log.Printf("mirror chain watcher target delete %s to shared fallback DB: %v", address, mirrorErr)
+					return
+				}
+				b.fallbackSubCache.Delete("all")
+			}
 		} else {
 			b.fallbackSubCache.Delete("all")
 		}
+	})
+}
+
+func (b *Bot) sharedSubscription(target storage.WatchTarget) storage.ChainWatcherSubscription {
+	return chainwatcher.ToSubscription(b.cfg.ChainWatcherBotID, chainwatcher.SubscriptionRequest{
+		ChatID: target.OwnerUserID, OwnerUserID: target.OwnerUserID, Address: target.Address,
+		Label: target.Label, WatchIncome: target.WatchIncome, WatchExpense: target.WatchExpense,
+		NotifyTRX: false, MinNotifyAmount: target.MinNotifyAmount, BaselineTimestamp: target.BaselineTimestamp,
 	})
 }
 
@@ -164,10 +199,14 @@ func (b *Bot) pollChainWatcherEvents(ctx context.Context) (chainWatcherPollTimin
 		timing.NotifyDuration += notificationTiming.NotifyDuration
 		timing.OutboxDuration += notificationTiming.OutboxDuration
 		timing.GatewayDuration += notificationTiming.GatewayDuration
+		trace := outboxTrace(fmt.Sprintf("chain:%d:%s:%s:%s", event.OwnerUserID, event.WatchAddress, event.EventID, event.Direction))
 		if err != nil {
-			log.Printf("process chain watcher event %s: %v", event.DeliveryID, err)
+			log.Printf("chain watcher delivery timing: trace=%s status=failed notify_ms=%d outbox_ms=%d gateway_kick_ms=%d error=%v",
+				trace, notificationTiming.NotifyDuration.Milliseconds(), notificationTiming.OutboxDuration.Milliseconds(), notificationTiming.GatewayDuration.Milliseconds(), err)
 			continue
 		}
+		log.Printf("chain watcher delivery timing: trace=%s status=queued notify_ms=%d outbox_ms=%d gateway_kick_ms=%d",
+			trace, notificationTiming.NotifyDuration.Milliseconds(), notificationTiming.OutboxDuration.Milliseconds(), notificationTiming.GatewayDuration.Milliseconds())
 		acked = append(acked, event.DeliveryID)
 	}
 	timing.AckedCount = len(acked)
@@ -206,7 +245,7 @@ func (b *Bot) checkChainWatcherHealth(ctx context.Context) {
 
 func (b *Bot) recordChainWatcherFailure(source string) {
 	if b.watcherFallback.recordFailure(source, time.Now()) {
-		log.Printf("chain watcher %s failed repeatedly; enabling temporary no-key fallback", source)
+		log.Printf("chain watcher %s failed repeatedly; requesting shared fallback lease", source)
 	}
 }
 
@@ -222,12 +261,16 @@ func (b *Bot) pollFallbackIfActive(ctx context.Context) {
 	}
 	state := b.watcherFallback.snapshot(time.Now())
 	if state.Mode == fallbackModePrimary {
+		b.fallbackLeaderActive.Store(false)
 		if b.fallbackStore != nil {
 			_ = b.fallbackStore.ReleaseChainWatcherFallbackLease(ctx, "public-no-key", b.cfg.BotFallbackInstanceID, string(state.Mode), time.Now())
 		}
 		return
 	}
-	if state.Mode != fallbackModeActive && state.Mode != fallbackModeRecovery {
+	if state.Mode != fallbackModePending && state.Mode != fallbackModeActive && state.Mode != fallbackModeRecovery {
+		return
+	}
+	if state.Mode == fallbackModePending && !state.LeaseRequested {
 		return
 	}
 	if b.fallbackStore == nil || b.cfg.BotFallbackInstanceID == "" {
@@ -246,8 +289,14 @@ func (b *Bot) pollFallbackIfActive(ctx context.Context) {
 			return
 		}
 		if !leader {
+			b.fallbackLeaderActive.Store(false)
 			_ = lease
 			return
+		}
+		b.watcherFallback.activateLease(time.Now())
+		state = b.watcherFallback.snapshot(time.Now())
+		if b.fallbackLeaderActive.CompareAndSwap(false, true) {
+			log.Printf("shared no-key fallback active: lease acquired by this instance")
 		}
 		b.fallbackTron.ProbeDueKeys(jobCtx, b.cfg.USDTContract)
 		stats, err := b.pollSharedGlobalFallback(jobCtx)
@@ -300,6 +349,11 @@ type sharedFallbackScanStats struct {
 
 func (b *Bot) pollSharedGlobalFallback(ctx context.Context) (sharedFallbackScanStats, error) {
 	var stats sharedFallbackScanStats
+	if handled, err := b.processOneFallbackGap(ctx); err != nil {
+		return stats, err
+	} else if handled {
+		return stats, nil
+	}
 	subs, err := b.fallbackSubscriptions(ctx)
 	if err != nil {
 		return stats, err
@@ -331,51 +385,102 @@ func (b *Bot) pollSharedGlobalFallback(ctx context.Context) (sharedFallbackScanS
 		return stats, err
 	}
 	newAnchor, anchorFound := chainwatcher.AnchorCoverage(fetch.Transfers, head.TxHash)
-	if err := b.fallbackStore.AdvanceChainWatcherFallbackHead(ctx, cutoff, newAnchor, now); err != nil {
-		return stats, err
-	}
-	if !anchorFound && head.TxHash != "" && b.fallbackExpandRunning.CompareAndSwap(false, true) {
-		go func() {
-			defer b.fallbackExpandRunning.Store(false)
-			expandCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			if !b.pollFallbackExpand(expandCtx, head.TxHash, minTimestamp, cutoff, byAddress) {
-				watermark, err := b.fallbackStore.GetChainWatcherWatermark(expandCtx)
-				if watermark.Timestamp <= 0 {
-					watermark.Timestamp = minTimestamp
-				}
-				if err == nil && watermark.Timestamp < cutoff-2000 {
-					budget := 3
-					advanced, _, _, _ := b.scanSharedFallbackWindow(expandCtx, watermark.Timestamp, cutoff-2000, byAddress, &budget)
-					if advanced > watermark.Timestamp {
-						_ = b.fallbackStore.AdvanceChainWatcherWatermark(expandCtx, advanced, "", "fallback", time.Now())
-					}
-				}
-			}
-		}()
+	if head.TxHash == "" || anchorFound {
+		if err := b.fallbackStore.AdvanceChainWatcherFallbackHead(ctx, cutoff, newAnchor, now); err != nil {
+			return stats, err
+		}
+	} else {
+		_, err := b.fallbackStore.EnqueueChainWatcherGap(ctx, storage.ChainWatcherGapTask{
+			Kind: "expand", Source: "fallback", Priority: 0, Reason: "fallback_anchor_missing",
+			FromTimestamp: minTimestamp, ToTimestamp: cutoff, StartPage: 3, EndPage: 20,
+			NextPage: 3, AnchorEventID: head.TxHash, HeadEventID: newAnchor,
+		}, now)
+		if err != nil {
+			return stats, err
+		}
 	}
 	return stats, nil
 }
 
-func (b *Bot) pollFallbackExpand(ctx context.Context, anchor string, minTimestamp, cutoff int64, byAddress map[string][]storage.ChainWatcherSubscription) bool {
-	for page := 3; page < 20; page++ {
-		fetch, err := b.fallbackTron.FetchGlobalUSDTTransfersRangeWithMetrics(ctx, b.cfg.USDTContract, minTimestamp, cutoff, page, 1)
-		if err != nil {
-			return false
-		}
-		if err := b.processSharedFallbackTransfers(ctx, fetch.Transfers, byAddress); err != nil {
-			return false
-		}
-		for _, transfer := range fetch.Transfers {
-			if chainwatcher.EventID(transfer) == anchor {
-				return true
-			}
-		}
-		if len(fetch.Transfers) < 50 {
-			return false
+func (b *Bot) processOneFallbackGap(ctx context.Context) (bool, error) {
+	task, ok, err := b.fallbackStore.ClaimChainWatcherGap(ctx, b.cfg.BotFallbackInstanceID, "fallback", b.cfg.BotFallbackLeaseTTL, time.Now())
+	if err != nil || !ok {
+		return false, err
+	}
+	subs, err := b.fallbackSubscriptions(ctx)
+	if err != nil {
+		_, _ = b.fallbackStore.ReleaseChainWatcherGap(ctx, task.ID, task.LeaseGeneration, task.LeaseOwner, err.Error(), time.Now())
+		return true, err
+	}
+	byAddress := make(map[string][]storage.ChainWatcherSubscription, len(subs))
+	for _, sub := range subs {
+		byAddress[sub.Address] = append(byAddress[sub.Address], sub)
+	}
+	page := task.NextPage
+	if page < task.StartPage {
+		page = task.StartPage
+	}
+	fetch, fetchErr := b.fallbackTron.FetchGlobalUSDTTransfersRangeWithMetrics(ctx, b.cfg.USDTContract, task.FromTimestamp, task.ToTimestamp, page, 1)
+	if fetchErr != nil {
+		_, _ = b.fallbackStore.ReleaseChainWatcherGap(ctx, task.ID, task.LeaseGeneration, task.LeaseOwner, fetchErr.Error(), time.Now())
+		return true, fetchErr
+	}
+	if err := b.processSharedFallbackTransfers(ctx, fetch.Transfers, byAddress); err != nil {
+		_, _ = b.fallbackStore.ReleaseChainWatcherGap(ctx, task.ID, task.LeaseGeneration, task.LeaseOwner, err.Error(), time.Now())
+		return true, err
+	}
+	anchorFound := false
+	for _, transfer := range fetch.Transfers {
+		if chainwatcher.EventID(transfer) == task.AnchorEventID {
+			anchorFound = true
 		}
 	}
-	return false
+	if task.Kind == "expand" && anchorFound {
+		return true, b.completeFallbackGap(ctx, task)
+	}
+	full := len(fetch.Transfers) >= 50
+	next := page + 1
+	if full && next < task.EndPage {
+		_, err = b.fallbackStore.YieldChainWatcherGap(ctx, task.ID, task.LeaseGeneration, task.LeaseOwner, next, "", time.Now())
+		return true, err
+	}
+	if task.Kind == "expand" {
+		completed, completeErr := b.fallbackStore.CompleteChainWatcherGap(ctx, task.ID, task.LeaseGeneration, task.LeaseOwner, time.Now())
+		if completeErr != nil || !completed {
+			return true, completeErr
+		}
+		_, err = b.fallbackStore.EnqueueChainWatcherGap(ctx, storage.ChainWatcherGapTask{
+			Kind: "window", Source: "fallback", Priority: 1, Reason: "fallback_expand_exhausted",
+			FromTimestamp: task.FromTimestamp, ToTimestamp: task.ToTimestamp,
+			StartPage: 0, EndPage: 20, NextPage: 0, HeadEventID: task.HeadEventID,
+		}, time.Now())
+		return true, err
+	}
+	if full && task.ToTimestamp-task.FromTimestamp > 1 {
+		middle := task.FromTimestamp + (task.ToTimestamp-task.FromTimestamp)/2
+		_, err = b.fallbackStore.SplitChainWatcherGapWindow(ctx, task, middle, time.Now())
+		return true, err
+	}
+	if full {
+		_, err = b.fallbackStore.ReleaseChainWatcherGap(ctx, task.ID, task.LeaseGeneration, task.LeaseOwner, "page_limit_at_minimum_window", time.Now())
+		if err == nil {
+			err = errors.New("fallback gap page limit reached at minimum time window")
+		}
+		return true, err
+	}
+	return true, b.completeFallbackGap(ctx, task)
+}
+
+func (b *Bot) completeFallbackGap(ctx context.Context, task storage.ChainWatcherGapTask) error {
+	completed, err := b.fallbackStore.CompleteChainWatcherGap(ctx, task.ID, task.LeaseGeneration, task.LeaseOwner, time.Now())
+	if err != nil || !completed {
+		return err
+	}
+	open, err := b.fallbackStore.CountOpenChainWatcherGaps(ctx, "fallback", time.Now())
+	if err != nil || open != 0 {
+		return err
+	}
+	return b.fallbackStore.AdvanceChainWatcherFallbackHead(ctx, task.ToTimestamp, task.HeadEventID, time.Now())
 }
 
 func (b *Bot) recordFallbackPollResult(err error) {
@@ -392,45 +497,6 @@ func (b *Bot) recordFallbackPollResult(err error) {
 		delay = steps[step]
 	}
 	b.fallbackNextPoll.Store(time.Now().Add(delay).UnixNano())
-}
-
-func (b *Bot) scanSharedFallbackWindow(ctx context.Context, from, to int64, byAddress map[string][]storage.ChainWatcherSubscription, budget *int) (int64, int64, int64, error) {
-	if to <= from || budget == nil || *budget <= 0 {
-		return from, 0, 0, nil
-	}
-	pages := b.cfg.BotFallbackGlobalPages
-	if pages > *budget {
-		pages = *budget
-	}
-	fetch, err := b.fallbackTron.FetchGlobalUSDTTransfersWindowWithMetrics(ctx, b.cfg.USDTContract, from, to, pages)
-	requests := int64(fetch.Metrics.Calls)
-	*budget -= fetch.Metrics.Calls
-	rateLimits := int64(0)
-	if _, limited := tron.IsRateLimited(err); limited {
-		rateLimits = 1
-	}
-	if err != nil {
-		return from, requests, rateLimits, err
-	}
-	if processErr := b.processSharedFallbackTransfers(ctx, fetch.Transfers, byAddress); processErr != nil {
-		return from, requests, rateLimits, processErr
-	}
-	saturated := fetch.Metrics.Pages >= pages && fetch.Metrics.LastPageRows >= 50
-	if !saturated {
-		return to, requests, rateLimits, nil
-	}
-	if to-from <= 1000 || *budget <= 0 {
-		return from, requests, rateLimits, nil
-	}
-	middle := from + (to-from)/2
-	leftTo, leftRequests, left429, leftErr := b.scanSharedFallbackWindow(ctx, from, middle, byAddress, budget)
-	requests += leftRequests
-	rateLimits += left429
-	if leftErr != nil || leftTo < middle || *budget <= 0 {
-		return leftTo, requests, rateLimits, leftErr
-	}
-	rightTo, rightRequests, right429, rightErr := b.scanSharedFallbackWindow(ctx, middle, to, byAddress, budget)
-	return rightTo, requests + rightRequests, rateLimits + right429, rightErr
 }
 
 func (b *Bot) processSharedFallbackTransfers(ctx context.Context, transfers []tron.Transfer, byAddress map[string][]storage.ChainWatcherSubscription) error {
@@ -521,13 +587,16 @@ type watcherFallbackController struct {
 	recoveryThreshold  int
 	lagThreshold       time.Duration
 	mode               fallbackMode
-	failures           int
-	firstFailureAt     time.Time
+	readyFailures      int
+	claimFailures      int
+	firstReadyFailure  time.Time
+	firstClaimFailure  time.Time
 	readySuccesses     int
 	claimSuccesses     int
 	watcherLag         time.Duration
 	startedAt          time.Time
 	lastWatcherSuccess time.Time
+	leaseRequested     bool
 }
 
 type notificationTiming struct {
@@ -588,36 +657,60 @@ func (c *watcherFallbackController) recordFailure(source string, now time.Time) 
 	if c.mode == fallbackModeDegraded {
 		return false
 	}
-	c.readySuccesses = 0
-	c.claimSuccesses = 0
-	c.failures++
-	if c.firstFailureAt.IsZero() {
-		c.firstFailureAt = now
+	if source == "ready" {
+		c.readyFailures++
+		c.readySuccesses = 0
+		if c.firstReadyFailure.IsZero() {
+			c.firstReadyFailure = now
+		}
+	} else {
+		c.claimFailures++
+		c.claimSuccesses = 0
+		if c.firstClaimFailure.IsZero() {
+			c.firstClaimFailure = now
+		}
 	}
 	if c.mode == fallbackModePrimary {
 		c.mode = fallbackModePending
-		return true
+		return false
 	}
 	if c.mode == fallbackModeRecovery {
 		c.mode = fallbackModeActive
 		return true
 	}
-	if c.mode == fallbackModeActive || c.failures < c.failThreshold || now.Sub(c.firstFailureAt) < 3*time.Second {
+	readyFailed := c.readyFailures >= c.failThreshold && !c.firstReadyFailure.IsZero() && now.Sub(c.firstReadyFailure) >= 3*time.Second
+	claimFailed := c.claimFailures >= c.failThreshold && !c.firstClaimFailure.IsZero() && now.Sub(c.firstClaimFailure) >= 3*time.Second
+	if c.mode == fallbackModeActive || (!readyFailed && !claimFailed) {
 		return false
+	}
+	c.leaseRequested = true
+	return true
+}
+
+func (c *watcherFallbackController) activateLease(now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.mode != fallbackModePending || !c.leaseRequested {
+		return
 	}
 	c.mode = fallbackModeActive
 	c.startedAt = now
-	return true
 }
 
 func (c *watcherFallbackController) recordSuccess(source string, now time.Time, lag time.Duration) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.lastWatcherSuccess = now
-	c.failures = 0
-	c.firstFailureAt = time.Time{}
-	if c.mode == fallbackModePending {
+	if source == "ready" {
+		c.lastWatcherSuccess = now
+		c.readyFailures = 0
+		c.firstReadyFailure = time.Time{}
+	} else {
+		c.claimFailures = 0
+		c.firstClaimFailure = time.Time{}
+	}
+	if c.mode == fallbackModePending && c.readyFailures == 0 && c.claimFailures == 0 {
 		c.mode = fallbackModePrimary
+		c.leaseRequested = false
 		return true
 	}
 	if c.mode == fallbackModeActive || c.mode == fallbackModeDegraded {
@@ -640,12 +733,13 @@ func (c *watcherFallbackController) recordSuccess(source string, now time.Time, 
 	}
 	c.mode = fallbackModePrimary
 	c.startedAt = time.Time{}
+	c.leaseRequested = false
 	return true
 }
 
 func (c *watcherFallbackController) active(now time.Time) bool {
-	mode := c.snapshot(now).Mode
-	return mode == fallbackModeActive || mode == fallbackModeRecovery
+	state := c.snapshot(now)
+	return (state.Mode == fallbackModePending && state.LeaseRequested) || state.Mode == fallbackModeActive || state.Mode == fallbackModeRecovery
 }
 
 func (c *watcherFallbackController) setDegraded() {
@@ -659,10 +753,11 @@ type fallbackStateSnapshot struct {
 	StartedAt          time.Time
 	LastWatcherSuccess time.Time
 	Exhausted          bool
+	LeaseRequested     bool
 }
 
 func (c *watcherFallbackController) snapshot(now time.Time) fallbackStateSnapshot {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return fallbackStateSnapshot{Mode: c.mode, StartedAt: c.startedAt, LastWatcherSuccess: c.lastWatcherSuccess, Exhausted: c.mode == fallbackModeDegraded}
+	return fallbackStateSnapshot{Mode: c.mode, StartedAt: c.startedAt, LastWatcherSuccess: c.lastWatcherSuccess, Exhausted: c.mode == fallbackModeDegraded, LeaseRequested: c.leaseRequested}
 }

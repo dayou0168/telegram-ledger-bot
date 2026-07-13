@@ -56,8 +56,15 @@ type FetchMetrics struct {
 }
 
 type TransferFetchResult struct {
-	Transfers []Transfer
-	Metrics   FetchMetrics
+	Transfers       []Transfer
+	Metrics         FetchMetrics
+	SuccessfulPages []int
+	FailedPages     []PageFailure
+}
+
+type PageFailure struct {
+	Page  int
+	Error string
 }
 
 type RequestMetrics struct {
@@ -270,8 +277,14 @@ func (c *Client) fetchGlobalUSDTTransfersWindowWithMetrics(ctx context.Context, 
 		result.Metrics.addRequest(pageResult.metrics)
 		result.Metrics.Pages++
 		result.Metrics.LastPageRows = pageResult.rows
-		if pageResult.err != nil && err == nil {
-			err = pageResult.err
+		absolutePage := startPage + pageResult.page
+		if pageResult.err != nil {
+			result.FailedPages = append(result.FailedPages, PageFailure{Page: absolutePage, Error: pageResult.err.Error()})
+			if err == nil {
+				err = pageResult.err
+			}
+		} else {
+			result.SuccessfulPages = append(result.SuccessfulPages, absolutePage)
 		}
 		for _, transfer := range pageResult.transfers {
 			key := TransferIdentity(transfer)
@@ -468,7 +481,7 @@ func (c *Client) getTimedWithLeaseLimit(ctx context.Context, path string, values
 		c.keys.endRequest(*lease, source)
 		metrics.APIDuration += time.Since(apiStarted)
 		if err != nil {
-			_ = c.keys.report(ctx, *lease, 0, err.Error(), 0, time.Now())
+			c.reportKeyResult(*lease, 0, err.Error(), 0)
 			lastKeyError = err
 			if failoverCount >= maxFailovers {
 				return metrics, err
@@ -486,11 +499,11 @@ func (c *Client) getTimedWithLeaseLimit(ctx context.Context, path string, values
 		raw, readErr := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if readErr != nil {
-			_ = c.keys.report(ctx, *lease, 0, readErr.Error(), 0, time.Now())
+			c.reportKeyResult(*lease, 0, readErr.Error(), 0)
 			return metrics, readErr
 		}
 		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
-		_ = c.keys.report(ctx, *lease, resp.StatusCode, string(raw), retryAfter, time.Now())
+		c.reportKeyResult(*lease, resp.StatusCode, string(raw), retryAfter)
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			httpErr := &HTTPError{StatusCode: resp.StatusCode, Body: string(raw), RetryAfter: retryAfter}
 			lastKeyError = httpErr
@@ -519,6 +532,12 @@ func (c *Client) getTimedWithLeaseLimit(ctx context.Context, path string, values
 		failover = false
 		return metrics, nil
 	}
+}
+
+func (c *Client) reportKeyResult(lease apiKeyLease, status int, body string, retryAfter time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = c.keys.report(ctx, lease, status, body, retryAfter, time.Now())
 }
 
 func parseRetryAfter(raw string, now time.Time) time.Duration {

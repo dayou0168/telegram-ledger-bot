@@ -49,14 +49,15 @@ func (c *Client) Enabled() bool {
 
 func (c *Client) UpsertSubscription(ctx context.Context, target storage.WatchTarget) error {
 	req := chainwatcher.SubscriptionRequest{
-		ChatID:          target.OwnerUserID,
-		OwnerUserID:     target.OwnerUserID,
-		Address:         target.Address,
-		Label:           target.Label,
-		MinNotifyAmount: target.MinNotifyAmount,
-		WatchIncome:     target.WatchIncome,
-		WatchExpense:    target.WatchExpense,
-		NotifyTRX:       target.NotifyTRX,
+		ChatID:            target.OwnerUserID,
+		OwnerUserID:       target.OwnerUserID,
+		Address:           target.Address,
+		Label:             target.Label,
+		MinNotifyAmount:   target.MinNotifyAmount,
+		WatchIncome:       target.WatchIncome,
+		WatchExpense:      target.WatchExpense,
+		NotifyTRX:         false,
+		BaselineTimestamp: target.BaselineTimestamp,
 	}
 	return c.post(ctx, "/v1/subscriptions/upsert", req, nil)
 }
@@ -70,14 +71,15 @@ func (c *Client) SyncSubscriptions(ctx context.Context, targets []storage.WatchT
 	req := chainwatcher.SyncRequest{Subscriptions: make([]chainwatcher.SubscriptionRequest, 0, len(targets))}
 	for _, target := range targets {
 		req.Subscriptions = append(req.Subscriptions, chainwatcher.SubscriptionRequest{
-			ChatID:          target.OwnerUserID,
-			OwnerUserID:     target.OwnerUserID,
-			Address:         target.Address,
-			Label:           target.Label,
-			MinNotifyAmount: target.MinNotifyAmount,
-			WatchIncome:     target.WatchIncome,
-			WatchExpense:    target.WatchExpense,
-			NotifyTRX:       target.NotifyTRX,
+			ChatID:            target.OwnerUserID,
+			OwnerUserID:       target.OwnerUserID,
+			Address:           target.Address,
+			Label:             target.Label,
+			MinNotifyAmount:   target.MinNotifyAmount,
+			WatchIncome:       target.WatchIncome,
+			WatchExpense:      target.WatchExpense,
+			NotifyTRX:         false,
+			BaselineTimestamp: target.BaselineTimestamp,
 		})
 	}
 	return c.post(ctx, "/v1/subscriptions/sync", req, nil)

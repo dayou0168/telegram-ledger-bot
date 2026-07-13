@@ -4,6 +4,9 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/config"
+	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
 )
 
 func TestWatcherFallbackControllerStateMachineAndRecovery(t *testing.T) {
@@ -18,9 +21,15 @@ func TestWatcherFallbackControllerStateMachineAndRecovery(t *testing.T) {
 	if mode := controller.snapshot(now.Add(time.Second)).Mode; mode != fallbackModePending {
 		t.Fatalf("second failure mode = %s, want pending", mode)
 	}
+	controller.recordFailure("ready", now.Add(2*time.Second))
 	controller.recordFailure("ready", now.Add(3*time.Second))
+	state := controller.snapshot(now.Add(3 * time.Second))
+	if state.Mode != fallbackModePending || !state.LeaseRequested {
+		t.Fatalf("fallback before lease = %+v, want pending lease request", state)
+	}
+	controller.activateLease(now.Add(3 * time.Second))
 	if mode := controller.snapshot(now.Add(time.Hour)).Mode; mode != fallbackModeActive {
-		t.Fatalf("long-running fallback mode = %s, want active", mode)
+		t.Fatalf("fallback after lease = %s, want active", mode)
 	}
 
 	controller.recordSuccess("ready", now.Add(time.Hour+time.Second), time.Second)
@@ -38,6 +47,16 @@ func TestWatcherFallbackControllerStateMachineAndRecovery(t *testing.T) {
 	}
 	if mode := controller.snapshot(now.Add(time.Hour + 5*time.Second)).Mode; mode != fallbackModePrimary {
 		t.Fatalf("recovered mode = %s, want primary", mode)
+	}
+}
+
+func TestSharedSubscriptionPreservesBaselineAndDisablesUnsupportedTRX(t *testing.T) {
+	bot := &Bot{cfg: config.Config{ChainWatcherBotID: "bot-a"}}
+	sub := bot.sharedSubscription(storage.WatchTarget{
+		OwnerUserID: 10, Address: "TAddress", WatchIncome: true, NotifyTRX: true, BaselineTimestamp: 1234,
+	})
+	if sub.BotID != "bot-a" || sub.ChatID != 10 || sub.BaselineTimestamp != 1234 || sub.NotifyTRX {
+		t.Fatalf("shared subscription = %+v", sub)
 	}
 }
 
@@ -71,5 +90,25 @@ func TestWatcherFallbackControllerEmptySuccessfulClaimsDoNotFail(t *testing.T) {
 	}
 	if mode := controller.snapshot(now.Add(10 * time.Second)).Mode; mode != fallbackModePrimary {
 		t.Fatalf("empty successful claims mode = %s, want primary", mode)
+	}
+}
+
+func TestWatcherFallbackReadyAndClaimFailuresRecoverIndependently(t *testing.T) {
+	now := time.Unix(3000, 0)
+	controller := newWatcherFallbackControllerWithRecovery(3, 2, 5*time.Second)
+	controller.recordFailure("claim", now)
+	controller.recordFailure("claim", now.Add(2*time.Second))
+	controller.recordFailure("claim", now.Add(3*time.Second))
+	if !controller.snapshot(now.Add(3 * time.Second)).LeaseRequested {
+		t.Fatal("claim failures did not request fallback lease")
+	}
+	controller.recordSuccess("ready", now.Add(4*time.Second), 0)
+	state := controller.snapshot(now.Add(4 * time.Second))
+	if state.Mode != fallbackModePending || !state.LeaseRequested {
+		t.Fatalf("ready success incorrectly cleared claim failure: %+v", state)
+	}
+	controller.recordSuccess("claim", now.Add(5*time.Second), 0)
+	if state := controller.snapshot(now.Add(5 * time.Second)); state.Mode != fallbackModePrimary {
+		t.Fatalf("both sources recovered state = %+v", state)
 	}
 }
