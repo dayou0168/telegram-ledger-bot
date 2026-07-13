@@ -124,6 +124,20 @@ func TestOlderSlowRoundFailureDoesNotOverrideNewerSuccessReadiness(t *testing.T)
 	}
 }
 
+func TestOlderSlowRoundSuccessStaysHistorical(t *testing.T) {
+	now := time.Now()
+	server := NewServer(config.ChainWatcherConfig{PollInterval: time.Second}, nil, nil)
+	server.status.recordScanSuccess("global", scanResult{RoundID: 2, APICallCount: 3}, time.Second, now)
+	server.status.recordHistoricalSuccess("global", scanResult{RoundID: 1, APICallCount: 9}, 3*time.Second, now.Add(time.Millisecond))
+	status := server.status.response(now.Add(time.Second), 5*time.Second, storage.ChainWatcherDeliveryStats{})
+	if status.Global.RoundID != 2 || status.Global.APICallCount != 3 {
+		t.Fatalf("historical success overwrote latest status: %+v", status.Global)
+	}
+	if len(status.Global.Recent) != 2 {
+		t.Fatalf("historical success missing from bounded diagnostics: %+v", status.Global.Recent)
+	}
+}
+
 func TestPartialMainScanCreatesOnlyExactFailedPageGaps(t *testing.T) {
 	tasks := failedPageGapTasks(scanResult{
 		MinTimestamp: 1000, CutoffTimestamp: 2000,
@@ -302,6 +316,22 @@ func TestCatchupOverlapIsCountedSeparately(t *testing.T) {
 	status := server.status.response(time.Now(), time.Second, storage.ChainWatcherDeliveryStats{})
 	if status.Catchup.OverlapSkipped != 1 || status.Catchup.APICallCount != 2 {
 		t.Fatalf("catchup status = %+v", status.Catchup)
+	}
+}
+
+func TestCatchupAllowsAtMostThreeInflightWorkers(t *testing.T) {
+	server := NewServer(config.ChainWatcherConfig{CatchupMaxInflight: 3}, nil, nil)
+	for worker := 0; worker < 3; worker++ {
+		if !server.tryStartScan("catchup") {
+			t.Fatalf("catchup worker %d rejected before limit", worker+1)
+		}
+	}
+	if server.tryStartScan("catchup") {
+		t.Fatal("fourth catchup worker should be rejected")
+	}
+	server.finishScan("catchup")
+	if !server.tryStartScan("catchup") {
+		t.Fatal("catchup slot did not reopen")
 	}
 }
 

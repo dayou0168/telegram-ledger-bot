@@ -112,3 +112,37 @@ func TestWatcherFallbackReadyAndClaimFailuresRecoverIndependently(t *testing.T) 
 		t.Fatalf("both sources recovered state = %+v", state)
 	}
 }
+
+func TestWatcherFallbackLeaseRequestLoggingIsBounded(t *testing.T) {
+	now := time.Unix(4000, 0)
+	controller := newWatcherFallbackControllerWithRecovery(2, 2, 5*time.Second)
+	first := controller.recordFailure("ready", now)
+	if !first.ModeChanged || first.Mode != fallbackModePending {
+		t.Fatalf("first notice = %+v", first)
+	}
+	requested := controller.recordFailure("ready", now.Add(3*time.Second))
+	if !requested.LeaseRequested {
+		t.Fatalf("threshold notice = %+v", requested)
+	}
+	for second := 4; second < 63; second++ {
+		notice := controller.recordFailure("ready", now.Add(time.Duration(second)*time.Second))
+		if notice.LeaseRequested || notice.SuppressedFailures != 0 {
+			t.Fatalf("unexpected per-second lease log at second %d: %+v", second, notice)
+		}
+	}
+	summary := controller.recordFailure("ready", now.Add(63*time.Second))
+	if summary.SuppressedFailures != 60 || summary.LeaseRequested {
+		t.Fatalf("periodic summary = %+v, want 60 suppressed failures", summary)
+	}
+	controller.activateLease(now.Add(63 * time.Second))
+	for second := 64; second < 123; second++ {
+		notice := controller.recordFailure("ready", now.Add(time.Duration(second)*time.Second))
+		if notice.SuppressedFailures != 0 {
+			t.Fatalf("active fallback logged before summary interval at second %d: %+v", second, notice)
+		}
+	}
+	activeSummary := controller.recordFailure("ready", now.Add(123*time.Second))
+	if activeSummary.SuppressedFailures != 60 {
+		t.Fatalf("active fallback summary = %+v, want 60", activeSummary)
+	}
+}

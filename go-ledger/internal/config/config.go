@@ -11,7 +11,7 @@ import (
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/tron"
 )
 
-const Version = "2.4.2"
+const Version = "2.4.3"
 
 type Config struct {
 	TelegramBotToken string
@@ -262,6 +262,7 @@ type ChainWatcherConfig struct {
 	CatchupEnabled          bool
 	CatchupPages            int
 	CatchupMaxRequests      int
+	CatchupMaxInflight      int
 	CatchupWindow           time.Duration
 	CatchupOverlap          time.Duration
 	CatchupMaxRPS           float64
@@ -300,6 +301,7 @@ func LoadChainWatcher() (ChainWatcherConfig, error) {
 		CatchupEnabled:          boolEnv("CHAIN_WATCHER_CATCHUP_ENABLED", true),
 		CatchupPages:            intEnv("CHAIN_WATCHER_CATCHUP_PAGE_LIMIT", 3),
 		CatchupMaxRequests:      intEnv("CHAIN_WATCHER_CATCHUP_MAX_REQUESTS_PER_TICK", 6),
+		CatchupMaxInflight:      intEnv("CHAIN_WATCHER_CATCHUP_MAX_INFLIGHT", 3),
 		CatchupWindow:           secondsEnv("CHAIN_WATCHER_CATCHUP_WINDOW_SECONDS", 30),
 		CatchupOverlap:          secondsEnv("CHAIN_WATCHER_CATCHUP_OVERLAP_SECONDS", 2),
 		CatchupMaxRPS:           floatEnv("CHAIN_WATCHER_CATCHUP_MAX_RPS", 8),
@@ -353,6 +355,12 @@ func LoadChainWatcher() (ChainWatcherConfig, error) {
 	}
 	if cfg.CatchupMaxRequests < 1 {
 		cfg.CatchupMaxRequests = 1
+	}
+	if cfg.CatchupMaxInflight < 1 {
+		cfg.CatchupMaxInflight = 1
+	}
+	if cfg.CatchupMaxInflight > 3 {
+		cfg.CatchupMaxInflight = 3
 	}
 	if cfg.CatchupWindow <= 0 {
 		cfg.CatchupWindow = 30 * time.Second
