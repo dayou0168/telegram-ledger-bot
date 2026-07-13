@@ -276,10 +276,10 @@ func TestAdminGlobalOperatorHierarchyHandlersAndSelectors(t *testing.T) {
 		t.Fatalf("reenable own secondary: status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	assertSelector("reenabled secondary", primarySession, []int64{secondaryID}, nil)
-	if allowed, err := store.HasBroadcastPermissionScope(ctx, secondaryID, "chat", chatID, ""); err != nil || allowed {
-		t.Fatalf("reenable restored chat permission: allowed=%v err=%v", allowed, err)
+	if allowed, err := store.HasBroadcastPermissionScope(ctx, secondaryID, "chat", chatID, ""); err != nil || !allowed {
+		t.Fatalf("reenable did not restore chat permission: allowed=%v err=%v", allowed, err)
 	}
-	if allowed, err := store.HasBroadcastPermissionScope(ctx, secondaryID, "group", 0, groupName); err != nil || allowed {
-		t.Fatalf("reenable restored group permission: allowed=%v err=%v", allowed, err)
+	if allowed, err := store.HasBroadcastPermissionScope(ctx, secondaryID, "group", 0, groupName); err != nil || !allowed {
+		t.Fatalf("reenable did not restore group permission: allowed=%v err=%v", allowed, err)
 	}
 }

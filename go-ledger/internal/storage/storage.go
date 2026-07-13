@@ -19,7 +19,7 @@ type Store struct {
 	keyCipher *keyCipher
 }
 
-const latestSchemaMigrationVersion = "2.4.3"
+const latestSchemaMigrationVersion = "2.4.3-broadcast-permission-restore"
 
 func Open(ctx context.Context, databaseURL string) (*Store, error) {
 	return open(ctx, databaseURL, true)
@@ -475,6 +475,19 @@ func (s *Store) migrate(ctx context.Context) error {
 			created_at TIMESTAMPTZ NOT NULL,
 			PRIMARY KEY(user_id, target, chat_id, group_name)
 		)`,
+		`CREATE TABLE IF NOT EXISTS broadcast_operator_permission_snapshots (
+			user_id BIGINT NOT NULL,
+			target TEXT NOT NULL,
+			chat_id BIGINT NOT NULL DEFAULT 0,
+			group_name TEXT NOT NULL DEFAULT '',
+			granted_by BIGINT NOT NULL DEFAULT 0,
+			original_created_at TIMESTAMPTZ NOT NULL,
+			archived_by BIGINT NOT NULL DEFAULT 0,
+			archived_at TIMESTAMPTZ NOT NULL,
+			PRIMARY KEY(user_id, target, chat_id, group_name)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_broadcast_permission_snapshots_user
+			ON broadcast_operator_permission_snapshots(user_id, target, group_name, chat_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_broadcast_permissions_user
 			ON broadcast_operator_permissions(user_id, target, group_name, chat_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_broadcast_permissions_chat
@@ -493,6 +506,25 @@ func (s *Store) migrate(ctx context.Context) error {
 			INSERT INTO schema_migrations(version, applied_at)
 			VALUES('2.4.2-disabled-global-operator-permissions', NOW())
 			ON CONFLICT(version) DO NOTHING
+			RETURNING 1
+		), archived AS (
+			INSERT INTO broadcast_operator_permission_snapshots(
+				user_id, target, chat_id, group_name, granted_by, original_created_at, archived_by, archived_at
+			)
+			SELECT p.user_id, p.target, p.chat_id, p.group_name, p.granted_by, p.created_at, 0, NOW()
+			FROM broadcast_operator_permissions p
+			CROSS JOIN migration
+			WHERE NOT EXISTS (
+				SELECT 1 FROM global_operators g
+				WHERE g.user_id=p.user_id AND g.status='active' AND g.level IN ('primary', 'secondary')
+			)
+			  AND ((p.target='chat' AND p.chat_id<>0 AND p.group_name='') OR
+			       (p.target='group' AND p.chat_id=0 AND p.group_name<>''))
+			ON CONFLICT(user_id, target, chat_id, group_name) DO UPDATE SET
+				granted_by=excluded.granted_by,
+				original_created_at=excluded.original_created_at,
+				archived_by=excluded.archived_by,
+				archived_at=excluded.archived_at
 			RETURNING 1
 		)
 		DELETE FROM broadcast_operator_permissions p
@@ -519,7 +551,49 @@ func (s *Store) migrate(ctx context.Context) error {
 				ALTER TABLE broadcast_operator_permissions ADD CONSTRAINT broadcast_permissions_user_fkey
 					FOREIGN KEY(user_id) REFERENCES global_operators(user_id) ON DELETE CASCADE;
 			END IF;
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='broadcast_permission_snapshots_target_check' AND conrelid='broadcast_operator_permission_snapshots'::regclass) THEN
+				ALTER TABLE broadcast_operator_permission_snapshots ADD CONSTRAINT broadcast_permission_snapshots_target_check
+					CHECK (target IN ('chat', 'group'));
+			END IF;
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='broadcast_permission_snapshots_shape_check' AND conrelid='broadcast_operator_permission_snapshots'::regclass) THEN
+				ALTER TABLE broadcast_operator_permission_snapshots ADD CONSTRAINT broadcast_permission_snapshots_shape_check
+					CHECK ((target='chat' AND chat_id<>0 AND group_name='') OR
+					       (target='group' AND chat_id=0 AND group_name<>''));
+			END IF;
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='broadcast_permission_snapshots_user_fkey' AND conrelid='broadcast_operator_permission_snapshots'::regclass) THEN
+				ALTER TABLE broadcast_operator_permission_snapshots ADD CONSTRAINT broadcast_permission_snapshots_user_fkey
+					FOREIGN KEY(user_id) REFERENCES global_operators(user_id) ON DELETE CASCADE;
+			END IF;
 		END $$`,
+		`WITH migration AS (
+			INSERT INTO schema_migrations(version, applied_at)
+			VALUES('2.4.3-disabled-broadcast-permission-snapshots', NOW())
+			ON CONFLICT(version) DO NOTHING
+			RETURNING 1
+		), archived AS (
+			INSERT INTO broadcast_operator_permission_snapshots(
+				user_id, target, chat_id, group_name, granted_by, original_created_at, archived_by, archived_at
+			)
+			SELECT p.user_id, p.target, p.chat_id, p.group_name, p.granted_by, p.created_at, 0, NOW()
+			FROM broadcast_operator_permissions p
+			CROSS JOIN migration
+			WHERE NOT EXISTS (
+				SELECT 1 FROM global_operators g
+				WHERE g.user_id=p.user_id AND g.status='active' AND g.level IN ('primary', 'secondary')
+			)
+			ON CONFLICT(user_id, target, chat_id, group_name) DO UPDATE SET
+				granted_by=excluded.granted_by,
+				original_created_at=excluded.original_created_at,
+				archived_by=excluded.archived_by,
+				archived_at=excluded.archived_at
+			RETURNING 1
+		)
+		DELETE FROM broadcast_operator_permissions p
+		USING migration
+		WHERE NOT EXISTS (
+			SELECT 1 FROM global_operators g
+			WHERE g.user_id=p.user_id AND g.status='active' AND g.level IN ('primary', 'secondary')
+		)`,
 		`CREATE TABLE IF NOT EXISTS admin_login_tickets (
 			token_hash TEXT PRIMARY KEY,
 			user_id BIGINT NOT NULL,
@@ -1362,11 +1436,6 @@ func (s *Store) NormalizeGlobalOperatorHierarchy(ctx context.Context, hostUserID
 		WHERE status='active' AND level='primary'`, now); err != nil {
 		return GlobalOperatorHierarchyRepairResult{}, err
 	}
-	if _, err := tx.Exec(ctx, `DELETE FROM broadcast_operator_permissions p
-		USING global_operator_level_repair_candidates c
-		WHERE p.user_id=c.user_id`); err != nil {
-		return GlobalOperatorHierarchyRepairResult{}, err
-	}
 	rows, err := tx.Query(ctx, `SELECT c.user_id, c.original_level, c.original_status,
 		COALESCE(c.original_parent_user_id, 0), c.created_by,
 		COALESCE(c.original_disabled_by, 0), c.original_disabled_at, c.had_disable_audit,
@@ -1479,10 +1548,12 @@ func (s *Store) NormalizeGlobalOperatorHierarchy(ctx context.Context, hostUserID
 		if _, err := tx.Exec(ctx, `UPDATE broadcast_operators SET status=$2, updated_at=$3 WHERE user_id=$1`, candidate.UserID, status, now); err != nil {
 			return err
 		}
-		if status == "disabled" {
-			if _, err := tx.Exec(ctx, `DELETE FROM broadcast_operator_permissions WHERE user_id=$1`, candidate.UserID); err != nil {
+		if status == "active" {
+			if _, err := restoreBroadcastPermissionSnapshot(ctx, tx, candidate.UserID, hostUserID, now); err != nil {
 				return err
 			}
+		} else if err := snapshotBroadcastPermissions(ctx, tx, candidate.UserID, hostUserID, now, false); err != nil {
+			return err
 		}
 		return insertPermissionAudit(ctx, tx, PermissionAuditEvent{
 			ActorUserID: hostUserID, SubjectType: "global_operator", SubjectUserID: candidate.UserID,
@@ -1533,6 +1604,9 @@ func (s *Store) NormalizeGlobalOperatorHierarchy(ctx context.Context, hostUserID
 			if _, err := tx.Exec(ctx, `DELETE FROM broadcast_operator_permissions WHERE user_id=$1`, candidate.UserID); err != nil {
 				return GlobalOperatorHierarchyRepairResult{}, err
 			}
+			if _, err := tx.Exec(ctx, `DELETE FROM broadcast_operator_permission_snapshots WHERE user_id=$1`, candidate.UserID); err != nil {
+				return GlobalOperatorHierarchyRepairResult{}, err
+			}
 			if err := insertPermissionAudit(ctx, tx, PermissionAuditEvent{
 				ActorUserID: hostUserID, SubjectType: "global_operator", SubjectUserID: candidate.UserID,
 				Action: "env_identity_detached", Level: candidate.CurrentLevel,
@@ -1551,7 +1625,7 @@ func (s *Store) NormalizeGlobalOperatorHierarchy(ctx context.Context, hostUserID
 		if _, err := tx.Exec(ctx, `UPDATE broadcast_operators SET status='disabled', updated_at=$2 WHERE user_id=$1`, candidate.UserID, now); err != nil {
 			return GlobalOperatorHierarchyRepairResult{}, err
 		}
-		if _, err := tx.Exec(ctx, `DELETE FROM broadcast_operator_permissions WHERE user_id=$1`, candidate.UserID); err != nil {
+		if err := snapshotBroadcastPermissions(ctx, tx, candidate.UserID, hostUserID, now, false); err != nil {
 			return GlobalOperatorHierarchyRepairResult{}, err
 		}
 		if err := insertPermissionAudit(ctx, tx, PermissionAuditEvent{
@@ -1643,6 +1717,77 @@ func insertPermissionAudit(ctx context.Context, tx pgx.Tx, event PermissionAudit
 	return err
 }
 
+func snapshotBroadcastPermissions(ctx context.Context, tx pgx.Tx, userID, archivedBy int64, now time.Time, replace bool) error {
+	if replace {
+		if _, err := tx.Exec(ctx, `DELETE FROM broadcast_operator_permission_snapshots WHERE user_id=$1`, userID); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO broadcast_operator_permission_snapshots(
+			user_id, target, chat_id, group_name, granted_by, original_created_at, archived_by, archived_at
+		)
+		SELECT user_id, target, chat_id, group_name, granted_by, created_at, $2, $3
+		FROM broadcast_operator_permissions WHERE user_id=$1
+		ON CONFLICT(user_id, target, chat_id, group_name) DO UPDATE SET
+			granted_by=excluded.granted_by,
+			original_created_at=excluded.original_created_at,
+			archived_by=excluded.archived_by,
+			archived_at=excluded.archived_at`, userID, archivedBy, now); err != nil {
+		return err
+	}
+	_, err := tx.Exec(ctx, `DELETE FROM broadcast_operator_permissions WHERE user_id=$1`, userID)
+	return err
+}
+
+func restoreBroadcastPermissionSnapshot(ctx context.Context, tx pgx.Tx, userID, restoredBy int64, now time.Time) (int, error) {
+	rows, err := tx.Query(ctx, `INSERT INTO broadcast_operator_permissions(
+			user_id, target, chat_id, group_name, granted_by, created_at
+		)
+		SELECT s.user_id, s.target, s.chat_id, s.group_name, s.granted_by, s.original_created_at
+		FROM broadcast_operator_permission_snapshots s
+		WHERE s.user_id=$1 AND (
+			(s.target='chat' AND EXISTS (SELECT 1 FROM groups g WHERE g.chat_id=s.chat_id)) OR
+			(s.target='group' AND EXISTS (SELECT 1 FROM broadcast_groups bg WHERE bg.name=s.group_name))
+		)
+		ON CONFLICT DO NOTHING
+		RETURNING target, chat_id, group_name`, userID)
+	if err != nil {
+		return 0, err
+	}
+	type restoredPermission struct {
+		target    string
+		chatID    int64
+		groupName string
+	}
+	var restored []restoredPermission
+	for rows.Next() {
+		var permission restoredPermission
+		if err := rows.Scan(&permission.target, &permission.chatID, &permission.groupName); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		restored = append(restored, permission)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	rows.Close()
+	for _, permission := range restored {
+		if err := insertPermissionAudit(ctx, tx, PermissionAuditEvent{
+			ActorUserID: restoredBy, SubjectType: "broadcast_permission", SubjectUserID: userID,
+			Action: "restored", TargetType: permission.target, ChatID: permission.chatID,
+			GroupName: permission.groupName, CreatedAt: now,
+		}); err != nil {
+			return 0, err
+		}
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM broadcast_operator_permission_snapshots WHERE user_id=$1`, userID); err != nil {
+		return 0, err
+	}
+	return len(restored), nil
+}
+
 func (s *Store) UpsertGlobalOperator(ctx context.Context, userID int64, level string, parentUserID, createdBy int64, remark string, now time.Time) error {
 	if userID <= 0 {
 		return errors.New("global operator user id is empty")
@@ -1686,6 +1831,11 @@ func (s *Store) UpsertGlobalOperator(ctx context.Context, userID int64, level st
 		ON CONFLICT(user_id) DO UPDATE SET status='active', remark=excluded.remark, updated_at=excluded.updated_at`,
 		userID, createdBy, remark, now, now); err != nil {
 		return err
+	}
+	if exists && oldStatus == "disabled" {
+		if _, err := restoreBroadcastPermissionSnapshot(ctx, tx, userID, createdBy, now); err != nil {
+			return err
+		}
 	}
 	action := "created"
 	if exists && oldStatus == "disabled" {
@@ -1767,7 +1917,7 @@ func (s *Store) DisableGlobalOperator(ctx context.Context, userID, disabledBy in
 			if _, err := tx.Exec(ctx, `UPDATE broadcast_operators SET status='disabled', updated_at=$1 WHERE user_id=$2`, now, childID); err != nil {
 				return false, err
 			}
-			if _, err := tx.Exec(ctx, `DELETE FROM broadcast_operator_permissions WHERE user_id=$1`, childID); err != nil {
+			if err := snapshotBroadcastPermissions(ctx, tx, childID, disabledBy, now, true); err != nil {
 				return false, err
 			}
 			if err := insertPermissionAudit(ctx, tx, PermissionAuditEvent{
@@ -1788,7 +1938,7 @@ func (s *Store) DisableGlobalOperator(ctx context.Context, userID, disabledBy in
 		now, userID); err != nil {
 		return false, err
 	}
-	if _, err := tx.Exec(ctx, `DELETE FROM broadcast_operator_permissions WHERE user_id=$1`, userID); err != nil {
+	if err := snapshotBroadcastPermissions(ctx, tx, userID, disabledBy, now, true); err != nil {
 		return false, err
 	}
 	if err := insertPermissionAudit(ctx, tx, PermissionAuditEvent{
@@ -2453,6 +2603,9 @@ func (s *Store) DeleteBroadcastGroupManaged(ctx context.Context, name string, ac
 	if _, err := tx.Exec(ctx, `DELETE FROM broadcast_operator_permissions WHERE target='group' AND group_name=$1`, name); err != nil {
 		return false, nil, err
 	}
+	if _, err := tx.Exec(ctx, `DELETE FROM broadcast_operator_permission_snapshots WHERE target='group' AND group_name=$1`, name); err != nil {
+		return false, nil, err
+	}
 	for _, userID := range affected {
 		if err := insertPermissionAudit(ctx, tx, PermissionAuditEvent{ActorUserID: actorUserID, SubjectType: "broadcast_permission", SubjectUserID: userID, Action: "revoke", TargetType: "group", GroupName: name, CreatedAt: now}); err != nil {
 			return false, nil, err
@@ -2507,6 +2660,9 @@ func (s *Store) RenameBroadcastGroup(ctx context.Context, oldName, newName strin
 		return false, nil, err
 	}
 	if _, err := tx.Exec(ctx, `UPDATE broadcast_operator_permissions SET group_name=$2 WHERE target='group' AND group_name=$1`, oldName, newName); err != nil {
+		return false, nil, err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE broadcast_operator_permission_snapshots SET group_name=$2 WHERE target='group' AND group_name=$1`, oldName, newName); err != nil {
 		return false, nil, err
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM broadcast_groups WHERE name=$1`, oldName); err != nil {

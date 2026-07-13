@@ -18,7 +18,7 @@ This file is the source of truth for Telegram user permissions in the Go/Postgre
 - A primary can create, update, re-enable, or disable only its own secondary operators.
 - A secondary cannot delegate.
 - Disabling a primary also disables its active secondaries.
-- Disable removes the affected operators' broadcast target permissions. Re-enable does not restore them.
+- Disable removes affected operators from active broadcast targets and stores an exact permission snapshot. Re-enable restores snapshot targets that still exist; explicit revocations made before a later disable are not resurrected.
 - Host/default environment identities are never database global-operator authorization subjects and cannot receive target permissions.
 
 Database checks, a self-reference foreign key, and a parent-validation trigger enforce these invariants independently of the web form.
@@ -71,9 +71,9 @@ Global operator checks for invite, backend, ledger, broadcast entry, and unlimit
 
 The 10-second `BOT_OPERATOR_CACHE_TTL_SECONDS` boundary remains only for ordinary single-group operator checks across multiple bot processes. Same-process add/remove actively invalidates it. Undo bypasses it entirely.
 
-The legacy active-`broadcast_operators` backfill is a strictly one-time migration and is skipped when upgrading a database that already had `global_operators`. Repeated startup cannot recreate a removed identity. The v2.4.3 hierarchy repair first quarantines legacy-derived identities, then uses host/parent/creator/audit evidence to normalize direct host grants to primary and their children to secondary. Ambiguous or explicitly disabled rows remain disabled. Environment identity shadows are detached, and no old target permissions are restored.
+The legacy active-`broadcast_operators` backfill is a strictly one-time migration and is skipped when upgrading a database that already had `global_operators`. Repeated startup cannot recreate a removed identity. The v2.4.3 hierarchy repair first quarantines legacy-derived identities, then uses host/parent/creator/audit evidence to normalize direct host grants to primary and their children to secondary. Ambiguous or explicitly disabled rows remain disabled. Environment identity shadows are detached. Broadcast scopes are preserved for identities recovered as active; scopes for disabled identities remain in `broadcast_operator_permission_snapshots` until that identity is re-enabled.
 
-`permission_audit_events` is append-only and records global-operator create/update/level/parent/re-enable/disable actions and broadcast grant/revoke actions with actor, subject, scope, and timestamp.
+`permission_audit_events` is append-only and records global-operator create/update/level/parent/re-enable/disable actions and broadcast grant/revoke/restore actions with actor, subject, scope, and timestamp.
 
 ## Module Boundary
 

@@ -87,7 +87,7 @@ func TestPostgresConcurrentOpenSerializesMigration(t *testing.T) {
 
 	var versions int
 	if err := admin.QueryRow(ctx,
-		"SELECT count(*) FROM "+quotedSchema+".schema_migrations WHERE version IN ('2.1.0', '2.2.0', '2.3.0', '2.4.1', '2.4.2', '2.4.3')",
+		"SELECT count(*) FROM "+quotedSchema+".schema_migrations WHERE version IN ('2.1.0', '2.2.0', '2.3.0', '2.4.1', '2.4.2', '2.4.3-broadcast-permission-restore')",
 	).Scan(&versions); err != nil {
 		t.Fatalf("query migration versions: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestPostgresGlobalOperatorHierarchyRepair(t *testing.T) {
 	chatID := -base
 
 	if _, err := store.pool.Exec(ctx, `DELETE FROM schema_migrations
-		WHERE version IN ('2.4.3', '2.4.3-global-operator-level-repair-quarantined', '2.4.3-global-operator-levels-normalized')`); err != nil {
+		WHERE version IN ('2.4.3', '2.4.3-broadcast-permission-restore', '2.4.3-disabled-broadcast-permission-snapshots', '2.4.3-global-operator-level-repair-quarantined', '2.4.3-global-operator-levels-normalized')`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.pool.Exec(ctx, `TRUNCATE global_operator_level_repair_candidates`); err != nil {
@@ -177,6 +177,11 @@ func TestPostgresGlobalOperatorHierarchyRepair(t *testing.T) {
 	if err := store.migrate(ctx); err != nil {
 		t.Fatalf("run v2.4.3 quarantine migration: %v", err)
 	}
+	var archivedPermissionCount int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM broadcast_operator_permission_snapshots
+		WHERE user_id=$1`, secondaryBID).Scan(&archivedPermissionCount); err != nil || archivedPermissionCount != 1 {
+		t.Fatalf("quarantine snapshot count = %d, err=%v; want 1", archivedPermissionCount, err)
+	}
 	for _, userID := range []int64{hostID, defaultID, primaryAID, primaryBID, secondaryAID, secondaryBID, explicitlyDisabledID, ambiguousID, validPrimaryID, hostCreatedSecondaryID} {
 		if active, err := store.IsGlobalOperator(ctx, userID); err != nil || active {
 			t.Fatalf("user %d should be fail-closed after quarantine: active=%v err=%v", userID, active, err)
@@ -207,8 +212,12 @@ func TestPostgresGlobalOperatorHierarchyRepair(t *testing.T) {
 	assertOperator(ambiguousID, "primary", "disabled", 0)
 	assertOperator(validPrimaryID, "primary", "active", 0)
 	assertOperator(hostCreatedSecondaryID, "secondary", "active", validPrimaryID)
-	if allowed, err := store.HasBroadcastPermissionScope(ctx, secondaryBID, "chat", chatID, ""); err != nil || allowed {
-		t.Fatalf("recovered identity restored old permission: allowed=%v err=%v", allowed, err)
+	if allowed, err := store.HasBroadcastPermissionScope(ctx, secondaryBID, "chat", chatID, ""); err != nil || !allowed {
+		t.Fatalf("recovered active identity lost old permission: allowed=%v err=%v", allowed, err)
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM broadcast_operator_permission_snapshots
+		WHERE user_id=$1`, secondaryBID).Scan(&archivedPermissionCount); err != nil || archivedPermissionCount != 0 {
+		t.Fatalf("recovered identity retained consumed snapshot: count=%d err=%v", archivedPermissionCount, err)
 	}
 	if again, err := store.NormalizeGlobalOperatorHierarchy(ctx, hostID, map[int64]struct{}{defaultID: {}}, now.Add(time.Minute)); err != nil || again.Changed() != 0 {
 		t.Fatalf("second normalization = %+v, err=%v", again, err)
@@ -917,14 +926,42 @@ func TestPostgresStoreBasicFlow(t *testing.T) {
 	if err := store.UpsertGlobalOperator(ctx, userID, "primary", 0, 9999, "reenabled primary", now.Add(time.Second)); err != nil {
 		t.Fatalf("reenable primary: %v", err)
 	}
-	permissions, err = store.ListBroadcastPermissions(ctx)
-	if err != nil {
-		t.Fatalf("list permissions after reenable: %v", err)
+	if allowed, err := store.HasBroadcastPermissionScope(ctx, userID, "chat", chatID, ""); err != nil || !allowed {
+		t.Fatalf("reenabled primary did not restore chat permission: allowed=%v err=%v", allowed, err)
 	}
-	for _, permission := range permissions {
-		if permission.UserID == userID {
-			t.Fatalf("reenable restored old broadcast permission: %+v", permission)
-		}
+	if allowed, err := store.HasBroadcastPermissionScope(ctx, secondaryUserID, "chat", chatID, ""); err != nil || allowed {
+		t.Fatalf("disabled secondary restored before reenable: allowed=%v err=%v", allowed, err)
+	}
+	if err := store.UpsertGlobalOperator(ctx, secondaryUserID, "secondary", userID, 9999, "reenabled secondary", now.Add(2*time.Second)); err != nil {
+		t.Fatalf("reenable secondary: %v", err)
+	}
+	if allowed, err := store.HasBroadcastPermissionScope(ctx, secondaryUserID, "chat", chatID, ""); err != nil || !allowed {
+		t.Fatalf("reenabled secondary did not restore chat permission: allowed=%v err=%v", allowed, err)
+	}
+	if removed, err := store.RemoveBroadcastPermission(ctx, userID, "chat", chatID, "", 9999, now.Add(3*time.Second)); err != nil || !removed {
+		t.Fatalf("remove restored permission: removed=%v err=%v", removed, err)
+	}
+	if disabled, err := store.DisableGlobalOperator(ctx, userID, 9999, now.Add(4*time.Second)); err != nil || !disabled {
+		t.Fatalf("disable after explicit revoke: disabled=%v err=%v", disabled, err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO broadcast_operator_permission_snapshots(
+		user_id, target, chat_id, group_name, granted_by, original_created_at, archived_by, archived_at
+	) VALUES($1, 'group', 0, 'deleted-group', $2, $3, $2, $3)`, userID, int64(9999), now.Add(4*time.Second)); err != nil {
+		t.Fatalf("insert stale permission snapshot: %v", err)
+	}
+	if err := store.UpsertGlobalOperator(ctx, userID, "primary", 0, 9999, "reenabled without revoked scope", now.Add(5*time.Second)); err != nil {
+		t.Fatalf("reenable after explicit revoke: %v", err)
+	}
+	if allowed, err := store.HasBroadcastPermissionScope(ctx, userID, "chat", chatID, ""); err != nil || allowed {
+		t.Fatalf("explicitly revoked permission was resurrected: allowed=%v err=%v", allowed, err)
+	}
+	if allowed, err := store.HasBroadcastPermissionScope(ctx, userID, "group", 0, "deleted-group"); err != nil || allowed {
+		t.Fatalf("deleted group snapshot was restored: allowed=%v err=%v", allowed, err)
+	}
+	var archivedPermissionCount int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM broadcast_operator_permission_snapshots
+		WHERE user_id=$1`, userID).Scan(&archivedPermissionCount); err != nil || archivedPermissionCount != 0 {
+		t.Fatalf("stale snapshot was not consumed: count=%d err=%v", archivedPermissionCount, err)
 	}
 	auditEvents, err := store.ListPermissionAuditEvents(ctx, userID, 20)
 	if err != nil {
@@ -934,7 +971,7 @@ func TestPostgresStoreBasicFlow(t *testing.T) {
 	for _, event := range auditEvents {
 		actions[event.Action] = true
 	}
-	for _, action := range []string{"created", "disabled", "reenabled"} {
+	for _, action := range []string{"created", "disabled", "reenabled", "restored"} {
 		if !actions[action] {
 			t.Fatalf("permission audit missing %q: %+v", action, auditEvents)
 		}
