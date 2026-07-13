@@ -12,32 +12,27 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-func TestPostgresConcurrentOpenSerializesMigration(t *testing.T) {
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("TEST_DATABASE_URL is not set")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-
+func postgresTestSchema(t *testing.T, ctx context.Context, dsn, prefix string) (string, *pgx.Conn, string) {
+	t.Helper()
 	admin, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		t.Fatalf("connect for schema setup: %v", err)
 	}
-	defer admin.Close(context.Background())
 
-	schema := fmt.Sprintf("migration_race_%d", time.Now().UnixNano())
+	schema := fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano())
 	quotedSchema := pgx.Identifier{schema}.Sanitize()
 	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+quotedSchema); err != nil {
+		admin.Close(context.Background())
 		t.Fatalf("create schema: %v", err)
 	}
-	defer func() {
+	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cleanupCancel()
 		if _, err := admin.Exec(cleanupCtx, "DROP SCHEMA "+quotedSchema+" CASCADE"); err != nil {
 			t.Errorf("drop schema: %v", err)
 		}
-	}()
+		admin.Close(context.Background())
+	})
 
 	migrationURL, err := url.Parse(dsn)
 	if err != nil || migrationURL.Scheme == "" {
@@ -46,6 +41,17 @@ func TestPostgresConcurrentOpenSerializesMigration(t *testing.T) {
 	query := migrationURL.Query()
 	query.Set("search_path", schema)
 	migrationURL.RawQuery = query.Encode()
+	return migrationURL.String(), admin, quotedSchema
+}
+
+func TestPostgresConcurrentOpenSerializesMigration(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	migrationURL, admin, quotedSchema := postgresTestSchema(t, ctx, dsn, "migration_race")
 
 	const openers = 4
 	start := make(chan struct{})
@@ -57,7 +63,7 @@ func TestPostgresConcurrentOpenSerializesMigration(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			store, err := Open(ctx, migrationURL.String())
+			store, err := Open(ctx, migrationURL)
 			if err != nil {
 				errs <- err
 				return
@@ -88,6 +94,48 @@ func TestPostgresConcurrentOpenSerializesMigration(t *testing.T) {
 	if versions != 5 {
 		t.Fatalf("migration versions = %d, want 5", versions)
 	}
+}
+
+func TestPostgresOpenSkipsAppliedMigrationDuringBusinessWrite(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	migrationURL, _, _ := postgresTestSchema(t, ctx, dsn, "migration_business_write")
+
+	store, err := Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatalf("initial Open: %v", err)
+	}
+	defer store.Close()
+
+	businessTx, err := store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin business write: %v", err)
+	}
+	defer businessTx.Rollback(context.Background())
+	now := time.Now().UTC()
+	userID := int64(890000000000 + now.UnixNano()%1000000)
+	if _, err := businessTx.Exec(ctx, `INSERT INTO global_operators(
+		user_id, level, status, parent_user_id, created_by, created_at, remark
+	) VALUES($1, 'primary', 'active', NULL, $1, $2, 'migration concurrency')`, userID, now); err != nil {
+		t.Fatalf("write global operator: %v", err)
+	}
+	if _, err := businessTx.Exec(ctx, `INSERT INTO broadcast_operators(
+		user_id, status, created_by, remark, created_at, updated_at
+	) VALUES($1, 'active', $1, 'migration concurrency', $2, $2)`, userID, now); err != nil {
+		t.Fatalf("write broadcast operator: %v", err)
+	}
+
+	openCtx, openCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer openCancel()
+	reopened, err := Open(openCtx, migrationURL)
+	if err != nil {
+		t.Fatalf("Open while business write holds table locks: %v", err)
+	}
+	reopened.Close()
 }
 
 func TestPostgresLedgerClearTicketSecurity(t *testing.T) {

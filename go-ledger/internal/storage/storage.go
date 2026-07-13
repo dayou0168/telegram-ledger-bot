@@ -19,6 +19,8 @@ type Store struct {
 	keyCipher *keyCipher
 }
 
+const latestSchemaMigrationVersion = "2.4.2"
+
 func Open(ctx context.Context, databaseURL string) (*Store, error) {
 	return open(ctx, databaseURL, true)
 }
@@ -95,6 +97,25 @@ func (s *Store) migrate(ctx context.Context) error {
 	// database and let the transaction release the lock on commit or rollback.
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext(current_database()), $1)`, int32(0x4d494752)); err != nil {
 		return fmt.Errorf("lock schema migration: %w", err)
+	}
+	var migrationsTableExists bool
+	if err := tx.QueryRow(ctx, `SELECT to_regclass('schema_migrations') IS NOT NULL`).Scan(&migrationsTableExists); err != nil {
+		return fmt.Errorf("inspect schema migration table: %w", err)
+	}
+	if migrationsTableExists {
+		var applied bool
+		if err := tx.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=$1)`,
+			latestSchemaMigrationVersion,
+		).Scan(&applied); err != nil {
+			return fmt.Errorf("inspect schema migration version: %w", err)
+		}
+		if applied {
+			if err := tx.Commit(ctx); err != nil {
+				return fmt.Errorf("commit schema migration check: %w", err)
+			}
+			return nil
+		}
 	}
 
 	statements := []string{
@@ -313,19 +334,19 @@ func (s *Store) migrate(ctx context.Context) error {
 		END $$`,
 		`DO $$
 		BEGIN
-			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='global_operators_level_check') THEN
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='global_operators_level_check' AND conrelid='global_operators'::regclass) THEN
 				ALTER TABLE global_operators ADD CONSTRAINT global_operators_level_check
 					CHECK (level IN ('primary', 'secondary'));
 			END IF;
-			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='global_operators_status_check') THEN
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='global_operators_status_check' AND conrelid='global_operators'::regclass) THEN
 				ALTER TABLE global_operators ADD CONSTRAINT global_operators_status_check
 					CHECK (status IN ('active', 'disabled'));
 			END IF;
-			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='global_operators_parent_shape_check') THEN
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='global_operators_parent_shape_check' AND conrelid='global_operators'::regclass) THEN
 				ALTER TABLE global_operators ADD CONSTRAINT global_operators_parent_shape_check
 					CHECK ((level='primary' AND parent_user_id IS NULL) OR (level='secondary' AND parent_user_id IS NOT NULL));
 			END IF;
-			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='global_operators_parent_fkey') THEN
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='global_operators_parent_fkey' AND conrelid='global_operators'::regclass) THEN
 				ALTER TABLE global_operators ADD CONSTRAINT global_operators_parent_fkey
 					FOREIGN KEY(parent_user_id) REFERENCES global_operators(user_id) ON DELETE RESTRICT;
 			END IF;
@@ -442,16 +463,16 @@ func (s *Store) migrate(ctx context.Context) error {
 		OR (p.target='group' AND (p.chat_id<>0 OR p.group_name=''))`,
 		`DO $$
 		BEGIN
-			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='broadcast_permissions_target_check') THEN
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='broadcast_permissions_target_check' AND conrelid='broadcast_operator_permissions'::regclass) THEN
 				ALTER TABLE broadcast_operator_permissions ADD CONSTRAINT broadcast_permissions_target_check
 					CHECK (target IN ('chat', 'group'));
 			END IF;
-			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='broadcast_permissions_shape_check') THEN
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='broadcast_permissions_shape_check' AND conrelid='broadcast_operator_permissions'::regclass) THEN
 				ALTER TABLE broadcast_operator_permissions ADD CONSTRAINT broadcast_permissions_shape_check
 					CHECK ((target='chat' AND chat_id<>0 AND group_name='') OR
 					       (target='group' AND chat_id=0 AND group_name<>''));
 			END IF;
-			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='broadcast_permissions_user_fkey') THEN
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='broadcast_permissions_user_fkey' AND conrelid='broadcast_operator_permissions'::regclass) THEN
 				ALTER TABLE broadcast_operator_permissions ADD CONSTRAINT broadcast_permissions_user_fkey
 					FOREIGN KEY(user_id) REFERENCES global_operators(user_id) ON DELETE CASCADE;
 			END IF;
@@ -913,8 +934,8 @@ func (s *Store) migrate(ctx context.Context) error {
 		return fmt.Errorf("record schema migration: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
-		VALUES('2.4.2', NOW())
-		ON CONFLICT(version) DO NOTHING`); err != nil {
+		VALUES($1, NOW())
+		ON CONFLICT(version) DO NOTHING`, latestSchemaMigrationVersion); err != nil {
 		return fmt.Errorf("record schema migration: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
