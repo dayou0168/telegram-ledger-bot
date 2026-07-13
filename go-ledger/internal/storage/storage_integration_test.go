@@ -3,11 +3,92 @@ package storage
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
+
+func TestPostgresConcurrentOpenSerializesMigration(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	admin, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect for schema setup: %v", err)
+	}
+	defer admin.Close(context.Background())
+
+	schema := fmt.Sprintf("migration_race_%d", time.Now().UnixNano())
+	quotedSchema := pgx.Identifier{schema}.Sanitize()
+	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+quotedSchema); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		if _, err := admin.Exec(cleanupCtx, "DROP SCHEMA "+quotedSchema+" CASCADE"); err != nil {
+			t.Errorf("drop schema: %v", err)
+		}
+	}()
+
+	migrationURL, err := url.Parse(dsn)
+	if err != nil || migrationURL.Scheme == "" {
+		t.Fatalf("TEST_DATABASE_URL must be a PostgreSQL URL: %q: %v", dsn, err)
+	}
+	query := migrationURL.Query()
+	query.Set("search_path", schema)
+	migrationURL.RawQuery = query.Encode()
+
+	const openers = 4
+	start := make(chan struct{})
+	stores := make(chan *Store, openers)
+	errs := make(chan error, openers)
+	var wg sync.WaitGroup
+	for i := 0; i < openers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			store, err := Open(ctx, migrationURL.String())
+			if err != nil {
+				errs <- err
+				return
+			}
+			stores <- store
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	close(stores)
+	for store := range stores {
+		store.Close()
+	}
+	for err := range errs {
+		t.Errorf("concurrent Open: %v", err)
+	}
+	if t.Failed() {
+		return
+	}
+
+	var versions int
+	if err := admin.QueryRow(ctx,
+		"SELECT count(*) FROM "+quotedSchema+".schema_migrations WHERE version IN ('2.1.0', '2.2.0', '2.3.0', '2.4.1', '2.4.2')",
+	).Scan(&versions); err != nil {
+		t.Fatalf("query migration versions: %v", err)
+	}
+	if versions != 5 {
+		t.Fatalf("migration versions = %d, want 5", versions)
+	}
+}
 
 func TestPostgresLedgerClearTicketSecurity(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")

@@ -82,6 +82,21 @@ func (s *Store) Close() {
 }
 
 func (s *Store) migrate(ctx context.Context) error {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin schema migration: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(context.Background())
+	}()
+
+	// PostgreSQL's IF NOT EXISTS checks do not prevent concurrent sessions from
+	// racing while they create the same catalog entry. Serialize migrations per
+	// database and let the transaction release the lock on commit or rollback.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext(current_database()), $1)`, int32(0x4d494752)); err != nil {
+		return fmt.Errorf("lock schema migration: %w", err)
+	}
+
 	statements := []string{
 		`CREATE TABLE IF NOT EXISTS schema_migrations (
 			version TEXT PRIMARY KEY,
@@ -873,34 +888,37 @@ func (s *Store) migrate(ctx context.Context) error {
 			WHERE status='failed'`,
 	}
 	for _, statement := range statements {
-		if _, err := s.pool.Exec(ctx, statement); err != nil {
+		if _, err := tx.Exec(ctx, statement); err != nil {
 			return fmt.Errorf("migrate: %w", err)
 		}
 	}
-	if _, err := s.pool.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
+	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
 		VALUES('2.1.0', NOW())
 		ON CONFLICT(version) DO NOTHING`); err != nil {
 		return fmt.Errorf("record schema migration: %w", err)
 	}
-	if _, err := s.pool.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
+	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
 		VALUES('2.2.0', NOW())
 		ON CONFLICT(version) DO NOTHING`); err != nil {
 		return fmt.Errorf("record schema migration: %w", err)
 	}
-	if _, err := s.pool.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
+	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
 		VALUES('2.3.0', NOW())
 		ON CONFLICT(version) DO NOTHING`); err != nil {
 		return fmt.Errorf("record schema migration: %w", err)
 	}
-	if _, err := s.pool.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
+	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
 		VALUES('2.4.1', NOW())
 		ON CONFLICT(version) DO NOTHING`); err != nil {
 		return fmt.Errorf("record schema migration: %w", err)
 	}
-	if _, err := s.pool.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
+	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
 		VALUES('2.4.2', NOW())
 		ON CONFLICT(version) DO NOTHING`); err != nil {
 		return fmt.Errorf("record schema migration: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit schema migration: %w", err)
 	}
 	return nil
 }
