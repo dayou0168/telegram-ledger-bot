@@ -9,15 +9,15 @@ This document is the recovery handoff for reinstalling the local system and cont
 - Repository: `dayou0168/telegram-ledger-bot`
 - Main line: Go + PostgreSQL
 - Deprecated line: the old Python runtime is retired. Do not restore, test, or publish it as the active product line.
-- Current source release candidate: `v2.4.2`
-- Last confirmed published release before this candidate: `v2.4.1`
-- The v2.4.2 release commit and URL do not exist until the explicit release workflow succeeds. Do not invent them from a local commit.
+- Current source release candidate: `v2.4.3`
+- Last confirmed published release before this candidate: `v2.4.2`
+- The v2.4.3 release commit and URL do not exist until the explicit release workflow succeeds. Do not invent them from a local commit.
 
-Intended v2.4.2 images after the explicit release workflow succeeds:
+Intended v2.4.3 images after the explicit release workflow succeeds:
 
 ```text
-ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.2
-ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.2
+ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.3
+ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.3
 ```
 
 ## Current Architecture
@@ -28,10 +28,10 @@ ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.2
 - In normal mode, the bot registers watched addresses with `ledger-chain-watcher` and claims watcher matched events.
 - Bot fallback is not the normal path. After sustained watcher failure, all bots compete for a PostgreSQL lease and only one shared no-key leader scans until the watcher has recovered and its watermark is caught up.
 - Shared no-key fallback requires the watcher PostgreSQL DSN and a unique stable `BOT_FALLBACK_INSTANCE_ID` per bot; there is no per-bot emergency scanner switch or fixed maximum active time.
-- v2.4.1 was the bot day-cutoff activation fix. The unpublished v2.4.2 candidate is the next bot + watcher synchronized rollout; use `docs/production-rollout-v2.4.2.md` after a real Release exists.
-- Ignore deployment files from the outer legacy worktree. The only candidate baseline is the confirmed `codex/v2.4.2-integration` commit.
+- v2.4.2 is the last confirmed GitHub release. The unpublished v2.4.3 candidate adds permission-hierarchy recovery and bounded chain-gap convergence; use `docs/production-rollout-v2.4.3.md` only after the real Release exists.
+- Ignore deployment files from the outer legacy worktree. The only candidate baseline is the confirmed `codex/v2.4.3-integration` commit.
 
-## v2.4.2 Candidate Watcher Configuration
+## v2.4.3 Candidate Watcher Configuration
 
 Expected watcher-side values:
 
@@ -164,11 +164,11 @@ docs/reinstall-handoff.md
 6. Pull and start the current images.
 
 ```powershell
-docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.2
-docker pull ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.2
+docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.3
+docker pull ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.3
 ```
 
-For the host systemd watcher, install the GitHub Release package for `v2.4.2` instead of extracting a binary from a container image. Wait for the real Release package, checksum, and `image-digests.txt`; do not invent them from candidate files.
+For the host systemd watcher, install the GitHub Release package for `v2.4.3` instead of extracting a binary from a container image. Wait for the real Release package, checksum, and `image-digests.txt`; do not invent them from candidate files.
 
 7. Verify after startup.
 

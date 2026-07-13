@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# v2.4.2 production rollout helper. The default action is read-only preflight.
+# v2.4.3 production rollout helper. The default action is read-only preflight.
 # Secrets and DSNs are read from existing runtime configuration or environment;
 # never put them in this file or pass them as positional command arguments.
 
@@ -105,7 +105,7 @@ backup_all() {
   discover_dsns
   discover_pg_tools
   umask 077
-  local dir="$BACKUP_ROOT/v2.4.2-$(date +%Y%m%d-%H%M%S)"
+  local dir="$BACKUP_ROOT/v2.4.3-$(date +%Y%m%d-%H%M%S)"
   install -d -m 0700 "$dir"
   log "creating verified backup: $dir"
 
@@ -207,12 +207,12 @@ acceptance() {
   discover_dsns
   [[ -n "${EXPECTED_BOT_REPO_DIGEST:-}" ]] || die "set EXPECTED_BOT_REPO_DIGEST from the Release"
   [[ -n "${EXPECTED_WATCHER_SHA256:-}" ]] || die "set EXPECTED_WATCHER_SHA256 from the Release"
-  log "checking v2.4.2 schema"
+  log "checking v2.4.3 schema"
   local bot_schema watcher_schema image_id repo_digests actual_watcher_sha unauth_code
-  bot_schema="$(PGDATABASE="$BOT_DATABASE_URL" "$PSQL" -Atqc "select count(*) from schema_migrations where version='2.4.2'; select count(*) from information_schema.columns where table_schema='public' and table_name='groups' and column_name='active_period_started_at';")"
-  [[ "$bot_schema" == $'1\n1' ]] || die "bot v2.4.2 migration/new column missing"
-  watcher_schema="$(PGDATABASE="$WATCHER_DATABASE_URL" "$PSQL" -Atqc "select count(*) from schema_migrations where version='2.4.2'; select count(*) from information_schema.tables where table_schema='public' and table_name in ('chain_watcher_gap_tasks','chain_watcher_metric_minutes');")"
-  [[ "$watcher_schema" == $'1\n2' ]] || die "watcher v2.4.2 migration/new tables missing"
+  bot_schema="$(PGDATABASE="$BOT_DATABASE_URL" "$PSQL" -Atqc "select count(*) from schema_migrations where version='2.4.3-broadcast-permission-restore'; select count(*) from information_schema.tables where table_schema='public' and table_name='broadcast_operator_permission_snapshots';")"
+  [[ "$bot_schema" == $'1\n1' ]] || die "bot v2.4.3 permission migration/snapshot table missing"
+  watcher_schema="$(PGDATABASE="$WATCHER_DATABASE_URL" "$PSQL" -Atqc "select count(*) from schema_migrations where version='2.4.3'; select count(*) from information_schema.columns where table_schema='public' and table_name='chain_watcher_gap_tasks' and column_name='head_event_id'; select count(*) from pg_indexes where schemaname='public' and indexname in ('idx_chain_watcher_gap_claim','idx_chain_watcher_gap_window_overlap');")"
+  [[ "$watcher_schema" == $'1\n1\n2' ]] || die "watcher v2.4.3 gap migration/column/indexes missing"
   unauth_code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$WATCHER_URL/status")"
   [[ "$unauth_code" == "401" ]] || die "unauthenticated /status returned $unauth_code, want 401"
   image_id="$(docker inspect "$BOT_CONTAINER" --format '{{.Image}}')"

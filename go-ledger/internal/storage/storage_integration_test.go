@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -93,6 +94,79 @@ func TestPostgresConcurrentOpenSerializesMigration(t *testing.T) {
 	}
 	if versions != 7 {
 		t.Fatalf("migration versions = %d, want 7", versions)
+	}
+}
+
+func TestPostgresV242ToV243MigrationIsIdempotent(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	migrationURL, admin, quotedSchema := postgresTestSchema(t, ctx, dsn, "migration_v243")
+
+	store, err := Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+
+	// Recreate the last released v2.4.2 boundary inside this isolated schema.
+	// The next Open must add both chain-gap and permission repair objects.
+	statements := []string{
+		"DELETE FROM " + quotedSchema + ".schema_migrations WHERE version LIKE '2.4.3%'",
+		"DROP INDEX IF EXISTS " + quotedSchema + ".idx_chain_watcher_gap_retention",
+		"DROP INDEX IF EXISTS " + quotedSchema + ".idx_chain_watcher_gap_window_overlap",
+		"ALTER TABLE " + quotedSchema + ".chain_watcher_gap_tasks DROP COLUMN IF EXISTS head_event_id",
+		"DROP TABLE IF EXISTS " + quotedSchema + ".broadcast_operator_permission_snapshots CASCADE",
+		"DROP TABLE IF EXISTS " + quotedSchema + ".global_operator_level_repair_candidates CASCADE",
+	}
+	for _, statement := range statements {
+		if _, err := admin.Exec(ctx, statement); err != nil {
+			t.Fatalf("prepare v2.4.2 schema: %v", err)
+		}
+	}
+
+	assertMigrated := func(label string) {
+		t.Helper()
+		var migrationCount int
+		if err := admin.QueryRow(ctx, "SELECT count(*) FROM "+quotedSchema+`.schema_migrations
+			WHERE version IN ('2.4.3', '2.4.3-broadcast-permission-restore')`).Scan(&migrationCount); err != nil {
+			t.Fatalf("%s migration markers: %v", label, err)
+		}
+		if migrationCount != 2 {
+			t.Fatalf("%s migration markers = %d, want 2", label, migrationCount)
+		}
+
+		var headColumn, retentionIndex, overlapIndex, snapshotsTable, candidatesTable bool
+		if err := admin.QueryRow(ctx, `SELECT
+			EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema=$1 AND table_name='chain_watcher_gap_tasks' AND column_name='head_event_id'),
+			to_regclass($2) IS NOT NULL,
+			to_regclass($3) IS NOT NULL,
+			to_regclass($4) IS NOT NULL,
+			to_regclass($5) IS NOT NULL`,
+			strings.Trim(quotedSchema, `"`),
+			strings.Trim(quotedSchema, `"`)+".idx_chain_watcher_gap_retention",
+			strings.Trim(quotedSchema, `"`)+".idx_chain_watcher_gap_window_overlap",
+			strings.Trim(quotedSchema, `"`)+".broadcast_operator_permission_snapshots",
+			strings.Trim(quotedSchema, `"`)+".global_operator_level_repair_candidates",
+		).Scan(&headColumn, &retentionIndex, &overlapIndex, &snapshotsTable, &candidatesTable); err != nil {
+			t.Fatalf("%s schema objects: %v", label, err)
+		}
+		if !headColumn || !retentionIndex || !overlapIndex || !snapshotsTable || !candidatesTable {
+			t.Fatalf("%s schema objects = head:%v retention:%v overlap:%v snapshots:%v candidates:%v",
+				label, headColumn, retentionIndex, overlapIndex, snapshotsTable, candidatesTable)
+		}
+	}
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		store, err = Open(ctx, migrationURL)
+		if err != nil {
+			t.Fatalf("Open after v2.4.2 attempt %d: %v", attempt, err)
+		}
+		store.Close()
+		assertMigrated(fmt.Sprintf("attempt %d", attempt))
 	}
 }
 
@@ -1409,6 +1483,57 @@ func TestNormalizeChainWatcherGapBacklogCollapsesLegacyOverlap(t *testing.T) {
 	task, ok, err := store.ClaimChainWatcherGap(ctx, "normalized-worker", "watcher", time.Minute, now.Add(2*time.Second))
 	if err != nil || !ok || task.FromTimestamp != base || task.ToTimestamp != base+10_000+legacyWindows-1 {
 		t.Fatalf("normalized task = %+v/%v/%v", task, ok, err)
+	}
+}
+
+func TestNormalizeChainWatcherGapBacklogKeepsDifferentHeadsSeparate(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	migrationURL, _, _ := postgresTestSchema(t, ctx, dsn, "gap_head_identity")
+	store, err := Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	base := now.UnixMilli()
+	for index, headEventID := range []string{"head-a", "head-b"} {
+		if _, err := store.EnqueueChainWatcherGap(ctx, ChainWatcherGapTask{
+			Kind: "window", Source: "watcher", Priority: 10, Reason: "head-boundary",
+			FromTimestamp: base + int64(index), ToTimestamp: base + 10_000 + int64(index),
+			HeadEventID: headEventID,
+		}, now.Add(time.Duration(index)*time.Millisecond)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	merged, err := store.NormalizeChainWatcherGapBacklog(ctx, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats, err := store.ChainWatcherGapStats(ctx, now.Add(time.Second))
+	if err != nil || merged != 0 || stats.PendingCount != 2 {
+		t.Fatalf("different heads merged/stats = %d/%+v/%v, want two pending", merged, stats, err)
+	}
+
+	heads := map[string]bool{}
+	for worker := 0; worker < 2; worker++ {
+		task, ok, err := store.ClaimChainWatcherGap(ctx, fmt.Sprintf("head-worker-%d", worker), "watcher", time.Minute, now.Add(2*time.Second))
+		if err != nil || !ok {
+			t.Fatalf("claim head %d = %+v/%v/%v", worker, task, ok, err)
+		}
+		heads[task.HeadEventID] = true
+		if completed, err := store.CompleteChainWatcherGap(ctx, task.ID, task.LeaseGeneration, task.LeaseOwner, now.Add(2*time.Second)); err != nil || !completed {
+			t.Fatalf("complete head %d = %v/%v", worker, completed, err)
+		}
+	}
+	if !heads["head-a"] || !heads["head-b"] || len(heads) != 2 {
+		t.Fatalf("claimed head identities = %#v", heads)
 	}
 }
 
