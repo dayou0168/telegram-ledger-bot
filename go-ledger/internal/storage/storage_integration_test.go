@@ -1822,19 +1822,31 @@ func TestChainWatcherCursorSurvivesNewStoreInstance(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	first, err := Open(ctx, dsn)
+	migrationURL, _, _ := postgresTestSchema(t, ctx, dsn, "dual_anchor_restart")
+	first, err := Open(ctx, migrationURL)
 	if err != nil {
 		t.Fatal(err)
 	}
 	timestamp := time.Now().UTC().UnixMilli()
-	eventID := fmt.Sprintf("restart-cursor-%d", timestamp)
-	if err := first.AdvanceChainWatcherWatermark(ctx, timestamp, eventID, "catchup", time.Now().UTC()); err != nil {
+	continuityID := fmt.Sprintf("restart-continuity-%d", timestamp)
+	headID := fmt.Sprintf("restart-head-%d", timestamp)
+	if err := first.AdvanceChainWatcherWatermark(ctx, timestamp-2000, continuityID, "catchup", time.Now().UTC()); err != nil {
 		first.Close()
 		t.Fatal(err)
 	}
+	if advanced, err := first.AdvanceChainWatcherRealtimeWatermark(ctx, timestamp, headID, time.Now().UTC()); err != nil || !advanced {
+		first.Close()
+		t.Fatalf("advance realtime head = %v/%v", advanced, err)
+	}
+	failedCtx, failedCancel := context.WithCancel(context.Background())
+	failedCancel()
+	if advanced, err := first.AdvanceChainWatcherRealtimeWatermark(failedCtx, timestamp+1000, "must-not-commit", time.Now().UTC()); err == nil || advanced {
+		first.Close()
+		t.Fatalf("cancelled realtime head write = %v/%v, want false/error", advanced, err)
+	}
 	first.Close()
 
-	second, err := Open(ctx, dsn)
+	second, err := Open(ctx, migrationURL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1843,8 +1855,82 @@ func TestChainWatcherCursorSurvivesNewStoreInstance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if watermark.Timestamp != timestamp || watermark.TxHash != eventID {
-		t.Fatalf("watermark after reopen = %+v, want %d/%s", watermark, timestamp, eventID)
+	if watermark.Timestamp != timestamp-2000 || watermark.TxHash != continuityID {
+		t.Fatalf("continuity watermark after reopen = %+v, want %d/%s", watermark, timestamp-2000, continuityID)
+	}
+	realtime, err := second.GetChainWatcherRealtimeWatermark(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if realtime.Timestamp != timestamp || realtime.TxHash != headID {
+		t.Fatalf("head anchor after reopen = %+v, want %d/%s", realtime, timestamp, headID)
+	}
+}
+
+func TestChainWatcherGapDiagnosticsWindowsAndRetention(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	migrationURL, _, _ := postgresTestSchema(t, ctx, dsn, "gap_metrics_retention")
+	store, err := Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC().Truncate(time.Minute).Add(30 * time.Second)
+	for index, age := range []time.Duration{30 * time.Second, 3 * time.Minute, 30 * time.Minute} {
+		createdAt := now.Add(-age)
+		if _, err := store.EnqueueChainWatcherGap(ctx, ChainWatcherGapTask{
+			Kind: "page", Source: "metrics", Priority: 2, Reason: "window-test",
+			FromTimestamp: createdAt.UnixMilli(), ToTimestamp: createdAt.Add(time.Second).UnixMilli(),
+			StartPage: index, EndPage: index + 1, NextPage: index,
+		}, createdAt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	diagnostics, err := store.ChainWatcherGapDiagnostics(ctx, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[int]int64{1: 1, 5: 2, 60: 3}
+	for window, expected := range want {
+		var got int64
+		for _, metric := range diagnostics.Metrics {
+			if metric.WindowMinutes == window && metric.Kind == "page" && metric.Priority == 2 {
+				got = metric.CreatedCount
+			}
+		}
+		if got != expected {
+			t.Fatalf("%d-minute created count = %d, want %d; metrics=%+v", window, got, expected, diagnostics.Metrics)
+		}
+	}
+
+	old := now.Add(-73 * time.Hour)
+	if _, err := store.pool.Exec(ctx, `INSERT INTO chain_watcher_gap_metric_minutes(
+		bucket_at,kind,priority,created_count,completed_count,merged_count,failed_count,fairness_selected_count
+	) VALUES($1,'old',9,1,0,0,0,0)`, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO chain_watcher_gap_tasks(
+		kind,source,priority,reason,from_timestamp,to_timestamp,start_page,end_page,next_page,status,created_at,updated_at,completed_at
+	) VALUES('page','retention',9,'old',1,2,0,1,0,'completed',$1,$1,$1)`, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CleanupChainWatcherRetention(ctx, 10*time.Minute, now); err != nil {
+		t.Fatal(err)
+	}
+	var oldMetrics, oldCompleted int
+	if err := store.pool.QueryRow(ctx, `SELECT
+		(SELECT COUNT(*) FROM chain_watcher_gap_metric_minutes WHERE kind='old'),
+		(SELECT COUNT(*) FROM chain_watcher_gap_tasks WHERE source='retention')`).Scan(&oldMetrics, &oldCompleted); err != nil {
+		t.Fatal(err)
+	}
+	if oldMetrics != 0 || oldCompleted != 0 {
+		t.Fatalf("72h cleanup left old metrics/tasks = %d/%d", oldMetrics, oldCompleted)
 	}
 }
 

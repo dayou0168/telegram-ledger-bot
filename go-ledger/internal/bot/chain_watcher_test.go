@@ -1,13 +1,129 @@
 package bot
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
 	"testing"
 	"time"
 
+	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/chainclient"
+	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/chainwatcher"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/config"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
+	"github.com/jackc/pgx/v5"
 )
+
+func TestChainWatcherClaimWritesCriticalOutboxKicksAndAcknowledges(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	admin, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close(ctx)
+	schema := fmt.Sprintf("bot_chain_outbox_%d", time.Now().UnixNano())
+	quotedSchema := pgx.Identifier{schema}.Sanitize()
+	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+quotedSchema); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = admin.Exec(context.Background(), "DROP SCHEMA "+quotedSchema+" CASCADE") }()
+	migrationURL, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := migrationURL.Query()
+	query.Set("search_path", schema)
+	migrationURL.RawQuery = query.Encode()
+	store, err := storage.Open(ctx, migrationURL.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	suffix := fmt.Sprint(time.Now().UnixNano())
+	event := chainwatcher.MatchedEvent{
+		DeliveryID: "delivery-" + suffix, EventID: "event-" + suffix, BotID: "bot-test",
+		ChatID: 88001, OwnerUserID: 88001, WatchAddress: "TWatch" + suffix,
+		Direction: "income", TxHash: "tx-" + suffix, From: "TFrom", To: "TWatch" + suffix,
+		Value: "1000000", TokenSymbol: "USDT", TokenAddress: "TR7", TokenDecimals: 6,
+		BlockTimestamp: time.Now().UTC().UnixMilli(),
+	}
+	acked := make(chan chainwatcher.AckRequest, 1)
+	watcherServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/events/claim":
+			_ = json.NewEncoder(w).Encode(chainwatcher.ClaimResponse{Events: []chainwatcher.MatchedEvent{event}})
+		case "/v1/events/ack":
+			var request chainwatcher.AckRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			acked <- request
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer watcherServer.Close()
+	cfg := config.Config{
+		ChainWatcherURL: watcherServer.URL, ChainWatcherBotID: "bot-test", ChainWatcherSecret: "test-secret",
+		ChainWatcherBatchSize: 10, BotWatcherClaimTimeout: time.Second,
+	}
+	bot := &Bot{
+		cfg: cfg, store: store, loc: time.UTC, notificationWake: make(chan struct{}, 1),
+		watcher: chainclient.New(cfg.ChainWatcherURL, cfg.ChainWatcherBotID, cfg.ChainWatcherSecret, time.Second),
+	}
+	timing, err := bot.pollChainWatcherEvents(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if timing.EventCount != 1 || timing.AckedCount != 1 {
+		t.Fatalf("claim timing = %+v, want one event acknowledged", timing)
+	}
+	select {
+	case <-bot.notificationWake:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("critical outbox insert did not immediately kick the send scheduler")
+	}
+	if timing.OutboxDuration <= 0 {
+		t.Fatalf("outbox timing was not recorded: %+v", timing)
+	}
+	select {
+	case request := <-acked:
+		if len(request.DeliveryIDs) != 1 || request.DeliveryIDs[0] != event.DeliveryID {
+			t.Fatalf("ack request = %+v", request)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("watcher delivery was not acknowledged after outbox commit")
+	}
+	items, err := store.ClaimDueNotifications(ctx, 100, 8, time.Now().UTC().Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, item := range items {
+		if item.Kind == "chain" && item.DedupeKey == "chain:88001:"+event.WatchAddress+":"+event.EventID+":income" {
+			found = true
+			if item.Priority != 0 {
+				t.Fatalf("chain outbox priority = %d, want critical priority 0", item.Priority)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("critical chain outbox row not found in %d claimed notifications", len(items))
+	}
+}
 
 func TestWatcherFallbackControllerStateMachineAndRecovery(t *testing.T) {
 	now := time.Unix(1000, 0)

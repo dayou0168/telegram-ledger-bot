@@ -575,6 +575,68 @@ func TestSaturatedOldRoundNormalPersistenceDoesNotBlockNextHead(t *testing.T) {
 	}
 }
 
+func TestSustainedMoreThan150TransfersPerSecondKeepsEachHeadOnSchedule(t *testing.T) {
+	const (
+		keyCount = 6
+		rounds   = 3
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("start") != "0" {
+			time.Sleep(1200 * time.Millisecond)
+		}
+		writeFullTransferPage(w)
+	}))
+	defer server.Close()
+	keys := make([]string, keyCount)
+	for index := range keys {
+		keys[index] = fmt.Sprintf("sustained-key-%d", index)
+	}
+	client := NewClientWithKeys(server.URL, keys, 2*time.Second, KeyPoolOptions{RealtimeInterval: time.Second})
+	started := time.Now()
+	roundInterval := 1050 * time.Millisecond
+	var persisted atomic.Int64
+	headDelays := make(chan time.Duration, rounds)
+	errs := make(chan error, rounds)
+	for round := 0; round < rounds; round++ {
+		due := started.Add(time.Duration(round) * roundInterval)
+		if wait := time.Until(due); wait > 0 {
+			time.Sleep(wait)
+		}
+		roundStarted := time.Now()
+		go func(cutoff int64) {
+			result, err := client.FetchScheduledMainPagesAt(context.Background(), "TR7", 1, cutoff, keyCount, 4, func(page TransferPageResult) error {
+				persisted.Add(int64(len(page.Transfers)))
+				if page.Page == 0 {
+					headDelays <- time.Since(roundStarted)
+				}
+				return nil
+			})
+			if err == nil && result.Metrics.Pages != keyCount {
+				err = fmt.Errorf("pages = %d, want %d", result.Metrics.Pages, keyCount)
+			}
+			errs <- err
+		}(int64(round + 1))
+	}
+	for round := 0; round < rounds; round++ {
+		select {
+		case delay := <-headDelays:
+			if delay > 350*time.Millisecond {
+				t.Fatalf("round %d head delay = %v, want <=350ms", round+1, delay)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("round %d head callback missed its one-second window", round+1)
+		}
+	}
+	for round := 0; round < rounds; round++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("round %d: %v", round+1, err)
+		}
+	}
+	if got, want := persisted.Load(), int64(rounds*keyCount*50); got != want {
+		t.Fatalf("persisted transfers = %d, want %d (~286 transfers/second for %d rounds)", got, want, rounds)
+	}
+}
+
 func TestLocalUsageCountDoesNotExhaustKey(t *testing.T) {
 	now := time.Date(2026, 7, 12, 20, 0, 0, 0, time.UTC)
 	pool := newKeyPool([]string{"key1"}, KeyPoolOptions{BudgetZone: time.UTC})
