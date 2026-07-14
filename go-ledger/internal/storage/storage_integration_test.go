@@ -711,6 +711,161 @@ func TestPostgresLedgerClearTicketSecurity(t *testing.T) {
 	}
 }
 
+func TestPostgresCutoffChangeInvalidatesLedgerClearTicketsAtomically(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Date(2026, 7, 15, 2, 0, 0, 0, time.UTC)
+	suffix := time.Now().UnixNano()
+	requesterID := int64(730000000000 + suffix%1000000)
+
+	setup := func(t *testing.T, chatID int64, cutoffHour int, token string) (Group, int64, LedgerClearTicket) {
+		t.Helper()
+		dayKey := "2026-07-15"
+		periodStartedAt := now.Add(-time.Hour)
+		if err := store.EnsureGroup(ctx, chatID, "cutoff clear ticket integration", periodStartedAt); err != nil {
+			t.Fatalf("ensure group: %v", err)
+		}
+		if err := store.SetGroupCutoffState(ctx, chatID, cutoffHour, true, dayKey, dayKey, periodStartedAt); err != nil {
+			t.Fatalf("set initial cutoff state: %v", err)
+		}
+		group, err := store.GetGroup(ctx, chatID)
+		if err != nil {
+			t.Fatalf("get initial group: %v", err)
+		}
+		recordID, err := store.InsertRecord(ctx, Record{
+			ChatID: chatID, DayKey: dayKey, Kind: "deposit", Currency: "CNY", Amount: "1",
+			Rate: "1", FeeRate: "0", ResultUSDT: "1", ActorUserID: requesterID,
+			PeriodStartedAt: group.ActivePeriodStartedAt, CreatedAt: group.ActivePeriodStartedAt.Add(time.Second),
+		})
+		if err != nil {
+			t.Fatalf("insert record: %v", err)
+		}
+		ticket := LedgerClearTicket{
+			TokenHash: token, ChatID: chatID, RequestedByUserID: requesterID,
+			DayKey: dayKey, ActivePeriodStartedAt: group.ActivePeriodStartedAt,
+			ExpiresAt: now.Add(time.Minute), CreatedAt: now,
+		}
+		if err := store.CreateLedgerClearTicket(ctx, ticket); err != nil {
+			t.Fatalf("create clear ticket: %v", err)
+		}
+		return group, recordID, ticket
+	}
+
+	assertTicketInvalidAndRecordIntact := func(t *testing.T, group Group, recordID int64, ticket LedgerClearTicket) {
+		t.Helper()
+		if _, ok, err := store.GetLedgerClearTicket(ctx, ticket.TokenHash); err != nil || ok {
+			t.Fatalf("old clear ticket still exists: ok=%t err=%v", ok, err)
+		}
+		result, err := store.ConsumeLedgerClearTicketAndDelete(ctx, ticket.TokenHash, group.ChatID, requesterID, true, group, now.Add(10*time.Second))
+		if err != nil || result.Status != LedgerClearTicketNotFound {
+			t.Fatalf("consume invalidated ticket = %+v, %v", result, err)
+		}
+		record, ok, err := store.GetRecord(ctx, recordID)
+		if err != nil || !ok || record.DeletedAt != nil {
+			t.Fatalf("invalidated ticket changed record = %+v, ok=%t err=%v", record, ok, err)
+		}
+	}
+
+	t.Run("zero to four keeps period and invalidates old ticket", func(t *testing.T) {
+		chatID := int64(-930000000000 - suffix%1000000)
+		before, recordID, ticket := setup(t, chatID, 0, fmt.Sprintf("cutoff-0-4-%d", suffix))
+		if err := store.SetGroupCutoffState(ctx, chatID, 4, true, before.ActiveDayKey, before.ActiveExpiresDayKey, now); err != nil {
+			t.Fatalf("set cutoff 4: %v", err)
+		}
+		after, err := store.GetGroup(ctx, chatID)
+		if err != nil {
+			t.Fatalf("get updated group: %v", err)
+		}
+		if !after.Active || after.CutoffHour != 4 || after.ActiveDayKey != before.ActiveDayKey || !after.ActivePeriodStartedAt.Equal(before.ActivePeriodStartedAt) {
+			t.Fatalf("cutoff change altered active period: before=%+v after=%+v", before, after)
+		}
+		assertTicketInvalidAndRecordIntact(t, after, recordID, ticket)
+
+		fresh := ticket
+		fresh.TokenHash = fmt.Sprintf("cutoff-0-4-fresh-%d", suffix)
+		fresh.ActivePeriodStartedAt = after.ActivePeriodStartedAt
+		fresh.DayKey = after.ActiveDayKey
+		if err := store.CreateLedgerClearTicket(ctx, fresh); err != nil {
+			t.Fatalf("create fresh clear ticket: %v", err)
+		}
+		result, err := store.ConsumeLedgerClearTicketAndDelete(ctx, fresh.TokenHash, chatID, requesterID, true, after, now.Add(20*time.Second))
+		if err != nil || result.Status != LedgerClearTicketApplied || result.DeletedCount != 1 {
+			t.Fatalf("consume fresh ticket = %+v, %v", result, err)
+		}
+	})
+
+	t.Run("four to disabled keeps period and invalidates old ticket", func(t *testing.T) {
+		chatID := int64(-931000000000 - suffix%1000000)
+		before, recordID, ticket := setup(t, chatID, 4, fmt.Sprintf("cutoff-4-disabled-%d", suffix))
+		if err := store.SetGroupCutoffState(ctx, chatID, -1, true, before.ActiveDayKey, "", now); err != nil {
+			t.Fatalf("disable cutoff: %v", err)
+		}
+		after, err := store.GetGroup(ctx, chatID)
+		if err != nil {
+			t.Fatalf("get updated group: %v", err)
+		}
+		if !after.Active || after.CutoffHour != -1 || after.ActiveDayKey != before.ActiveDayKey || after.ActiveExpiresDayKey != "" || !after.ActivePeriodStartedAt.Equal(before.ActivePeriodStartedAt) {
+			t.Fatalf("disabling cutoff altered active period: before=%+v after=%+v", before, after)
+		}
+		assertTicketInvalidAndRecordIntact(t, after, recordID, ticket)
+	})
+
+	t.Run("ticket delete failure rolls back cutoff update", func(t *testing.T) {
+		chatID := int64(-932000000000 - suffix%1000000)
+		before, _, ticket := setup(t, chatID, 0, fmt.Sprintf("cutoff-rollback-%d", suffix))
+		nameSuffix := fmt.Sprintf("%d", suffix)
+		functionName := "test_fail_clear_ticket_delete_" + nameSuffix
+		triggerName := "test_fail_clear_ticket_delete_trigger_" + nameSuffix
+		quotedFunction := pgx.Identifier{functionName}.Sanitize()
+		quotedTrigger := pgx.Identifier{triggerName}.Sanitize()
+		if _, err := store.pool.Exec(ctx, fmt.Sprintf(`CREATE FUNCTION %s() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+	IF OLD.chat_id = %d THEN
+		RAISE EXCEPTION 'forced clear ticket delete failure';
+	END IF;
+	RETURN OLD;
+END
+$$`, quotedFunction, chatID)); err != nil {
+			t.Fatalf("create failure function: %v", err)
+		}
+		if _, err := store.pool.Exec(ctx, fmt.Sprintf(`CREATE TRIGGER %s BEFORE DELETE ON ledger_clear_tickets
+FOR EACH ROW EXECUTE FUNCTION %s()`, quotedTrigger, quotedFunction)); err != nil {
+			_, _ = store.pool.Exec(context.Background(), "DROP FUNCTION IF EXISTS "+quotedFunction+"()")
+			t.Fatalf("create failure trigger: %v", err)
+		}
+		t.Cleanup(func() {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cleanupCancel()
+			_, _ = store.pool.Exec(cleanupCtx, "DROP TRIGGER IF EXISTS "+quotedTrigger+" ON ledger_clear_tickets")
+			_, _ = store.pool.Exec(cleanupCtx, "DROP FUNCTION IF EXISTS "+quotedFunction+"()")
+		})
+
+		if err := store.SetGroupCutoffState(ctx, chatID, 4, true, before.ActiveDayKey, before.ActiveExpiresDayKey, now); err == nil {
+			t.Fatal("cutoff update succeeded despite forced ticket delete failure")
+		}
+		after, err := store.GetGroup(ctx, chatID)
+		if err != nil {
+			t.Fatalf("get group after rollback: %v", err)
+		}
+		if after.CutoffHour != before.CutoffHour || after.Active != before.Active || after.ActiveDayKey != before.ActiveDayKey || !after.ActivePeriodStartedAt.Equal(before.ActivePeriodStartedAt) {
+			t.Fatalf("failed cutoff update was not rolled back: before=%+v after=%+v", before, after)
+		}
+		if _, ok, err := store.GetLedgerClearTicket(ctx, ticket.TokenHash); err != nil || !ok {
+			t.Fatalf("ticket delete was not rolled back: ok=%t err=%v", ok, err)
+		}
+	})
+}
+
 func TestPostgresBroadcastGroupRenameDeleteKeepsPermissionsConsistent(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {

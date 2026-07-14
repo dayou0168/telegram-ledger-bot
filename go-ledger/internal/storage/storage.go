@@ -1481,7 +1481,12 @@ func (s *Store) SetGroupActivePeriod(ctx context.Context, chatID int64, active b
 }
 
 func (s *Store) SetGroupCutoffState(ctx context.Context, chatID int64, cutoffHour int, active bool, activeDayKey, activeExpiresDayKey string, now time.Time) error {
-	_, err := s.pool.Exec(ctx, `UPDATE groups SET cutoff_hour=$1, active=$2,
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer rollback(ctx, tx)
+	_, err = tx.Exec(ctx, `UPDATE groups SET cutoff_hour=$1, active=$2,
 		active_day_key=CASE WHEN $3<>'' THEN $3 WHEN NOT $2 THEN '' ELSE active_day_key END,
 		active_expires_day_key=CASE WHEN $3<>'' THEN $4 WHEN NOT $2 THEN '' ELSE active_expires_day_key END,
 		active_period_started_at=CASE
@@ -1491,7 +1496,15 @@ func (s *Store) SetGroupCutoffState(ctx context.Context, chatID int64, cutoffHou
 		END,
 		updated_at=$5 WHERE chat_id=$6`,
 		cutoffHour, active, activeDayKey, activeExpiresDayKey, now, chatID)
-	return err
+	if err != nil {
+		return err
+	}
+	// A cutoff change invalidates the confirmation context even when the
+	// current accounting period intentionally remains unchanged.
+	if _, err := tx.Exec(ctx, `DELETE FROM ledger_clear_tickets WHERE chat_id=$1`, chatID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *Store) SetGroupBusinessOpen(ctx context.Context, chatID int64, open bool, now time.Time) error {
