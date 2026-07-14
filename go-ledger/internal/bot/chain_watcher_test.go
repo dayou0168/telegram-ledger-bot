@@ -209,6 +209,25 @@ func TestWatcherFallbackControllerEmptySuccessfulClaimsDoNotFail(t *testing.T) {
 	}
 }
 
+func TestContinuityOnlyDegradationDoesNotStartFallback(t *testing.T) {
+	status := chainwatcher.StatusResponse{
+		Status: "degraded/continuity", SourceReady: true, ContinuityReady: false,
+		CatchupLagSeconds: 3600,
+	}
+	if !chainWatcherSourceReadyDuringCatchup(status) {
+		t.Fatalf("continuity-only degradation should preserve source health: %+v", status)
+	}
+	status.SourceReady = false
+	if chainWatcherSourceReadyDuringCatchup(status) {
+		t.Fatal("stale/unavailable source must still trigger fallback")
+	}
+	status.SourceReady = true
+	status.Status = "degraded/readiness_db"
+	if chainWatcherSourceReadyDuringCatchup(status) {
+		t.Fatal("readiness DB failure must not be treated as continuity-only degradation")
+	}
+}
+
 func TestWatcherFallbackReadyAndClaimFailuresRecoverIndependently(t *testing.T) {
 	now := time.Unix(3000, 0)
 	controller := newWatcherFallbackControllerWithRecovery(3, 2, 5*time.Second)

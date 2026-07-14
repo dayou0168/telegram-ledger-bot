@@ -123,6 +123,7 @@ func TestPostgresV242ToV243MigrationIsIdempotent(t *testing.T) {
 		"DELETE FROM " + quotedSchema + ".schema_migrations WHERE version='" + latestSchemaMigrationVersion + "'",
 		"DROP INDEX IF EXISTS " + quotedSchema + ".idx_chain_watcher_gap_retention",
 		"DROP INDEX IF EXISTS " + quotedSchema + ".idx_chain_watcher_gap_window_overlap",
+		"DROP INDEX IF EXISTS " + quotedSchema + ".idx_chain_watcher_gap_fair_claim",
 		"ALTER TABLE " + quotedSchema + ".chain_watcher_gap_tasks DROP COLUMN IF EXISTS head_event_id",
 		"DROP TABLE IF EXISTS " + quotedSchema + ".broadcast_operator_permission_snapshots CASCADE",
 		"DROP TABLE IF EXISTS " + quotedSchema + ".global_operator_level_repair_candidates CASCADE",
@@ -144,24 +145,26 @@ func TestPostgresV242ToV243MigrationIsIdempotent(t *testing.T) {
 			t.Fatalf("%s migration markers = %d, want 2", label, migrationCount)
 		}
 
-		var headColumn, retentionIndex, overlapIndex, snapshotsTable, candidatesTable bool
+		var headColumn, retentionIndex, overlapIndex, fairClaimIndex, snapshotsTable, candidatesTable bool
 		if err := admin.QueryRow(ctx, `SELECT
 			EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema=$1 AND table_name='chain_watcher_gap_tasks' AND column_name='head_event_id'),
 			to_regclass($2) IS NOT NULL,
 			to_regclass($3) IS NOT NULL,
 			to_regclass($4) IS NOT NULL,
-			to_regclass($5) IS NOT NULL`,
+			to_regclass($5) IS NOT NULL,
+			to_regclass($6) IS NOT NULL`,
 			strings.Trim(quotedSchema, `"`),
 			strings.Trim(quotedSchema, `"`)+".idx_chain_watcher_gap_retention",
 			strings.Trim(quotedSchema, `"`)+".idx_chain_watcher_gap_window_overlap",
+			strings.Trim(quotedSchema, `"`)+".idx_chain_watcher_gap_fair_claim",
 			strings.Trim(quotedSchema, `"`)+".broadcast_operator_permission_snapshots",
 			strings.Trim(quotedSchema, `"`)+".global_operator_level_repair_candidates",
-		).Scan(&headColumn, &retentionIndex, &overlapIndex, &snapshotsTable, &candidatesTable); err != nil {
+		).Scan(&headColumn, &retentionIndex, &overlapIndex, &fairClaimIndex, &snapshotsTable, &candidatesTable); err != nil {
 			t.Fatalf("%s schema objects: %v", label, err)
 		}
-		if !headColumn || !retentionIndex || !overlapIndex || !snapshotsTable || !candidatesTable {
-			t.Fatalf("%s schema objects = head:%v retention:%v overlap:%v snapshots:%v candidates:%v",
-				label, headColumn, retentionIndex, overlapIndex, snapshotsTable, candidatesTable)
+		if !headColumn || !retentionIndex || !overlapIndex || !fairClaimIndex || !snapshotsTable || !candidatesTable {
+			t.Fatalf("%s schema objects = head:%v retention:%v overlap:%v fair:%v snapshots:%v candidates:%v",
+				label, headColumn, retentionIndex, overlapIndex, fairClaimIndex, snapshotsTable, candidatesTable)
 		}
 	}
 
@@ -2291,6 +2294,123 @@ func TestLeasedAnchorGapKeepsAtMostOnePendingOverlapSuccessor(t *testing.T) {
 	stats, err := store.ChainWatcherGapStats(ctx, now.Add(time.Second))
 	if err != nil || stats.LeasedCount != 1 || stats.PendingCount != 1 {
 		t.Fatalf("leased/pending overlap stats = %+v/%v, want 1/1", stats, err)
+	}
+}
+
+func TestProgressedWindowGapKeepsCursorAndOneUnstartedSuccessor(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	migrationURL, _, _ := postgresTestSchema(t, ctx, dsn, "gap_progress_successor")
+	store, err := Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	base := now.UnixMilli()
+	originalID, err := store.EnqueueChainWatcherGap(ctx, ChainWatcherGapTask{
+		Kind: "window", Source: "watcher", Priority: 1, Reason: "original",
+		FromTimestamp: base, ToTimestamp: base + 10_000,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := store.ClaimChainWatcherGap(ctx, "progress-worker", "watcher_priority", time.Minute, now)
+	if err != nil || !ok || claimed.ID != originalID {
+		t.Fatalf("claim original = %+v/%v/%v", claimed, ok, err)
+	}
+	if yielded, err := store.YieldChainWatcherGap(ctx, claimed.ID, claimed.LeaseGeneration, claimed.LeaseOwner, 7, "", now.Add(time.Second)); err != nil || !yielded {
+		t.Fatalf("yield original = %v/%v", yielded, err)
+	}
+
+	for round := 1; round <= 100; round++ {
+		if _, err := store.EnqueueChainWatcherGap(ctx, ChainWatcherGapTask{
+			Kind: "window", Source: "watcher", Priority: 1, Reason: "growing-successor",
+			FromTimestamp: base + int64(round), ToTimestamp: base + 10_000 + int64(round),
+		}, now.Add(time.Second+time.Duration(round)*time.Millisecond)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.NormalizeChainWatcherGapBacklog(ctx, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := store.pool.Query(ctx, `SELECT id,from_timestamp,to_timestamp,start_page,next_page
+		FROM chain_watcher_gap_tasks WHERE status='pending' ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	type gapCursor struct {
+		id          int64
+		from, to    int64
+		start, next int
+	}
+	var gaps []gapCursor
+	for rows.Next() {
+		var gap gapCursor
+		if err := rows.Scan(&gap.id, &gap.from, &gap.to, &gap.start, &gap.next); err != nil {
+			t.Fatal(err)
+		}
+		gaps = append(gaps, gap)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(gaps) != 2 {
+		t.Fatalf("pending gaps = %+v, want progressed task plus one successor", gaps)
+	}
+	if gaps[0].id != originalID || gaps[0].from != base || gaps[0].to != base+10_000 || gaps[0].next != 7 {
+		t.Fatalf("progressed gap changed during merge/normalize: %+v", gaps[0])
+	}
+	if gaps[1].next != gaps[1].start || gaps[1].from != base+1 || gaps[1].to != base+10_100 {
+		t.Fatalf("successor gap = %+v", gaps[1])
+	}
+}
+
+func TestFairGapClaimRotatesByLastHandledTime(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	migrationURL, _, _ := postgresTestSchema(t, ctx, dsn, "gap_fair_rotation")
+	store, err := Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	base := now.UnixMilli()
+	ids := make([]int64, 0, 3)
+	for index := 0; index < 3; index++ {
+		id, err := store.EnqueueChainWatcherGap(ctx, ChainWatcherGapTask{
+			Kind: "window", Source: "watcher", Priority: 2, Reason: fmt.Sprintf("window-%d", index),
+			FromTimestamp: base + int64(index*10_000), ToTimestamp: base + int64(index*10_000+5_000),
+		}, now.Add(time.Duration(index-30)*time.Minute))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+
+	first, ok, err := store.ClaimChainWatcherGap(ctx, "fair-a", "watcher_fair", time.Minute, now)
+	if err != nil || !ok || first.ID != ids[0] {
+		t.Fatalf("first fair claim = %+v/%v/%v, want %d", first, ok, err, ids[0])
+	}
+	if yielded, err := store.YieldChainWatcherGap(ctx, first.ID, first.LeaseGeneration, first.LeaseOwner, first.NextPage, "", now); err != nil || !yielded {
+		t.Fatalf("yield first = %v/%v", yielded, err)
+	}
+	second, ok, err := store.ClaimChainWatcherGap(ctx, "fair-b", "watcher_fair", time.Minute, now.Add(time.Second))
+	if err != nil || !ok || second.ID != ids[1] {
+		t.Fatalf("second fair claim = %+v/%v/%v, want %d instead of immediately reclaiming %d", second, ok, err, ids[1], ids[0])
 	}
 }
 

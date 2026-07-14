@@ -230,6 +230,10 @@ func (b *Bot) checkChainWatcherHealth(ctx context.Context) {
 	defer cancel()
 	status, err := b.watcher.Ready(healthCtx)
 	if err != nil {
+		if chainWatcherSourceReadyDuringCatchup(status) {
+			b.recordChainWatcherSuccess("ready", time.Duration(status.CatchupLagSeconds)*time.Second)
+			return
+		}
 		b.recordChainWatcherFailure("ready", err.Error())
 		return
 	}
@@ -238,6 +242,10 @@ func (b *Bot) checkChainWatcherHealth(ctx context.Context) {
 		return
 	}
 	b.recordChainWatcherSuccess("ready", time.Duration(status.CatchupLagSeconds)*time.Second)
+}
+
+func chainWatcherSourceReadyDuringCatchup(status chainwatcher.StatusResponse) bool {
+	return status.SourceReady && !status.ContinuityReady && status.Status == "degraded/continuity"
 }
 
 func (b *Bot) recordChainWatcherFailure(source, detail string) {

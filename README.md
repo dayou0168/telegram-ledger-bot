@@ -233,7 +233,7 @@ watcher 有两种部署模式：
 
 机器人保存监听地址、event identity 去重和 Telegram outbox；watcher 负责统一链上数据入口、统一解析、按多机器人订阅匹配和短期事件队列。机器人配置了 `CHAIN_WATCHER_URL`、`CHAIN_WATCHER_BOT_ID`、`CHAIN_WATCHER_SECRET` 后，默认停用本机地址监听轮询，改为注册订阅并每秒领取 watcher matched events。事件身份优先使用 `tx_hash + event/log index + contract`，缺少 index 时使用稳定 fingerprint，支持同一交易内多个 Transfer 且不会因 realtime/catch-up/fallback 重叠而重复提醒。
 
-`/healthz` 只表示 watcher 进程存活；`/readyz` 综合链源新鲜度、连续 watermark 和未闭合 gap，cursor 未建立时明确显示 `catchup_lag_unknown=true`。`/status` 受 `CHAIN_WATCHER_ADMIN_TOKEN` 保护，包含 round ID、最多 3 个在途主轮次、分段耗时、429/key 状态、pending/claim lag、gap 和 retention 统计；最近轮次明细有界保存，分钟聚合保留 72 小时。bot 自动 fallback 依据 `/readyz` 的链源状态，不把“没有新交易”误判为故障。
+`/healthz` 只表示 watcher 进程存活；`/readyz` 综合链源新鲜度、连续 watermark 和未闭合 gap，cursor 未建立时明确显示 `catchup_lag_unknown=true`。响应同时区分 `source_ready` 与 `continuity_ready`：历史 gap 未闭合时完整 readiness 仍为 503，但链源持续成功不会单独触发新的 bot fallback；claim 或链源真正失败仍会触发。`/status` 受 `CHAIN_WATCHER_ADMIN_TOKEN` 保护，包含 round ID、最多 3 个在途主轮次、分段耗时、429/key 状态、pending/claim lag、gap 和 retention 统计；最近轮次明细有界保存，分钟聚合保留 72 小时。
 
 主扫描固定每秒一轮，实际基础页数由小数 base token 累积产生。`CHAIN_WATCHER_MAIN_SCAN_TIMEOUT_MS=3000` 是整轮独立 API deadline；`CHAIN_WATCHER_MAIN_MAX_INFLIGHT_ROUNDS=3` 允许慢轮次有界流水并发。`HEAD_MAX_CONCURRENCY=32` 只限制 API 页任务，`HEAD_PERSIST_CONCURRENCY=8` 只限制 P2..PN 普通持久化 worker，P1 另有保留 lane。成功页立即落库，失败页形成带 lease generation 的精确 gap。`CHAIN_WATCHER_CATCHUP_MAX_INFLIGHT=8` 是独立 worker 安全天花板，实际并发按健康 Key 和 surplus 自动伸缩。重叠时间窗会合并，公平调度保证旧低优先级 window 在持续高优先级流量下仍被领取。
 

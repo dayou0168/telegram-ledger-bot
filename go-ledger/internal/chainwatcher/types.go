@@ -49,6 +49,7 @@ type ClaimResponse struct {
 type StatusResponse struct {
 	Status                string                    `json:"status"`
 	Ready                 bool                      `json:"ready"`
+	SourceReady           bool                      `json:"source_ready"`
 	Now                   time.Time                 `json:"now"`
 	StaleAfterMS          int64                     `json:"stale_after_ms"`
 	Global                ScanStatusResponse        `json:"global"`
@@ -130,6 +131,7 @@ type MetricAggregateResponse struct {
 type ReadyStatusResponse struct {
 	Status            string    `json:"status"`
 	Ready             bool      `json:"ready"`
+	SourceReady       bool      `json:"source_ready"`
 	Now               time.Time `json:"now"`
 	CatchupLagSeconds int64     `json:"catchup_lag_seconds"`
 	CatchupLagUnknown bool      `json:"catchup_lag_unknown"`

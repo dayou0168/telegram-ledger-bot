@@ -492,16 +492,7 @@ func (s *Server) enqueueExpandGap(result scanResult) error {
 }
 
 func (s *Server) gapLoop(ctx context.Context, workerIndex int) {
-	interval := s.cfg.CatchupInterval
-	if interval <= 0 {
-		interval = 30 * time.Second
-	}
-	if fairnessWait := s.cfg.GapFairnessMaxWait; fairnessWait > 0 && interval > fairnessWait {
-		interval = fairnessWait
-	}
-	if workerIndex == 0 && (interval > time.Second || interval <= 0) {
-		interval = time.Second
-	}
+	interval := gapWorkerPollInterval(s.cfg.CatchupInterval, s.cfg.GapFairnessMaxWait, workerIndex)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	claimRound := 0
@@ -520,6 +511,14 @@ func (s *Server) gapLoop(ctx context.Context, workerIndex int) {
 func (s *Server) processOneGap(ctx context.Context, workerIndex, claimRound int) {
 	effective := s.catchupInflightLimit()
 	if effective < 1 || workerIndex >= effective {
+		return
+	}
+	now := time.Now()
+	if s.shouldSkipCatchup(now) {
+		return
+	}
+	poolStatus := s.tron.KeyPoolStatus(now)
+	if poolStatus.CompensationBudgetRPS <= 0 || poolStatus.CompensationTokens < 1 {
 		return
 	}
 	if !s.tryStartScan("catchup") {
@@ -543,7 +542,7 @@ func (s *Server) processOneGap(ctx context.Context, workerIndex, claimRound int)
 		s.reconcileIfGapQueueDrained()
 		return
 	}
-	if task.Priority > 1 && s.shouldSkipCatchup(time.Now()) {
+	if s.shouldSkipCatchup(time.Now()) {
 		dbCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		now := time.Now()
 		_, _ = s.store.DeferChainWatcherGapUntil(dbCtx, task.ID, task.LeaseGeneration, task.LeaseOwner,
@@ -564,6 +563,19 @@ func (s *Server) processOneGap(ctx context.Context, workerIndex, claimRound int)
 		dbCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		now := time.Now()
 		delay := gapRetryDelay(task.Attempts, processErr, s.cfg.PollInterval)
+		if tron.IsCompensationDeferred(processErr) {
+			reason := "compensation_deferred"
+			var deferred *tron.CompensationDeferredError
+			if errors.As(processErr, &deferred) && deferred.Reason != "" {
+				reason = deferred.Reason
+			}
+			_, _ = s.store.DeferChainWatcherGapUntil(dbCtx, task.ID, task.LeaseGeneration, task.LeaseOwner,
+				reason, now.Add(delay), now)
+			cancel()
+			s.status.recordCatchupDeferred(reason)
+			s.wakeGapAfter(delay)
+			return
+		}
 		_, _ = s.store.ReleaseChainWatcherGapUntil(dbCtx, task.ID, task.LeaseGeneration, task.LeaseOwner,
 			processErr.Error(), now.Add(delay), now)
 		cancel()
@@ -575,6 +587,20 @@ func (s *Server) processOneGap(ctx context.Context, workerIndex, claimRound int)
 	s.status.recordScanSuccess(lane, result, duration, time.Now())
 	s.recordMetric(lane, true, result)
 	s.reconcileIfGapQueueDrained()
+}
+
+func gapWorkerPollInterval(configured, fairnessWait time.Duration, workerIndex int) time.Duration {
+	interval := configured
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	if fairnessWait > 0 && interval > fairnessWait {
+		interval = fairnessWait
+	}
+	if workerIndex == 0 && interval > 250*time.Millisecond {
+		return 250 * time.Millisecond
+	}
+	return interval
 }
 
 func gapWorkerClass(effective, workerIndex, claimRound, fairnessEvery int) string {
@@ -593,10 +619,14 @@ func gapRetryDelay(attempts int, err error, pollInterval time.Duration) time.Dur
 		return httpErr.RetryAfter
 	}
 	if tron.IsCompensationDeferred(err) {
-		if pollInterval <= 0 {
-			return time.Second
+		delay := pollInterval / 4
+		if delay < 200*time.Millisecond {
+			delay = 200 * time.Millisecond
 		}
-		return pollInterval
+		if delay > 500*time.Millisecond {
+			delay = 500 * time.Millisecond
+		}
+		return delay
 	}
 	if attempts < 1 {
 		attempts = 1
@@ -1846,9 +1876,10 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) readinessResponse(ctx context.Context, now time.Time) ReadyStatusResponse {
 	base := s.status.response(now, s.sourceStaleAfter(), storage.ChainWatcherDeliveryStats{})
-	response := ReadyStatusResponse{Status: base.Status, Ready: base.Ready, Now: now}
+	response := ReadyStatusResponse{Status: base.Status, Ready: base.Ready, SourceReady: base.Ready, Now: now}
 	if s.tron != nil && s.tron.KeyPoolStatus(now).AvailableCount == 0 {
 		response.Ready = false
+		response.SourceReady = false
 		response.Status = "DEGRADED/NO_KEYS"
 	}
 	if s.store == nil {
@@ -1904,6 +1935,7 @@ func (s *Server) statusResponse(ctx context.Context, now time.Time) StatusRespon
 		}
 	}
 	response := s.status.response(now, s.sourceStaleAfter(), delivery)
+	response.SourceReady = response.Ready
 	response.MainInflightRounds = s.globalInflight()
 	response.MainInflightLimit = s.cfg.MainMaxInflight
 	response.HeadAPIMaxConcurrency = s.cfg.HeadMaxConcurrency
@@ -1936,6 +1968,7 @@ func (s *Server) statusResponse(ctx context.Context, now time.Time) StatusRespon
 		response.GapScheduler.FairnessMaxWaitMS = s.cfg.GapFairnessMaxWait.Milliseconds()
 		if response.TronscanKeys.AvailableCount == 0 {
 			response.Ready = false
+			response.SourceReady = false
 			response.Status = "DEGRADED/NO_KEYS"
 		}
 	}

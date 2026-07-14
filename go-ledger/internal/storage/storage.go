@@ -21,7 +21,7 @@ type Store struct {
 	keyCipher    *keyCipher
 }
 
-const latestSchemaMigrationVersion = "2.4.6-chain-gap-scheduler"
+const latestSchemaMigrationVersion = "2.4.7-chain-gap-convergence"
 
 func Open(ctx context.Context, databaseURL string) (*Store, error) {
 	return open(ctx, databaseURL, true)
@@ -1055,6 +1055,9 @@ func (s *Store) migrate(ctx context.Context) error {
 			ON chain_watcher_gap_tasks(updated_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_gap_ready_claim
 			ON chain_watcher_gap_tasks(priority, retry_after, created_at, id)
+			WHERE status IN ('pending','leased')`,
+		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_gap_fair_claim
+			ON chain_watcher_gap_tasks(updated_at, created_at, id)
 			WHERE status IN ('pending','leased')`,
 		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_gap_window_overlap
 			ON chain_watcher_gap_tasks(source, from_timestamp, to_timestamp)
@@ -5535,6 +5538,7 @@ func coalescePendingWindowGap(ctx context.Context, tx pgx.Tx, task ChainWatcherG
 	rows, err := tx.Query(ctx, `SELECT id, from_timestamp, to_timestamp, start_page, next_page, priority
 		FROM chain_watcher_gap_tasks
 		WHERE kind='window' AND source=$1 AND status='pending'
+		  AND next_page=start_page
 		  AND from_timestamp <= $3 AND to_timestamp >= $2
 		  AND start_page=$4 AND end_page=$5
 		ORDER BY id FOR UPDATE`, task.Source, task.FromTimestamp, task.ToTimestamp,
@@ -5612,6 +5616,7 @@ func coalescePendingExpandGap(ctx context.Context, tx pgx.Tx, task ChainWatcherG
 		anchor_event_id,priority,created_at
 		FROM chain_watcher_gap_tasks
 		WHERE kind='expand' AND source=$1 AND status='pending'
+		  AND next_page=start_page
 		  AND from_timestamp <= $3 AND to_timestamp >= $2
 		  AND to_timestamp=$4 AND anchor_event_id=$5
 		ORDER BY created_at,id FOR UPDATE`, task.Source, task.FromTimestamp, task.ToTimestamp,
@@ -5748,6 +5753,7 @@ func (s *Store) NormalizeChainWatcherGapBacklog(ctx context.Context, now time.Ti
 	rows, err := tx.Query(ctx, `SELECT id,source,priority,reason,from_timestamp,to_timestamp,
 		start_page,end_page,anchor_event_id,head_event_id
 		FROM chain_watcher_gap_tasks WHERE kind='window' AND status='pending'
+		  AND next_page=start_page
 		ORDER BY source,start_page,end_page,anchor_event_id,from_timestamp,to_timestamp,id FOR UPDATE`)
 	if err != nil {
 		return 0, err
@@ -5817,6 +5823,7 @@ func (s *Store) NormalizeChainWatcherGapBacklog(ctx context.Context, now time.Ti
 	expandRows, err := tx.Query(ctx, `SELECT id,source,priority,reason,from_timestamp,to_timestamp,
 		start_page,end_page,anchor_event_id,created_at
 		FROM chain_watcher_gap_tasks WHERE kind='expand' AND status='pending'
+		  AND next_page=start_page
 		ORDER BY source,from_timestamp,to_timestamp,created_at,id FOR UPDATE`)
 	if err != nil {
 		return 0, err
@@ -5927,7 +5934,8 @@ func (s *Store) ClaimChainWatcherGap(ctx context.Context, owner, workerClass str
 		  AND ((NOT $2) OR source='fallback')
 		  AND (retry_after IS NULL OR retry_after <= $1)
 		ORDER BY CASE WHEN $3 AND (kind='window' OR priority>1) THEN 0 WHEN $3 THEN 1 ELSE 0 END,
-			CASE WHEN $3 THEN created_at END ASC, priority ASC, from_timestamp ASC, id ASC
+			CASE WHEN $3 THEN updated_at END ASC, CASE WHEN $3 THEN created_at END ASC,
+			priority ASC, from_timestamp ASC, id ASC
 		LIMIT 1 FOR UPDATE SKIP LOCKED
 	)
 	UPDATE chain_watcher_gap_tasks g SET status='leased', lease_owner=$4,

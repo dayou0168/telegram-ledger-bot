@@ -84,7 +84,9 @@ func TestReadyReturnsDegradedError(t *testing.T) {
 			t.Fatalf("unexpected path %q", r.URL.Path)
 		}
 		w.WriteHeader(http.StatusServiceUnavailable)
-		_ = json.NewEncoder(w).Encode(chainwatcher.StatusResponse{Status: "degraded", Ready: false})
+		_ = json.NewEncoder(w).Encode(chainwatcher.StatusResponse{
+			Status: "degraded/continuity", Ready: false, SourceReady: true, ContinuityReady: false,
+		})
 	}))
 	defer server.Close()
 
@@ -93,7 +95,7 @@ func TestReadyReturnsDegradedError(t *testing.T) {
 	if err == nil {
 		t.Fatal("Ready() error = nil, want degraded error")
 	}
-	if status.Ready || status.Status != "degraded" {
+	if status.Ready || !status.SourceReady || status.Status != "degraded/continuity" {
 		t.Fatalf("unexpected status: %#v", status)
 	}
 }

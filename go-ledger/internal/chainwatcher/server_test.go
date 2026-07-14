@@ -37,6 +37,26 @@ func TestReadyzReflectsSourceFailureAndEmptySuccess(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("readyz after empty successful scan = %d, want %d", rec.Code, http.StatusOK)
 	}
+	var ready ReadyStatusResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &ready); err != nil {
+		t.Fatal(err)
+	}
+	if !ready.SourceReady {
+		t.Fatalf("successful empty scan must report source_ready: %+v", ready)
+	}
+}
+
+func TestGapWorkerPollingUsesTokensWithoutLockingToRealtimeSecond(t *testing.T) {
+	if got := gapWorkerPollInterval(30*time.Second, 10*time.Second, 0); got != 250*time.Millisecond {
+		t.Fatalf("priority worker interval = %v, want 250ms", got)
+	}
+	if got := gapWorkerPollInterval(30*time.Second, 10*time.Second, 1); got != 10*time.Second {
+		t.Fatalf("secondary worker interval = %v, want fairness bound", got)
+	}
+	deferred := &tron.CompensationDeferredError{Reason: "compensation_token_bucket_empty"}
+	if got := gapRetryDelay(20, deferred, time.Second); got != 250*time.Millisecond {
+		t.Fatalf("deferred retry = %v, want 250ms and independent of attempts", got)
+	}
 }
 
 func TestReadyzDegradedWhenAllKeysRateLimited(t *testing.T) {
