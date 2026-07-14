@@ -416,7 +416,7 @@ func (g *telegramSendGateway) execute(workerCtx context.Context, req telegramSen
 		}
 		if g.limiter != nil {
 			rateStarted := time.Now()
-			if err := g.limiter.Wait(req.ctx, req.chatID); err != nil {
+			if err := g.limiter.Wait(req.ctx, req.priority, req.chatID); err != nil {
 				metrics.RateLimitDuration += time.Since(rateStarted)
 				metrics.CompletedAt = time.Now()
 				metrics.TotalDuration = metrics.CompletedAt.Sub(metrics.EnqueuedAt)

@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -264,12 +265,161 @@ func TestSendGatewayRetryAfterDelay(t *testing.T) {
 func TestTelegramRateLimiterPerChat(t *testing.T) {
 	limiter := newTelegramRateLimiter()
 	limiter.globalInterval = 0
-	limiter.chatInterval = time.Second
+	limiter.chatInterval = 30 * time.Millisecond
+	limiter.bulkInterval = 0
 
-	if wait := limiter.reserveWait(1001); wait != 0 {
-		t.Fatalf("first reservation wait = %v, want 0", wait)
+	if err := limiter.Wait(context.Background(), sendPriorityNormal, 1001); err != nil {
+		t.Fatalf("first reservation: %v", err)
 	}
-	if wait := limiter.reserveWait(1001); wait <= 0 {
-		t.Fatalf("second same-chat reservation wait = %v, want >0", wait)
+	started := time.Now()
+	if err := limiter.Wait(context.Background(), sendPriorityCritical, 1001); err != nil {
+		t.Fatalf("second reservation: %v", err)
 	}
+	if elapsed := time.Since(started); elapsed < 20*time.Millisecond {
+		t.Fatalf("same-chat reservation elapsed = %v, want >=20ms", elapsed)
+	}
+}
+
+func TestSendGatewayRealLimiterBulkCannotReserveAheadOfCritical(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	limiter := newTelegramRateLimiter()
+	limiter.globalInterval = 20 * time.Millisecond
+	limiter.chatInterval = 0
+	limiter.bulkInterval = 30 * time.Millisecond
+	gateway := newTelegramSendGateway(nil, limiter, 3, 32)
+	gateway.Start(ctx)
+
+	if _, err := gateway.Do(ctx, sendPriorityNormal, 1, func(context.Context) (telegram.Message, error) {
+		return telegram.Message{MessageID: 1}, nil
+	}); err != nil {
+		t.Fatalf("seed global limiter: %v", err)
+	}
+
+	var mu sync.Mutex
+	order := make([]string, 0, 8)
+	record := func(value string) telegramSendOperation {
+		return func(context.Context) (telegram.Message, error) {
+			mu.Lock()
+			order = append(order, value)
+			mu.Unlock()
+			return telegram.Message{MessageID: 2}, nil
+		}
+	}
+	bulkDone := make(chan error, 6)
+	for i := 0; i < 6; i++ {
+		value := i
+		go func() {
+			_, err := gateway.Do(ctx, sendPriorityBulk, int64(100+value), record("bulk"))
+			bulkDone <- err
+		}()
+	}
+	waitForLimiterWaiters(t, limiter, sendPriorityBulk, 1)
+
+	criticalStarted := time.Now()
+	criticalDone := make(chan error, 1)
+	go func() {
+		_, err := gateway.Do(ctx, sendPriorityCritical, 999, record("critical"))
+		criticalDone <- err
+	}()
+	waitForLimiterWaiters(t, limiter, sendPriorityCritical, 1)
+	normalDone := make(chan error, 1)
+	go func() {
+		_, err := gateway.Do(ctx, sendPriorityNormal, 998, record("normal"))
+		normalDone <- err
+	}()
+
+	if err := <-criticalDone; err != nil {
+		t.Fatalf("critical send: %v", err)
+	}
+	if elapsed := time.Since(criticalStarted); elapsed > 100*time.Millisecond {
+		t.Fatalf("critical limiter latency = %v, want <=100ms", elapsed)
+	}
+	if err := <-normalDone; err != nil {
+		t.Fatalf("normal send: %v", err)
+	}
+	for i := 0; i < 6; i++ {
+		if err := <-bulkDone; err != nil {
+			t.Fatalf("bulk send %d: %v", i, err)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(order) != 8 || order[0] != "critical" {
+		t.Fatalf("limiter order = %v, want critical first and all lanes complete", order)
+	}
+}
+
+func TestTelegramRateLimiterCancellationRemovesWaiter(t *testing.T) {
+	limiter := newTelegramRateLimiter()
+	limiter.mu.Lock()
+	limiter.nextGlobal = time.Now().Add(time.Second)
+	limiter.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- limiter.Wait(ctx, sendPriorityBulk, 42)
+	}()
+	waitForLimiterWaiters(t, limiter, sendPriorityBulk, 1)
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled limiter wait = %v", err)
+	}
+	limiter.mu.Lock()
+	defer limiter.mu.Unlock()
+	if len(limiter.waiters) != 0 {
+		t.Fatalf("limiter retained %d canceled waiters", len(limiter.waiters))
+	}
+}
+
+func TestTelegramRateLimiterFairnessAfterCriticalBurst(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	limiter := newTelegramRateLimiter()
+	limiter.globalInterval = time.Millisecond
+	limiter.chatInterval = 0
+	limiter.bulkInterval = 0
+	limiter.mu.Lock()
+	limiter.nextGlobal = time.Now().Add(30 * time.Millisecond)
+	limiter.criticalBurst = telegramRateFairnessBurst
+	limiter.mu.Unlock()
+	order := make(chan string, 2)
+	go func() {
+		if err := limiter.Wait(ctx, sendPriorityBulk, 1); err == nil {
+			order <- "bulk"
+		}
+	}()
+	waitForLimiterWaiters(t, limiter, sendPriorityBulk, 1)
+	go func() {
+		if err := limiter.Wait(ctx, sendPriorityCritical, 2); err == nil {
+			order <- "critical"
+		}
+	}()
+	waitForLimiterWaiters(t, limiter, sendPriorityCritical, 1)
+	if first := <-order; first != "bulk" {
+		t.Fatalf("fairness slot = %s, want bulk after critical burst", first)
+	}
+	if second := <-order; second != "critical" {
+		t.Fatalf("post-fairness slot = %s, want critical", second)
+	}
+}
+
+func waitForLimiterWaiters(t *testing.T, limiter *telegramRateLimiter, priority sendPriority, count int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		limiter.mu.Lock()
+		found := 0
+		for _, waiter := range limiter.waiters {
+			if waiter.priority == priority {
+				found++
+			}
+		}
+		limiter.mu.Unlock()
+		if found >= count {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("limiter did not queue %d %s waiters", count, priority)
 }

@@ -22,7 +22,7 @@ type Store struct {
 	keyCipher    *keyCipher
 }
 
-const latestSchemaMigrationVersion = "2.4.11-ledger-period-summary"
+const latestSchemaMigrationVersion = "2.4.12-update-admission-priority"
 
 const (
 	PermissionScopeGlobalOperator = "global_operator"
@@ -200,6 +200,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		`ALTER TABLE groups ADD COLUMN IF NOT EXISTS exchange_rate_source TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE groups ADD COLUMN IF NOT EXISTS exchange_rate_rank INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE groups ADD COLUMN IF NOT EXISTS exchange_rate_offset TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE groups ADD COLUMN IF NOT EXISTS last_telegram_update_id BIGINT NOT NULL DEFAULT 0`,
 		`CREATE TABLE IF NOT EXISTS users (
 			chat_id BIGINT NOT NULL,
 			user_id BIGINT NOT NULL,
@@ -208,6 +209,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			last_seen_at TIMESTAMPTZ NOT NULL,
 			PRIMARY KEY(chat_id, user_id)
 		)`,
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_telegram_update_id BIGINT NOT NULL DEFAULT 0`,
 		`CREATE INDEX IF NOT EXISTS idx_users_chat_seen
 			ON users(chat_id, last_seen_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_users_chat_username_lower
@@ -1366,6 +1368,21 @@ func (s *Store) EnsureGroup(ctx context.Context, chatID int64, title string, now
 	return err
 }
 
+func (s *Store) EnsureGroupForTelegramUpdate(ctx context.Context, chatID int64, title string, updateID int64, now time.Time) error {
+	if updateID <= 0 {
+		return s.EnsureGroup(ctx, chatID, title, now)
+	}
+	_, err := s.pool.Exec(ctx, `INSERT INTO groups(chat_id, title, created_at, updated_at, last_telegram_update_id)
+		VALUES($1, $2, $3, $4, $5)
+		ON CONFLICT(chat_id) DO UPDATE SET
+			title=excluded.title,
+			updated_at=excluded.updated_at,
+			last_telegram_update_id=excluded.last_telegram_update_id
+		WHERE groups.last_telegram_update_id < excluded.last_telegram_update_id`,
+		chatID, title, now, now, updateID)
+	return err
+}
+
 func (s *Store) TouchUser(ctx context.Context, chatID int64, user User, now time.Time) error {
 	_, err := s.pool.Exec(ctx, `INSERT INTO users(chat_id, user_id, username, display_name, last_seen_at)
 		VALUES($1, $2, $3, $4, $5)
@@ -1374,6 +1391,31 @@ func (s *Store) TouchUser(ctx context.Context, chatID int64, user User, now time
 			display_name=excluded.display_name,
 			last_seen_at=excluded.last_seen_at`,
 		chatID, user.ID, user.Username, user.DisplayName, now)
+	return err
+}
+
+func (s *Store) EnsureUser(ctx context.Context, chatID int64, user User, now time.Time) error {
+	_, err := s.pool.Exec(ctx, `INSERT INTO users(chat_id, user_id, username, display_name, last_seen_at)
+		VALUES($1, $2, $3, $4, $5)
+		ON CONFLICT(chat_id, user_id) DO NOTHING`,
+		chatID, user.ID, user.Username, user.DisplayName, now)
+	return err
+}
+
+func (s *Store) TouchUserForTelegramUpdate(ctx context.Context, chatID int64, user User, updateID int64, now time.Time) error {
+	if updateID <= 0 {
+		return s.TouchUser(ctx, chatID, user, now)
+	}
+	_, err := s.pool.Exec(ctx, `INSERT INTO users(
+			chat_id, user_id, username, display_name, last_seen_at, last_telegram_update_id
+		) VALUES($1, $2, $3, $4, $5, $6)
+		ON CONFLICT(chat_id, user_id) DO UPDATE SET
+			username=excluded.username,
+			display_name=excluded.display_name,
+			last_seen_at=excluded.last_seen_at,
+			last_telegram_update_id=excluded.last_telegram_update_id
+		WHERE users.last_telegram_update_id < excluded.last_telegram_update_id`,
+		chatID, user.ID, user.Username, user.DisplayName, now, updateID)
 	return err
 }
 

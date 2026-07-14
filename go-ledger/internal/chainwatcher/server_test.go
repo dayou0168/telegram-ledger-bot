@@ -333,7 +333,7 @@ func TestCatchupSplitsSaturatedWindowWithoutSkippingGap(t *testing.T) {
 	}))
 	defer api.Close()
 
-	client := tron.NewClientWithKeys(api.URL, []string{"k1", "k2", "k3"}, 3*time.Second, tron.KeyPoolOptions{CompensationMaxRPS: 12})
+	client := tron.NewClientWithKeys(api.URL, []string{"k1", "k2", "k3"}, 3*time.Second, tron.KeyPoolOptions{CompensationMaxRPS: 0.1})
 	server := NewServer(config.ChainWatcherConfig{CatchupPages: 1, USDTContract: "TR7"}, nil, client)
 	budget := 20
 	advanced, result, err := server.scanCatchupWindow(context.Background(), 1000, 5000, map[string][]storage.ChainWatcherSubscription{}, &budget)
@@ -460,7 +460,7 @@ func TestExpandYieldsWhenSurplusBudgetIsExhausted(t *testing.T) {
 	}))
 	defer api.Close()
 	keys := []string{"k1", "k2", "k3", "k4", "k5", "k6", "k7", "k8", "k9", "k10"}
-	client := tron.NewClientWithKeys(api.URL, keys, 2*time.Second, tron.KeyPoolOptions{CompensationMaxRPS: 50})
+	client := tron.NewClientWithKeys(api.URL, keys, 2*time.Second, tron.KeyPoolOptions{CompensationMaxRPS: 0.1})
 	server := NewServer(config.ChainWatcherConfig{RecoverySafetyMaxPages: 8, USDTContract: "TR7"}, nil, client)
 	server.subDirty = false
 	server.subByAddress = map[string][]storage.ChainWatcherSubscription{}

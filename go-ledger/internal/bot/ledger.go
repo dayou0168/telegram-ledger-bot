@@ -319,7 +319,7 @@ func (b *Bot) handleOperatorCommand(ctx context.Context, msg telegram.Message, u
 	for _, target := range targets {
 		if add {
 			doneTouch := measurePerfStage(ctx, "db_user_touch")
-			if err := b.store.TouchUser(ctx, msg.Chat.ID, target, now); err != nil {
+			if err := b.store.EnsureUser(ctx, msg.Chat.ID, target, now); err != nil {
 				doneTouch()
 				return err
 			}

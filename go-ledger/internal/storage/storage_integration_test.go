@@ -617,6 +617,93 @@ func TestPostgresOpenSkipsAppliedMigrationDuringBusinessWrite(t *testing.T) {
 	reopened.Close()
 }
 
+func TestPostgresTelegramMetadataNewestUpdateWinsAcrossInstances(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	storeA, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open store A: %v", err)
+	}
+	defer storeA.Close()
+	storeB, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open store B: %v", err)
+	}
+	defer storeB.Close()
+
+	suffix := time.Now().UnixNano()
+	chatID := int64(-905000000000 - suffix%1000000)
+	userID := int64(705000000000 + suffix%1000000)
+	periodStart := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+	if err := storeA.EnsureGroup(ctx, chatID, "initial", periodStart); err != nil {
+		t.Fatalf("ensure initial group: %v", err)
+	}
+	if err := storeA.SetGroupActivePeriod(ctx, chatID, true, "2026-07-15", "2026-07-15", periodStart); err != nil {
+		t.Fatalf("start accounting period: %v", err)
+	}
+
+	releaseOlder := make(chan struct{})
+	olderDone := make(chan error, 1)
+	go func() {
+		<-releaseOlder
+		if err := storeB.EnsureGroupForTelegramUpdate(ctx, chatID, "older title", 100, periodStart.Add(time.Second)); err != nil {
+			olderDone <- err
+			return
+		}
+		olderDone <- storeB.TouchUserForTelegramUpdate(ctx, chatID, User{
+			ID: userID, Username: "older", DisplayName: "Older Name",
+		}, 100, periodStart.Add(time.Second))
+	}()
+
+	newerAt := periodStart.Add(2 * time.Second)
+	if err := storeA.EnsureGroupForTelegramUpdate(ctx, chatID, "newest title", 200, newerAt); err != nil {
+		t.Fatalf("write newer group metadata: %v", err)
+	}
+	if err := storeA.TouchUserForTelegramUpdate(ctx, chatID, User{
+		ID: userID, Username: "newest", DisplayName: "Newest Name",
+	}, 200, newerAt); err != nil {
+		t.Fatalf("write newer user metadata: %v", err)
+	}
+	close(releaseOlder)
+	if err := <-olderDone; err != nil {
+		t.Fatalf("write delayed older metadata: %v", err)
+	}
+	if err := storeB.EnsureUser(ctx, chatID, User{
+		ID: userID, Username: "historical", DisplayName: "Historical Reply Name",
+	}, periodStart); err != nil {
+		t.Fatalf("ensure historical reply user: %v", err)
+	}
+
+	group, err := storeB.GetGroup(ctx, chatID)
+	if err != nil {
+		t.Fatalf("get group after reverse completion: %v", err)
+	}
+	if group.Title != "newest title" || !group.Active || !group.ActivePeriodStartedAt.Equal(periodStart) {
+		t.Fatalf("group metadata/state after reverse completion = %+v", group)
+	}
+	var groupUpdateID int64
+	if err := storeB.pool.QueryRow(ctx, `SELECT last_telegram_update_id FROM groups WHERE chat_id=$1`, chatID).Scan(&groupUpdateID); err != nil {
+		t.Fatalf("read group update id: %v", err)
+	}
+	var username, displayName string
+	var userUpdateID int64
+	var lastSeen time.Time
+	if err := storeB.pool.QueryRow(ctx, `SELECT username,display_name,last_seen_at,last_telegram_update_id
+		FROM users WHERE chat_id=$1 AND user_id=$2`, chatID, userID).Scan(
+		&username, &displayName, &lastSeen, &userUpdateID,
+	); err != nil {
+		t.Fatalf("read user metadata: %v", err)
+	}
+	if groupUpdateID != 200 || username != "newest" || displayName != "Newest Name" || userUpdateID != 200 || !lastSeen.Equal(newerAt) {
+		t.Fatalf("newest metadata did not win: group_update=%d user=%q/%q user_update=%d last_seen=%v",
+			groupUpdateID, username, displayName, userUpdateID, lastSeen)
+	}
+}
+
 func TestPostgresLedgerClearTicketSecurity(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {

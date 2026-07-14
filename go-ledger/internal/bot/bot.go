@@ -31,15 +31,16 @@ type Bot struct {
 	perms         permissions.Policy
 	loc           *time.Location
 
-	dispatcher    *worker.Dispatcher
-	ledgerPool    *worker.Pool
-	controlPool   *worker.Pool
-	chainPool     *worker.Pool
-	ratePool      *worker.Pool
-	broadcastPool *worker.Pool
-	queryPool     *worker.Pool
-	notifyPool    *worker.Pool
-	criticalPool  *worker.Pool
+	dispatcher      *worker.Dispatcher
+	updateAdmission *updateAdmission
+	ledgerPool      *worker.Pool
+	controlPool     *worker.Pool
+	chainPool       *worker.Pool
+	ratePool        *worker.Pool
+	broadcastPool   *worker.Pool
+	queryPool       *worker.Pool
+	notifyPool      *worker.Pool
+	criticalPool    *worker.Pool
 
 	groupTouchCache       *ttlCache[string]
 	groupCache            *ttlCache[storage.Group]
@@ -94,6 +95,7 @@ func New(cfg config.Config, store *storage.Store, tg *telegram.Client, tronClien
 		perms:                 permissions.NewPolicy(cfg.HostUserID, cfg.DefaultOperatorIDs),
 		loc:                   loc,
 		dispatcher:            worker.NewDispatcher(cfg.QueueSize),
+		updateAdmission:       newUpdateAdmission(cfg.QueueSize),
 		ledgerPool:            worker.NewPool("ledger", cfg.LedgerWorkers, cfg.QueueSize),
 		controlPool:           worker.NewPool("control", cfg.ControlWorkers, cfg.QueueSize),
 		chainPool:             worker.NewPool("chain", cfg.ChainWorkers, cfg.QueueSize),
@@ -132,6 +134,7 @@ func (b *Bot) Run(ctx context.Context) error {
 	b.notifyPool.StartN(ctx, b.cfg.NotifyWorkers)
 	b.criticalPool.Start(ctx)
 	b.sendGateway.Start(ctx)
+	b.updateAdmission.Start(ctx)
 
 	if b.cfg.ChainWatcherEnabled() {
 		if b.fallbackStore == nil {
@@ -162,32 +165,11 @@ func (b *Bot) Run(ctx context.Context) error {
 			time.Sleep(time.Second)
 			continue
 		}
-		for _, update := range updates {
-			if update.UpdateID >= offset {
-				offset = update.UpdateID + 1
+		if !b.admitUpdateBatch(ctx, updates, &offset) {
+			if err := ctx.Err(); err != nil {
+				return err
 			}
-			now := time.Now().In(b.loc)
-			claimed, err := b.store.ClaimUpdate(ctx, update.UpdateID, now)
-			if err != nil {
-				log.Printf("claim update %d: %v", update.UpdateID, err)
-				continue
-			}
-			if !claimed {
-				continue
-			}
-			key, pool := b.updateRoute(update)
-			u := update
-			queuedAt := time.Now()
-			b.dispatcher.Submit(ctx, key, pool, func(jobCtx context.Context) {
-				trace := newPerfTrace(u.UpdateID, updateChatID(u))
-				traceCtx := contextWithPerfTrace(jobCtx, trace)
-				addPerfStage(traceCtx, "queue_wait", time.Since(queuedAt))
-				markPerfQueue(traceCtx, key, b.dispatcher.Depth(key))
-				if err := b.handleUpdate(traceCtx, u); err != nil {
-					log.Printf("handle update %d: %v", u.UpdateID, err)
-				}
-				finishPerfTrace(trace, b.cfg.SlowUpdateThreshold)
-			})
+			return fmt.Errorf("update admission stopped")
 		}
 	}
 }
@@ -304,6 +286,7 @@ func (b *Bot) updateRoute(update telegram.Update) (string, worker.Executor) {
 
 func (b *Bot) handleUpdate(ctx context.Context, update telegram.Update) error {
 	ctx = contextWithPermissionMemo(ctx)
+	ctx = context.WithValue(ctx, telegramUpdateIDContextKey{}, update.UpdateID)
 	switch {
 	case update.Message != nil:
 		return b.handleMessage(ctx, *update.Message)
@@ -414,12 +397,9 @@ func (b *Bot) handleMessage(ctx context.Context, msg telegram.Message) error {
 }
 
 func (b *Bot) handlePrivateMessage(ctx context.Context, msg telegram.Message, user storage.User, text string, now time.Time) error {
-	doneTouch := measurePerfStage(ctx, "db_user_touch")
-	if err := b.store.TouchUser(ctx, msg.Chat.ID, user, now); err != nil {
-		doneTouch()
+	if err := b.touchUserCached(ctx, msg.Chat.ID, user, now); err != nil {
 		return err
 	}
-	doneTouch()
 	b.recordIncomingPrivateChatMessage(ctx, msg, user, now)
 	if msg.UsersShared != nil {
 		return b.handleUsersShared(ctx, msg)
@@ -521,7 +501,7 @@ func (b *Bot) handleMyChatMember(ctx context.Context, upd telegram.ChatMemberUpd
 			_, _ = b.sendText(ctx, sendPriorityNormal, upd.Chat.ID, "邀请人没有授权，机器人将自动退出。", nil)
 			return b.tg.LeaveChat(ctx, upd.Chat.ID)
 		}
-		if err := b.store.EnsureGroup(ctx, upd.Chat.ID, upd.Chat.Title, now); err != nil {
+		if err := b.ensureGroupCached(ctx, upd.Chat.ID, upd.Chat.Title, now); err != nil {
 			return err
 		}
 		return nil
@@ -573,6 +553,13 @@ func userFromTelegram(u telegram.User) storage.User {
 }
 
 func (b *Bot) ensureGroupCached(ctx context.Context, chatID int64, title string, now time.Time) error {
+	updateID, _ := ctx.Value(telegramUpdateIDContextKey{}).(int64)
+	if updateID > 0 {
+		markPerfCache(ctx, "group_touch", false)
+		done := measurePerfStage(ctx, "db_group_touch")
+		defer done()
+		return b.store.EnsureGroupForTelegramUpdate(ctx, chatID, title, updateID, now)
+	}
 	key := strconv.FormatInt(chatID, 10)
 	if cached, ok := b.groupTouchCache.Get(key); ok && cached == title {
 		markPerfCache(ctx, "group_touch", true)
@@ -589,6 +576,13 @@ func (b *Bot) ensureGroupCached(ctx context.Context, chatID int64, title string,
 }
 
 func (b *Bot) touchUserCached(ctx context.Context, chatID int64, user storage.User, now time.Time) error {
+	updateID, _ := ctx.Value(telegramUpdateIDContextKey{}).(int64)
+	if updateID > 0 {
+		markPerfCache(ctx, "user_touch", false)
+		done := measurePerfStage(ctx, "db_user_touch")
+		defer done()
+		return b.store.TouchUserForTelegramUpdate(ctx, chatID, user, updateID, now)
+	}
 	key := fmt.Sprintf("%d:%d", chatID, user.ID)
 	value := user.Username + "|" + user.DisplayName
 	if cached, ok := b.userTouchCache.Get(key); ok && cached == value {
@@ -604,6 +598,8 @@ func (b *Bot) touchUserCached(ctx context.Context, chatID int64, user storage.Us
 	b.userTouchCache.Set(key, value)
 	return nil
 }
+
+type telegramUpdateIDContextKey struct{}
 
 func (b *Bot) getGroupCached(ctx context.Context, chatID int64) (storage.Group, error) {
 	key := strconv.FormatInt(chatID, 10)
