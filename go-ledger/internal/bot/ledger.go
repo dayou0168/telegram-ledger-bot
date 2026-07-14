@@ -546,6 +546,17 @@ func (b *Bot) canUseLedgerForUndo(ctx context.Context, group storage.Group, user
 	return b.store.IsOperator(ctx, group.ChatID, userID)
 }
 
+func (b *Bot) canUseLedgerFresh(ctx context.Context, chatID, userID int64) (bool, error) {
+	globalAccess, err := b.hasGlobalLedgerAccess(ctx, userID)
+	if err != nil || globalAccess {
+		return globalAccess, err
+	}
+	if b.groupOperatorLookup != nil {
+		return b.groupOperatorLookup(ctx, chatID, userID)
+	}
+	return b.store.IsOperator(ctx, chatID, userID)
+}
+
 func (b *Bot) canManageGroup(ctx context.Context, chatID, userID int64) (bool, error) {
 	globalAccess, err := b.hasGlobalLedgerAccess(ctx, userID)
 	if err != nil {

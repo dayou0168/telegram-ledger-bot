@@ -40,27 +40,30 @@ type Bot struct {
 	queryPool     *worker.Pool
 	notifyPool    *worker.Pool
 
-	groupTouchCache      *ttlCache[string]
-	groupCache           *ttlCache[storage.Group]
-	billSummaryCache     *ttlCache[storage.BillSummaryData]
-	userTouchCache       *ttlCache[string]
-	operatorCache        *ttlCache[bool]
-	watchTargetCache     *ttlCache[[]storage.WatchTarget]
-	fallbackSubCache     *ttlCache[[]storage.ChainWatcherSubscription]
-	rateBookCache        *ttlCache[[]p2p.OrderBookEntry]
-	rateBookState        rateBookState
-	privateStates        *ttlCache[privateState]
-	notificationWake     chan struct{}
-	telegramLimiter      *telegramRateLimiter
-	sendGateway          *telegramSendGateway
-	watchRunning         atomic.Bool
-	watcherFallback      *watcherFallbackController
-	watcherTiming        chainWatcherTimingStatus
-	fallbackNextPoll     atomic.Int64
-	fallbackBackoff      atomic.Int32
-	fallbackLeaderActive atomic.Bool
-	globalOperatorLookup func(context.Context, int64) (permissions.UserCapabilities, bool, error)
-	groupOperatorLookup  func(context.Context, int64, int64) (bool, error)
+	groupTouchCache       *ttlCache[string]
+	groupCache            *ttlCache[storage.Group]
+	billSummaryCache      *ttlCache[storage.BillSummaryData]
+	userTouchCache        *ttlCache[string]
+	operatorCache         *ttlCache[bool]
+	globalCapabilityCache *globalCapabilityCache
+	watchTargetCache      *ttlCache[[]storage.WatchTarget]
+	fallbackSubCache      *ttlCache[[]storage.ChainWatcherSubscription]
+	rateBookCache         *ttlCache[[]p2p.OrderBookEntry]
+	rateBookState         rateBookState
+	privateStates         *ttlCache[privateState]
+	notificationWake      chan struct{}
+	telegramLimiter       *telegramRateLimiter
+	sendGateway           *telegramSendGateway
+	watchRunning          atomic.Bool
+	watcherFallback       *watcherFallbackController
+	watcherTiming         chainWatcherTimingStatus
+	fallbackNextPoll      atomic.Int64
+	fallbackBackoff       atomic.Int32
+	fallbackLeaderActive  atomic.Bool
+	globalPermissionEpoch atomic.Int64
+	globalOperatorLookup  func(context.Context, int64) (permissions.UserCapabilities, bool, error)
+	permissionEpochLookup func(context.Context) (int64, error)
+	groupOperatorLookup   func(context.Context, int64, int64) (bool, error)
 }
 
 func New(cfg config.Config, store *storage.Store, tg *telegram.Client, tronClient *tron.Client, p2pClient *p2p.Client, fallbackStores ...*storage.Store) *Bot {
@@ -73,36 +76,37 @@ func New(cfg config.Config, store *storage.Store, tg *telegram.Client, tronClien
 		fallbackStore = fallbackStores[0]
 	}
 	bot := &Bot{
-		cfg:              cfg,
-		store:            store,
-		fallbackStore:    fallbackStore,
-		tg:               tg,
-		tron:             tronClient,
-		fallbackTron:     tron.NewPublicFallbackClient(cfg.TronAPIBase, cfg.RequestTimeout),
-		p2p:              p2pClient,
-		watcher:          chainclient.New(cfg.ChainWatcherURL, cfg.ChainWatcherBotID, cfg.ChainWatcherSecret, cfg.RequestTimeout),
-		perms:            permissions.NewPolicy(cfg.HostUserID, cfg.DefaultOperatorIDs),
-		loc:              loc,
-		dispatcher:       worker.NewDispatcher(),
-		ledgerPool:       worker.NewPool("ledger", cfg.LedgerWorkers, cfg.QueueSize),
-		controlPool:      worker.NewPool("control", cfg.ControlWorkers, cfg.QueueSize),
-		chainPool:        worker.NewPool("chain", cfg.ChainWorkers, cfg.QueueSize),
-		ratePool:         worker.NewPool("rate", cfg.RateWorkers, cfg.QueueSize),
-		broadcastPool:    worker.NewPool("broadcast", cfg.BroadcastWorkers, cfg.QueueSize),
-		queryPool:        worker.NewPool("query", cfg.QueryWorkers, cfg.QueueSize),
-		notifyPool:       worker.NewPool("notify", cfg.NotifyWorkers, cfg.QueueSize),
-		groupTouchCache:  newTTLCache[string](cfg.GroupCacheTTL),
-		groupCache:       newTTLCache[storage.Group](cfg.GroupCacheTTL),
-		billSummaryCache: newTTLCache[storage.BillSummaryData](cfg.BillSummaryCacheTTL),
-		userTouchCache:   newTTLCache[string](cfg.UserTouchCacheTTL),
-		operatorCache:    newTTLCache[bool](cfg.OperatorCacheTTL),
-		watchTargetCache: newTTLCache[[]storage.WatchTarget](cfg.WatchCacheTTL),
-		fallbackSubCache: newTTLCache[[]storage.ChainWatcherSubscription](cfg.WatchCacheTTL),
-		rateBookCache:    newTTLCache[[]p2p.OrderBookEntry](cfg.P2PCacheTTL),
-		privateStates:    newTTLCache[privateState](30 * time.Minute),
-		notificationWake: make(chan struct{}, 1),
-		telegramLimiter:  newTelegramRateLimiter(),
-		watcherFallback:  newWatcherFallbackControllerWithRecovery(cfg.BotWatcherFailThreshold, cfg.BotFallbackRecoverySuccesses, cfg.BotFallbackRecoveryLag),
+		cfg:                   cfg,
+		store:                 store,
+		fallbackStore:         fallbackStore,
+		tg:                    tg,
+		tron:                  tronClient,
+		fallbackTron:          tron.NewPublicFallbackClient(cfg.TronAPIBase, cfg.RequestTimeout),
+		p2p:                   p2pClient,
+		watcher:               chainclient.New(cfg.ChainWatcherURL, cfg.ChainWatcherBotID, cfg.ChainWatcherSecret, cfg.RequestTimeout),
+		perms:                 permissions.NewPolicy(cfg.HostUserID, cfg.DefaultOperatorIDs),
+		loc:                   loc,
+		dispatcher:            worker.NewDispatcher(),
+		ledgerPool:            worker.NewPool("ledger", cfg.LedgerWorkers, cfg.QueueSize),
+		controlPool:           worker.NewPool("control", cfg.ControlWorkers, cfg.QueueSize),
+		chainPool:             worker.NewPool("chain", cfg.ChainWorkers, cfg.QueueSize),
+		ratePool:              worker.NewPool("rate", cfg.RateWorkers, cfg.QueueSize),
+		broadcastPool:         worker.NewPool("broadcast", cfg.BroadcastWorkers, cfg.QueueSize),
+		queryPool:             worker.NewPool("query", cfg.QueryWorkers, cfg.QueueSize),
+		notifyPool:            worker.NewPool("notify", cfg.NotifyWorkers, cfg.QueueSize),
+		groupTouchCache:       newTTLCache[string](cfg.GroupCacheTTL),
+		groupCache:            newTTLCache[storage.Group](cfg.GroupCacheTTL),
+		billSummaryCache:      newTTLCache[storage.BillSummaryData](cfg.BillSummaryCacheTTL),
+		userTouchCache:        newTTLCache[string](cfg.UserTouchCacheTTL),
+		operatorCache:         newTTLCache[bool](cfg.OperatorCacheTTL),
+		globalCapabilityCache: newGlobalCapabilityCache(cfg.GlobalPermissionCacheTTL, cfg.GlobalPermissionCacheSize),
+		watchTargetCache:      newTTLCache[[]storage.WatchTarget](cfg.WatchCacheTTL),
+		fallbackSubCache:      newTTLCache[[]storage.ChainWatcherSubscription](cfg.WatchCacheTTL),
+		rateBookCache:         newTTLCache[[]p2p.OrderBookEntry](cfg.P2PCacheTTL),
+		privateStates:         newTTLCache[privateState](30 * time.Minute),
+		notificationWake:      make(chan struct{}, 1),
+		telegramLimiter:       newTelegramRateLimiter(),
+		watcherFallback:       newWatcherFallbackControllerWithRecovery(cfg.BotWatcherFailThreshold, cfg.BotFallbackRecoverySuccesses, cfg.BotFallbackRecoveryLag),
 	}
 	bot.fallbackTron.SetMinRequestInterval(cfg.BotFallbackRequestInterval)
 	bot.sendGateway = newTelegramSendGateway(tg, bot.telegramLimiter, cfg.NotifyWorkers, cfg.QueueSize)
@@ -131,6 +135,7 @@ func (b *Bot) Run(ctx context.Context) error {
 	go b.notificationOutboxScheduler(ctx)
 	go b.privateCleanupScheduler(ctx)
 	go b.rateScheduler(ctx)
+	go b.permissionInvalidationScheduler(ctx)
 
 	var offset int64
 	for {
@@ -269,6 +274,7 @@ func (b *Bot) updateRoute(update telegram.Update) (string, worker.Executor) {
 }
 
 func (b *Bot) handleUpdate(ctx context.Context, update telegram.Update) error {
+	ctx = contextWithPermissionMemo(ctx)
 	switch {
 	case update.Message != nil:
 		return b.handleMessage(ctx, *update.Message)

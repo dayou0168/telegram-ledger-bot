@@ -484,6 +484,11 @@ type LedgerClearTicketResult struct {
 	DeletedCount int64
 }
 
+type PermissionInvalidation struct {
+	Scope string `json:"scope"`
+	Epoch int64  `json:"epoch"`
+}
+
 type AddressValidation struct {
 	ChatID           int64
 	Address          string

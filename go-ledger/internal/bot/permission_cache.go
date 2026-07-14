@@ -2,32 +2,125 @@ package bot
 
 import (
 	"context"
+	"errors"
+	"log"
+	"time"
 
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/permissions"
+	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
 )
 
 func ledgerPermissionCacheKey(chatID, userID int64) string {
 	return formatID(chatID) + ":" + formatID(userID)
 }
 
-func broadcastPermissionCacheKey(userID int64) string {
-	return "broadcast:" + formatID(userID)
-}
-
-func addressWatchPrivilegeCacheKey(userID int64) string {
-	return "address_watch_unlimited:" + formatID(userID)
-}
-
 func (b *Bot) globalOperatorCapabilities(ctx context.Context, userID int64) (permissions.UserCapabilities, bool, error) {
-	if b.globalOperatorLookup != nil {
-		return b.globalOperatorLookup(ctx, userID)
+	memo := permissionMemoFromContext(ctx)
+	if memo != nil {
+		memo.mu.Lock()
+		defer memo.mu.Unlock()
+		if value, ok := memo.capabilities[userID]; ok {
+			return value.Capabilities, value.Active, nil
+		}
 	}
-	level, ok, err := b.store.GetGlobalOperatorLevel(ctx, userID)
-	if err != nil || !ok {
+
+	epoch, err := b.currentGlobalPermissionEpoch(ctx, memo)
+	if err != nil {
 		return permissions.UserCapabilities{}, false, err
 	}
-	caps := permissions.UserCapabilities{GlobalOperatorLevel: level}
-	return caps, caps.IsGlobalOperator(), nil
+	if value, ok := b.globalCapabilityCache.Get(userID, epoch); ok {
+		if memo != nil {
+			memo.capabilities[userID] = value
+		}
+		return value.Capabilities, value.Active, nil
+	}
+
+	var value globalCapabilityValue
+	if b.globalOperatorLookup != nil {
+		value.Capabilities, value.Active, err = b.globalOperatorLookup(ctx, userID)
+	} else {
+		var level string
+		level, value.Active, err = b.store.GetGlobalOperatorLevel(ctx, userID)
+		if value.Active {
+			value.Capabilities = permissions.UserCapabilities{GlobalOperatorLevel: level}
+			value.Active = value.Capabilities.IsGlobalOperator()
+		}
+	}
+	if err != nil {
+		return permissions.UserCapabilities{}, false, err
+	}
+	b.globalCapabilityCache.Set(userID, epoch, value)
+	if memo != nil {
+		memo.capabilities[userID] = value
+	}
+	return value.Capabilities, value.Active, nil
+}
+
+func (b *Bot) currentGlobalPermissionEpoch(ctx context.Context, memo *updatePermissionMemo) (int64, error) {
+	if memo != nil && memo.epochLoaded {
+		return memo.epoch, nil
+	}
+	var (
+		epoch int64
+		err   error
+	)
+	if b.permissionEpochLookup != nil {
+		epoch, err = b.permissionEpochLookup(ctx)
+	} else if b.store != nil {
+		epoch, err = b.store.GetPermissionEpoch(ctx, storage.PermissionScopeGlobalOperator)
+	} else {
+		epoch = b.globalPermissionEpoch.Load()
+		if epoch == 0 {
+			epoch = 1
+		}
+	}
+	if err != nil {
+		return 0, err
+	}
+	b.applyGlobalPermissionEpoch(epoch)
+	if memo != nil {
+		memo.epochLoaded = true
+		memo.epoch = epoch
+	}
+	return epoch, nil
+}
+
+func (b *Bot) applyGlobalPermissionEpoch(epoch int64) {
+	if epoch <= 0 {
+		return
+	}
+	for {
+		current := b.globalPermissionEpoch.Load()
+		if epoch <= current {
+			return
+		}
+		if b.globalPermissionEpoch.CompareAndSwap(current, epoch) {
+			b.globalCapabilityCache.Clear()
+			return
+		}
+	}
+}
+
+func (b *Bot) permissionInvalidationScheduler(ctx context.Context) {
+	if b.store == nil {
+		return
+	}
+	for ctx.Err() == nil {
+		err := b.store.ListenPermissionInvalidations(ctx, func(event storage.PermissionInvalidation) {
+			if event.Scope == storage.PermissionScopeGlobalOperator {
+				b.applyGlobalPermissionEpoch(event.Epoch)
+			}
+		})
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+			return
+		}
+		log.Printf("permission invalidation listener: %v", err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Second):
+		}
+	}
 }
 
 func (b *Bot) hasGlobalLedgerAccess(ctx context.Context, userID int64) (bool, error) {
@@ -46,20 +139,18 @@ func (b *Bot) InvalidateLedgerPermission(chatID, userID int64) {
 		return
 	}
 	b.operatorCache.Delete(ledgerPermissionCacheKey(chatID, userID))
-	b.operatorCache.Delete(addressWatchPrivilegeCacheKey(userID))
 }
 
 func (b *Bot) InvalidateBroadcastPermission(userID int64) {
-	if b.operatorCache != nil {
-		b.operatorCache.Delete(broadcastPermissionCacheKey(userID))
-		b.operatorCache.Delete(addressWatchPrivilegeCacheKey(userID))
-	}
 	if b.privateStates != nil {
 		b.privateStates.Delete(formatID(userID))
 	}
 }
 
 func (b *Bot) InvalidateAllPermissionCaches() {
+	if b.globalCapabilityCache != nil {
+		b.globalCapabilityCache.Clear()
+	}
 	if b.operatorCache != nil {
 		b.operatorCache.Clear()
 	}

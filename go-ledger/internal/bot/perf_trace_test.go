@@ -32,40 +32,36 @@ func TestInvalidateBillSummaryCacheRemovesCachedDay(t *testing.T) {
 	}
 }
 
-func TestInvalidateLedgerPermissionRemovesOperatorAndAddressWatchPrivilege(t *testing.T) {
+func TestInvalidateLedgerPermissionRemovesOperator(t *testing.T) {
 	b := &Bot{operatorCache: newTTLCache[bool](time.Minute)}
 	b.operatorCache.Set(ledgerPermissionCacheKey(-1001, 2002), true)
-	b.operatorCache.Set(addressWatchPrivilegeCacheKey(2002), true)
 
 	b.InvalidateLedgerPermission(-1001, 2002)
 
 	if _, ok := b.operatorCache.Get(ledgerPermissionCacheKey(-1001, 2002)); ok {
 		t.Fatal("ledger operator cache should be invalidated immediately")
 	}
-	if _, ok := b.operatorCache.Get(addressWatchPrivilegeCacheKey(2002)); ok {
-		t.Fatal("address watch privilege cache should be invalidated with ledger permission")
-	}
 }
 
-func TestInvalidateBroadcastPermissionRemovesOperatorAddressAndState(t *testing.T) {
+func TestInvalidateBroadcastPermissionRemovesState(t *testing.T) {
 	b := &Bot{
-		operatorCache: newTTLCache[bool](time.Minute),
 		privateStates: newTTLCache[privateState](time.Minute),
 	}
-	b.operatorCache.Set(broadcastPermissionCacheKey(2002), true)
-	b.operatorCache.Set(addressWatchPrivilegeCacheKey(2002), true)
 	b.privateStates.Set(formatID(2002), privateState{Mode: "all", ChatIDs: []int64{-1001}})
 
 	b.InvalidateBroadcastPermission(2002)
 
-	if _, ok := b.operatorCache.Get(broadcastPermissionCacheKey(2002)); ok {
-		t.Fatal("broadcast operator cache should be invalidated immediately")
-	}
-	if _, ok := b.operatorCache.Get(addressWatchPrivilegeCacheKey(2002)); ok {
-		t.Fatal("address watch privilege cache should be invalidated with broadcast permission")
-	}
 	if _, ok := b.privateStates.Get(formatID(2002)); ok {
 		t.Fatal("broadcast private state should be invalidated immediately")
+	}
+}
+
+func TestInvalidateAllPermissionCachesClearsCapabilityInputs(t *testing.T) {
+	b := &Bot{globalCapabilityCache: newGlobalCapabilityCache(time.Minute, 4)}
+	b.globalCapabilityCache.Set(2002, 1, globalCapabilityValue{Active: true})
+	b.InvalidateAllPermissionCaches()
+	if b.globalCapabilityCache.Len() != 0 {
+		t.Fatal("global capability input cache should be invalidated immediately")
 	}
 }
 

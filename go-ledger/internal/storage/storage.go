@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -21,7 +22,12 @@ type Store struct {
 	keyCipher    *keyCipher
 }
 
-const latestSchemaMigrationVersion = "2.4.7-chain-gap-convergence"
+const latestSchemaMigrationVersion = "2.4.10-global-permission-epoch"
+
+const (
+	PermissionScopeGlobalOperator = "global_operator"
+	permissionInvalidationChannel = "ledger_permission_invalidation"
+)
 
 func Open(ctx context.Context, databaseURL string) (*Store, error) {
 	return open(ctx, databaseURL, true)
@@ -404,6 +410,31 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE TRIGGER trg_validate_global_operator_parent
 			BEFORE INSERT OR UPDATE OF level, status, parent_user_id ON global_operators
 			FOR EACH ROW EXECUTE FUNCTION validate_global_operator_parent()`,
+		`CREATE TABLE IF NOT EXISTS permission_epochs (
+			scope TEXT PRIMARY KEY,
+			epoch BIGINT NOT NULL DEFAULT 1,
+			updated_at TIMESTAMPTZ NOT NULL
+		)`,
+		`INSERT INTO permission_epochs(scope, epoch, updated_at)
+			VALUES('global_operator', 1, NOW())
+			ON CONFLICT(scope) DO NOTHING`,
+		`CREATE OR REPLACE FUNCTION invalidate_global_operator_permissions() RETURNS trigger AS $$
+		DECLARE
+			new_epoch BIGINT;
+		BEGIN
+			UPDATE permission_epochs
+			SET epoch=epoch+1, updated_at=NOW()
+			WHERE scope='global_operator'
+			RETURNING epoch INTO new_epoch;
+			PERFORM pg_notify('ledger_permission_invalidation',
+				json_build_object('scope', 'global_operator', 'epoch', new_epoch)::TEXT);
+			RETURN NULL;
+		END;
+		$$ LANGUAGE plpgsql`,
+		`DROP TRIGGER IF EXISTS trg_invalidate_global_operator_permissions ON global_operators`,
+		`CREATE TRIGGER trg_invalidate_global_operator_permissions
+			AFTER INSERT OR UPDATE OR DELETE ON global_operators
+			FOR EACH STATEMENT EXECUTE FUNCTION invalidate_global_operator_permissions()`,
 		`CREATE TABLE IF NOT EXISTS global_operator_level_repair_candidates (
 			user_id BIGINT PRIMARY KEY,
 			original_level TEXT NOT NULL,
@@ -1266,6 +1297,11 @@ func (s *Store) migrate(ctx context.Context) error {
 		return fmt.Errorf("record broadcast group owner transfer migration: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
+		VALUES('2.4.7-chain-gap-convergence', NOW())
+		ON CONFLICT(version) DO NOTHING`); err != nil {
+		return fmt.Errorf("record chain gap convergence migration: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
 		VALUES($1, NOW())
 		ON CONFLICT(version) DO NOTHING`, latestSchemaMigrationVersion); err != nil {
 		return fmt.Errorf("record schema migration: %w", err)
@@ -2057,6 +2093,46 @@ func (s *Store) GetGlobalOperatorLevel(ctx context.Context, userID int64) (strin
 		return "", false, nil
 	}
 	return level, err == nil, err
+}
+
+func (s *Store) GetPermissionEpoch(ctx context.Context, scope string) (int64, error) {
+	var epoch int64
+	err := s.pool.QueryRow(ctx, `SELECT epoch FROM permission_epochs WHERE scope=$1`, strings.TrimSpace(scope)).Scan(&epoch)
+	return epoch, err
+}
+
+// ListenPermissionInvalidations dedicates one pooled connection to PostgreSQL
+// notifications. LISTEN happens before the initial epoch read so callers cannot
+// miss a committed permission change while establishing the subscription.
+func (s *Store) ListenPermissionInvalidations(ctx context.Context, handle func(PermissionInvalidation)) error {
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, `LISTEN `+permissionInvalidationChannel); err != nil {
+		return err
+	}
+	var epoch int64
+	if err := conn.QueryRow(ctx, `SELECT epoch FROM permission_epochs WHERE scope=$1`, PermissionScopeGlobalOperator).Scan(&epoch); err != nil {
+		return err
+	}
+	if handle != nil {
+		handle(PermissionInvalidation{Scope: PermissionScopeGlobalOperator, Epoch: epoch})
+	}
+	for {
+		notification, err := conn.Conn().WaitForNotification(ctx)
+		if err != nil {
+			return err
+		}
+		var event PermissionInvalidation
+		if err := json.Unmarshal([]byte(notification.Payload), &event); err != nil || event.Scope == "" || event.Epoch <= 0 {
+			continue
+		}
+		if handle != nil {
+			handle(event)
+		}
+	}
 }
 
 func (s *Store) GetGlobalOperator(ctx context.Context, userID int64) (GlobalOperator, bool, error) {
@@ -2851,13 +2927,14 @@ func (s *Store) CleanupAdminLoginTickets(ctx context.Context, cutoff time.Time) 
 }
 
 const (
-	LedgerClearTicketApplied       = "applied"
-	LedgerClearTicketConsumed      = "consumed"
-	LedgerClearTicketNotFound      = "not_found"
-	LedgerClearTicketWrongChat     = "wrong_chat"
-	LedgerClearTicketWrongUser     = "wrong_user"
-	LedgerClearTicketExpired       = "expired"
-	LedgerClearTicketPeriodChanged = "period_changed"
+	LedgerClearTicketApplied          = "applied"
+	LedgerClearTicketConsumed         = "consumed"
+	LedgerClearTicketNotFound         = "not_found"
+	LedgerClearTicketWrongChat        = "wrong_chat"
+	LedgerClearTicketWrongUser        = "wrong_user"
+	LedgerClearTicketPermissionDenied = "permission_denied"
+	LedgerClearTicketExpired          = "expired"
+	LedgerClearTicketPeriodChanged    = "period_changed"
 )
 
 func (s *Store) CreateLedgerClearTicket(ctx context.Context, ticket LedgerClearTicket) error {
@@ -2875,7 +2952,29 @@ func (s *Store) CreateLedgerClearTicket(ctx context.Context, ticket LedgerClearT
 	return err
 }
 
-func (s *Store) ConsumeLedgerClearTicketAndDelete(ctx context.Context, tokenHash string, chatID, userID int64, now time.Time) (LedgerClearTicketResult, error) {
+func (s *Store) GetLedgerClearTicket(ctx context.Context, tokenHash string) (LedgerClearTicket, bool, error) {
+	var ticket LedgerClearTicket
+	var consumed pgtype.Timestamptz
+	err := s.pool.QueryRow(ctx, `SELECT token_hash, chat_id, requested_by_user_id, day_key,
+			active_period_started_at, expires_at, consumed_at, created_at
+		FROM ledger_clear_tickets WHERE token_hash=$1`, strings.TrimSpace(tokenHash)).Scan(
+		&ticket.TokenHash, &ticket.ChatID, &ticket.RequestedByUserID, &ticket.DayKey,
+		&ticket.ActivePeriodStartedAt, &ticket.ExpiresAt, &consumed, &ticket.CreatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return LedgerClearTicket{}, false, nil
+	}
+	if err != nil {
+		return LedgerClearTicket{}, false, err
+	}
+	if consumed.Valid {
+		value := consumed.Time
+		ticket.ConsumedAt = &value
+	}
+	return ticket, true, nil
+}
+
+func (s *Store) ConsumeLedgerClearTicketAndDelete(ctx context.Context, tokenHash string, chatID, userID int64, configuredPrivileged bool, expected Group, now time.Time) (LedgerClearTicketResult, error) {
 	result := LedgerClearTicketResult{Status: LedgerClearTicketNotFound}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -2913,16 +3012,40 @@ func (s *Store) ConsumeLedgerClearTicketAndDelete(ctx context.Context, tokenHash
 		result.Status = LedgerClearTicketExpired
 		return result, tx.Commit(ctx)
 	}
+	if !configuredPrivileged {
+		var one int
+		err = tx.QueryRow(ctx, `SELECT 1 FROM global_operators
+			WHERE user_id=$1 AND status='active' AND level IN ('primary', 'secondary')
+			FOR UPDATE`, userID).Scan(&one)
+		if errors.Is(err, pgx.ErrNoRows) {
+			err = tx.QueryRow(ctx, `SELECT 1 FROM operators
+				WHERE chat_id=$1 AND user_id=$2 FOR UPDATE`, chatID, userID).Scan(&one)
+		}
+		if errors.Is(err, pgx.ErrNoRows) {
+			result.Status = LedgerClearTicketPermissionDenied
+			return result, tx.Commit(ctx)
+		}
+		if err != nil {
+			return result, err
+		}
+	}
 
 	var active bool
-	var dayKey string
+	var dayKey, expiresDayKey string
 	var periodStartedAt time.Time
-	err = tx.QueryRow(ctx, `SELECT active, active_day_key, active_period_started_at
-		FROM groups WHERE chat_id=$1 FOR UPDATE`, chatID).Scan(&active, &dayKey, &periodStartedAt)
+	var cutoffHour int
+	err = tx.QueryRow(ctx, `SELECT active, active_day_key, active_expires_day_key,
+			active_period_started_at, cutoff_hour
+		FROM groups WHERE chat_id=$1 FOR UPDATE`, chatID).Scan(
+		&active, &dayKey, &expiresDayKey, &periodStartedAt, &cutoffHour,
+	)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return result, err
 	}
-	if errors.Is(err, pgx.ErrNoRows) || !active || dayKey != ticket.DayKey || !periodStartedAt.Equal(ticket.ActivePeriodStartedAt) {
+	if errors.Is(err, pgx.ErrNoRows) || !active || !expected.Active ||
+		dayKey != ticket.DayKey || dayKey != expected.ActiveDayKey ||
+		expiresDayKey != expected.ActiveExpiresDayKey || cutoffHour != expected.CutoffHour ||
+		!periodStartedAt.Equal(ticket.ActivePeriodStartedAt) || !periodStartedAt.Equal(expected.ActivePeriodStartedAt) {
 		result.Status = LedgerClearTicketPeriodChanged
 		return result, tx.Commit(ctx)
 	}

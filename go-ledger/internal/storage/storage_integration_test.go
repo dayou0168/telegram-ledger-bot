@@ -99,6 +99,103 @@ func TestPostgresConcurrentOpenSerializesMigration(t *testing.T) {
 	}
 }
 
+func TestPostgresGlobalPermissionEpochNotifiesOtherStore(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	migrationURL, _, _ := postgresTestSchema(t, ctx, dsn, "permission_epoch")
+	storeA, err := Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storeA.Close()
+	storeB, err := Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storeB.Close()
+
+	events := make(chan PermissionInvalidation, 4)
+	listenCtx, stopListener := context.WithCancel(ctx)
+	defer stopListener()
+	listenerErr := make(chan error, 1)
+	go func() {
+		listenerErr <- storeB.ListenPermissionInvalidations(listenCtx, func(event PermissionInvalidation) {
+			events <- event
+		})
+	}()
+	var initial PermissionInvalidation
+	select {
+	case initial = <-events:
+	case err := <-listenerErr:
+		t.Fatalf("start listener: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("listener did not report initial epoch")
+	}
+	if initial.Scope != PermissionScopeGlobalOperator || initial.Epoch <= 0 {
+		t.Fatalf("initial event = %+v", initial)
+	}
+	waitForEpoch := func(want int64) PermissionInvalidation {
+		t.Helper()
+		for {
+			select {
+			case event := <-events:
+				if event.Scope == PermissionScopeGlobalOperator && event.Epoch >= want {
+					return event
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatalf("notification did not reach epoch %d", want)
+			}
+		}
+	}
+
+	userID := int64(700000000000 + time.Now().UnixNano()%1000000)
+	now := time.Now().UTC()
+	if err := storeA.UpsertGlobalOperator(ctx, userID, "primary", 0, userID, "epoch integration", now); err != nil {
+		t.Fatal(err)
+	}
+	epoch, err := storeB.GetPermissionEpoch(ctx, PermissionScopeGlobalOperator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := waitForEpoch(epoch)
+	if changed.Epoch != epoch {
+		t.Fatalf("stored epoch = %d; notification = %+v", epoch, changed)
+	}
+	if disabled, err := storeA.DisableGlobalOperator(ctx, userID, userID, now.Add(time.Second)); err != nil || !disabled {
+		t.Fatalf("disable global operator = %v, %v", disabled, err)
+	}
+	disabledEpoch, err := storeA.GetPermissionEpoch(ctx, PermissionScopeGlobalOperator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event := waitForEpoch(disabledEpoch); event.Epoch != disabledEpoch {
+		t.Fatalf("disable notification = %+v, want epoch %d", event, disabledEpoch)
+	}
+	if _, err := storeA.pool.Exec(ctx, `DELETE FROM global_operators WHERE user_id=$1`, userID); err != nil {
+		t.Fatal(err)
+	}
+	deletedEpoch, err := storeA.GetPermissionEpoch(ctx, PermissionScopeGlobalOperator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event := waitForEpoch(deletedEpoch); event.Epoch != deletedEpoch {
+		t.Fatalf("delete notification = %+v, want epoch %d", event, deletedEpoch)
+	}
+	stopListener()
+	select {
+	case err := <-listenerErr:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("listener stop: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("listener did not stop")
+	}
+}
+
 func TestPostgresV242ToV243MigrationIsIdempotent(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
@@ -570,16 +667,22 @@ func TestPostgresLedgerClearTicketSecurity(t *testing.T) {
 	if err := storeA.CreateLedgerClearTicket(ctx, ticket); err != nil {
 		t.Fatalf("create ticket: %v", err)
 	}
-	if got, err := storeA.ConsumeLedgerClearTicketAndDelete(ctx, ticket.TokenHash, chatID, otherUserID, now.Add(10*time.Second)); err != nil || got.Status != LedgerClearTicketWrongUser {
+	if got, err := storeA.ConsumeLedgerClearTicketAndDelete(ctx, ticket.TokenHash, chatID, otherUserID, true, group, now.Add(10*time.Second)); err != nil || got.Status != LedgerClearTicketWrongUser {
 		t.Fatalf("other user result = %+v, %v", got, err)
 	}
 	if record, ok, err := storeA.GetRecord(ctx, recordID); err != nil || !ok || record.DeletedAt != nil {
 		t.Fatalf("other user changed record = %+v, ok=%t err=%v", record, ok, err)
 	}
-	if got, err := storeB.ConsumeLedgerClearTicketAndDelete(ctx, ticket.TokenHash, chatID, requesterID, now.Add(59*time.Second)); err != nil || got.Status != LedgerClearTicketApplied || got.DeletedCount != 1 {
+	if got, err := storeA.ConsumeLedgerClearTicketAndDelete(ctx, ticket.TokenHash, chatID, requesterID, false, group, now.Add(20*time.Second)); err != nil || got.Status != LedgerClearTicketPermissionDenied {
+		t.Fatalf("revoked permission result = %+v, %v", got, err)
+	}
+	if record, ok, err := storeA.GetRecord(ctx, recordID); err != nil || !ok || record.DeletedAt != nil {
+		t.Fatalf("revoked permission changed record = %+v, ok=%t err=%v", record, ok, err)
+	}
+	if got, err := storeB.ConsumeLedgerClearTicketAndDelete(ctx, ticket.TokenHash, chatID, requesterID, true, group, now.Add(59*time.Second)); err != nil || got.Status != LedgerClearTicketApplied || got.DeletedCount != 1 {
 		t.Fatalf("second instance 59s result = %+v, %v", got, err)
 	}
-	if got, err := storeA.ConsumeLedgerClearTicketAndDelete(ctx, ticket.TokenHash, chatID, requesterID, now.Add(59*time.Second)); err != nil || got.Status != LedgerClearTicketConsumed {
+	if got, err := storeA.ConsumeLedgerClearTicketAndDelete(ctx, ticket.TokenHash, chatID, requesterID, true, group, now.Add(59*time.Second)); err != nil || got.Status != LedgerClearTicketConsumed {
 		t.Fatalf("repeat result = %+v, %v", got, err)
 	}
 
@@ -588,7 +691,7 @@ func TestPostgresLedgerClearTicketSecurity(t *testing.T) {
 	if err := storeA.CreateLedgerClearTicket(ctx, expired); err != nil {
 		t.Fatalf("create expiring ticket: %v", err)
 	}
-	if got, err := storeA.ConsumeLedgerClearTicketAndDelete(ctx, expired.TokenHash, chatID, requesterID, now.Add(61*time.Second)); err != nil || got.Status != LedgerClearTicketExpired {
+	if got, err := storeA.ConsumeLedgerClearTicketAndDelete(ctx, expired.TokenHash, chatID, requesterID, true, group, now.Add(61*time.Second)); err != nil || got.Status != LedgerClearTicketExpired {
 		t.Fatalf("61s result = %+v, %v", got, err)
 	}
 
@@ -603,7 +706,7 @@ func TestPostgresLedgerClearTicketSecurity(t *testing.T) {
 	if err := storeA.SetGroupActivePeriod(ctx, chatID, true, dayKey, dayKey, now.Add(2*time.Minute+time.Second)); err != nil {
 		t.Fatalf("restart period: %v", err)
 	}
-	if got, err := storeB.ConsumeLedgerClearTicketAndDelete(ctx, oldPeriod.TokenHash, chatID, requesterID, now.Add(30*time.Second)); err != nil || got.Status != LedgerClearTicketPeriodChanged {
+	if got, err := storeB.ConsumeLedgerClearTicketAndDelete(ctx, oldPeriod.TokenHash, chatID, requesterID, true, group, now.Add(30*time.Second)); err != nil || got.Status != LedgerClearTicketPeriodChanged {
 		t.Fatalf("old period result = %+v, %v", got, err)
 	}
 }

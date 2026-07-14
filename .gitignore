@@ -5,3 +5,5 @@
 data/
 go-ledger/ledger-bot
 go-ledger/ledger-bot.exe
+go-ledger/.gocache/
+go-ledger/.gotmp/

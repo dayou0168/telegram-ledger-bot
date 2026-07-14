@@ -197,6 +197,19 @@ func TestLoadBillSummaryCacheTTL(t *testing.T) {
 	}
 }
 
+func TestLoadGlobalPermissionCacheBounds(t *testing.T) {
+	t.Setenv("TELEGRAM_BOT_TOKEN", "token")
+	t.Setenv("BOT_GLOBAL_PERMISSION_CACHE_TTL_SECONDS", "75")
+	t.Setenv("BOT_GLOBAL_PERMISSION_CACHE_SIZE", "123")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.GlobalPermissionCacheTTL != 75*time.Second || cfg.GlobalPermissionCacheSize != 123 {
+		t.Fatalf("global permission cache = %s/%d, want 75s/123", cfg.GlobalPermissionCacheTTL, cfg.GlobalPermissionCacheSize)
+	}
+}
+
 func TestLoadOutboxRetentionDefaultsAndEnv(t *testing.T) {
 	t.Setenv("TELEGRAM_BOT_TOKEN", "token")
 	t.Setenv("BOT_OUTBOX_SENT_RETENTION_HOURS", "")

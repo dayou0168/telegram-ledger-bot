@@ -79,7 +79,38 @@ func (b *Bot) handleClearLedgerCallback(ctx context.Context, cb telegram.Callbac
 		return b.tg.AnswerCallback(ctx, cb.ID, "操作无效")
 	}
 	now := time.Now().In(b.loc)
-	result, err := b.store.ConsumeLedgerClearTicketAndDelete(ctx, adminauth.HashToken(parts[2]), cb.Message.Chat.ID, cb.From.ID, now)
+	tokenHash := adminauth.HashToken(parts[2])
+	ticket, ok, err := b.store.GetLedgerClearTicket(ctx, tokenHash)
+	if err != nil {
+		return err
+	}
+	if !ok || ticket.ConsumedAt != nil {
+		return b.tg.AnswerCallback(ctx, cb.ID, "纭宸插け鏁?")
+	}
+	if ticket.ChatID != cb.Message.Chat.ID || ticket.RequestedByUserID != cb.From.ID {
+		return b.tg.AnswerCallback(ctx, cb.ID, "杩欎笉鏄綘鐨勬竻璐︾‘璁?")
+	}
+	if !ticket.ExpiresAt.After(now) {
+		return b.tg.AnswerCallback(ctx, cb.ID, "纭宸茶繃鏈燂紝璇烽噸鏂板彂閫佹竻璐︽寚浠?")
+	}
+	allowed, err := b.canUseLedgerFresh(ctx, cb.Message.Chat.ID, cb.From.ID)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return b.tg.AnswerCallback(ctx, cb.ID, "娌℃湁娓呴櫎璐﹀崟鏉冮檺")
+	}
+	group, err := b.store.GetGroup(ctx, cb.Message.Chat.ID)
+	if err != nil {
+		return err
+	}
+	if !groupAccountingActive(group, now) || group.ActivePeriodStartedAt.IsZero() ||
+		currentLedgerDayKey(group, now) != ticket.DayKey ||
+		!group.ActivePeriodStartedAt.Equal(ticket.ActivePeriodStartedAt) {
+		return b.tg.AnswerCallback(ctx, cb.ID, "璐︽湡宸插彉鍖栵紝璇烽噸鏂扮‘璁?")
+	}
+	result, err := b.store.ConsumeLedgerClearTicketAndDelete(ctx, tokenHash, cb.Message.Chat.ID, cb.From.ID,
+		b.perms.HasGlobalLedgerAccess(cb.From.ID), group, now)
 	if err != nil {
 		return err
 	}
@@ -90,6 +121,8 @@ func (b *Bot) handleClearLedgerCallback(ctx context.Context, cb telegram.Callbac
 		return b.tg.AnswerCallback(ctx, cb.ID, "确认已过期，请重新发送清账指令")
 	case storage.LedgerClearTicketPeriodChanged:
 		return b.tg.AnswerCallback(ctx, cb.ID, "账期已变化，请重新确认")
+	case storage.LedgerClearTicketPermissionDenied:
+		return b.tg.AnswerCallback(ctx, cb.ID, "没有清除账单权限。")
 	case storage.LedgerClearTicketApplied:
 		// Continue below.
 	default:

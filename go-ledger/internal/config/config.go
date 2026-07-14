@@ -36,6 +36,8 @@ type Config struct {
 	BillSummaryCacheTTL        time.Duration
 	UserTouchCacheTTL          time.Duration
 	OperatorCacheTTL           time.Duration
+	GlobalPermissionCacheTTL   time.Duration
+	GlobalPermissionCacheSize  int
 	WatchCacheTTL              time.Duration
 	SlowUpdateThreshold        time.Duration
 	PollTimeout                time.Duration
@@ -109,6 +111,8 @@ func Load() (Config, error) {
 		BillSummaryCacheTTL:           secondsEnv("BOT_BILL_SUMMARY_CACHE_TTL_SECONDS", 30),
 		UserTouchCacheTTL:             secondsEnv("BOT_USER_TOUCH_CACHE_TTL_SECONDS", 180),
 		OperatorCacheTTL:              secondsEnv("BOT_OPERATOR_CACHE_TTL_SECONDS", 10),
+		GlobalPermissionCacheTTL:      secondsEnv("BOT_GLOBAL_PERMISSION_CACHE_TTL_SECONDS", 60),
+		GlobalPermissionCacheSize:     intEnv("BOT_GLOBAL_PERMISSION_CACHE_SIZE", 4096),
 		WatchCacheTTL:                 secondsEnv("BOT_WATCH_CACHE_TTL_SECONDS", 3),
 		SlowUpdateThreshold:           millisEnv("BOT_SLOW_UPDATE_THRESHOLD_MS", 800),
 		PollTimeout:                   secondsEnv("BOT_POLL_TIMEOUT", 50),
@@ -229,6 +233,12 @@ func Load() (Config, error) {
 	}
 	if cfg.BillSummaryCacheTTL <= 0 {
 		cfg.BillSummaryCacheTTL = 30 * time.Second
+	}
+	if cfg.GlobalPermissionCacheTTL <= 0 {
+		cfg.GlobalPermissionCacheTTL = 60 * time.Second
+	}
+	if cfg.GlobalPermissionCacheSize < 1 {
+		cfg.GlobalPermissionCacheSize = 4096
 	}
 	if cfg.AddressWatchFreeLimit < 0 {
 		cfg.AddressWatchFreeLimit = 0
