@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -566,6 +567,68 @@ func TestSharedRoundDeadlineDoesNotCoolElevenHealthyKeys(t *testing.T) {
 	}
 	if result.Metrics.Pages < 1 {
 		t.Fatalf("next round pages = %d, want at least the reserved head", result.Metrics.Pages)
+	}
+}
+
+func TestEqualParentAndRequestTimeoutKeepsPartialElevenKeyRoundHealthy(t *testing.T) {
+	const keyCount = 11
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		start, _ := strconv.Atoi(r.URL.Query().Get("start"))
+		if start < 4*50 {
+			writeShortTransferPage(w)
+			return
+		}
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	keys := make([]string, keyCount)
+	for index := range keys {
+		keys[index] = fmt.Sprintf("key-%02d", index)
+	}
+	const timeout = 120 * time.Millisecond
+	client := NewClientWithKeys(server.URL, keys, timeout, KeyPoolOptions{RealtimeInterval: time.Second, BudgetZone: time.UTC})
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	result, err := client.FetchScheduledMainPagesAt(ctx, "TR7", 1, 1000, keyCount, 4, nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("round error = %v, want parent deadline", err)
+	}
+	if got := calls.Load(); got != keyCount {
+		t.Fatalf("request count = %d, want %d", got, keyCount)
+	}
+	if len(result.SuccessfulPages) != 4 || len(result.FailedPages) != keyCount-4 {
+		t.Fatalf("partial result = success %v failures %v", result.SuccessfulPages, result.FailedPages)
+	}
+	status := client.KeyPoolStatus(time.Now())
+	if status.HealthyCount != keyCount || status.AvailableCount != keyCount || status.CooldownCount != 0 {
+		t.Fatalf("equal deadlines cooled keys: %+v", status)
+	}
+}
+
+func TestWrappedLateParentDeadlineDoesNotCoolKeys(t *testing.T) {
+	const keyCount = 11
+	keys := make([]string, keyCount)
+	for index := range keys {
+		keys[index] = fmt.Sprintf("key-%02d", index)
+	}
+	client := NewClientWithKeys("https://tronscan.invalid", keys, 100*time.Millisecond, KeyPoolOptions{RealtimeInterval: time.Second})
+	client.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		<-req.Context().Done()
+		// Model a transport that returns after the old round has already ended
+		// and wraps the context error in url.Error.
+		time.Sleep(20 * time.Millisecond)
+		return nil, &url.Error{Op: http.MethodGet, URL: req.URL.String(), Err: req.Context().Err()}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if _, err := client.FetchScheduledMainPagesAt(ctx, "TR7", 1, 1000, keyCount, 4, nil); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("wrapped late error = %v, want parent deadline", err)
+	}
+	status := client.KeyPoolStatus(time.Now())
+	if status.HealthyCount != keyCount || status.AvailableCount != keyCount || status.CooldownCount != 0 {
+		t.Fatalf("wrapped late deadline cooled keys: %+v", status)
 	}
 }
 
@@ -1201,6 +1264,12 @@ func writeFullTransferPage(w http.ResponseWriter) {
 func writeShortTransferPage(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprint(w, `{"token_transfers":[]}`)
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return fn(request)
 }
 
 type memoryUsageStore struct {

@@ -478,7 +478,8 @@ func (b *Bot) processOneFallbackGap(ctx context.Context) (bool, error) {
 	}
 	full := len(fetch.Transfers) >= 50
 	next := page + 1
-	if full && next < task.EndPage {
+	pageLimit := fallbackGapPageLimit(task, b.cfg.BotFallbackSafetyMaxPages)
+	if full && next < pageLimit {
 		_, err = b.fallbackStore.YieldChainWatcherGap(ctx, task.ID, task.LeaseGeneration, task.LeaseOwner, next, "", time.Now())
 		return true, err
 	}
@@ -507,6 +508,17 @@ func (b *Bot) processOneFallbackGap(ctx context.Context) (bool, error) {
 		return true, err
 	}
 	return true, b.completeFallbackGap(ctx, task)
+}
+
+func fallbackGapPageLimit(task storage.ChainWatcherGapTask, safetyMax int) int {
+	pageLimit := task.EndPage
+	if task.Kind == "window" || pageLimit <= task.StartPage {
+		pageLimit = safetyMax
+	}
+	if pageLimit <= task.StartPage {
+		pageLimit = task.StartPage + 1
+	}
+	return pageLimit
 }
 
 func (b *Bot) completeFallbackGap(ctx context.Context, task storage.ChainWatcherGapTask) error {

@@ -16,10 +16,13 @@ import (
 )
 
 type Client struct {
-	baseURL string
-	http    *http.Client
-	keys    *keyPool
+	baseURL        string
+	http           *http.Client
+	requestTimeout time.Duration
+	keys           *keyPool
 }
+
+var errTronscanRequestTimeout = errors.New("tronscan request timeout")
 
 type Transfer struct {
 	Hash           string
@@ -110,9 +113,10 @@ func NewPublicFallbackClient(baseURL string, timeout time.Duration) *Client {
 
 func NewClientWithKeys(baseURL string, apiKeys []string, timeout time.Duration, opts KeyPoolOptions) *Client {
 	return &Client{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		http:    &http.Client{Timeout: timeout},
-		keys:    newKeyPool(apiKeys, opts),
+		baseURL:        strings.TrimRight(baseURL, "/"),
+		http:           &http.Client{},
+		requestTimeout: timeout,
+		keys:           newKeyPool(apiKeys, opts),
 	}
 }
 
@@ -622,8 +626,10 @@ func (c *Client) getTimedWithLeaseLimit(ctx context.Context, path string, values
 		}
 		metrics.Calls++
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+		requestCtx, requestCancel := c.newRequestContext(ctx)
+		req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, apiURL, nil)
 		if err != nil {
+			requestCancel()
 			return metrics, err
 		}
 		req.Header.Set("Accept", "application/json")
@@ -636,11 +642,13 @@ func (c *Client) getTimedWithLeaseLimit(ctx context.Context, path string, values
 		c.keys.endRequest(*lease, source)
 		metrics.APIDuration += time.Since(apiStarted)
 		if err != nil {
-			// All pages in a realtime round share its deadline. Charging that
-			// cancellation to every in-flight key can cool the entire pool at
-			// once, even though the upstream and the keys remain healthy.
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return metrics, ctxErr
+			requestCause := context.Cause(requestCtx)
+			requestCancel()
+			// The request context has one authoritative timer. A parent/round
+			// cancellation never changes key health, even if net/http wraps the
+			// returned error or the transport returns after the round ended.
+			if requestCause != nil && !errors.Is(requestCause, errTronscanRequestTimeout) {
+				return metrics, requestCause
 			}
 			c.reportKeyResult(*lease, 0, err.Error(), 0)
 			lastKeyError = err
@@ -659,9 +667,11 @@ func (c *Client) getTimedWithLeaseLimit(ctx context.Context, path string, values
 		}
 		raw, readErr := io.ReadAll(resp.Body)
 		resp.Body.Close()
+		requestCause := context.Cause(requestCtx)
+		requestCancel()
 		if readErr != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return metrics, ctxErr
+			if requestCause != nil && !errors.Is(requestCause, errTronscanRequestTimeout) {
+				return metrics, requestCause
 			}
 			c.reportKeyResult(*lease, 0, readErr.Error(), 0)
 			return metrics, readErr
@@ -696,6 +706,21 @@ func (c *Client) getTimedWithLeaseLimit(ctx context.Context, path string, values
 		failover = false
 		return metrics, nil
 	}
+}
+
+// newRequestContext avoids racing http.Client.Timeout against a scan-round
+// deadline. When the caller already has the earlier deadline, it remains the
+// sole timeout owner. Otherwise a marked child timeout protects standalone
+// requests and is correctly attributed to the key/transport path.
+func (c *Client) newRequestContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if c.requestTimeout <= 0 {
+		return context.WithCancel(parent)
+	}
+	requestDeadline := time.Now().Add(c.requestTimeout)
+	if parentDeadline, ok := parent.Deadline(); ok && !parentDeadline.After(requestDeadline) {
+		return context.WithCancel(parent)
+	}
+	return context.WithTimeoutCause(parent, c.requestTimeout, errTronscanRequestTimeout)
 }
 
 func (c *Client) reportKeyResult(lease apiKeyLease, status int, body string, retryAfter time.Duration) {

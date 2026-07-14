@@ -198,6 +198,17 @@ func TestFallbackPollBackoffStepsAndRecovers(t *testing.T) {
 	}
 }
 
+func TestFallbackWindowKeepsPagingUntilSafetyLimit(t *testing.T) {
+	task := storage.ChainWatcherGapTask{Kind: "window", StartPage: 0, EndPage: 0, NextPage: 53}
+	if got := fallbackGapPageLimit(task, 256); got != 256 {
+		t.Fatalf("window page limit = %d, want configured safety limit", got)
+	}
+	task = storage.ChainWatcherGapTask{Kind: "expand", StartPage: 3, EndPage: 4096, NextPage: 53}
+	if got := fallbackGapPageLimit(task, 256); got != 4096 {
+		t.Fatalf("expand page limit = %d, want task end page", got)
+	}
+}
+
 func TestWatcherFallbackControllerEmptySuccessfulClaimsDoNotFail(t *testing.T) {
 	now := time.Unix(2000, 0)
 	controller := newWatcherFallbackControllerWithRecovery(3, 2, 5*time.Second)

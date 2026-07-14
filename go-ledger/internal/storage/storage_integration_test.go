@@ -2171,6 +2171,46 @@ func TestChainWatcherWindowSplitRestartsBothChildPageCursors(t *testing.T) {
 	}
 }
 
+func TestChainWatcherOrdinaryCursorUpdatesNeverRegress(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	migrationURL, _, _ := postgresTestSchema(t, ctx, dsn, "gap_cursor_monotonic")
+	store, err := Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now().UTC()
+	base := now.UnixMilli()
+	if _, err := store.EnqueueChainWatcherGap(ctx, ChainWatcherGapTask{
+		Kind: "window", Source: "fallback", Priority: 1,
+		FromTimestamp: base, ToTimestamp: base + 10_000,
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+	task, ok, err := store.ClaimChainWatcherGap(ctx, "cursor-worker", "fallback", time.Minute, now)
+	if err != nil || !ok {
+		t.Fatalf("claim = %+v/%v/%v", task, ok, err)
+	}
+	if advanced, err := store.AdvanceChainWatcherGapPage(ctx, task.ID, task.LeaseGeneration, task.LeaseOwner, 53, time.Minute, now); err != nil || !advanced {
+		t.Fatalf("advance to 53 = %v/%v", advanced, err)
+	}
+	if yielded, err := store.YieldChainWatcherGap(ctx, task.ID, task.LeaseGeneration, task.LeaseOwner, 36, "", now.Add(time.Second)); err != nil || !yielded {
+		t.Fatalf("stale yield = %v/%v", yielded, err)
+	}
+	claimed, ok, err := store.ClaimChainWatcherGap(ctx, "cursor-worker-2", "fallback", time.Minute, now.Add(2*time.Second))
+	if err != nil || !ok {
+		t.Fatalf("reclaim = %+v/%v/%v", claimed, ok, err)
+	}
+	if claimed.NextPage != 53 {
+		t.Fatalf("ordinary cursor regressed to %d, want 53", claimed.NextPage)
+	}
+}
+
 func TestNormalizeChainWatcherGapBacklogCollapsesLegacyOverlap(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {

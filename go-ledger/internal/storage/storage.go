@@ -5970,7 +5970,7 @@ func (s *Store) ClaimChainWatcherGap(ctx context.Context, owner, workerClass str
 }
 
 func (s *Store) AdvanceChainWatcherGapPage(ctx context.Context, id, generation int64, owner string, nextPage int, lease time.Duration, now time.Time) (bool, error) {
-	tag, err := s.pool.Exec(ctx, `UPDATE chain_watcher_gap_tasks SET next_page=$4,
+	tag, err := s.pool.Exec(ctx, `UPDATE chain_watcher_gap_tasks SET next_page=GREATEST(next_page,$4),
 		lease_until=$5::timestamptz+($6 * interval '1 second'), updated_at=$5
 		WHERE id=$1 AND lease_generation=$2 AND lease_owner=$3 AND status='leased'`,
 		id, generation, owner, nextPage, now, lease.Seconds())
@@ -5978,7 +5978,7 @@ func (s *Store) AdvanceChainWatcherGapPage(ctx context.Context, id, generation i
 }
 
 func (s *Store) YieldChainWatcherGap(ctx context.Context, id, generation int64, owner string, nextPage int, lastError string, now time.Time) (bool, error) {
-	tag, err := s.pool.Exec(ctx, `UPDATE chain_watcher_gap_tasks SET next_page=$4,
+	tag, err := s.pool.Exec(ctx, `UPDATE chain_watcher_gap_tasks SET next_page=GREATEST(next_page,$4),
 		status='pending',lease_owner='',lease_until=NULL,retry_after=NULL,last_error=$5,updated_at=$6
 		WHERE id=$1 AND lease_generation=$2 AND lease_owner=$3 AND status='leased'`,
 		id, generation, owner, nextPage, lastError, now)
