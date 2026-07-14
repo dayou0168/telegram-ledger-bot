@@ -12,15 +12,15 @@ then dispatches the explicit release workflow and verifies the immutable assets.
 pwsh -File scripts/publish-release.ps1 -DryRun
 
 .EXAMPLE
-pwsh -File scripts/publish-release.ps1 -Version 2.4.7
+pwsh -File scripts/publish-release.ps1 -Version 2.4.8
 #>
 [CmdletBinding()]
 param(
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = '2.4.7',
+    [string]$Version = '2.4.8',
 
     [ValidatePattern('^[0-9a-f]{40}$')]
-    [string]$ExpectedRemoteMaster = 'e573252bd9156ddddcdf8e572edacc94ff493909',
+    [string]$ExpectedRemoteMaster = '56d957832512a3afc9b5faaf51d0e624373ea9cb',
 
     [string]$Repository = 'dayou0168/telegram-ledger-bot',
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# v2.4.7 production rollout helper. The default action is read-only preflight.
+# v2.4.8 production rollout helper. The default action is read-only preflight.
 # Secrets and DSNs are read from existing runtime configuration or environment;
 # never put them in this file or pass them as positional command arguments.
 
@@ -111,7 +111,7 @@ backup_all() {
   discover_dsns
   discover_pg_tools
   umask 077
-  local dir="$BACKUP_ROOT/v2.4.7-$(date +%Y%m%d-%H%M%S)"
+  local dir="$BACKUP_ROOT/v2.4.8-$(date +%Y%m%d-%H%M%S)"
   install -d -m 0700 "$dir"
   log "creating verified backup: $dir"
 
@@ -142,6 +142,16 @@ wait_watcher() {
     sleep 2
   done
   return 1
+}
+
+watcher_runtime_rollback() {
+  local dir="$1"
+  log "restoring watcher runtime files from $dir; bot remains unchanged"
+  install -m 0755 "$dir/ledger-chain-watcher.before" "$WATCHER_BINARY"
+  install -m 0600 "$dir/watcher.env.before" "$WATCHER_ENV_FILE"
+  install -m 0644 "$dir/watcher.service.before" "$WATCHER_UNIT_FILE"
+  systemctl daemon-reload
+  systemctl restart "$WATCHER_SERVICE"
 }
 
 runtime_rollback() {
@@ -197,6 +207,30 @@ upgrade() {
   log "run acceptance and complete the real USDT transfer checklist before closing the window"
 }
 
+upgrade_watcher() {
+  require_apply
+  preflight
+  [[ -n "${NEW_WATCHER_BINARY:-}" && -f "$NEW_WATCHER_BINARY" ]] || die "set NEW_WATCHER_BINARY"
+  [[ -n "${NEW_WATCHER_SHA256:-}" ]] || die "set NEW_WATCHER_SHA256"
+  printf '%s  %s\n' "$NEW_WATCHER_SHA256" "$NEW_WATCHER_BINARY" | sha256sum -c -
+
+  local dir token
+  dir="$(backup_all | tail -1)"
+  token="$(admin_token)"
+
+  log "upgrading watcher only; bot container remains unchanged"
+  install -m 0755 "$NEW_WATCHER_BINARY" "$WATCHER_BINARY.new"
+  mv -f "$WATCHER_BINARY.new" "$WATCHER_BINARY"
+  systemctl restart "$WATCHER_SERVICE"
+  if ! wait_watcher "$token"; then
+    journalctl -u "$WATCHER_SERVICE" -n 100 --no-pager >&2 || true
+    watcher_runtime_rollback "$dir"
+    die "watcher upgrade failed; watcher-only runtime rollback attempted"
+  fi
+  log "watcher-only upgrade complete; bot was not recreated; backup=$dir"
+  log "run acceptance and complete the real upstream timeout/cancellation checklist before closing the window"
+}
+
 rollback() {
   require_apply
   [[ -n "${ROLLBACK_DIR:-}" && -d "$ROLLBACK_DIR" ]] || die "set ROLLBACK_DIR"
@@ -210,19 +244,22 @@ rollback() {
 acceptance() {
   preflight
   discover_dsns
-  [[ -n "${EXPECTED_BOT_REPO_DIGEST:-}" ]] || die "set EXPECTED_BOT_REPO_DIGEST from the Release"
   [[ -n "${EXPECTED_WATCHER_SHA256:-}" ]] || die "set EXPECTED_WATCHER_SHA256 from the Release"
-  log "checking v2.4.7 schema"
+  log "checking v2.4.8 watcher runtime and historical schema"
   local bot_schema watcher_schema image_id repo_digests actual_watcher_sha unauth_code
   bot_schema="$(PGDATABASE="$BOT_DATABASE_URL" "$PSQL" -Atqc "select count(*) from schema_migrations where version='2.4.4-broadcast-group-ownership'; select count(*) from schema_migrations where version='2.4.5-broadcast-group-owner-transfer'; select count(*) from schema_migrations where version='2.4.6-chain-gap-scheduler'; select count(*) from schema_migrations where version='2.4.7-chain-gap-convergence'; select count(*) from information_schema.columns where table_schema='public' and table_name='broadcast_groups' and column_name='owner_user_id'; select count(*) from information_schema.tables where table_schema='public' and table_name in ('broadcast_group_owner_repair_candidates','broadcast_group_audit_events'); select count(*) from information_schema.tables where table_schema='public' and table_name='broadcast_group_owner_transfer_events'; select count(*) from information_schema.tables where table_schema='public' and table_name='chain_watcher_gap_metric_minutes'; select count(*) from pg_indexes where schemaname='public' and indexname='idx_broadcast_groups_owner'; select count(*) from pg_indexes where schemaname='public' and indexname='idx_chain_watcher_gap_fair_claim'; select count(*) from pg_indexes where schemaname='public' and indexname in ('idx_broadcast_group_owner_transfer_group','idx_broadcast_group_owner_transfer_actor','idx_broadcast_group_owner_transfer_new_owner'); select count(*) from pg_trigger where tgname='trg_broadcast_group_owner_transfer_immutable' and not tgisinternal;")"
-  [[ "$bot_schema" == $'1\n1\n1\n1\n1\n2\n1\n1\n1\n1\n3\n1' ]] || die "bot v2.4.7 migration objects missing"
+  [[ "$bot_schema" == $'1\n1\n1\n1\n1\n2\n1\n1\n1\n1\n3\n1' ]] || die "historical bot migration objects missing"
   watcher_schema="$(PGDATABASE="$WATCHER_DATABASE_URL" "$PSQL" -Atqc "select count(*) from schema_migrations where version='2.4.3'; select count(*) from schema_migrations where version='2.4.6-chain-gap-scheduler'; select count(*) from schema_migrations where version='2.4.7-chain-gap-convergence'; select count(*) from information_schema.columns where table_schema='public' and table_name='chain_watcher_gap_tasks' and column_name in ('head_event_id','retry_after'); select count(*) from information_schema.tables where table_schema='public' and table_name='chain_watcher_gap_metric_minutes'; select count(*) from pg_indexes where schemaname='public' and indexname in ('idx_chain_watcher_gap_claim','idx_chain_watcher_gap_window_overlap','idx_chain_watcher_gap_ready_claim','idx_chain_watcher_gap_fair_claim');")"
-  [[ "$watcher_schema" == $'1\n1\n1\n2\n1\n4' ]] || die "watcher v2.4.7 gap convergence migration/columns/indexes missing"
+  [[ "$watcher_schema" == $'1\n1\n1\n2\n1\n4' ]] || die "historical watcher migration/columns/indexes missing"
   unauth_code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$WATCHER_URL/status")"
   [[ "$unauth_code" == "401" ]] || die "unauthenticated /status returned $unauth_code, want 401"
   image_id="$(docker inspect "$BOT_CONTAINER" --format '{{.Image}}')"
   repo_digests="$(docker image inspect "$image_id" --format '{{join .RepoDigests "\n"}}')"
-  grep -Fq "$EXPECTED_BOT_REPO_DIGEST" <<<"$repo_digests" || die "bot repo digest mismatch"
+  if [[ -n "${EXPECTED_BOT_REPO_DIGEST:-}" ]]; then
+    grep -Fq "$EXPECTED_BOT_REPO_DIGEST" <<<"$repo_digests" || die "bot repo digest mismatch"
+  else
+    log "EXPECTED_BOT_REPO_DIGEST not set; bot image is intentionally unchanged for watcher-only v2.4.8"
+  fi
   actual_watcher_sha="$(sha256sum "$WATCHER_BINARY" | awk '{print $1}')"
   [[ "$actual_watcher_sha" == "$EXPECTED_WATCHER_SHA256" ]] || die "watcher SHA256 mismatch"
   docker inspect "$BOT_CONTAINER" --format 'image={{.Config.Image}} image_id={{.Image}} state={{.State.Status}} restarts={{.RestartCount}}'
@@ -251,7 +288,8 @@ case "$ACTION" in
   preflight) preflight ;;
   backup) require_apply; preflight; backup_all ;;
   upgrade) upgrade ;;
+  upgrade-watcher) upgrade_watcher ;;
   rollback) rollback ;;
   acceptance) acceptance ;;
-  *) die "usage: $0 {preflight|backup|upgrade|rollback|acceptance} [--apply]" ;;
+  *) die "usage: $0 {preflight|backup|upgrade|upgrade-watcher|rollback|acceptance} [--apply]" ;;
 esac
