@@ -1,15 +1,15 @@
 # Telegram 记账机器人 Go 部署运维
 
-当前源码发布候选为 Go v2.4.5，正式 tag、Release 和 GHCR 镜像只能由显式发布 workflow 产生。生产部署使用 GHCR 预构建镜像、PostgreSQL 和共享链上监听服务 `ledger-chain-watcher`。服务器上不需要源码构建作为默认路径。v2.4.5 的发布说明见 [releases/v2.4.5.md](releases/v2.4.5.md)，生产预检、备份、升级、回滚和验收见 [production-rollout-v2.4.5.md](production-rollout-v2.4.5.md)。
+当前源码发布候选为 Go v2.4.6，正式 tag、Release 和 GHCR 镜像只能由显式发布 workflow 产生。生产部署使用 GHCR 预构建镜像、PostgreSQL 和共享链上监听服务 `ledger-chain-watcher`。服务器上不需要源码构建作为默认路径。v2.4.6 的发布说明见 [releases/v2.4.6.md](releases/v2.4.6.md)，生产预检、备份、升级、回滚和验收见 [production-rollout-v2.4.6.md](production-rollout-v2.4.6.md)。
 
-唯一候选基线是本集成仓库的已确认 v2.4.5 发布提交；外层旧工作区中的部署文件和未跟踪脚本已过时或尚未审查，不得直接合并或投产。
+唯一候选基线是本集成仓库的已确认 v2.4.6 发布提交；外层旧工作区中的部署文件和未跟踪脚本已过时或尚未审查，不得直接合并或投产。
 
 ## 部署基线
 
-- 机器人镜像：`ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.5`
-- watcher 镜像：`ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.5`（发布流程一致性产物；生产可继续运行已验收 watcher）
+- 机器人镜像：`ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.6`
+- watcher 镜像：`ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.6`
 
-v2.4.5 是 bot 侧广播分组 owner 转让、原子权限补齐、审计和后台响应式操作区更新。上线前必须备份每个 bot 数据库；watcher 代码未变，不要求仅为本轮更新或重启。发布流程仍按既有规则生成同版本 watcher 镜像和宿主机资产。只有 Release、镜像 digest 和校验和实际可用后才能执行生产升级。
+v2.4.6 重构 watcher 的 Key 预算、实时 P1 保留通道和持久 gap scheduler，并让 bot 链上 outbox 使用 priority 0 原子入队。上线前必须同时备份 bot 与 watcher 数据库；本轮先升级 watcher、确认 `/readyz` 和 `/status`，再升级 bot。只有 Release、镜像 digest 和校验和实际可用后才能执行生产升级。
 - 数据库：每个机器人实例独立 PostgreSQL 16
 - 链上监听：多个机器人共享 `ledger-chain-watcher`，watcher 使用独立 PostgreSQL 保存订阅、匹配事件和投递游标
 - 推荐入口：宝塔 Docker Compose
@@ -294,14 +294,14 @@ BOT_REQUEST_TIMEOUT=70
 
 从旧版本升级时，删除 `CHAIN_WATCHER_GLOBAL_SCAN_PAGES` 和 `CHAIN_WATCHER_GLOBAL_EXPAND_PAGE_LIMIT`；二进制只会把前者报告为 deprecated，不再恢复固定页数。`CHAIN_WATCHER_CATCHUP_MAX_RPS=0` 使用动态 surplus，`CHAIN_WATCHER_CATCHUP_MAX_INFLIGHT=8` 是与 Key 数量解耦的保守 worker 安全天花板。
 
-如后续确需统一 watcher 版本，正式 Release 可用后可下载 v2.4.5 发布包并安装二进制到固定路径；本轮 watcher 代码未变，升级 bot 不依赖该步骤：
+正式 Release 可用后，下载 v2.4.6 发布包并安装二进制到固定路径。本轮 watcher 是必需升级项，必须先于 bot 更新：
 
 ```bash
 cd /tmp
-wget -O ledger-chain-watcher-v2.4.5-linux-amd64.tar.gz \
-  https://github.com/dayou0168/telegram-ledger-bot/releases/download/v2.4.5/ledger-chain-watcher-v2.4.5-linux-amd64.tar.gz
-tar -xzf ledger-chain-watcher-v2.4.5-linux-amd64.tar.gz
-install -m 0755 ledger-chain-watcher-v2.4.5-linux-amd64/ledger-chain-watcher /usr/local/bin/ledger-chain-watcher
+wget -O ledger-chain-watcher-v2.4.6-linux-amd64.tar.gz \
+  https://github.com/dayou0168/telegram-ledger-bot/releases/download/v2.4.6/ledger-chain-watcher-v2.4.6-linux-amd64.tar.gz
+tar -xzf ledger-chain-watcher-v2.4.6-linux-amd64.tar.gz
+install -m 0755 ledger-chain-watcher-v2.4.6-linux-amd64/ledger-chain-watcher /usr/local/bin/ledger-chain-watcher
 /usr/local/bin/ledger-chain-watcher --help
 ```
 
@@ -411,7 +411,7 @@ journalctl -u ledger-chain-watcher -f
 ```text
 ledger-chain-watcher        共享链上监听服务和 watcher PostgreSQL
 ledger-main                 当前记账机器人实例
-ledger-ops                  第二个独立 Go v2.4.5 机器人实例
+ledger-ops                  第二个独立 Go v2.4.6 机器人实例
 ```
 
 先创建共享 Docker 网络：
@@ -525,7 +525,7 @@ ports:
 
 ## 未来接 TRON Lite FullNode + Kafka
 
-当前已发布 watcher 统一请求 Tronscan/TronGrid。未来切换自建节点时，机器人配置不变，只调整 watcher；跨服务器网络和安全验收必须先按 [production-rollout-v2.4.5.md](production-rollout-v2.4.5.md) 的事件服务器清单完成：
+当前已发布 watcher 统一请求 Tronscan/TronGrid。未来切换自建节点时，机器人配置不变，只调整 watcher；跨服务器网络和安全验收必须先按 [production-rollout-v2.4.6.md](production-rollout-v2.4.6.md) 的事件服务器清单完成：
 
 ```yaml
 CHAIN_WATCHER_SOURCE: "kafka"
@@ -621,7 +621,7 @@ gzip backups/*.sql
 
 建议把 `backups/` 同步到服务器外部位置，例如另一台机器、对象存储或网盘。
 
-仓库提供 [deploy/offsite-backup.sh](../deploy/offsite-backup.sh) 作为默认只读、显式 `push --apply` 才上传的异地 rsync 模板。异地备份和季度恢复演练步骤见 [production-rollout-v2.4.5.md](production-rollout-v2.4.5.md)。没有完成异地下载与临时库恢复前，不应把本机压缩文件视为完整灾备。
+仓库提供 [deploy/offsite-backup.sh](../deploy/offsite-backup.sh) 作为默认只读、显式 `push --apply` 才上传的异地 rsync 模板。异地备份和季度恢复演练步骤见 [production-rollout-v2.4.6.md](production-rollout-v2.4.6.md)。没有完成异地下载与临时库恢复前，不应把本机压缩文件视为完整灾备。
 
 ## 日志保留和磁盘保护
 

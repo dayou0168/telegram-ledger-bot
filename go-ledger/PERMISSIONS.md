@@ -1,4 +1,4 @@
-# Go Ledger Bot v2.4.5 Permissions
+# Go Ledger Bot v2.4.6 Permissions
 
 This file is the source of truth for Telegram user permissions in the Go/PostgreSQL runtime. Business modules must use `internal/permissions` and the storage capability helpers instead of reading host/default configuration or legacy operator tables directly.
 

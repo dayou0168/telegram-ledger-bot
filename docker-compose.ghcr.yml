@@ -1,4 +1,4 @@
-# v2.4.5 发布候选模板；仅在显式发布 workflow 成功后用于生产升级。
+# v2.4.6 发布候选模板；仅在显式发布 workflow 成功后用于生产升级。
 #
 # 宝塔 GHCR 模板：
 # 1. 单机器人一体部署可直接粘贴本文件。
@@ -54,7 +54,7 @@ services:
       retries: 10
 
   ledger-chain-watcher:
-    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.5
+    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.6
     container_name: ledger-chain-watcher
     restart: unless-stopped
     logging:
@@ -112,7 +112,7 @@ services:
       retries: 10
 
   ledger-bot:
-    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.5
+    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.6
     container_name: ledger-bot-go
     restart: unless-stopped
     logging:

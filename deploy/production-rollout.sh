@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# v2.4.5 production rollout helper. The default action is read-only preflight.
+# v2.4.6 production rollout helper. The default action is read-only preflight.
 # Secrets and DSNs are read from existing runtime configuration or environment;
 # never put them in this file or pass them as positional command arguments.
 
@@ -105,7 +105,7 @@ backup_all() {
   discover_dsns
   discover_pg_tools
   umask 077
-  local dir="$BACKUP_ROOT/v2.4.5-$(date +%Y%m%d-%H%M%S)"
+  local dir="$BACKUP_ROOT/v2.4.6-$(date +%Y%m%d-%H%M%S)"
   install -d -m 0700 "$dir"
   log "creating verified backup: $dir"
 
@@ -207,12 +207,12 @@ acceptance() {
   discover_dsns
   [[ -n "${EXPECTED_BOT_REPO_DIGEST:-}" ]] || die "set EXPECTED_BOT_REPO_DIGEST from the Release"
   [[ -n "${EXPECTED_WATCHER_SHA256:-}" ]] || die "set EXPECTED_WATCHER_SHA256 from the Release"
-  log "checking v2.4.5 schema"
+  log "checking v2.4.6 schema"
   local bot_schema watcher_schema image_id repo_digests actual_watcher_sha unauth_code
-  bot_schema="$(PGDATABASE="$BOT_DATABASE_URL" "$PSQL" -Atqc "select count(*) from schema_migrations where version='2.4.4-broadcast-group-ownership'; select count(*) from schema_migrations where version='2.4.5-broadcast-group-owner-transfer'; select count(*) from information_schema.columns where table_schema='public' and table_name='broadcast_groups' and column_name='owner_user_id'; select count(*) from information_schema.tables where table_schema='public' and table_name in ('broadcast_group_owner_repair_candidates','broadcast_group_audit_events'); select count(*) from information_schema.tables where table_schema='public' and table_name='broadcast_group_owner_transfer_events'; select count(*) from pg_indexes where schemaname='public' and indexname='idx_broadcast_groups_owner'; select count(*) from pg_indexes where schemaname='public' and indexname in ('idx_broadcast_group_owner_transfer_group','idx_broadcast_group_owner_transfer_actor','idx_broadcast_group_owner_transfer_new_owner'); select count(*) from pg_trigger where tgname='trg_broadcast_group_owner_transfer_immutable' and not tgisinternal;")"
-  [[ "$bot_schema" == $'1\n1\n1\n2\n1\n1\n3\n1' ]] || die "bot v2.4.5 broadcast-group owner-transfer migration objects missing"
-  watcher_schema="$(PGDATABASE="$WATCHER_DATABASE_URL" "$PSQL" -Atqc "select count(*) from schema_migrations where version='2.4.3'; select count(*) from information_schema.columns where table_schema='public' and table_name='chain_watcher_gap_tasks' and column_name='head_event_id'; select count(*) from pg_indexes where schemaname='public' and indexname in ('idx_chain_watcher_gap_claim','idx_chain_watcher_gap_window_overlap');")"
-  [[ "$watcher_schema" == $'1\n1\n2' ]] || die "watcher v2.4.3 gap migration/column/indexes missing"
+  bot_schema="$(PGDATABASE="$BOT_DATABASE_URL" "$PSQL" -Atqc "select count(*) from schema_migrations where version='2.4.4-broadcast-group-ownership'; select count(*) from schema_migrations where version='2.4.5-broadcast-group-owner-transfer'; select count(*) from schema_migrations where version='2.4.6-chain-gap-scheduler'; select count(*) from information_schema.columns where table_schema='public' and table_name='broadcast_groups' and column_name='owner_user_id'; select count(*) from information_schema.tables where table_schema='public' and table_name in ('broadcast_group_owner_repair_candidates','broadcast_group_audit_events'); select count(*) from information_schema.tables where table_schema='public' and table_name='broadcast_group_owner_transfer_events'; select count(*) from information_schema.tables where table_schema='public' and table_name='chain_watcher_gap_metric_minutes'; select count(*) from pg_indexes where schemaname='public' and indexname='idx_broadcast_groups_owner'; select count(*) from pg_indexes where schemaname='public' and indexname in ('idx_broadcast_group_owner_transfer_group','idx_broadcast_group_owner_transfer_actor','idx_broadcast_group_owner_transfer_new_owner'); select count(*) from pg_trigger where tgname='trg_broadcast_group_owner_transfer_immutable' and not tgisinternal;")"
+  [[ "$bot_schema" == $'1\n1\n1\n1\n2\n1\n1\n1\n3\n1' ]] || die "bot v2.4.6 migration objects missing"
+  watcher_schema="$(PGDATABASE="$WATCHER_DATABASE_URL" "$PSQL" -Atqc "select count(*) from schema_migrations where version='2.4.3'; select count(*) from schema_migrations where version='2.4.6-chain-gap-scheduler'; select count(*) from information_schema.columns where table_schema='public' and table_name='chain_watcher_gap_tasks' and column_name in ('head_event_id','retry_after'); select count(*) from information_schema.tables where table_schema='public' and table_name='chain_watcher_gap_metric_minutes'; select count(*) from pg_indexes where schemaname='public' and indexname in ('idx_chain_watcher_gap_claim','idx_chain_watcher_gap_window_overlap','idx_chain_watcher_gap_ready_claim');")"
+  [[ "$watcher_schema" == $'1\n1\n2\n1\n3' ]] || die "watcher v2.4.6 gap scheduler migration/columns/indexes missing"
   unauth_code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$WATCHER_URL/status")"
   [[ "$unauth_code" == "401" ]] || die "unauthenticated /status returned $unauth_code, want 401"
   image_id="$(docker inspect "$BOT_CONTAINER" --format '{{.Image}}')"
