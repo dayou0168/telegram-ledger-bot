@@ -189,6 +189,15 @@ type TelegramInboxStats struct {
 	LeaseReclaims int64         `json:"lease_reclaims"`
 }
 
+type TelegramPrivateRouteState struct {
+	StreamKey       string
+	UserID          int64
+	StateJSON       []byte
+	HasState        bool
+	VersionUpdateID int64
+	UpdatedAt       time.Time
+}
+
 type BroadcastReplaceSetting struct {
 	Enabled   bool
 	Text      string

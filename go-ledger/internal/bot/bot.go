@@ -59,6 +59,7 @@ type Bot struct {
 	criticalOutboxWake    chan int64
 	telegramLedgerWake    chan struct{}
 	telegramBypassWake    chan struct{}
+	telegramInboxLease    time.Duration
 	telegramLimiter       *telegramRateLimiter
 	sendGateway           *telegramSendGateway
 	watchRunning          atomic.Bool
@@ -74,7 +75,11 @@ type Bot struct {
 	permissionEpochLookup func(context.Context) (int64, error)
 	groupOperatorLookup   func(context.Context, int64, int64) (bool, error)
 	updateHandler         func(context.Context, telegram.Update) error
+	inboxMarkHandled      func(context.Context, storage.TelegramInboxUpdate, string, time.Time) (bool, error)
+	inboxComplete         func(context.Context, storage.TelegramInboxUpdate, string, time.Time) (bool, error)
 }
+
+const privateStateTTL = 30 * time.Minute
 
 func (b *Bot) executeUpdate(ctx context.Context, update telegram.Update) error {
 	if b.updateHandler != nil {
@@ -126,11 +131,12 @@ func New(cfg config.Config, store *storage.Store, tg *telegram.Client, tronClien
 		watchTargetCache:      newTTLCache[[]storage.WatchTarget](cfg.WatchCacheTTL),
 		fallbackSubCache:      newTTLCache[[]storage.ChainWatcherSubscription](cfg.WatchCacheTTL),
 		rateBookCache:         newTTLCache[[]p2p.OrderBookEntry](cfg.P2PCacheTTL),
-		privateStates:         newTTLCache[privateState](30 * time.Minute),
+		privateStates:         newTTLCache[privateState](privateStateTTL),
 		notificationWake:      make(chan struct{}, 1),
 		criticalOutboxWake:    make(chan int64, cfg.QueueSize),
 		telegramLedgerWake:    make(chan struct{}, 1),
 		telegramBypassWake:    make(chan struct{}, 1),
+		telegramInboxLease:    telegramInboxLease,
 		telegramLimiter:       newTelegramRateLimiter(),
 		watcherFallback:       newWatcherFallbackControllerWithRecovery(cfg.BotWatcherFailThreshold, cfg.BotFallbackRecoverySuccesses, cfg.BotFallbackRecoveryLag),
 	}

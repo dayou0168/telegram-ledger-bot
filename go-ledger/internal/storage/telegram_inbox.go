@@ -161,7 +161,8 @@ func (s *Store) ClaimTelegramUpdates(ctx context.Context, streamKey, lane, owner
 
 func (s *Store) MarkTelegramUpdateHandled(ctx context.Context, streamKey string, updateID int64, owner string, now time.Time) (bool, error) {
 	tag, err := s.pool.Exec(ctx, `UPDATE telegram_update_inbox SET handled_at=$4,updated_at=$4
-		WHERE stream_key=$1 AND update_id=$2 AND status='processing' AND lease_owner=$3`,
+		WHERE stream_key=$1 AND update_id=$2 AND status='processing' AND lease_owner=$3
+		  AND lease_until > $4`,
 		strings.TrimSpace(streamKey), updateID, strings.TrimSpace(owner), now)
 	return tag.RowsAffected() == 1, err
 }
@@ -171,7 +172,8 @@ func (s *Store) RenewTelegramUpdateLease(ctx context.Context, streamKey string, 
 		lease = time.Minute
 	}
 	tag, err := s.pool.Exec(ctx, `UPDATE telegram_update_inbox SET lease_until=$4+$5::interval,updated_at=$4
-		WHERE stream_key=$1 AND update_id=$2 AND status='processing' AND lease_owner=$3`,
+		WHERE stream_key=$1 AND update_id=$2 AND status='processing' AND lease_owner=$3
+		  AND lease_until > $4`,
 		strings.TrimSpace(streamKey), updateID, strings.TrimSpace(owner), now, durationInterval(lease))
 	return tag.RowsAffected() == 1, err
 }
@@ -179,7 +181,8 @@ func (s *Store) RenewTelegramUpdateLease(ctx context.Context, streamKey string, 
 func (s *Store) CompleteTelegramUpdate(ctx context.Context, streamKey string, updateID int64, owner string, now time.Time) (bool, error) {
 	tag, err := s.pool.Exec(ctx, `UPDATE telegram_update_inbox
 		SET status='done',lease_owner='',lease_until=NULL,last_error='',done_at=$4,updated_at=$4
-		WHERE stream_key=$1 AND update_id=$2 AND status='processing' AND lease_owner=$3 AND handled_at IS NOT NULL`,
+		WHERE stream_key=$1 AND update_id=$2 AND status='processing' AND lease_owner=$3
+		  AND handled_at IS NOT NULL AND lease_until > $4`,
 		strings.TrimSpace(streamKey), updateID, strings.TrimSpace(owner), now)
 	return tag.RowsAffected() == 1, err
 }
@@ -195,12 +198,96 @@ func (s *Store) RetryTelegramUpdate(ctx context.Context, streamKey string, updat
 			next_attempt_at=CASE WHEN attempts >= $4 THEN next_attempt_at ELSE $5 END,
 			lease_owner='',lease_until=NULL,last_error=$6,updated_at=$7
 		WHERE stream_key=$1 AND update_id=$2 AND status='processing' AND lease_owner=$3
+		  AND lease_until > $7
 		RETURNING status`, strings.TrimSpace(streamKey), updateID, strings.TrimSpace(owner), maxAttempts,
 		retryAt, lastError, now).Scan(&status)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", nil
 	}
 	return status, err
+}
+
+func (s *Store) GetTelegramPrivateRouteState(ctx context.Context, streamKey string, userID int64) (TelegramPrivateRouteState, bool, error) {
+	var state TelegramPrivateRouteState
+	err := s.pool.QueryRow(ctx, `SELECT stream_key,user_id,state_json,has_state,version_update_id,updated_at
+		FROM telegram_private_route_states WHERE stream_key=$1 AND user_id=$2`,
+		strings.TrimSpace(streamKey), userID).Scan(&state.StreamKey, &state.UserID, &state.StateJSON,
+		&state.HasState, &state.VersionUpdateID, &state.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return TelegramPrivateRouteState{StreamKey: strings.TrimSpace(streamKey), UserID: userID, VersionUpdateID: -1}, false, nil
+	}
+	return state, err == nil, err
+}
+
+func (s *Store) CommitTelegramPrivateStateAndMarkHandled(ctx context.Context, item TelegramInboxUpdate, owner string, userID, expectedVersion int64, stateJSON []byte, hasState bool, now time.Time) (bool, error) {
+	if strings.TrimSpace(item.StreamKey) == "" || item.UpdateID < 0 || strings.TrimSpace(owner) == "" || userID <= 0 || item.UpdateID <= expectedVersion {
+		return false, errors.New("telegram private state commit is incomplete")
+	}
+	if len(stateJSON) == 0 {
+		stateJSON = []byte(`{}`)
+	}
+	if !json.Valid(stateJSON) {
+		return false, errors.New("telegram private state is not valid JSON")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer rollback(ctx, tx)
+	var owned int
+	err = tx.QueryRow(ctx, `SELECT 1 FROM telegram_update_inbox
+		WHERE stream_key=$1 AND update_id=$2 AND status='processing' AND lease_owner=$3
+		  AND lease_until > $4 AND handled_at IS NULL
+		FOR UPDATE`, item.StreamKey, item.UpdateID, strings.TrimSpace(owner), now).Scan(&owned)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, tx.Commit(ctx)
+	}
+	if err != nil {
+		return false, err
+	}
+	var currentVersion int64
+	err = tx.QueryRow(ctx, `SELECT version_update_id FROM telegram_private_route_states
+		WHERE stream_key=$1 AND user_id=$2 FOR UPDATE`, item.StreamKey, userID).Scan(&currentVersion)
+	if errors.Is(err, pgx.ErrNoRows) {
+		currentVersion = -1
+	} else if err != nil {
+		return false, err
+	}
+	if currentVersion != expectedVersion || item.UpdateID <= currentVersion {
+		return false, tx.Commit(ctx)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO telegram_private_route_states(
+		stream_key,user_id,state_json,has_state,version_update_id,updated_at
+	) VALUES($1,$2,$3::jsonb,$4,$5,$6)
+	ON CONFLICT(stream_key,user_id) DO UPDATE SET
+		state_json=excluded.state_json,has_state=excluded.has_state,
+		version_update_id=excluded.version_update_id,updated_at=excluded.updated_at`,
+		item.StreamKey, userID, stateJSON, hasState, item.UpdateID, now); err != nil {
+		return false, err
+	}
+	tag, err := tx.Exec(ctx, `UPDATE telegram_update_inbox SET handled_at=$4,updated_at=$4
+		WHERE stream_key=$1 AND update_id=$2 AND status='processing' AND lease_owner=$3
+		  AND lease_until > $4 AND handled_at IS NULL`, item.StreamKey, item.UpdateID, strings.TrimSpace(owner), now)
+	if err != nil {
+		return false, err
+	}
+	if tag.RowsAffected() != 1 {
+		return false, tx.Commit(ctx)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *Store) DeleteTelegramPrivateRouteState(ctx context.Context, streamKey string, userID int64) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM telegram_private_route_states WHERE stream_key=$1 AND user_id=$2`, strings.TrimSpace(streamKey), userID)
+	return err
+}
+
+func (s *Store) DeleteAllTelegramPrivateRouteStates(ctx context.Context, streamKey string) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM telegram_private_route_states WHERE stream_key=$1`, strings.TrimSpace(streamKey))
+	return err
 }
 
 func (s *Store) TelegramInboxStats(ctx context.Context, streamKey string, now time.Time) (TelegramInboxStats, error) {

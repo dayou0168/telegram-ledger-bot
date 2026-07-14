@@ -295,6 +295,11 @@ func TestSendGatewayRealLimiterBulkCannotReserveAheadOfCritical(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed global limiter: %v", err)
 	}
+	// Keep the next slot far enough away that all priority lanes are
+	// observably queued even on fast schedulers.
+	limiter.mu.Lock()
+	limiter.nextGlobal = time.Now().Add(100 * time.Millisecond)
+	limiter.mu.Unlock()
 
 	var mu sync.Mutex
 	order := make([]string, 0, 8)
@@ -332,8 +337,8 @@ func TestSendGatewayRealLimiterBulkCannotReserveAheadOfCritical(t *testing.T) {
 	if err := <-criticalDone; err != nil {
 		t.Fatalf("critical send: %v", err)
 	}
-	if elapsed := time.Since(criticalStarted); elapsed > 100*time.Millisecond {
-		t.Fatalf("critical limiter latency = %v, want <=100ms", elapsed)
+	if elapsed := time.Since(criticalStarted); elapsed > 250*time.Millisecond {
+		t.Fatalf("critical limiter latency = %v, want <=250ms", elapsed)
 	}
 	if err := <-normalDone; err != nil {
 		t.Fatalf("normal send: %v", err)

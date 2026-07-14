@@ -2,12 +2,35 @@ package bot
 
 import (
 	"context"
+	"encoding/json"
+	"reflect"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/worker"
 )
+
+func TestDurableTelegramPayloadLegacyPrivateStateRoundTrip(t *testing.T) {
+	want := privateState{
+		Mode: "quick_reply", TargetName: "source", ChatIDs: []int64{-101, -102}, NotifyAll: true,
+		ControlMessageID: 41, WatchAddress: "TSource", QuickReplyTargetChat: -202,
+		QuickReplyMessageID: 42, ReturnMode: "group", ReturnTargetName: "saved",
+		ReturnChatIDs: []int64{-101, -102}, ReturnNotifyAll: true, ReturnControlMessageID: 43,
+		CreatedAt: time.Date(2026, 7, 15, 10, 11, 12, 0, time.UTC),
+	}
+	payload, err := json.Marshal(durableTelegramPayload{Version: 1, Update: privateMessageUpdate(801, 901, "legacy"), LegacyPrivateState: &want})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded durableTelegramPayload
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.LegacyPrivateState == nil || !reflect.DeepEqual(*decoded.LegacyPrivateState, want) {
+		t.Fatalf("legacy private state round trip=%+v want=%+v", decoded.LegacyPrivateState, want)
+	}
+}
 
 func TestUpdateAdmissionBypassFloodDoesNotBlockLedgerAndLosesNoJobs(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())

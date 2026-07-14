@@ -320,7 +320,8 @@ func TestPostgresLedgerSummaryBackfillUsesRecordKeysetAndPeriodReconcile(t *test
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	store, err := Open(ctx, dsn)
+	migrationURL, _, _ := postgresTestSchema(t, ctx, dsn, "ledger_summary_backfill")
+	store, err := Open(ctx, migrationURL)
 	if err != nil {
 		t.Fatal(err)
 	}

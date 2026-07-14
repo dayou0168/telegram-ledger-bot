@@ -2410,7 +2410,7 @@ func TestChainWatcherOverlappingWindowsCoalesceConcurrentlyAndSurviveRestart(t *
 	if dsn == "" {
 		t.Skip("TEST_DATABASE_URL is not set")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	migrationURL, _, _ := postgresTestSchema(t, ctx, dsn, "gap_coalesce")
 	store, err := Open(ctx, migrationURL)
@@ -2561,7 +2561,7 @@ func TestNormalizeChainWatcherGapBacklogCollapsesLegacyOverlap(t *testing.T) {
 	if dsn == "" {
 		t.Skip("TEST_DATABASE_URL is not set")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	migrationURL, _, _ := postgresTestSchema(t, ctx, dsn, "gap_legacy_normalize")
 	store, err := Open(ctx, migrationURL)

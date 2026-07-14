@@ -22,7 +22,7 @@ type Store struct {
 	keyCipher    *keyCipher
 }
 
-const latestSchemaMigrationVersion = "2.4.13-telegram-durable-inbox"
+const latestSchemaMigrationVersion = "2.4.14-telegram-private-route-state"
 
 const (
 	PermissionScopeGlobalOperator = "global_operator"
@@ -195,6 +195,17 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_telegram_inbox_done_cleanup
 			ON telegram_update_inbox(done_at, stream_key, update_id)
 			WHERE status='done'`,
+		`CREATE TABLE IF NOT EXISTS telegram_private_route_states (
+			stream_key TEXT NOT NULL,
+			user_id BIGINT NOT NULL,
+			state_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+			has_state BOOLEAN NOT NULL DEFAULT FALSE,
+			version_update_id BIGINT NOT NULL,
+			updated_at TIMESTAMPTZ NOT NULL,
+			PRIMARY KEY(stream_key, user_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_telegram_private_route_states_updated
+			ON telegram_private_route_states(updated_at, stream_key, user_id)`,
 		`CREATE TABLE IF NOT EXISTS groups (
 			chat_id BIGINT PRIMARY KEY,
 			title TEXT NOT NULL DEFAULT '',

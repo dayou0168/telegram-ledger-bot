@@ -247,3 +247,91 @@ func TestPostgresUndoOutboxDedupePreventsReplayDeletingNextRecord(t *testing.T) 
 		t.Fatal("replayed undo deleted the next record")
 	}
 }
+
+func TestPostgresTelegramPrivateRouteStateCASAndLeaseOwnership(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	migrationURL, _, _ := postgresTestSchema(t, ctx, dsn, "private_route_state")
+	storeA, err := Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storeA.Close()
+	storeB, err := Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storeB.Close()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	stream := "private-cas"
+	userID := int64(99101)
+	items := []TelegramInboxUpdate{
+		{UpdateID: 200, Payload: []byte(`{"update_id":200}`), Lane: "ledger", RouteKey: "private:99101"},
+		{UpdateID: 201, Payload: []byte(`{"update_id":201}`), Lane: "ledger", RouteKey: "private:99101"},
+		{UpdateID: 202, Payload: []byte(`{"update_id":202}`), Lane: "ledger", RouteKey: "private:99101"},
+	}
+	if _, err := storeA.PersistTelegramUpdateBatch(ctx, stream, items, now); err != nil {
+		t.Fatal(err)
+	}
+	first, err := storeA.ClaimTelegramUpdates(ctx, stream, "ledger", "owner-a", 10, 5, 100*time.Millisecond, now)
+	if err != nil || len(first) != 1 || first[0].UpdateID != 200 {
+		t.Fatalf("first claim=%v err=%v", inboxIDs(first), err)
+	}
+	if ok, err := storeA.CommitTelegramPrivateStateAndMarkHandled(ctx, first[0], "owner-a", userID, -1,
+		[]byte(`{"Mode":"quick_reply","NotifyAll":false}`), true, now.Add(time.Millisecond)); err != nil || !ok {
+		t.Fatalf("first state commit=%v err=%v", ok, err)
+	}
+	if ok, err := storeA.CompleteTelegramUpdate(ctx, stream, 200, "owner-a", now.Add(2*time.Millisecond)); err != nil || !ok {
+		t.Fatalf("first completion=%v err=%v", ok, err)
+	}
+	state, found, err := storeB.GetTelegramPrivateRouteState(ctx, stream, userID)
+	if err != nil || !found || !state.HasState || state.VersionUpdateID != 200 {
+		t.Fatalf("state after restart=%+v found=%v err=%v", state, found, err)
+	}
+	second, err := storeB.ClaimTelegramUpdates(ctx, stream, "ledger", "owner-b", 10, 5, 100*time.Millisecond, now.Add(3*time.Millisecond))
+	if err != nil || len(second) != 1 || second[0].UpdateID != 201 {
+		t.Fatalf("second claim=%v err=%v", inboxIDs(second), err)
+	}
+	if ok, err := storeB.CommitTelegramPrivateStateAndMarkHandled(ctx, second[0], "owner-b", userID, -1,
+		[]byte(`{"Mode":"stale"}`), true, now.Add(4*time.Millisecond)); err != nil || ok {
+		t.Fatalf("stale CAS=%v err=%v", ok, err)
+	}
+	if ok, err := storeB.CommitTelegramPrivateStateAndMarkHandled(ctx, second[0], "owner-b", userID, 200,
+		[]byte(`{}`), false, now.Add(5*time.Millisecond)); err != nil || !ok {
+		t.Fatalf("second state commit=%v err=%v", ok, err)
+	}
+	if ok, err := storeB.CompleteTelegramUpdate(ctx, stream, 201, "owner-b", now.Add(6*time.Millisecond)); err != nil || !ok {
+		t.Fatalf("second completion=%v err=%v", ok, err)
+	}
+	state, found, err = storeA.GetTelegramPrivateRouteState(ctx, stream, userID)
+	if err != nil || !found || state.HasState || state.VersionUpdateID != 201 {
+		t.Fatalf("tombstone state=%+v found=%v err=%v", state, found, err)
+	}
+	third, err := storeA.ClaimTelegramUpdates(ctx, stream, "ledger", "owner-old", 1, 5, 40*time.Millisecond, now.Add(7*time.Millisecond))
+	if err != nil || len(third) != 1 || third[0].UpdateID != 202 {
+		t.Fatalf("third claim=%v err=%v", inboxIDs(third), err)
+	}
+	reclaimAt := now.Add(60 * time.Millisecond)
+	reclaimed, err := storeB.ClaimTelegramUpdates(ctx, stream, "ledger", "owner-new", 1, 5, time.Minute, reclaimAt)
+	if err != nil || len(reclaimed) != 1 || reclaimed[0].UpdateID != 202 {
+		t.Fatalf("reclaimed claim=%v err=%v", inboxIDs(reclaimed), err)
+	}
+	if ok, err := storeA.RenewTelegramUpdateLease(ctx, stream, 202, "owner-old", time.Minute, reclaimAt); err != nil || ok {
+		t.Fatalf("stale renew=%v err=%v", ok, err)
+	}
+	if ok, err := storeA.MarkTelegramUpdateHandled(ctx, stream, 202, "owner-old", reclaimAt); err != nil || ok {
+		t.Fatalf("stale handled=%v err=%v", ok, err)
+	}
+	if ok, err := storeA.CommitTelegramPrivateStateAndMarkHandled(ctx, third[0], "owner-old", userID, 201,
+		[]byte(`{"Mode":"stale"}`), true, reclaimAt); err != nil || ok {
+		t.Fatalf("stale private commit=%v err=%v", ok, err)
+	}
+	if ok, err := storeB.CommitTelegramPrivateStateAndMarkHandled(ctx, reclaimed[0], "owner-new", userID, 201,
+		[]byte(`{"Mode":"broadcast","NotifyAll":true}`), true, reclaimAt.Add(time.Millisecond)); err != nil || !ok {
+		t.Fatalf("new owner state commit=%v err=%v", ok, err)
+	}
+}
