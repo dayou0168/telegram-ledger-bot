@@ -46,6 +46,29 @@ func TestReadyzReflectsSourceFailureAndEmptySuccess(t *testing.T) {
 	}
 }
 
+func TestReadyzDoesNotFlapWhenOlderRoundTimesOutAfterNewerSuccess(t *testing.T) {
+	now := time.Now()
+	server := NewServer(config.ChainWatcherConfig{
+		PollInterval: time.Second,
+		Lookback:     10 * time.Minute,
+	}, nil, nil)
+
+	server.status.recordScanSuccess("global", scanResult{RoundID: 12}, 20*time.Millisecond, now)
+	server.status.recordScanError("global", context.DeadlineExceeded, now.Add(time.Second), scanResult{RoundID: 11}, 3*time.Second, now.Add(10*time.Millisecond))
+	rec := httptest.NewRecorder()
+	server.handleReady(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("readyz after stale round timeout = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var ready ReadyStatusResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &ready); err != nil {
+		t.Fatal(err)
+	}
+	if !ready.SourceReady {
+		t.Fatalf("older failed round overrode newer source success: %+v", ready)
+	}
+}
+
 func TestGapWorkerPollingUsesTokensWithoutLockingToRealtimeSecond(t *testing.T) {
 	if got := gapWorkerPollInterval(30*time.Second, 10*time.Second, 0); got != 250*time.Millisecond {
 		t.Fatalf("priority worker interval = %v, want 250ms", got)

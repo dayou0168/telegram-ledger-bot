@@ -598,6 +598,12 @@ func (c *Client) getTimedWithLeaseLimit(ctx context.Context, path string, values
 		waited, err := c.keys.reserve(ctx, *lease, source, failover)
 		metrics.WaitDuration += waited
 		if err != nil {
+			// A scan-round deadline is scheduler backpressure, not evidence that
+			// the leased API key is unhealthy. Do not fail over after the caller
+			// has already canceled the shared round context.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return metrics, ctxErr
+			}
 			if failoverCount >= maxFailovers {
 				return metrics, err
 			}
@@ -630,6 +636,12 @@ func (c *Client) getTimedWithLeaseLimit(ctx context.Context, path string, values
 		c.keys.endRequest(*lease, source)
 		metrics.APIDuration += time.Since(apiStarted)
 		if err != nil {
+			// All pages in a realtime round share its deadline. Charging that
+			// cancellation to every in-flight key can cool the entire pool at
+			// once, even though the upstream and the keys remain healthy.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return metrics, ctxErr
+			}
 			c.reportKeyResult(*lease, 0, err.Error(), 0)
 			lastKeyError = err
 			if failoverCount >= maxFailovers {
@@ -648,6 +660,9 @@ func (c *Client) getTimedWithLeaseLimit(ctx context.Context, path string, values
 		raw, readErr := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if readErr != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return metrics, ctxErr
+			}
 			c.reportKeyResult(*lease, 0, readErr.Error(), 0)
 			return metrics, readErr
 		}

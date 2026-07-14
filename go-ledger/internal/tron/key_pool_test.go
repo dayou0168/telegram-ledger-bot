@@ -517,6 +517,78 @@ func TestScheduledMainTimedOutHeadDoesNotBlockReturnedPages(t *testing.T) {
 	}
 }
 
+func TestSharedRoundDeadlineDoesNotCoolElevenHealthyKeys(t *testing.T) {
+	const keyCount = 11
+	var phase atomic.Int32
+	var blockedRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if phase.Load() == 0 {
+			blockedRequests.Add(1)
+			<-r.Context().Done()
+			return
+		}
+		writeShortTransferPage(w)
+	}))
+	defer server.Close()
+
+	keys := make([]string, keyCount)
+	for index := range keys {
+		keys[index] = fmt.Sprintf("key-%02d", index)
+	}
+	client := NewClientWithKeys(server.URL, keys, 5*time.Second, KeyPoolOptions{
+		RealtimeInterval: time.Second,
+		BudgetZone:       time.UTC,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer cancel()
+	if _, err := client.FetchScheduledMainPagesAt(ctx, "TR7", 1, 1000, keyCount, 4, nil); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("shared round error = %v, want deadline exceeded", err)
+	}
+	if got := blockedRequests.Load(); got != keyCount {
+		t.Fatalf("in-flight requests = %d, want %d", got, keyCount)
+	}
+	status := client.KeyPoolStatus(time.Now())
+	if status.HealthyCount != keyCount || status.AvailableCount != keyCount || status.CooldownCount != 0 {
+		t.Fatalf("caller deadline changed key health: %+v", status)
+	}
+	for _, key := range status.Keys {
+		if key.LastFailureAt != nil || key.ConsecutiveFailures != 0 {
+			t.Fatalf("caller deadline recorded a key failure: %+v", key)
+		}
+	}
+
+	// Base tokens were consumed by the canceled round, but the emergency head
+	// reservation must keep the next P1 alive while a healthy key is available.
+	phase.Store(1)
+	result, err := client.FetchScheduledMainPagesAt(context.Background(), "TR7", 1, 2000, keyCount, 4, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Metrics.Pages < 1 {
+		t.Fatalf("next round pages = %d, want at least the reserved head", result.Metrics.Pages)
+	}
+}
+
+func TestHTTPClientTimeoutStillCoolsFailingKey(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+	}))
+	defer server.Close()
+	client := NewClientWithKeys(server.URL, []string{"key1"}, 20*time.Millisecond, KeyPoolOptions{BudgetZone: time.UTC})
+
+	_, err := client.FetchScheduledMainPagesAt(context.Background(), "TR7", 1, 1000, 1, 1, nil)
+	if err == nil {
+		t.Fatal("expected HTTP client timeout")
+	}
+	status := client.KeyPoolStatus(time.Now())
+	if status.CooldownCount != 1 || status.AvailableCount != 0 {
+		t.Fatalf("real transport timeout did not cool the key: %+v", status)
+	}
+	if status.Keys[0].LastFailureAt == nil || status.Keys[0].LastErrorClass == "" {
+		t.Fatalf("real transport timeout was not classified: %+v", status.Keys[0])
+	}
+}
+
 func TestSaturatedOldRoundNormalPersistenceDoesNotBlockNextHead(t *testing.T) {
 	const keyCount = 30
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
