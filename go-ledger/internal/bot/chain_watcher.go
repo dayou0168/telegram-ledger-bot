@@ -353,11 +353,7 @@ type sharedFallbackScanStats struct {
 
 func (b *Bot) pollSharedGlobalFallback(ctx context.Context) (sharedFallbackScanStats, error) {
 	var stats sharedFallbackScanStats
-	if handled, err := b.processOneFallbackGap(ctx); err != nil {
-		return stats, err
-	} else if handled {
-		return stats, nil
-	}
+	started := time.Now()
 	subs, err := b.fallbackSubscriptions(ctx)
 	if err != nil {
 		return stats, err
@@ -376,7 +372,7 @@ func (b *Bot) pollSharedGlobalFallback(ctx context.Context) (sharedFallbackScanS
 	now := time.Now()
 	cutoff := now.UnixMilli()
 	minTimestamp := now.Add(-10 * time.Minute).UnixMilli()
-	fetch, err := b.fallbackTron.FetchGlobalUSDTTransfersAtWithMetrics(ctx, b.cfg.USDTContract, minTimestamp, cutoff, 3)
+	fetch, err := b.fallbackTron.FetchGlobalUSDTTransfersAtWithMetrics(ctx, b.cfg.USDTContract, minTimestamp, cutoff, 1)
 	stats.From, stats.To = head.Timestamp, cutoff
 	stats.Requests, stats.Pages = int64(fetch.Metrics.Calls), int64(fetch.Metrics.Pages)
 	if _, limited := tron.IsRateLimited(err); limited {
@@ -389,6 +385,33 @@ func (b *Bot) pollSharedGlobalFallback(ctx context.Context) (sharedFallbackScanS
 		return stats, err
 	}
 	newAnchor, anchorFound := chainwatcher.AnchorCoverage(fetch.Transfers, head.TxHash)
+	shortPage := len(fetch.Transfers) < 50
+	nextPage := 1
+	deadline := started.Add(b.cfg.BotFallbackHeadTimeBudget)
+	for head.TxHash != "" && !anchorFound && !shortPage && nextPage < b.cfg.BotFallbackSafetyMaxPages {
+		if time.Now().Add(100 * time.Millisecond).After(deadline) {
+			break
+		}
+		pageCtx, cancel := context.WithDeadline(ctx, deadline)
+		page, pageErr := b.fallbackTron.FetchGlobalUSDTTransfersRangeWithMetrics(pageCtx, b.cfg.USDTContract, minTimestamp, cutoff, nextPage, 1)
+		cancel()
+		stats.Requests += int64(page.Metrics.Calls)
+		stats.Pages += int64(page.Metrics.Pages)
+		if _, limited := tron.IsRateLimited(pageErr); limited {
+			stats.RateLimits++
+		}
+		if pageErr != nil {
+			break
+		}
+		if err := b.processSharedFallbackTransfers(ctx, page.Transfers, byAddress); err != nil {
+			return stats, err
+		}
+		if _, found := chainwatcher.AnchorCoverage(page.Transfers, head.TxHash); found {
+			anchorFound = true
+		}
+		shortPage = len(page.Transfers) < 50
+		nextPage++
+	}
 	if head.TxHash == "" || anchorFound {
 		if err := b.fallbackStore.AdvanceChainWatcherFallbackHead(ctx, cutoff, newAnchor, now); err != nil {
 			return stats, err
@@ -396,12 +419,15 @@ func (b *Bot) pollSharedGlobalFallback(ctx context.Context) (sharedFallbackScanS
 	} else {
 		_, err := b.fallbackStore.EnqueueChainWatcherGap(ctx, storage.ChainWatcherGapTask{
 			Kind: "expand", Source: "fallback", Priority: 0, Reason: "fallback_anchor_missing",
-			FromTimestamp: minTimestamp, ToTimestamp: cutoff, StartPage: 3, EndPage: 20,
-			NextPage: 3, AnchorEventID: head.TxHash, HeadEventID: newAnchor,
+			FromTimestamp: minTimestamp, ToTimestamp: cutoff, StartPage: nextPage, EndPage: b.cfg.BotFallbackSafetyMaxPages,
+			NextPage: nextPage, AnchorEventID: head.TxHash, HeadEventID: newAnchor,
 		}, now)
 		if err != nil {
 			return stats, err
 		}
+	}
+	if time.Now().Add(100 * time.Millisecond).Before(deadline) {
+		_, _ = b.processOneFallbackGap(ctx)
 	}
 	return stats, nil
 }
@@ -456,7 +482,7 @@ func (b *Bot) processOneFallbackGap(ctx context.Context) (bool, error) {
 		_, err = b.fallbackStore.EnqueueChainWatcherGap(ctx, storage.ChainWatcherGapTask{
 			Kind: "window", Source: "fallback", Priority: 1, Reason: "fallback_expand_exhausted",
 			FromTimestamp: task.FromTimestamp, ToTimestamp: task.ToTimestamp,
-			StartPage: 0, EndPage: 20, NextPage: 0, HeadEventID: task.HeadEventID,
+			StartPage: 0, EndPage: b.cfg.BotFallbackSafetyMaxPages, NextPage: 0, HeadEventID: task.HeadEventID,
 		}, time.Now())
 		return true, err
 	}

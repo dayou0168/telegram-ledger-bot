@@ -30,20 +30,46 @@ func main() {
 
 	tronClient := tron.NewClientWithKeys(cfg.TronAPIBase, cfg.TronAPIKeys, cfg.RequestTimeout, tron.KeyPoolOptions{
 		MinInterval:          cfg.RequestInterval,
+		RealtimeInterval:     cfg.PollInterval,
 		AuthProbeInterval:    cfg.KeyAuthProbeInterval,
 		InvalidProbeInterval: cfg.KeyInvalidProbeInterval,
 		BlockedProbeInterval: cfg.KeyBlockedProbeInterval,
 		CompensationMaxRPS:   cfg.CatchupMaxRPS,
+		SurplusBurstWindow:   cfg.SurplusBurstWindow,
+		DailyQuotaPerKey:     cfg.KeyDailyQuota,
 		BudgetZone:           cfg.BudgetLocation,
 		UsageStore:           db,
 	})
-	tronClient.ConfigureMainBudget(cfg.GlobalPages, cfg.PollInterval)
 	if err := tronClient.SeedAndRefreshKeyRegistry(ctx, cfg.TronAPIKeys); err != nil {
 		log.Fatalf("seed tronscan key registry: %v", err)
 	}
 	if err := tronClient.RestoreKeyPool(ctx); err != nil {
 		log.Fatalf("restore tronscan key usage: %v", err)
 	}
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := tronClient.FlushKeyUsage(flushCtx); err != nil {
+			log.Printf("final tronscan key usage flush: %v", err)
+		}
+	}()
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				flushCtx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
+				err := tronClient.FlushKeyUsage(flushCtx)
+				cancel()
+				if err != nil {
+					log.Printf("flush tronscan key usage: %v", err)
+				}
+			}
+		}
+	}()
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()

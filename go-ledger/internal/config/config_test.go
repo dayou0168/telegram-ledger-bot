@@ -13,8 +13,15 @@ func TestLoadChainWatcherDefaults(t *testing.T) {
 	t.Setenv("CHAIN_WATCHER_MAIN_SCAN_TIMEOUT_MS", "")
 	t.Setenv("CHAIN_WATCHER_MAIN_MAX_INFLIGHT_ROUNDS", "")
 	t.Setenv("CHAIN_WATCHER_CATCHUP_MAX_INFLIGHT", "")
+	t.Setenv("CHAIN_WATCHER_CATCHUP_MAX_RPS", "")
 	t.Setenv("CHAIN_WATCHER_GLOBAL_SCAN_PAGES", "")
 	t.Setenv("TRONSCAN_GLOBAL_SCAN_PAGES", "")
+	t.Setenv("CHAIN_WATCHER_HEAD_TIME_BUDGET_MS", "")
+	t.Setenv("CHAIN_WATCHER_HEAD_SAFETY_MAX_PAGES", "")
+	t.Setenv("CHAIN_WATCHER_HEAD_MAX_CONCURRENCY", "")
+	t.Setenv("CHAIN_WATCHER_HEAD_PERSIST_CONCURRENCY", "")
+	t.Setenv("CHAIN_WATCHER_RECOVERY_SAFETY_MAX_PAGES", "")
+	t.Setenv("CHAIN_WATCHER_SURPLUS_BURST_SECONDS", "")
 	t.Setenv("CHAIN_WATCHER_TRON_REQUEST_INTERVAL_MS", "")
 	t.Setenv("CHAIN_WATCHER_TRONSCAN_KEY_INTERVAL_MS", "")
 	t.Setenv("CHAIN_WATCHER_TRONSCAN_DAILY_LIMIT_PER_KEY", "")
@@ -31,17 +38,29 @@ func TestLoadChainWatcherDefaults(t *testing.T) {
 	if got := cfg.PollInterval.Seconds(); got != 1 {
 		t.Fatalf("PollInterval = %.0f seconds, want 1", got)
 	}
-	if cfg.GlobalPages != 3 {
-		t.Fatalf("GlobalPages = %d, want 3", cfg.GlobalPages)
+	if cfg.DeprecatedGlobalPagesConfigured || cfg.DeprecatedGlobalPages != 0 {
+		t.Fatalf("deprecated global pages = %d/%v, want 0/false", cfg.DeprecatedGlobalPages, cfg.DeprecatedGlobalPagesConfigured)
 	}
 	if cfg.MainScanTimeout != 3*time.Second || cfg.MainMaxInflight != 3 {
 		t.Fatalf("main scan timeout/inflight = %v/%d, want 3s/3", cfg.MainScanTimeout, cfg.MainMaxInflight)
 	}
-	if cfg.CatchupMaxInflight != 3 {
-		t.Fatalf("CatchupMaxInflight = %d, want 3", cfg.CatchupMaxInflight)
+	if cfg.CatchupMaxInflight != 8 || cfg.GapFairnessEvery != 4 {
+		t.Fatalf("catchup inflight/fairness = %d/%d, want 8/4", cfg.CatchupMaxInflight, cfg.GapFairnessEvery)
 	}
-	if cfg.GlobalExpandPageLimit != 20 || cfg.CatchupOverlap != 2*time.Second || cfg.CatchupInterval != 30*time.Second {
-		t.Fatalf("expand/catchup defaults = %d/%v/%v", cfg.GlobalExpandPageLimit, cfg.CatchupOverlap, cfg.CatchupInterval)
+	if cfg.CatchupMaxRPS != 0 {
+		t.Fatalf("CatchupMaxRPS = %v, want dynamic surplus without an extra cap", cfg.CatchupMaxRPS)
+	}
+	if cfg.KeyDailyQuota != 100000 {
+		t.Fatalf("KeyDailyQuota = %d, want 100000", cfg.KeyDailyQuota)
+	}
+	if cfg.HeadTimeBudget != 850*time.Millisecond || cfg.HeadSafetyMaxPages != 256 || cfg.RecoverySafetyMaxPages != 4096 {
+		t.Fatalf("head safety defaults = %v/%d/%d", cfg.HeadTimeBudget, cfg.HeadSafetyMaxPages, cfg.RecoverySafetyMaxPages)
+	}
+	if cfg.HeadMaxConcurrency != 32 || cfg.HeadPersistConcurrency != 8 {
+		t.Fatalf("head concurrency defaults = api %d persist %d", cfg.HeadMaxConcurrency, cfg.HeadPersistConcurrency)
+	}
+	if cfg.SurplusBurstWindow != 60*time.Second || cfg.CatchupOverlap != 2*time.Second || cfg.CatchupInterval != 30*time.Second {
+		t.Fatalf("budget/catchup defaults = %v/%v/%v", cfg.SurplusBurstWindow, cfg.CatchupOverlap, cfg.CatchupInterval)
 	}
 	if got := cfg.RequestInterval.Milliseconds(); got != 200 {
 		t.Fatalf("RequestInterval = %d ms, want 200", got)
@@ -63,15 +82,15 @@ func TestLoadChainWatcherClampsInflightRoundsToThree(t *testing.T) {
 	}
 }
 
-func TestLoadChainWatcherClampsCatchupInflightToThree(t *testing.T) {
+func TestLoadChainWatcherClampsCatchupInflightToSafetyCeiling(t *testing.T) {
 	t.Setenv("CHAIN_WATCHER_KEY_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 	t.Setenv("CHAIN_WATCHER_CATCHUP_MAX_INFLIGHT", "99")
 	cfg, err := LoadChainWatcher()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.CatchupMaxInflight != 3 {
-		t.Fatalf("CatchupMaxInflight = %d, want 3", cfg.CatchupMaxInflight)
+	if cfg.CatchupMaxInflight != 64 {
+		t.Fatalf("CatchupMaxInflight = %d, want 64", cfg.CatchupMaxInflight)
 	}
 }
 
@@ -97,15 +116,16 @@ func TestLoadChainWatcherAPIKeyPoolAndLegacyCompatibility(t *testing.T) {
 	}
 }
 
-func TestLoadChainWatcherRejectsEleventhAPIKey(t *testing.T) {
+func TestLoadChainWatcherAcceptsDynamicAPIKeyPool(t *testing.T) {
 	t.Setenv("CHAIN_WATCHER_KEY_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
-	keys := make([]string, 11)
+	keys := make([]string, 30)
 	for i := range keys {
 		keys[i] = fmt.Sprintf("key-%d", i)
 	}
 	t.Setenv("CHAIN_WATCHER_TRONSCAN_API_KEYS", strings.Join(keys, ","))
-	if _, err := LoadChainWatcher(); err == nil || !strings.Contains(err.Error(), "at most 10") {
-		t.Fatalf("LoadChainWatcher error = %v, want at most 10", err)
+	cfg, err := LoadChainWatcher()
+	if err != nil || len(cfg.TronAPIKeys) != 30 {
+		t.Fatalf("LoadChainWatcher keys/error = %d/%v, want 30/nil", len(cfg.TronAPIKeys), err)
 	}
 }
 

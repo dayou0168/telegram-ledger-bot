@@ -16,7 +16,6 @@ import (
 const (
 	sharedLimitWindow    = time.Minute
 	longRateLimitBackoff = 15 * time.Minute
-	MaxConfiguredKeys    = 10
 )
 
 var ErrCompensationDeferred = errors.New("tronscan compensation deferred")
@@ -80,12 +79,15 @@ const (
 
 type KeyPoolOptions struct {
 	MinInterval          time.Duration
+	RealtimeInterval     time.Duration
 	BudgetZone           *time.Location
 	AuthCooldown         time.Duration
 	AuthProbeInterval    time.Duration
 	InvalidProbeInterval time.Duration
 	BlockedProbeInterval time.Duration
 	CompensationMaxRPS   float64
+	SurplusBurstWindow   time.Duration
+	DailyQuotaPerKey     int
 	UsageStore           KeyUsageStore
 	AllowAnonymous       bool
 	PublicFallback       bool
@@ -113,61 +115,78 @@ type KeyUsageStore interface {
 	RecordTronscanKeyResult(context.Context, string, string, int, time.Time, time.Time, time.Time) (KeyUsageRecord, error)
 }
 
+type KeyUsageBatchStore interface {
+	PersistTronscanKeyUsage(context.Context, []KeyUsageRecord, time.Time) error
+}
+
 type KeyPoolStatus struct {
-	KeyCount                   int            `json:"key_count"`
-	AvailableCount             int            `json:"available_count"`
-	EnabledCount               int            `json:"enabled_count"`
-	HealthyCount               int            `json:"healthy_count"`
-	CooldownCount              int            `json:"cooldown_count"`
-	ExhaustedCount             int            `json:"exhausted_count"`
-	InvalidCount               int            `json:"invalid_count"`
-	RequiredMainKeyCount       int            `json:"required_main_key_count"`
-	MainCapacitySafe           bool           `json:"main_capacity_safe"`
-	CapacityWarning            string         `json:"capacity_warning,omitempty"`
-	BudgetTimezone             string         `json:"budget_timezone"`
-	NextBudgetResetAt          time.Time      `json:"next_budget_reset_at"`
-	RateLimitedKeys            int            `json:"rate_limited_keys"`
-	PossibleSharedLimit        bool           `json:"possible_shared_limit"`
-	TodayMainRequests          int            `json:"today_main_requests"`
-	TodayCompRequests          int            `json:"today_compensation_requests"`
-	TodayOtherRequests         int            `json:"today_other_requests"`
-	TodayFailoverRequests      int            `json:"today_failover_requests"`
-	PersistenceError           string         `json:"persistence_error,omitempty"`
-	CompensationDeferred       bool           `json:"compensation_deferred"`
-	CompensationDeferredReason string         `json:"compensation_deferred_reason,omitempty"`
-	RealtimeReservedRPS        float64        `json:"realtime_reserved_rps"`
-	CompensationBudgetRPS      float64        `json:"compensation_budget_rps"`
-	CompensationTokens         float64        `json:"compensation_tokens"`
-	PerKeyLimitRPS             float64        `json:"per_key_limit_rps"`
-	Keys                       []APIKeyStatus `json:"keys"`
+	KeyCount                     int            `json:"key_count"`
+	AvailableCount               int            `json:"available_count"`
+	EnabledCount                 int            `json:"enabled_count"`
+	HealthyCount                 int            `json:"healthy_count"`
+	CooldownCount                int            `json:"cooldown_count"`
+	ExhaustedCount               int            `json:"exhausted_count"`
+	InvalidCount                 int            `json:"invalid_count"`
+	MainCapacitySafe             bool           `json:"main_capacity_safe"`
+	CapacityWarning              string         `json:"capacity_warning,omitempty"`
+	BudgetTimezone               string         `json:"budget_timezone"`
+	NextBudgetResetAt            time.Time      `json:"next_budget_reset_at"`
+	RateLimitedKeys              int            `json:"rate_limited_keys"`
+	PossibleSharedLimit          bool           `json:"possible_shared_limit"`
+	TodayMainRequests            int            `json:"today_main_requests"`
+	TodayCompRequests            int            `json:"today_compensation_requests"`
+	TodayOtherRequests           int            `json:"today_other_requests"`
+	TodayFailoverRequests        int            `json:"today_failover_requests"`
+	PersistenceError             string         `json:"persistence_error,omitempty"`
+	CompensationDeferred         bool           `json:"compensation_deferred"`
+	CompensationDeferredReason   string         `json:"compensation_deferred_reason,omitempty"`
+	RealtimeReservedRPS          float64        `json:"realtime_reserved_rps"`
+	BaseBudgetRPS                float64        `json:"base_budget_rps"`
+	BaseTokens                   float64        `json:"base_tokens"`
+	BasePagesAvailable           int            `json:"base_pages_available"`
+	CompensationBudgetRPS        float64        `json:"compensation_budget_rps"`
+	CompensationTokens           float64        `json:"compensation_tokens"`
+	SurplusGeneratedRPS          float64        `json:"surplus_generated_rps"`
+	SurplusBurstSeconds          int64          `json:"surplus_burst_seconds"`
+	PerKeyLimitRPS               float64        `json:"per_key_limit_rps"`
+	RealtimeReservationConflicts int64          `json:"realtime_reservation_conflicts"`
+	DailyQuotaPerKey             int            `json:"daily_quota_per_key"`
+	TodayRemainingEstimate       int            `json:"today_remaining_estimate"`
+	Keys                         []APIKeyStatus `json:"keys"`
 }
 
 type APIKeyStatus struct {
-	Index               int        `json:"index"`
-	Fingerprint         string     `json:"fingerprint"`
-	TodayRequests       int        `json:"today_requests"`
-	MainRequests        int        `json:"main_requests"`
-	CompRequests        int        `json:"compensation_requests"`
-	OtherRequests       int        `json:"other_requests"`
-	FailoverRequests    int        `json:"failover_requests"`
-	RateLimitCount      int        `json:"rate_limit_count"`
-	AuthErrorCount      int        `json:"auth_error_count"`
-	LastHTTPStatus      int        `json:"last_http_status,omitempty"`
-	Last429At           *time.Time `json:"last_429_at,omitempty"`
-	CooldownUntil       *time.Time `json:"cooldown_until,omitempty"`
-	DisabledUntil       *time.Time `json:"disabled_until,omitempty"`
-	NextRequestAt       *time.Time `json:"next_request_at,omitempty"`
-	Available           bool       `json:"available"`
-	UnavailableFor      string     `json:"unavailable_for,omitempty"`
-	Enabled             bool       `json:"enabled"`
-	Health              string     `json:"health"`
-	Reason              string     `json:"reason,omitempty"`
-	ConsecutiveFailures int        `json:"consecutive_failures"`
-	NextProbeAt         *time.Time `json:"next_probe_at,omitempty"`
-	LastUsedAt          *time.Time `json:"last_used_at,omitempty"`
-	LastSuccessAt       *time.Time `json:"last_success_at,omitempty"`
-	LastFailureAt       *time.Time `json:"last_failure_at,omitempty"`
-	LastErrorClass      string     `json:"last_error,omitempty"`
+	Index                  int        `json:"index"`
+	Fingerprint            string     `json:"fingerprint"`
+	TodayRequests          int        `json:"today_requests"`
+	TodayRemainingEstimate int        `json:"today_remaining_estimate"`
+	SustainableRPS         float64    `json:"sustainable_rps"`
+	EffectiveRPS           float64    `json:"effective_rps"`
+	BaseRPS                float64    `json:"base_rps"`
+	SurplusRPS             float64    `json:"surplus_rps"`
+	BaseTokens             float64    `json:"base_tokens"`
+	MainRequests           int        `json:"main_requests"`
+	CompRequests           int        `json:"compensation_requests"`
+	OtherRequests          int        `json:"other_requests"`
+	FailoverRequests       int        `json:"failover_requests"`
+	RateLimitCount         int        `json:"rate_limit_count"`
+	AuthErrorCount         int        `json:"auth_error_count"`
+	LastHTTPStatus         int        `json:"last_http_status,omitempty"`
+	Last429At              *time.Time `json:"last_429_at,omitempty"`
+	CooldownUntil          *time.Time `json:"cooldown_until,omitempty"`
+	DisabledUntil          *time.Time `json:"disabled_until,omitempty"`
+	NextRequestAt          *time.Time `json:"next_request_at,omitempty"`
+	Available              bool       `json:"available"`
+	UnavailableFor         string     `json:"unavailable_for,omitempty"`
+	Enabled                bool       `json:"enabled"`
+	Health                 string     `json:"health"`
+	Reason                 string     `json:"reason,omitempty"`
+	ConsecutiveFailures    int        `json:"consecutive_failures"`
+	NextProbeAt            *time.Time `json:"next_probe_at,omitempty"`
+	LastUsedAt             *time.Time `json:"last_used_at,omitempty"`
+	LastSuccessAt          *time.Time `json:"last_success_at,omitempty"`
+	LastFailureAt          *time.Time `json:"last_failure_at,omitempty"`
+	LastErrorClass         string     `json:"last_error,omitempty"`
 }
 
 type apiKeyState struct {
@@ -198,6 +217,12 @@ type apiKeyState struct {
 	lastSuccessAt             time.Time
 	lastFailureAt             time.Time
 	lastErrorClass            string
+	sustainableRPS            float64
+	effectiveRPS              float64
+	baseRPS                   float64
+	surplusRPS                float64
+	baseTokens                float64
+	budgetTokenUpdatedAt      time.Time
 }
 
 type apiKeyLease struct {
@@ -208,34 +233,39 @@ type apiKeyLease struct {
 }
 
 type keyPool struct {
-	mu                     sync.Mutex
-	keys                   []apiKeyState
-	mainNext               int
-	compNext               int
-	minInterval            time.Duration
-	budgetZone             *time.Location
-	authCooldown           time.Duration
-	authProbeInterval      time.Duration
-	invalidProbeInterval   time.Duration
-	blockedProbeInterval   time.Duration
-	usageStore             KeyUsageStore
-	registryStore          KeyRegistryStore
-	loadedDay              string
-	lastStoreError         string
-	mainPages              int
-	pollInterval           time.Duration
-	nextMainAt             time.Time
-	mainPriorityUntil      time.Time
-	realtimeReserved       map[string]time.Time
-	compTokens             float64
-	compLastRefill         time.Time
-	compBudgetRPS          float64
-	lastCompDeferredReason string
-	compBusy               map[string]int
-	compMaxRPS             float64
-	compPressure           float64
-	publicFallback         bool
-	now                    func() time.Time
+	mu                       sync.Mutex
+	keys                     []apiKeyState
+	mainNext                 int
+	compNext                 int
+	minInterval              time.Duration
+	budgetZone               *time.Location
+	authCooldown             time.Duration
+	authProbeInterval        time.Duration
+	invalidProbeInterval     time.Duration
+	blockedProbeInterval     time.Duration
+	usageStore               KeyUsageStore
+	batchUsageStore          KeyUsageBatchStore
+	dirtyUsage               map[string]KeyUsageRecord
+	registryStore            KeyRegistryStore
+	loadedDay                string
+	lastStoreError           string
+	pollInterval             time.Duration
+	nextMainAt               time.Time
+	mainPriorityUntil        time.Time
+	realtimeReserved         map[string]time.Time
+	compTokens               float64
+	compLastRefill           time.Time
+	compBudgetRPS            float64
+	lastCompDeferredReason   string
+	compBusy                 map[string]int
+	compMaxRPS               float64
+	surplusBurstWindow       time.Duration
+	dailyQuotaPerKey         int
+	compPressure             float64
+	publicFallback           bool
+	mainReservationConflicts int64
+	baseEmergencyRequests    int64
+	now                      func() time.Time
 }
 
 func newKeyPool(keys []string, opts KeyPoolOptions) *keyPool {
@@ -258,8 +288,17 @@ func newKeyPool(keys []string, opts KeyPoolOptions) *keyPool {
 	if opts.BlockedProbeInterval <= 0 {
 		opts.BlockedProbeInterval = time.Hour
 	}
-	if opts.CompensationMaxRPS <= 0 {
-		opts.CompensationMaxRPS = 8
+	if opts.CompensationMaxRPS < 0 {
+		opts.CompensationMaxRPS = 0
+	}
+	if opts.SurplusBurstWindow <= 0 {
+		opts.SurplusBurstWindow = 60 * time.Second
+	}
+	if opts.DailyQuotaPerKey < 1 {
+		opts.DailyQuotaPerKey = 100000
+	}
+	if opts.RealtimeInterval <= 0 {
+		opts.RealtimeInterval = time.Second
 	}
 	keys = normalizeAPIKeys(keys)
 	if len(keys) == 0 && opts.AllowAnonymous {
@@ -270,19 +309,25 @@ func newKeyPool(keys []string, opts KeyPoolOptions) *keyPool {
 		states = append(states, apiKeyState{key: key, fingerprint: keyFingerprint(key), enabled: true, health: "healthy"})
 	}
 	registryStore, _ := opts.UsageStore.(KeyRegistryStore)
+	batchUsageStore, _ := opts.UsageStore.(KeyUsageBatchStore)
 	return &keyPool{
 		keys:                 states,
 		minInterval:          opts.MinInterval,
+		pollInterval:         opts.RealtimeInterval,
 		budgetZone:           zone,
 		authCooldown:         opts.AuthCooldown,
 		authProbeInterval:    opts.AuthProbeInterval,
 		invalidProbeInterval: opts.InvalidProbeInterval,
 		blockedProbeInterval: opts.BlockedProbeInterval,
 		usageStore:           opts.UsageStore,
+		batchUsageStore:      batchUsageStore,
+		dirtyUsage:           make(map[string]KeyUsageRecord),
 		registryStore:        registryStore,
 		realtimeReserved:     make(map[string]time.Time),
 		compBusy:             make(map[string]int),
 		compMaxRPS:           opts.CompensationMaxRPS,
+		surplusBurstWindow:   opts.SurplusBurstWindow,
+		dailyQuotaPerKey:     opts.DailyQuotaPerKey,
 		compPressure:         1,
 		publicFallback:       opts.PublicFallback,
 		now:                  time.Now,
@@ -320,16 +365,6 @@ func keyFingerprint(key string) string {
 
 func FingerprintAPIKey(key string) string {
 	return keyFingerprint(strings.TrimSpace(key))
-}
-
-func (p *keyPool) configureMainBudget(pages int, interval time.Duration) {
-	if p == nil {
-		return
-	}
-	p.mu.Lock()
-	p.mainPages = pages
-	p.pollInterval = interval
-	p.mu.Unlock()
 }
 
 func (p *keyPool) setMinInterval(interval time.Duration) {
@@ -393,9 +428,6 @@ func (p *keyPool) refreshRegistry(ctx context.Context) error {
 	records, err := p.registryStore.ListTronscanAPIKeys(ctx)
 	if err != nil {
 		return err
-	}
-	if len(records) > MaxConfiguredKeys {
-		return fmt.Errorf("Tronscan API key registry contains %d keys; maximum is %d", len(records), MaxConfiguredKeys)
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -495,8 +527,10 @@ func (p *keyPool) lease(ctx context.Context, source RequestSource, excluded map[
 	}
 	index, reason := p.selectLeaseLocked(now, start, excluded, source, failover)
 	if index < 0 {
-		if source == RequestSourceCompensation && reason == "realtime key reservation" {
+		if source == RequestSourceCompensation || source == RequestSourceExpand {
 			p.compTokens++
+		}
+		if (source == RequestSourceCompensation || source == RequestSourceExpand) && reason == "realtime key reservation" {
 			p.lastCompDeferredReason = "realtime_keys_reserved"
 			return apiKeyLease{}, &CompensationDeferredError{Reason: "realtime_keys_reserved"}
 		}
@@ -517,7 +551,7 @@ func (p *keyPool) lease(ctx context.Context, source RequestSource, excluded map[
 			p.compNext = (index + 1) % len(p.keys)
 		}
 	}
-	if source == RequestSourceCompensation {
+	if source == RequestSourceCompensation || source == RequestSourceExpand {
 		p.lastCompDeferredReason = ""
 	}
 	return p.leaseForStateLocked(index), nil
@@ -565,9 +599,96 @@ func (p *keyPool) mainLeases(ctx context.Context, count int) ([]apiKeyLease, err
 	for i := 0; i < count; i++ {
 		index := eligible[i%len(eligible)]
 		leases[i] = p.leaseForStateLocked(index)
+		if p.compBusy[leases[i].fingerprint] > 0 {
+			p.mainReservationConflicts++
+		}
 		p.realtimeReserved[leases[i].fingerprint] = p.mainPriorityUntil
 	}
 	p.mainNext = (leases[count-1].index + 1) % len(p.keys)
+	return leases, nil
+}
+
+// scheduledMainLeases converts the per-key sustainable daily budget into
+// fractional base tokens. Each healthy key normally contributes up to one
+// realtime page per second; fractional capacity is retained for a later tick.
+func (p *keyPool) scheduledMainLeases(ctx context.Context, maximum int) ([]apiKeyLease, error) {
+	if maximum < 1 {
+		maximum = 1
+	}
+	now := p.now()
+	if err := p.ensureDayLoaded(ctx, now); err != nil {
+		return nil, err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.resetBudgetDaysLocked(now)
+	p.refillSchedulerTokensLocked(now)
+
+	type candidate struct {
+		index int
+		dist  int
+	}
+	candidates := make([]candidate, 0, len(p.keys))
+	available := make([]candidate, 0, len(p.keys))
+	for offset := 0; offset < len(p.keys); offset++ {
+		index := (p.mainNext + offset) % len(p.keys)
+		state := &p.keys[index]
+		if !p.eligibleLocked(state, now, 0) {
+			continue
+		}
+		entry := candidate{index: index, dist: offset}
+		available = append(available, entry)
+		if state.baseTokens >= 1 {
+			candidates = append(candidates, entry)
+		}
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		left, right := &p.keys[candidates[i].index], &p.keys[candidates[j].index]
+		if left.todayRequests != right.todayRequests {
+			return left.todayRequests < right.todayRequests
+		}
+		return candidates[i].dist < candidates[j].dist
+	})
+	if len(candidates) > maximum {
+		candidates = candidates[:maximum]
+	}
+	// The local daily estimate is planning data, not an outage switch. Keep one
+	// hot-head request alive while the upstream still accepts a healthy key.
+	if len(candidates) == 0 && len(available) > 0 {
+		sort.SliceStable(available, func(i, j int) bool {
+			left, right := &p.keys[available[i].index], &p.keys[available[j].index]
+			if left.todayRequests != right.todayRequests {
+				return left.todayRequests < right.todayRequests
+			}
+			return available[i].dist < available[j].dist
+		})
+		candidates = available[:1]
+		p.baseEmergencyRequests++
+	}
+	if len(candidates) == 0 {
+		return nil, &KeyPoolUnavailableError{Reason: "no eligible keys", RetryAfter: 30 * time.Second}
+	}
+
+	p.nextMainAt = now.Add(p.pollInterval)
+	priorityWindow := p.minInterval + 100*time.Millisecond
+	if p.pollInterval > 0 && priorityWindow > 3*p.pollInterval/4 {
+		priorityWindow = 3 * p.pollInterval / 4
+	}
+	p.mainPriorityUntil = now.Add(priorityWindow)
+	leases := make([]apiKeyLease, 0, len(candidates))
+	for _, candidate := range candidates {
+		state := &p.keys[candidate.index]
+		if state.baseTokens >= 1 {
+			state.baseTokens--
+		}
+		lease := p.leaseForStateLocked(candidate.index)
+		if p.compBusy[lease.fingerprint] > 0 {
+			p.mainReservationConflicts++
+		}
+		p.realtimeReserved[lease.fingerprint] = p.mainPriorityUntil
+		leases = append(leases, lease)
+	}
+	p.mainNext = (leases[len(leases)-1].index + 1) % len(p.keys)
 	return leases, nil
 }
 
@@ -604,47 +725,78 @@ func (p *keyPool) takeCompensationTokenLocked(now time.Time) string {
 }
 
 func (p *keyPool) updateCompensationBudgetLocked(now time.Time) {
-	eligible := 0
+	p.refillSchedulerTokensLocked(now)
+	budgetRPS := 0.0
 	for index := range p.keys {
-		state := &p.keys[index]
-		if !p.eligibleLocked(state, now, 0) {
-			continue
-		}
-		eligible++
-	}
-	realtimeRPS := float64(0)
-	if p.mainPages > 0 && p.pollInterval > 0 {
-		realtimeRPS = float64(p.mainPages) / p.pollInterval.Seconds()
-	}
-	perKeyRPS := 5.0
-	if p.minInterval > 0 {
-		perKeyRPS = 1 / p.minInterval.Seconds()
-	}
-	budgetRPS := float64(eligible)*perKeyRPS - realtimeRPS
-	if budgetRPS < 0 {
-		budgetRPS = 0
+		budgetRPS += p.keys[index].surplusRPS
 	}
 	budgetRPS *= p.compPressure
 	if p.compMaxRPS > 0 && budgetRPS > p.compMaxRPS {
 		budgetRPS = p.compMaxRPS
 	}
-	if p.compLastRefill.IsZero() {
+	initializing := p.compLastRefill.IsZero()
+	if initializing {
 		p.compLastRefill = now
-		if budgetRPS > 0 {
-			p.compTokens = 1
-		}
 	} else if now.After(p.compLastRefill) {
 		p.compTokens += now.Sub(p.compLastRefill).Seconds() * budgetRPS
 		p.compLastRefill = now
 	}
-	capacity := budgetRPS * 2
-	if capacity < 1 {
+	capacity := budgetRPS * p.surplusBurstWindow.Seconds()
+	if capacity < 1 && budgetRPS > 0 {
 		capacity = 1
+	}
+	if initializing && capacity > 0 && p.compTokens < 1 {
+		p.compTokens = math.Min(1, capacity)
 	}
 	if p.compTokens > capacity {
 		p.compTokens = capacity
 	}
 	p.compBudgetRPS = budgetRPS
+}
+
+func (p *keyPool) refillSchedulerTokensLocked(now time.Time) {
+	secondsLeft := nextBudgetReset(now, p.budgetZone).Sub(now).Seconds()
+	if secondsLeft < 1 {
+		secondsLeft = 1
+	}
+	instantLimit := 5.0
+	if p.minInterval > 0 {
+		instantLimit = math.Min(5, 1/p.minInterval.Seconds())
+	}
+	for index := range p.keys {
+		state := &p.keys[index]
+		previous := state.budgetTokenUpdatedAt
+		state.budgetTokenUpdatedAt = now
+		state.sustainableRPS = 0
+		state.effectiveRPS = 0
+		state.baseRPS = 0
+		state.surplusRPS = 0
+		if !p.eligibleLocked(state, now, 0) {
+			continue
+		}
+		remaining := p.dailyQuotaPerKey - state.todayRequests
+		if remaining < 0 {
+			remaining = 0
+		}
+		state.sustainableRPS = float64(remaining) / secondsLeft
+		state.effectiveRPS = math.Min(instantLimit, state.sustainableRPS)
+		state.baseRPS = math.Min(1, state.effectiveRPS)
+		state.surplusRPS = math.Max(0, state.effectiveRPS-state.baseRPS)
+		if previous.IsZero() {
+			state.baseTokens = state.baseRPS
+			continue
+		}
+		elapsed := now.Sub(previous).Seconds()
+		if elapsed <= 0 {
+			continue
+		}
+		state.baseTokens += elapsed * state.baseRPS
+		// Base capacity is consumed every realtime tick; retaining more than one
+		// page per key would turn an idle period into an unintended burst.
+		if state.baseTokens > 1 {
+			state.baseTokens = 1
+		}
+	}
 }
 
 func (p *keyPool) beginRequest(lease apiKeyLease, source RequestSource) {
@@ -706,7 +858,7 @@ func (p *keyPool) selectLeaseLocked(now time.Time, start int, excluded map[strin
 			reason = "keys cooling down"
 			continue
 		}
-		if source != RequestSourceCompensation {
+		if source != RequestSourceCompensation && source != RequestSourceExpand {
 			return index, ""
 		}
 		if state.todayRequests < selectedUsage {
@@ -765,32 +917,9 @@ func (p *keyPool) reserve(ctx context.Context, lease apiKeyLease, source Request
 			}
 			continue
 		}
-		if p.usageStore != nil {
-			fingerprint := state.fingerprint
-			day := state.budgetDay
-			state.nextRequestAt = now.Add(p.minInterval)
-			p.mu.Unlock()
-			record, allowed, err := p.usageStore.ReserveTronscanKeyRequest(ctx, fingerprint, day, source, failover, 0, now)
-			if err != nil {
-				p.mu.Lock()
-				p.lastStoreError = err.Error()
-				p.mu.Unlock()
-				return time.Since(waitStarted), err
-			}
-			p.mu.Lock()
-			if current := p.stateIndexLocked(lease); current >= 0 {
-				p.applyRecordLocked(&p.keys[current], record)
-			}
-			p.lastStoreError = ""
-			p.mu.Unlock()
-			if !allowed {
-				return time.Since(waitStarted), &HTTPError{StatusCode: 429, Body: "API key daily budget exhausted", RetryAfter: nextBudgetReset(now, p.budgetZone).Sub(now)}
-			}
-			return time.Since(waitStarted), nil
-		} else {
-			p.incrementSourceLocked(state, source, failover)
-		}
+		p.incrementSourceLocked(state, source, failover)
 		state.nextRequestAt = now.Add(p.minInterval)
+		p.markUsageDirtyLocked(state)
 		p.mu.Unlock()
 		return time.Since(waitStarted), nil
 	}
@@ -811,6 +940,59 @@ func (p *keyPool) incrementSourceLocked(state *apiKeyState, source RequestSource
 	}
 }
 
+func (p *keyPool) markUsageDirtyLocked(state *apiKeyState) {
+	if p.batchUsageStore == nil || state == nil || state.fingerprint == "" {
+		return
+	}
+	p.dirtyUsage[usageDirtyKey(state.fingerprint, state.budgetDay)] = KeyUsageRecord{
+		Fingerprint: state.fingerprint, BudgetDay: state.budgetDay,
+		RequestCount: state.todayRequests, MainRequestCount: state.mainRequests,
+		CompRequestCount: state.compRequests, OtherRequestCount: state.otherRequests,
+		FailoverCount: state.failoverRequests, RateLimitCount: state.rateLimitCount,
+		AuthErrorCount: state.authErrorCount, LastHTTPStatus: state.lastHTTPStatus,
+		Last429At: state.last429At, CooldownUntil: state.cooldownUntil,
+		DisabledUntil: state.disabledUntil,
+	}
+}
+
+func (p *keyPool) flushUsage(ctx context.Context) error {
+	if p == nil || p.batchUsageStore == nil {
+		return nil
+	}
+	p.mu.Lock()
+	if len(p.dirtyUsage) == 0 {
+		p.mu.Unlock()
+		return nil
+	}
+	records := make([]KeyUsageRecord, 0, len(p.dirtyUsage))
+	for _, record := range p.dirtyUsage {
+		records = append(records, record)
+	}
+	p.dirtyUsage = make(map[string]KeyUsageRecord)
+	p.mu.Unlock()
+	if err := p.batchUsageStore.PersistTronscanKeyUsage(ctx, records, p.now()); err != nil {
+		p.mu.Lock()
+		for _, record := range records {
+			key := usageDirtyKey(record.Fingerprint, record.BudgetDay)
+			current, exists := p.dirtyUsage[key]
+			if !exists || current.RequestCount < record.RequestCount {
+				p.dirtyUsage[key] = record
+			}
+		}
+		p.lastStoreError = err.Error()
+		p.mu.Unlock()
+		return err
+	}
+	p.mu.Lock()
+	p.lastStoreError = ""
+	p.mu.Unlock()
+	return nil
+}
+
+func usageDirtyKey(fingerprint, day string) string {
+	return fingerprint + "|" + day
+}
+
 func (p *keyPool) report(ctx context.Context, lease apiKeyLease, status int, body string, retryAfter time.Duration, now time.Time) error {
 	if p == nil {
 		return nil
@@ -827,6 +1009,7 @@ func (p *keyPool) report(ctx context.Context, lease apiKeyLease, status int, bod
 	}
 	p.resetBudgetDaysLocked(now)
 	state := &p.keys[stateIndex]
+	persistRegistry := lease.probe || status < 200 || status >= 300 || (state.health != "" && state.health != "healthy")
 	state.lastHTTPStatus = status
 	state.lastUsedAt = now
 	switch status {
@@ -906,29 +1089,9 @@ func (p *keyPool) report(ctx context.Context, lease apiKeyLease, status int, bod
 			state.nextProbeAt = state.cooldownUntil
 		}
 	}
-	fingerprint := state.fingerprint
-	day := state.budgetDay
-	last429At := state.last429At
-	cooldownUntil := state.cooldownUntil
-	disabledUntil := state.disabledUntil
+	p.markUsageDirtyLocked(state)
 	p.mu.Unlock()
-
-	if p.usageStore != nil && status != 0 {
-		record, err := p.usageStore.RecordTronscanKeyResult(ctx, fingerprint, day, status, last429At, cooldownUntil, disabledUntil)
-		if err != nil {
-			p.mu.Lock()
-			p.lastStoreError = err.Error()
-			p.mu.Unlock()
-			return err
-		}
-		p.mu.Lock()
-		if current := p.stateIndexLocked(lease); current >= 0 {
-			p.applyRecordLocked(&p.keys[current], record)
-		}
-		p.lastStoreError = ""
-		p.mu.Unlock()
-	}
-	if p.registryStore != nil {
+	if p.registryStore != nil && persistRegistry {
 		p.mu.Lock()
 		current := p.stateIndexLocked(lease)
 		if current < 0 {
@@ -1128,25 +1291,23 @@ func (p *keyPool) status(now time.Time) KeyPoolStatus {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.resetBudgetDaysLocked(now)
-	required := requiredKeyCount(p.mainPages, p.pollInterval, p.minInterval)
 	status := KeyPoolStatus{
-		KeyCount:             len(p.keys),
-		RequiredMainKeyCount: required,
-		MainCapacitySafe:     true,
-		BudgetTimezone:       p.budgetZone.String(),
-		NextBudgetResetAt:    nextBudgetReset(now, p.budgetZone),
-		PersistenceError:     p.lastStoreError,
-		Keys:                 make([]APIKeyStatus, 0, len(p.keys)),
+		KeyCount:                     len(p.keys),
+		MainCapacitySafe:             true,
+		BudgetTimezone:               p.budgetZone.String(),
+		NextBudgetResetAt:            nextBudgetReset(now, p.budgetZone),
+		PersistenceError:             p.lastStoreError,
+		DailyQuotaPerKey:             p.dailyQuotaPerKey,
+		RealtimeReservationConflicts: p.mainReservationConflicts,
+		Keys:                         make([]APIKeyStatus, 0, len(p.keys)),
 	}
 	if p.minInterval > 0 {
 		status.PerKeyLimitRPS = 1 / p.minInterval.Seconds()
 	}
 	p.updateCompensationBudgetLocked(now)
-	status.RealtimeReservedRPS = 0
-	if p.mainPages > 0 && p.pollInterval > 0 {
-		status.RealtimeReservedRPS = float64(p.mainPages) / p.pollInterval.Seconds()
-	}
+	status.SurplusBurstSeconds = int64(p.surplusBurstWindow.Seconds())
 	status.CompensationBudgetRPS = p.compBudgetRPS
+	status.SurplusGeneratedRPS = p.compBudgetRPS
 	status.CompensationTokens = p.compTokens
 	status.CompensationDeferredReason = p.lastCompDeferredReason
 	status.CompensationDeferred = p.lastCompDeferredReason != ""
@@ -1168,60 +1329,67 @@ func (p *keyPool) status(now time.Time) KeyPoolStatus {
 		available, unavailableFor := p.availableLocked(state, now)
 		if available {
 			status.AvailableCount++
+		} else if unavailableFor == "daily_budget" {
+			status.ExhaustedCount++
 		}
 		if !state.last429At.IsZero() && now.Sub(state.last429At) <= sharedLimitWindow {
 			status.RateLimitedKeys++
 		}
+		remaining := p.dailyQuotaPerKey - state.todayRequests
+		if remaining < 0 {
+			remaining = 0
+		}
 		status.Keys = append(status.Keys, APIKeyStatus{
-			Index:               index,
-			Fingerprint:         state.fingerprint,
-			TodayRequests:       state.todayRequests,
-			MainRequests:        state.mainRequests,
-			CompRequests:        state.compRequests,
-			OtherRequests:       state.otherRequests,
-			FailoverRequests:    state.failoverRequests,
-			RateLimitCount:      state.rateLimitCount,
-			AuthErrorCount:      state.authErrorCount,
-			LastHTTPStatus:      state.lastHTTPStatus,
-			Last429At:           timePointer(state.last429At),
-			CooldownUntil:       timePointer(state.cooldownUntil),
-			DisabledUntil:       timePointer(state.disabledUntil),
-			NextRequestAt:       timePointer(state.nextRequestAt),
-			Available:           available,
-			UnavailableFor:      unavailableFor,
-			Enabled:             state.enabled,
-			Health:              state.health,
-			Reason:              state.reason,
-			ConsecutiveFailures: state.consecutiveFailures,
-			NextProbeAt:         timePointer(state.nextProbeAt),
-			LastUsedAt:          timePointer(state.lastUsedAt),
-			LastSuccessAt:       timePointer(state.lastSuccessAt),
-			LastFailureAt:       timePointer(state.lastFailureAt),
-			LastErrorClass:      state.lastErrorClass,
+			Index:                  index,
+			Fingerprint:            state.fingerprint,
+			TodayRequests:          state.todayRequests,
+			TodayRemainingEstimate: remaining,
+			SustainableRPS:         state.sustainableRPS,
+			EffectiveRPS:           state.effectiveRPS,
+			BaseRPS:                state.baseRPS,
+			SurplusRPS:             state.surplusRPS,
+			BaseTokens:             state.baseTokens,
+			MainRequests:           state.mainRequests,
+			CompRequests:           state.compRequests,
+			OtherRequests:          state.otherRequests,
+			FailoverRequests:       state.failoverRequests,
+			RateLimitCount:         state.rateLimitCount,
+			AuthErrorCount:         state.authErrorCount,
+			LastHTTPStatus:         state.lastHTTPStatus,
+			Last429At:              timePointer(state.last429At),
+			CooldownUntil:          timePointer(state.cooldownUntil),
+			DisabledUntil:          timePointer(state.disabledUntil),
+			NextRequestAt:          timePointer(state.nextRequestAt),
+			Available:              available,
+			UnavailableFor:         unavailableFor,
+			Enabled:                state.enabled,
+			Health:                 state.health,
+			Reason:                 state.reason,
+			ConsecutiveFailures:    state.consecutiveFailures,
+			NextProbeAt:            timePointer(state.nextProbeAt),
+			LastUsedAt:             timePointer(state.lastUsedAt),
+			LastSuccessAt:          timePointer(state.lastSuccessAt),
+			LastFailureAt:          timePointer(state.lastFailureAt),
+			LastErrorClass:         state.lastErrorClass,
 		})
 		status.TodayMainRequests += state.mainRequests
 		status.TodayCompRequests += state.compRequests
 		status.TodayOtherRequests += state.otherRequests
 		status.TodayFailoverRequests += state.failoverRequests
+		status.TodayRemainingEstimate += remaining
+		status.BaseBudgetRPS += state.baseRPS
+		status.BaseTokens += state.baseTokens
 	}
+	status.RealtimeReservedRPS = status.BaseBudgetRPS
+	status.BasePagesAvailable = int(math.Floor(status.BaseTokens + 1e-9))
 	status.PossibleSharedLimit = status.KeyCount > 1 && status.RateLimitedKeys >= 2
-	status.MainCapacitySafe = required == 0 || status.AvailableCount >= required
+	status.MainCapacitySafe = status.AvailableCount > 0
 	if !status.MainCapacitySafe {
-		status.CapacityWarning = fmt.Sprintf("main scan requires at least %d available keys at the configured per-key rate; available %d", required, status.AvailableCount)
+		status.CapacityWarning = "no healthy key is currently available for the realtime head"
+	} else if status.BaseBudgetRPS < 1 {
+		status.CapacityWarning = fmt.Sprintf("sustainable realtime capacity is %.3f pages/s; emergency head requests remain enabled until upstream rejection", status.BaseBudgetRPS)
 	}
 	return status
-}
-
-func requiredKeyCount(pages int, interval, minRequestInterval time.Duration) int {
-	if pages < 1 || interval <= 0 {
-		return 0
-	}
-	perKeyRPS := 5.0
-	if minRequestInterval > 0 {
-		perKeyRPS = 1 / minRequestInterval.Seconds()
-	}
-	requiredRPS := float64(pages) / interval.Seconds()
-	return int(math.Ceil(requiredRPS / perKeyRPS))
 }
 
 func (p *keyPool) availableLocked(state *apiKeyState, now time.Time) (bool, string) {

@@ -356,26 +356,28 @@ type ChainWatcherCatchupState struct {
 }
 
 type ChainWatcherGapTask struct {
-	ID              int64
-	Kind            string
-	Source          string
-	Priority        int
-	Reason          string
-	FromTimestamp   int64
-	ToTimestamp     int64
-	StartPage       int
-	EndPage         int
-	NextPage        int
-	AnchorEventID   string
-	HeadEventID     string
-	Status          string
-	LeaseOwner      string
-	LeaseGeneration int64
-	LeaseUntil      time.Time
-	Attempts        int
-	LastError       string
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
+	ID               int64
+	Kind             string
+	Source           string
+	Priority         int
+	Reason           string
+	FromTimestamp    int64
+	ToTimestamp      int64
+	StartPage        int
+	EndPage          int
+	NextPage         int
+	AnchorEventID    string
+	HeadEventID      string
+	Status           string
+	LeaseOwner       string
+	LeaseGeneration  int64
+	LeaseUntil       time.Time
+	RetryAfter       time.Time
+	Attempts         int
+	LastError        string
+	FairnessSelected bool
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
 }
 
 type ChainWatcherGapStats struct {
@@ -383,6 +385,30 @@ type ChainWatcherGapStats struct {
 	LeasedCount  int64
 	OldestFrom   int64
 	OldestAgeMS  int64
+}
+
+type ChainWatcherGapMetric struct {
+	WindowMinutes      int
+	Kind               string
+	Priority           int
+	CreatedCount       int64
+	CompletedCount     int64
+	MergedCount        int64
+	FailedCount        int64
+	FairnessSelections int64
+}
+
+type ChainWatcherGapGroup struct {
+	Kind        string
+	Priority    int
+	Pending     int64
+	Leased      int64
+	OldestAgeMS int64
+}
+
+type ChainWatcherGapDiagnostics struct {
+	Metrics []ChainWatcherGapMetric
+	Groups  []ChainWatcherGapGroup
 }
 
 type ChainWatcherReadiness struct {

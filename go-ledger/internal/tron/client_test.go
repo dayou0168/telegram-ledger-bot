@@ -141,7 +141,7 @@ func TestFetchKeepsMultipleEventsFromSameTransaction(t *testing.T) {
 	}
 }
 
-func TestThreeHeadPagesShareOneCutoff(t *testing.T) {
+func TestExplicitMultiPageFetchSharesOneCutoff(t *testing.T) {
 	var mu sync.Mutex
 	var cutoffs []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

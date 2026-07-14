@@ -74,7 +74,45 @@ type StatusResponse struct {
 	LeasedGapCount        int64                     `json:"leased_gap_count"`
 	MainInflightRounds    int                       `json:"main_inflight_rounds"`
 	MainInflightLimit     int                       `json:"main_inflight_limit"`
+	HeadAPIMaxConcurrency int                       `json:"head_api_max_concurrency"`
+	HeadPersistWorkers    int                       `json:"head_persist_workers"`
+	HeadPriorityDBLanes   int                       `json:"head_priority_db_lanes"`
+	HeadOnTime            bool                      `json:"head_on_time"`
+	HeadLatenessMS        int64                     `json:"head_lateness_ms"`
+	GapScheduler          GapSchedulerStatus        `json:"gap_scheduler"`
+	DeprecatedConfig      []string                  `json:"deprecated_config,omitempty"`
 	Metrics72H            []MetricAggregateResponse `json:"metrics_72h,omitempty"`
+}
+
+type GapSchedulerStatus struct {
+	ConfiguredWorkers      int                       `json:"configured_workers"`
+	ActiveWorkers          int                       `json:"active_workers"`
+	EffectiveConcurrency   int                       `json:"effective_concurrency"`
+	ConcurrencyCapReached  bool                      `json:"concurrency_cap_reached"`
+	P1ReservationConflicts int64                     `json:"p1_reservation_conflicts"`
+	FairnessMaxWaitMS      int64                     `json:"fairness_max_wait_ms"`
+	Metrics                []GapMetricStatusResponse `json:"metrics"`
+	OpenGroups             []GapGroupStatusResponse  `json:"open_groups"`
+}
+
+type GapMetricStatusResponse struct {
+	WindowMinutes      int    `json:"window_minutes"`
+	Kind               string `json:"kind"`
+	Priority           int    `json:"priority"`
+	Created            int64  `json:"created"`
+	Completed          int64  `json:"completed"`
+	NetChange          int64  `json:"net_change"`
+	Merged             int64  `json:"merged"`
+	Failed             int64  `json:"failed"`
+	FairnessSelections int64  `json:"fairness_selections"`
+}
+
+type GapGroupStatusResponse struct {
+	Kind        string `json:"kind"`
+	Priority    int    `json:"priority"`
+	Pending     int64  `json:"pending"`
+	Leased      int64  `json:"leased"`
+	OldestAgeMS int64  `json:"oldest_age_ms"`
 }
 
 type MetricAggregateResponse struct {
@@ -153,9 +191,17 @@ type ScanStatusResponse struct {
 	AddressCount       int                 `json:"address_count"`
 	APICallCount       int                 `json:"api_call_count"`
 	PageCount          int                 `json:"page_count"`
+	PageLimit          int                 `json:"page_limit"`
 	PageLimitReached   bool                `json:"page_limit_reached"`
+	BasePageCount      int                 `json:"base_page_count"`
+	DynamicPageCount   int                 `json:"dynamic_page_count"`
+	ContinuationPage   int                 `json:"continuation_page"`
+	YieldReason        string              `json:"yield_reason,omitempty"`
 	CutoffTimestamp    int64               `json:"cutoff_timestamp"`
 	AnchorFound        bool                `json:"anchor_found"`
+	AnchorHitCount     int64               `json:"anchor_hit_count"`
+	AnchorMissCount    int64               `json:"anchor_miss_count"`
+	AnchorHitRate      float64             `json:"anchor_hit_rate"`
 	PreviousAnchorID   string              `json:"previous_anchor_id,omitempty"`
 	HeadEventID        string              `json:"head_event_id,omitempty"`
 	Recent             []ScanRoundResponse `json:"recent,omitempty"`

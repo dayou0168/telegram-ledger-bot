@@ -2,13 +2,10 @@ package config
 
 import (
 	"errors"
-	"fmt"
 	"os"
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/tron"
 )
 
 const Version = "2.4.5"
@@ -62,7 +59,8 @@ type Config struct {
 	BotFallbackSharedDatabaseURL  string
 	BotFallbackInstanceID         string
 	BotFallbackLeaseTTL           time.Duration
-	BotFallbackGlobalPages        int
+	BotFallbackHeadTimeBudget     time.Duration
+	BotFallbackSafetyMaxPages     int
 	BotFallbackRequestInterval    time.Duration
 	BotFallbackRecoverySuccesses  int
 	BotFallbackRecoveryLag        time.Duration
@@ -133,7 +131,8 @@ func Load() (Config, error) {
 		BotFallbackSharedDatabaseURL:  strings.TrimSpace(os.Getenv("BOT_FALLBACK_SHARED_DATABASE_URL")),
 		BotFallbackInstanceID:         strings.TrimSpace(os.Getenv("BOT_FALLBACK_INSTANCE_ID")),
 		BotFallbackLeaseTTL:           secondsEnv("BOT_FALLBACK_LEASE_SECONDS", 15),
-		BotFallbackGlobalPages:        intEnv("BOT_FALLBACK_GLOBAL_PAGES", 3),
+		BotFallbackHeadTimeBudget:     millisEnv("BOT_FALLBACK_HEAD_TIME_BUDGET_MS", 850),
+		BotFallbackSafetyMaxPages:     intEnv("BOT_FALLBACK_SAFETY_MAX_PAGES", 256),
 		BotFallbackRequestInterval:    millisEnv("BOT_FALLBACK_REQUEST_INTERVAL_MS", 0),
 		BotFallbackRecoverySuccesses:  intEnv("BOT_FALLBACK_RECOVERY_SUCCESS_ROUNDS", 3),
 		BotFallbackRecoveryLag:        secondsEnv("BOT_FALLBACK_RECOVERY_LAG_SECONDS", 5),
@@ -204,8 +203,11 @@ func Load() (Config, error) {
 	if cfg.BotFallbackLeaseTTL <= 0 {
 		cfg.BotFallbackLeaseTTL = 15 * time.Second
 	}
-	if cfg.BotFallbackGlobalPages < 1 {
-		cfg.BotFallbackGlobalPages = 1
+	if cfg.BotFallbackHeadTimeBudget <= 0 {
+		cfg.BotFallbackHeadTimeBudget = 850 * time.Millisecond
+	}
+	if cfg.BotFallbackSafetyMaxPages < 1 {
+		cfg.BotFallbackSafetyMaxPages = 256
 	}
 	if cfg.BotFallbackRequestInterval < 0 {
 		cfg.BotFallbackRequestInterval = 0
@@ -243,79 +245,97 @@ func (cfg Config) SharedFallbackEnabled() bool {
 }
 
 type ChainWatcherConfig struct {
-	DatabaseURL             string
-	ListenAddr              string
-	AdminToken              string
-	KeyEncryptionKey        string
-	Timezone                string
-	RequestTimeout          time.Duration
-	TronAPIBase             string
-	TronAPIKey              string
-	TronAPIKeys             []string
-	USDTContract            string
-	PollInterval            time.Duration
-	MainScanTimeout         time.Duration
-	MainMaxInflight         int
-	GlobalPages             int
-	GlobalExpandPageLimit   int
-	CatchupInterval         time.Duration
-	CatchupEnabled          bool
-	CatchupPages            int
-	CatchupMaxRequests      int
-	CatchupMaxInflight      int
-	CatchupWindow           time.Duration
-	CatchupOverlap          time.Duration
-	CatchupMaxRPS           float64
-	CatchupTargetLag        time.Duration
-	CatchupMaxLag           time.Duration
-	RequestInterval         time.Duration
-	KeyAuthProbeInterval    time.Duration
-	KeyInvalidProbeInterval time.Duration
-	KeyBlockedProbeInterval time.Duration
-	BudgetTimezone          string
-	BudgetLocation          *time.Location
-	Lookback                time.Duration
-	BotCredentials          map[string]string
-	ClaimLease              time.Duration
-	DeliveryRetryEvery      time.Duration
+	DatabaseURL                     string
+	ListenAddr                      string
+	AdminToken                      string
+	KeyEncryptionKey                string
+	Timezone                        string
+	RequestTimeout                  time.Duration
+	TronAPIBase                     string
+	TronAPIKey                      string
+	TronAPIKeys                     []string
+	USDTContract                    string
+	PollInterval                    time.Duration
+	MainScanTimeout                 time.Duration
+	MainMaxInflight                 int
+	DeprecatedGlobalPages           int
+	DeprecatedGlobalPagesConfigured bool
+	HeadTimeBudget                  time.Duration
+	HeadSafetyMaxPages              int
+	HeadMaxConcurrency              int
+	HeadPersistConcurrency          int
+	RecoverySafetyMaxPages          int
+	CatchupInterval                 time.Duration
+	CatchupEnabled                  bool
+	CatchupPages                    int
+	CatchupMaxRequests              int
+	CatchupMaxInflight              int
+	GapFairnessEvery                int
+	GapFairnessMaxWait              time.Duration
+	CatchupWindow                   time.Duration
+	CatchupOverlap                  time.Duration
+	CatchupMaxRPS                   float64
+	SurplusBurstWindow              time.Duration
+	CatchupTargetLag                time.Duration
+	CatchupMaxLag                   time.Duration
+	RequestInterval                 time.Duration
+	KeyDailyQuota                   int
+	KeyAuthProbeInterval            time.Duration
+	KeyInvalidProbeInterval         time.Duration
+	KeyBlockedProbeInterval         time.Duration
+	BudgetTimezone                  string
+	BudgetLocation                  *time.Location
+	Lookback                        time.Duration
+	BotCredentials                  map[string]string
+	ClaimLease                      time.Duration
+	DeliveryRetryEvery              time.Duration
 }
 
 func LoadChainWatcher() (ChainWatcherConfig, error) {
 	cfg := ChainWatcherConfig{
-		DatabaseURL:             envAny([]string{"CHAIN_WATCHER_DATABASE_URL", "DATABASE_URL", "POSTGRES_DSN"}, "postgres://ledger:ledger@127.0.0.1:5432/ledger_bot?sslmode=disable"),
-		ListenAddr:              env("CHAIN_WATCHER_ADDR", ":8090"),
-		AdminToken:              strings.TrimSpace(os.Getenv("CHAIN_WATCHER_ADMIN_TOKEN")),
-		KeyEncryptionKey:        strings.TrimSpace(os.Getenv("CHAIN_WATCHER_KEY_ENCRYPTION_KEY")),
-		Timezone:                env("BOT_TIMEZONE", "Asia/Shanghai"),
-		RequestTimeout:          secondsEnv("BOT_REQUEST_TIMEOUT", 70),
-		TronAPIBase:             strings.TrimRight(envAny([]string{"CHAIN_WATCHER_TRONSCAN_API_BASE", "TRONSCAN_API_BASE", "TRONGRID_API_BASE"}, "https://apilist.tronscanapi.com/api"), "/"),
-		TronAPIKey:              strings.TrimSpace(envAny([]string{"CHAIN_WATCHER_TRONSCAN_API_KEY", "CHAIN_WATCHER_TRON_API_KEY", "TRONGRID_API_KEY"}, "")),
-		TronAPIKeys:             parseListEnv(os.Getenv("CHAIN_WATCHER_TRONSCAN_API_KEYS")),
-		USDTContract:            env("TRON_USDT_CONTRACT", "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"),
-		PollInterval:            secondsEnv("CHAIN_WATCHER_SOURCE_POLL_SECONDS", 1),
-		MainScanTimeout:         millisEnv("CHAIN_WATCHER_MAIN_SCAN_TIMEOUT_MS", 3000),
-		MainMaxInflight:         intEnv("CHAIN_WATCHER_MAIN_MAX_INFLIGHT_ROUNDS", 3),
-		GlobalPages:             intEnv("CHAIN_WATCHER_GLOBAL_SCAN_PAGES", intEnv("TRONSCAN_GLOBAL_SCAN_PAGES", 3)),
-		GlobalExpandPageLimit:   intEnv("CHAIN_WATCHER_GLOBAL_EXPAND_PAGE_LIMIT", 20),
-		CatchupInterval:         secondsEnv("CHAIN_WATCHER_CATCHUP_STATE_INTERVAL_SECONDS", 30),
-		CatchupEnabled:          boolEnv("CHAIN_WATCHER_CATCHUP_ENABLED", true),
-		CatchupPages:            intEnv("CHAIN_WATCHER_CATCHUP_PAGE_LIMIT", 3),
-		CatchupMaxRequests:      intEnv("CHAIN_WATCHER_CATCHUP_MAX_REQUESTS_PER_TICK", 6),
-		CatchupMaxInflight:      intEnv("CHAIN_WATCHER_CATCHUP_MAX_INFLIGHT", 3),
-		CatchupWindow:           secondsEnv("CHAIN_WATCHER_CATCHUP_WINDOW_SECONDS", 30),
-		CatchupOverlap:          secondsEnv("CHAIN_WATCHER_CATCHUP_OVERLAP_SECONDS", 2),
-		CatchupMaxRPS:           floatEnv("CHAIN_WATCHER_CATCHUP_MAX_RPS", 8),
-		CatchupTargetLag:        secondsEnv("CHAIN_WATCHER_CATCHUP_TARGET_LAG_SECONDS", 30),
-		CatchupMaxLag:           secondsEnv("CHAIN_WATCHER_CATCHUP_MAX_LAG_SECONDS", 120),
-		RequestInterval:         millisEnv("CHAIN_WATCHER_TRONSCAN_KEY_INTERVAL_MS", int(millisEnv("CHAIN_WATCHER_TRON_REQUEST_INTERVAL_MS", 200)/time.Millisecond)),
-		KeyAuthProbeInterval:    secondsEnv("CHAIN_WATCHER_KEY_AUTH_PROBE_SECONDS", 5),
-		KeyInvalidProbeInterval: secondsEnv("CHAIN_WATCHER_KEY_INVALID_PROBE_SECONDS", 1800),
-		KeyBlockedProbeInterval: secondsEnv("CHAIN_WATCHER_KEY_BLOCKED_PROBE_SECONDS", 3600),
-		BudgetTimezone:          "UTC",
-		Lookback:                secondsEnv("CHAIN_WATCHER_LOOKBACK_SECONDS", 600),
-		BotCredentials:          parseBotCredentials(os.Getenv("CHAIN_WATCHER_BOTS")),
-		ClaimLease:              secondsEnv("CHAIN_WATCHER_CLAIM_LEASE_SECONDS", 30),
-		DeliveryRetryEvery:      secondsEnv("CHAIN_WATCHER_DELIVERY_RETRY_SECONDS", 2),
+		DatabaseURL:                     envAny([]string{"CHAIN_WATCHER_DATABASE_URL", "DATABASE_URL", "POSTGRES_DSN"}, "postgres://ledger:ledger@127.0.0.1:5432/ledger_bot?sslmode=disable"),
+		ListenAddr:                      env("CHAIN_WATCHER_ADDR", ":8090"),
+		AdminToken:                      strings.TrimSpace(os.Getenv("CHAIN_WATCHER_ADMIN_TOKEN")),
+		KeyEncryptionKey:                strings.TrimSpace(os.Getenv("CHAIN_WATCHER_KEY_ENCRYPTION_KEY")),
+		Timezone:                        env("BOT_TIMEZONE", "Asia/Shanghai"),
+		RequestTimeout:                  secondsEnv("BOT_REQUEST_TIMEOUT", 70),
+		TronAPIBase:                     strings.TrimRight(envAny([]string{"CHAIN_WATCHER_TRONSCAN_API_BASE", "TRONSCAN_API_BASE", "TRONGRID_API_BASE"}, "https://apilist.tronscanapi.com/api"), "/"),
+		TronAPIKey:                      strings.TrimSpace(envAny([]string{"CHAIN_WATCHER_TRONSCAN_API_KEY", "CHAIN_WATCHER_TRON_API_KEY", "TRONGRID_API_KEY"}, "")),
+		TronAPIKeys:                     parseListEnv(os.Getenv("CHAIN_WATCHER_TRONSCAN_API_KEYS")),
+		USDTContract:                    env("TRON_USDT_CONTRACT", "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"),
+		PollInterval:                    secondsEnv("CHAIN_WATCHER_SOURCE_POLL_SECONDS", 1),
+		MainScanTimeout:                 millisEnv("CHAIN_WATCHER_MAIN_SCAN_TIMEOUT_MS", 3000),
+		MainMaxInflight:                 intEnv("CHAIN_WATCHER_MAIN_MAX_INFLIGHT_ROUNDS", 3),
+		DeprecatedGlobalPages:           intEnv("CHAIN_WATCHER_GLOBAL_SCAN_PAGES", intEnv("TRONSCAN_GLOBAL_SCAN_PAGES", 0)),
+		DeprecatedGlobalPagesConfigured: strings.TrimSpace(os.Getenv("CHAIN_WATCHER_GLOBAL_SCAN_PAGES")) != "" || strings.TrimSpace(os.Getenv("TRONSCAN_GLOBAL_SCAN_PAGES")) != "",
+		HeadTimeBudget:                  millisEnv("CHAIN_WATCHER_HEAD_TIME_BUDGET_MS", 850),
+		HeadSafetyMaxPages:              intEnv("CHAIN_WATCHER_HEAD_SAFETY_MAX_PAGES", 256),
+		HeadMaxConcurrency:              intEnv("CHAIN_WATCHER_HEAD_MAX_CONCURRENCY", 32),
+		HeadPersistConcurrency:          intEnv("CHAIN_WATCHER_HEAD_PERSIST_CONCURRENCY", 8),
+		RecoverySafetyMaxPages:          intEnv("CHAIN_WATCHER_RECOVERY_SAFETY_MAX_PAGES", intEnv("CHAIN_WATCHER_ANCHOR_RECOVERY_MAX_PAGES", intEnv("CHAIN_WATCHER_GLOBAL_EXPAND_PAGE_LIMIT", 4096))),
+		CatchupInterval:                 secondsEnv("CHAIN_WATCHER_CATCHUP_STATE_INTERVAL_SECONDS", 30),
+		CatchupEnabled:                  boolEnv("CHAIN_WATCHER_CATCHUP_ENABLED", true),
+		CatchupPages:                    intEnv("CHAIN_WATCHER_CATCHUP_PAGE_LIMIT", 3),
+		CatchupMaxRequests:              intEnv("CHAIN_WATCHER_CATCHUP_MAX_REQUESTS_PER_TICK", 6),
+		CatchupMaxInflight:              intEnv("CHAIN_WATCHER_CATCHUP_MAX_INFLIGHT", 8),
+		GapFairnessEvery:                intEnv("CHAIN_WATCHER_GAP_FAIRNESS_EVERY", 4),
+		GapFairnessMaxWait:              secondsEnv("CHAIN_WATCHER_GAP_FAIRNESS_MAX_WAIT_SECONDS", 5),
+		CatchupWindow:                   secondsEnv("CHAIN_WATCHER_CATCHUP_WINDOW_SECONDS", 30),
+		CatchupOverlap:                  secondsEnv("CHAIN_WATCHER_CATCHUP_OVERLAP_SECONDS", 2),
+		CatchupMaxRPS:                   floatEnv("CHAIN_WATCHER_CATCHUP_MAX_RPS", 0),
+		SurplusBurstWindow:              secondsEnv("CHAIN_WATCHER_SURPLUS_BURST_SECONDS", 60),
+		CatchupTargetLag:                secondsEnv("CHAIN_WATCHER_CATCHUP_TARGET_LAG_SECONDS", 30),
+		CatchupMaxLag:                   secondsEnv("CHAIN_WATCHER_CATCHUP_MAX_LAG_SECONDS", 120),
+		RequestInterval:                 millisEnv("CHAIN_WATCHER_TRONSCAN_KEY_INTERVAL_MS", int(millisEnv("CHAIN_WATCHER_TRON_REQUEST_INTERVAL_MS", 200)/time.Millisecond)),
+		KeyDailyQuota:                   intEnv("CHAIN_WATCHER_TRONSCAN_DAILY_QUOTA_PER_KEY", intEnv("CHAIN_WATCHER_TRONSCAN_DAILY_LIMIT_PER_KEY", 100000)),
+		KeyAuthProbeInterval:            secondsEnv("CHAIN_WATCHER_KEY_AUTH_PROBE_SECONDS", 5),
+		KeyInvalidProbeInterval:         secondsEnv("CHAIN_WATCHER_KEY_INVALID_PROBE_SECONDS", 1800),
+		KeyBlockedProbeInterval:         secondsEnv("CHAIN_WATCHER_KEY_BLOCKED_PROBE_SECONDS", 3600),
+		BudgetTimezone:                  "UTC",
+		Lookback:                        secondsEnv("CHAIN_WATCHER_LOOKBACK_SECONDS", 600),
+		BotCredentials:                  parseBotCredentials(os.Getenv("CHAIN_WATCHER_BOTS")),
+		ClaimLease:                      secondsEnv("CHAIN_WATCHER_CLAIM_LEASE_SECONDS", 30),
+		DeliveryRetryEvery:              secondsEnv("CHAIN_WATCHER_DELIVERY_RETRY_SECONDS", 2),
 	}
 	if strings.TrimSpace(cfg.DatabaseURL) == "" {
 		return cfg, errors.New("DATABASE_URL is required")
@@ -335,17 +355,38 @@ func LoadChainWatcher() (ChainWatcherConfig, error) {
 	if cfg.MainMaxInflight > 3 {
 		cfg.MainMaxInflight = 3
 	}
-	if cfg.GlobalPages < 1 {
-		cfg.GlobalPages = 1
+	if cfg.HeadTimeBudget <= 0 {
+		cfg.HeadTimeBudget = 850 * time.Millisecond
 	}
-	if cfg.GlobalExpandPageLimit < cfg.GlobalPages {
-		cfg.GlobalExpandPageLimit = 20
+	if cfg.HeadTimeBudget >= cfg.PollInterval && cfg.PollInterval > 200*time.Millisecond {
+		cfg.HeadTimeBudget = cfg.PollInterval - 100*time.Millisecond
+	}
+	if cfg.HeadSafetyMaxPages < 1 {
+		cfg.HeadSafetyMaxPages = 256
+	}
+	if cfg.HeadSafetyMaxPages > 4096 {
+		cfg.HeadSafetyMaxPages = 4096
+	}
+	if cfg.HeadMaxConcurrency < 1 {
+		cfg.HeadMaxConcurrency = 1
+	}
+	if cfg.HeadMaxConcurrency > 32 {
+		cfg.HeadMaxConcurrency = 32
+	}
+	if cfg.HeadPersistConcurrency < 1 {
+		cfg.HeadPersistConcurrency = 1
+	}
+	if cfg.HeadPersistConcurrency > 30 {
+		cfg.HeadPersistConcurrency = 30
+	}
+	if cfg.RecoverySafetyMaxPages < cfg.HeadSafetyMaxPages {
+		cfg.RecoverySafetyMaxPages = cfg.HeadSafetyMaxPages
+	}
+	if cfg.RecoverySafetyMaxPages > 65536 {
+		cfg.RecoverySafetyMaxPages = 65536
 	}
 	if len(cfg.TronAPIKeys) == 0 && cfg.TronAPIKey != "" {
 		cfg.TronAPIKeys = []string{cfg.TronAPIKey}
-	}
-	if len(cfg.TronAPIKeys) > tron.MaxConfiguredKeys {
-		return cfg, fmt.Errorf("CHAIN_WATCHER_TRONSCAN_API_KEYS supports at most %d keys; got %d", tron.MaxConfiguredKeys, len(cfg.TronAPIKeys))
 	}
 	if cfg.CatchupInterval <= 0 {
 		cfg.CatchupInterval = 30 * time.Second
@@ -359,8 +400,17 @@ func LoadChainWatcher() (ChainWatcherConfig, error) {
 	if cfg.CatchupMaxInflight < 1 {
 		cfg.CatchupMaxInflight = 1
 	}
-	if cfg.CatchupMaxInflight > 3 {
-		cfg.CatchupMaxInflight = 3
+	if cfg.CatchupMaxInflight > 64 {
+		cfg.CatchupMaxInflight = 64
+	}
+	if cfg.GapFairnessEvery < 2 {
+		cfg.GapFairnessEvery = 2
+	}
+	if cfg.GapFairnessEvery > 20 {
+		cfg.GapFairnessEvery = 20
+	}
+	if cfg.GapFairnessMaxWait <= 0 {
+		cfg.GapFairnessMaxWait = 5 * time.Second
 	}
 	if cfg.CatchupWindow <= 0 {
 		cfg.CatchupWindow = 30 * time.Second
@@ -368,8 +418,14 @@ func LoadChainWatcher() (ChainWatcherConfig, error) {
 	if cfg.CatchupOverlap < 0 {
 		cfg.CatchupOverlap = 0
 	}
-	if cfg.CatchupMaxRPS <= 0 {
-		cfg.CatchupMaxRPS = 8
+	if cfg.CatchupMaxRPS < 0 {
+		cfg.CatchupMaxRPS = 0
+	}
+	if cfg.SurplusBurstWindow <= 0 {
+		cfg.SurplusBurstWindow = 60 * time.Second
+	}
+	if cfg.SurplusBurstWindow > 10*time.Minute {
+		cfg.SurplusBurstWindow = 10 * time.Minute
 	}
 	if cfg.CatchupTargetLag <= 0 {
 		cfg.CatchupTargetLag = 30 * time.Second
@@ -382,6 +438,9 @@ func LoadChainWatcher() (ChainWatcherConfig, error) {
 	}
 	if cfg.RequestInterval < 200*time.Millisecond {
 		cfg.RequestInterval = 200 * time.Millisecond
+	}
+	if cfg.KeyDailyQuota < 1 {
+		cfg.KeyDailyQuota = 100000
 	}
 	if cfg.KeyAuthProbeInterval <= 0 {
 		cfg.KeyAuthProbeInterval = 5 * time.Second

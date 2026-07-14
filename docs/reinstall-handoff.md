@@ -39,13 +39,19 @@ Expected watcher-side values:
 CHAIN_WATCHER_SOURCE_POLL_SECONDS=1
 CHAIN_WATCHER_MAIN_SCAN_TIMEOUT_MS=3000
 CHAIN_WATCHER_MAIN_MAX_INFLIGHT_ROUNDS=3
-CHAIN_WATCHER_GLOBAL_SCAN_PAGES=3
-CHAIN_WATCHER_GLOBAL_EXPAND_PAGE_LIMIT=20
+CHAIN_WATCHER_HEAD_TIME_BUDGET_MS=850
+CHAIN_WATCHER_HEAD_SAFETY_MAX_PAGES=256
+CHAIN_WATCHER_HEAD_MAX_CONCURRENCY=32
+CHAIN_WATCHER_HEAD_PERSIST_CONCURRENCY=8
+CHAIN_WATCHER_RECOVERY_SAFETY_MAX_PAGES=4096
+CHAIN_WATCHER_SURPLUS_BURST_SECONDS=60
 CHAIN_WATCHER_CATCHUP_ENABLED=true
 CHAIN_WATCHER_CATCHUP_STATE_INTERVAL_SECONDS=30
 CHAIN_WATCHER_CATCHUP_PAGE_LIMIT=3
 CHAIN_WATCHER_CATCHUP_MAX_REQUESTS_PER_TICK=6
-CHAIN_WATCHER_CATCHUP_MAX_INFLIGHT=3
+CHAIN_WATCHER_CATCHUP_MAX_INFLIGHT=8
+CHAIN_WATCHER_CATCHUP_MAX_RPS=0
+CHAIN_WATCHER_TRONSCAN_DAILY_LIMIT_PER_KEY=100000
 CHAIN_WATCHER_CATCHUP_WINDOW_SECONDS=30
 CHAIN_WATCHER_CATCHUP_OVERLAP_SECONDS=2
 CHAIN_WATCHER_LOOKBACK_SECONDS=600
@@ -54,7 +60,7 @@ CHAIN_WATCHER_TRONSCAN_KEY_INTERVAL_MS=200
 CHAIN_WATCHER_KEY_ENCRYPTION_KEY=base64_encoded_32_byte_key
 ```
 
-The main scan always creates three page jobs per second with an independent 3000ms API deadline and at most three in-flight rounds. Successful pages are committed even when another page fails; failures and missing anchors become fenced PostgreSQL gap tasks. High-priority page/anchor repair is separate from lower-priority watermark/window catch-up, and per-address polling is disabled by default. Key registry, usage, cooldown, cursor, and gap state are persisted; `/status` requires the admin Bearer token and exposes fingerprints only.
+The main scan derives its page count from fractional sustainable base tokens; there is no fixed base-page count or key-count ceiling. A full healthy key contributes about one base page per second (86,400/day) and about 13,600/day to shared surplus. The local 100,000 count is planning and observability data; upstream 429 responses remain authoritative. API page concurrency is capped separately at 32. P1 has a reserved persistence lane while P2..PN use a bounded pool of eight workers. Successful pages commit independently; exact failed pages and missing anchors become fenced PostgreSQL gap tasks. Registry, batched usage, cooldown, cursor, and gap state persist across restarts; `/status` requires the admin Bearer token and exposes fingerprints only.
 
 The supported in-flight variable is `CHAIN_WATCHER_MAIN_MAX_INFLIGHT_ROUNDS`. Do not use the unsupported name `CHAIN_WATCHER_MAIN_SCAN_MAX_INFLIGHT`.
 

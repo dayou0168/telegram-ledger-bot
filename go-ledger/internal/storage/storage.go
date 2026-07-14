@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -15,11 +16,12 @@ import (
 )
 
 type Store struct {
-	pool      *pgxpool.Pool
-	keyCipher *keyCipher
+	pool         *pgxpool.Pool
+	priorityPool *pgxpool.Pool
+	keyCipher    *keyCipher
 }
 
-const latestSchemaMigrationVersion = "2.4.5-broadcast-group-owner-transfer"
+const latestSchemaMigrationVersion = "2.4.6-chain-gap-scheduler"
 
 func Open(ctx context.Context, databaseURL string) (*Store, error) {
 	return open(ctx, databaseURL, true)
@@ -44,6 +46,25 @@ func OpenChainWatcher(ctx context.Context, databaseURL, encryptionKey string) (*
 		return nil, err
 	}
 	if err := store.migrateTronscanKeyEncryption(ctx); err != nil {
+		store.Close()
+		return nil, err
+	}
+	priorityCfg, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		store.Close()
+		return nil, err
+	}
+	priorityCfg.MaxConns = 1
+	priorityCfg.MinConns = 1
+	priorityCfg.MaxConnLifetime = 30 * time.Minute
+	priorityCfg.MaxConnIdleTime = 5 * time.Minute
+	priorityCfg.HealthCheckPeriod = 30 * time.Second
+	store.priorityPool, err = pgxpool.NewWithConfig(ctx, priorityCfg)
+	if err != nil {
+		store.Close()
+		return nil, err
+	}
+	if err := store.priorityPool.Ping(ctx); err != nil {
 		store.Close()
 		return nil, err
 	}
@@ -80,6 +101,9 @@ func open(ctx context.Context, databaseURL string, migrate bool) (*Store, error)
 }
 
 func (s *Store) Close() {
+	if s.priorityPool != nil {
+		s.priorityPool.Close()
+	}
 	s.pool.Close()
 }
 
@@ -1026,8 +1050,12 @@ func (s *Store) migrate(ctx context.Context) error {
 			ON chain_watcher_gap_tasks(priority, from_timestamp, id)
 			WHERE status IN ('pending','leased')`,
 		`ALTER TABLE chain_watcher_gap_tasks ADD COLUMN IF NOT EXISTS head_event_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE chain_watcher_gap_tasks ADD COLUMN IF NOT EXISTS retry_after TIMESTAMPTZ`,
 		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_gap_retention
 			ON chain_watcher_gap_tasks(updated_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_gap_ready_claim
+			ON chain_watcher_gap_tasks(priority, retry_after, created_at, id)
+			WHERE status IN ('pending','leased')`,
 		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_gap_window_overlap
 			ON chain_watcher_gap_tasks(source, from_timestamp, to_timestamp)
 			WHERE kind='window' AND status IN ('pending','leased')`,
@@ -1043,6 +1071,17 @@ func (s *Store) migrate(ctx context.Context) error {
 			write_ms BIGINT NOT NULL DEFAULT 0,
 			overlap_count BIGINT NOT NULL DEFAULT 0,
 			PRIMARY KEY(bucket_at, lane)
+		)`,
+		`CREATE TABLE IF NOT EXISTS chain_watcher_gap_metric_minutes (
+			bucket_at TIMESTAMPTZ NOT NULL,
+			kind TEXT NOT NULL,
+			priority INTEGER NOT NULL,
+			created_count BIGINT NOT NULL DEFAULT 0,
+			completed_count BIGINT NOT NULL DEFAULT 0,
+			merged_count BIGINT NOT NULL DEFAULT 0,
+			failed_count BIGINT NOT NULL DEFAULT 0,
+			fairness_selected_count BIGINT NOT NULL DEFAULT 0,
+			PRIMARY KEY(bucket_at, kind, priority)
 		)`,
 		`CREATE TABLE IF NOT EXISTS chain_watcher_subscriptions (
 			bot_id TEXT NOT NULL,
@@ -1217,6 +1256,11 @@ func (s *Store) migrate(ctx context.Context) error {
 		VALUES('2.4.4-broadcast-group-ownership', NOW())
 		ON CONFLICT(version) DO NOTHING`); err != nil {
 		return fmt.Errorf("record broadcast group ownership migration: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
+		VALUES('2.4.5-broadcast-group-owner-transfer', NOW())
+		ON CONFLICT(version) DO NOTHING`); err != nil {
+		return fmt.Errorf("record broadcast group owner transfer migration: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
 		VALUES($1, NOW())
@@ -5070,6 +5114,20 @@ func (s *Store) ListChainWatcherSubscriptions(ctx context.Context) ([]ChainWatch
 }
 
 func (s *Store) RecordChainWatcherMatches(ctx context.Context, event ChainWatcherEvent, deliveries []ChainWatcherMatchedEvent, now time.Time) (int, error) {
+	return s.recordChainWatcherMatches(ctx, s.pool, event, deliveries, now)
+}
+
+// RecordChainWatcherMatchesPriority uses the watcher's reserved one-connection
+// pool so P1 delivery creation cannot queue behind normal-page persistence.
+func (s *Store) RecordChainWatcherMatchesPriority(ctx context.Context, event ChainWatcherEvent, deliveries []ChainWatcherMatchedEvent, now time.Time) (int, error) {
+	pool := s.priorityPool
+	if pool == nil {
+		pool = s.pool
+	}
+	return s.recordChainWatcherMatches(ctx, pool, event, deliveries, now)
+}
+
+func (s *Store) recordChainWatcherMatches(ctx context.Context, pool *pgxpool.Pool, event ChainWatcherEvent, deliveries []ChainWatcherMatchedEvent, now time.Time) (int, error) {
 	event.EventID = strings.TrimSpace(event.EventID)
 	event.TxHash = strings.TrimSpace(event.TxHash)
 	if event.EventID == "" {
@@ -5078,7 +5136,7 @@ func (s *Store) RecordChainWatcherMatches(ctx context.Context, event ChainWatche
 	if event.TxHash == "" {
 		return 0, errors.New("chain watcher tx hash is empty")
 	}
-	tx, err := s.pool.Begin(ctx)
+	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -5093,9 +5151,7 @@ func (s *Store) RecordChainWatcherMatches(ctx context.Context, event ChainWatche
 	if err != nil {
 		return 0, err
 	}
-	if eventTag.RowsAffected() == 0 {
-		return 0, tx.Commit(ctx)
-	}
+	_ = eventTag // deliveries remain independently idempotent on delivery_id
 	inserted := 0
 	for _, d := range deliveries {
 		d.DeliveryID = strings.TrimSpace(d.DeliveryID)
@@ -5281,19 +5337,6 @@ func (s *Store) UpsertTronscanAPIKey(ctx context.Context, fingerprint, apiKey st
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('chain_watcher_api_keys'))`); err != nil {
 		return err
 	}
-	var exists bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM chain_watcher_api_keys WHERE fingerprint=$1)`, fingerprint).Scan(&exists); err != nil {
-		return err
-	}
-	if !exists {
-		var count int
-		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM chain_watcher_api_keys`).Scan(&count); err != nil {
-			return err
-		}
-		if count >= tron.MaxConfiguredKeys {
-			return fmt.Errorf("Tronscan API key registry supports at most %d keys; delete one before adding another", tron.MaxConfiguredKeys)
-		}
-	}
 	_, err = tx.Exec(ctx, `INSERT INTO chain_watcher_api_keys(
 		fingerprint, api_key, api_key_ciphertext, enabled, health, reason, next_probe_at, created_at, updated_at
 	) VALUES($1,'',$2,$3,'suspect','new_or_updated',$4,$4,$4)
@@ -5417,33 +5460,55 @@ func (s *Store) EnqueueChainWatcherGap(ctx context.Context, task ChainWatcherGap
 	if task.NextPage < task.StartPage {
 		task.NextPage = task.StartPage
 	}
-	if task.Kind != "window" {
-		return enqueueChainWatcherGapRow(ctx, s.pool, task, now)
-	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return 0, err
 	}
 	defer rollback(ctx, tx)
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('chain_watcher_window_gap'))`); err != nil {
+	var result gapEnqueueResult
+	if task.Kind == "window" || task.Kind == "expand" {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('chain_watcher_gap_merge'))`); err != nil {
+			return 0, err
+		}
+		if task.Kind == "expand" {
+			result, err = coalescePendingExpandGap(ctx, tx, task, now)
+		} else {
+			result, err = coalescePendingWindowGap(ctx, tx, task, now)
+		}
+	} else {
+		result, err = enqueueChainWatcherGapRow(ctx, tx, task, now)
+	}
+	if err != nil {
 		return 0, err
 	}
-	id, err := coalescePendingWindowGap(ctx, tx, task, now)
-	if err != nil {
+	created, merged := int64(0), int64(0)
+	if result.created {
+		created = 1
+	}
+	if result.merged {
+		merged = 1
+	}
+	if err := recordChainWatcherGapMetric(ctx, tx, task.Kind, task.Priority, created, 0, merged, 0, 0, now); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, err
 	}
-	return id, nil
+	return result.id, nil
 }
 
 type gapQueryRower interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
-func enqueueChainWatcherGapRow(ctx context.Context, query gapQueryRower, task ChainWatcherGapTask, now time.Time) (int64, error) {
-	var id int64
+type gapEnqueueResult struct {
+	id      int64
+	created bool
+	merged  bool
+}
+
+func enqueueChainWatcherGapRow(ctx context.Context, query gapQueryRower, task ChainWatcherGapTask, now time.Time) (gapEnqueueResult, error) {
+	var result gapEnqueueResult
 	err := query.QueryRow(ctx, `INSERT INTO chain_watcher_gap_tasks(
 		kind, source, priority, reason, from_timestamp, to_timestamp,
 		start_page, end_page, next_page, anchor_event_id, head_event_id, status, created_at, updated_at
@@ -5456,24 +5521,26 @@ func enqueueChainWatcherGapRow(ctx context.Context, query gapQueryRower, task Ch
 		head_event_id=CASE WHEN chain_watcher_gap_tasks.status='completed' THEN excluded.head_event_id ELSE chain_watcher_gap_tasks.head_event_id END,
 		lease_owner=CASE WHEN chain_watcher_gap_tasks.status='completed' THEN '' ELSE chain_watcher_gap_tasks.lease_owner END,
 		lease_until=CASE WHEN chain_watcher_gap_tasks.status='completed' THEN NULL ELSE chain_watcher_gap_tasks.lease_until END,
+		retry_after=CASE WHEN chain_watcher_gap_tasks.status='completed' THEN NULL ELSE chain_watcher_gap_tasks.retry_after END,
 		completed_at=CASE WHEN chain_watcher_gap_tasks.status='completed' THEN NULL ELSE chain_watcher_gap_tasks.completed_at END,
 		updated_at=excluded.updated_at
-	RETURNING id`, task.Kind, task.Source, task.Priority, task.Reason,
+	RETURNING id,(xmax=0)`, task.Kind, task.Source, task.Priority, task.Reason,
 		task.FromTimestamp, task.ToTimestamp, task.StartPage, task.EndPage,
-		task.NextPage, task.AnchorEventID, task.HeadEventID, now).Scan(&id)
-	return id, err
+		task.NextPage, task.AnchorEventID, task.HeadEventID, now).Scan(&result.id, &result.created)
+	result.merged = !result.created
+	return result, err
 }
 
-func coalescePendingWindowGap(ctx context.Context, tx pgx.Tx, task ChainWatcherGapTask, now time.Time) (int64, error) {
+func coalescePendingWindowGap(ctx context.Context, tx pgx.Tx, task ChainWatcherGapTask, now time.Time) (gapEnqueueResult, error) {
 	rows, err := tx.Query(ctx, `SELECT id, from_timestamp, to_timestamp, start_page, next_page, priority
 		FROM chain_watcher_gap_tasks
 		WHERE kind='window' AND source=$1 AND status='pending'
-		  AND from_timestamp < $3 AND to_timestamp > $2
-		  AND start_page=$4 AND end_page=$5 AND anchor_event_id=$6 AND head_event_id=$7
+		  AND from_timestamp <= $3 AND to_timestamp >= $2
+		  AND start_page=$4 AND end_page=$5
 		ORDER BY id FOR UPDATE`, task.Source, task.FromTimestamp, task.ToTimestamp,
-		task.StartPage, task.EndPage, task.AnchorEventID, task.HeadEventID)
+		task.StartPage, task.EndPage)
 	if err != nil {
-		return 0, err
+		return gapEnqueueResult{}, err
 	}
 	type pendingWindow struct {
 		id                  int64
@@ -5486,13 +5553,13 @@ func coalescePendingWindowGap(ctx context.Context, tx pgx.Tx, task ChainWatcherG
 		var item pendingWindow
 		if err := rows.Scan(&item.id, &item.from, &item.to, &item.startPage, &item.nextPage, &item.priority); err != nil {
 			rows.Close()
-			return 0, err
+			return gapEnqueueResult{}, err
 		}
 		pending = append(pending, item)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return 0, err
+		return gapEnqueueResult{}, err
 	}
 	rows.Close()
 	if len(pending) == 0 {
@@ -5518,15 +5585,14 @@ func coalescePendingWindowGap(ctx context.Context, tx pgx.Tx, task ChainWatcherG
 			ids = append(ids, item.id)
 		}
 		if _, err := tx.Exec(ctx, `DELETE FROM chain_watcher_gap_tasks WHERE id=ANY($1)`, ids); err != nil {
-			return 0, err
+			return gapEnqueueResult{}, err
 		}
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM chain_watcher_gap_tasks
 		WHERE id<>$1 AND kind='window' AND source=$2 AND status='completed'
-		  AND from_timestamp=$3 AND to_timestamp=$4 AND start_page=$5 AND end_page=$6
-		  AND anchor_event_id=$7 AND head_event_id=$8`, canonical.id, task.Source, from, to,
-		task.StartPage, task.EndPage, task.AnchorEventID, task.HeadEventID); err != nil {
-		return 0, err
+		  AND from_timestamp=$3 AND to_timestamp=$4 AND start_page=$5 AND end_page=$6`,
+		canonical.id, task.Source, from, to, task.StartPage, task.EndPage); err != nil {
+		return gapEnqueueResult{}, err
 	}
 	nextPage := canonical.nextPage
 	if canonical.from != from || canonical.to != to {
@@ -5534,11 +5600,136 @@ func coalescePendingWindowGap(ctx context.Context, tx pgx.Tx, task ChainWatcherG
 	}
 	_, err = tx.Exec(ctx, `UPDATE chain_watcher_gap_tasks SET
 		priority=$2, reason=$3, from_timestamp=$4, to_timestamp=$5,
-		start_page=$6, end_page=$7, next_page=$8, anchor_event_id=$9,
-		head_event_id=$10, updated_at=$11
+		start_page=$6, end_page=$7, next_page=$8, anchor_event_id='',
+		head_event_id='', updated_at=$9
 		WHERE id=$1`, canonical.id, priority, task.Reason, from, to,
-		task.StartPage, task.EndPage, nextPage, task.AnchorEventID, task.HeadEventID, now)
-	return canonical.id, err
+		task.StartPage, task.EndPage, nextPage, now)
+	return gapEnqueueResult{id: canonical.id, merged: true}, err
+}
+
+func coalescePendingExpandGap(ctx context.Context, tx pgx.Tx, task ChainWatcherGapTask, now time.Time) (gapEnqueueResult, error) {
+	rows, err := tx.Query(ctx, `SELECT id,from_timestamp,to_timestamp,start_page,end_page,next_page,
+		anchor_event_id,priority,created_at
+		FROM chain_watcher_gap_tasks
+		WHERE kind='expand' AND source=$1 AND status='pending'
+		  AND from_timestamp <= $3 AND to_timestamp >= $2
+		  AND to_timestamp=$4 AND anchor_event_id=$5
+		ORDER BY created_at,id FOR UPDATE`, task.Source, task.FromTimestamp, task.ToTimestamp,
+		task.ToTimestamp, task.AnchorEventID)
+	if err != nil {
+		return gapEnqueueResult{}, err
+	}
+	type pendingExpand struct {
+		id                           int64
+		from, to                     int64
+		startPage, endPage, nextPage int
+		anchorID                     string
+		priority                     int
+		createdAt                    time.Time
+	}
+	var pending []pendingExpand
+	for rows.Next() {
+		var item pendingExpand
+		if err := rows.Scan(&item.id, &item.from, &item.to, &item.startPage, &item.endPage,
+			&item.nextPage, &item.anchorID, &item.priority, &item.createdAt); err != nil {
+			rows.Close()
+			return gapEnqueueResult{}, err
+		}
+		pending = append(pending, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return gapEnqueueResult{}, err
+	}
+	rows.Close()
+	if len(pending) == 0 {
+		var leasedID int64
+		err := tx.QueryRow(ctx, `SELECT id FROM chain_watcher_gap_tasks
+			WHERE kind='expand' AND source=$1 AND status='leased'
+			  AND from_timestamp <= $2 AND to_timestamp >= $3
+			  AND to_timestamp=$4 AND anchor_event_id=$5
+			ORDER BY id LIMIT 1`, task.Source, task.FromTimestamp, task.ToTimestamp,
+			task.ToTimestamp, task.AnchorEventID).Scan(&leasedID)
+		if err == nil {
+			return gapEnqueueResult{id: leasedID, merged: true}, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return gapEnqueueResult{}, err
+		}
+		var overlapping int
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM chain_watcher_gap_tasks
+			WHERE kind='expand' AND source=$1 AND status IN ('pending','leased')
+			  AND from_timestamp <= $3 AND to_timestamp >= $2`, task.Source,
+			task.FromTimestamp, task.ToTimestamp).Scan(&overlapping); err != nil {
+			return gapEnqueueResult{}, err
+		}
+		if overlapping > 0 {
+			// Different cutoffs/anchors cannot safely share page offsets. Collapse
+			// their union into one closed high-priority time-window successor.
+			window := task
+			window.Kind = "window"
+			if window.Priority > 1 {
+				window.Priority = 1
+			}
+			window.StartPage, window.EndPage, window.NextPage = 0, 0, 0
+			window.AnchorEventID, window.HeadEventID = "", ""
+			window.Reason = "overlapping_anchor_continuations"
+			return coalescePendingWindowGap(ctx, tx, window, now)
+		}
+		return enqueueChainWatcherGapRow(ctx, tx, task, now)
+	}
+	canonical := pending[0]
+	from, to := task.FromTimestamp, task.ToTimestamp
+	startPage, endPage := task.StartPage, task.EndPage
+	priority := task.Priority
+	anchorID := canonical.anchorID
+	for _, item := range pending {
+		if item.from < from {
+			from = item.from
+		}
+		if item.to > to {
+			to = item.to
+		}
+		if item.startPage < startPage {
+			startPage = item.startPage
+		}
+		if item.endPage > endPage {
+			endPage = item.endPage
+		}
+		if item.priority < priority {
+			priority = item.priority
+		}
+	}
+	if len(pending) > 1 {
+		ids := make([]int64, 0, len(pending)-1)
+		for _, item := range pending[1:] {
+			ids = append(ids, item.id)
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM chain_watcher_gap_tasks WHERE id=ANY($1)`, ids); err != nil {
+			return gapEnqueueResult{}, err
+		}
+	}
+	_, err = tx.Exec(ctx, `UPDATE chain_watcher_gap_tasks SET
+		priority=$2,reason=$3,from_timestamp=$4,to_timestamp=$5,start_page=$6,end_page=$7,
+		next_page=$6,anchor_event_id=$8,last_error='',retry_after=NULL,updated_at=$9
+		WHERE id=$1`, canonical.id, priority, task.Reason, from, to, startPage, endPage, anchorID, now)
+	return gapEnqueueResult{id: canonical.id, merged: true}, err
+}
+
+func recordChainWatcherGapMetric(ctx context.Context, tx pgx.Tx, kind string, priority int,
+	created, completed, merged, failed, fairness int64, now time.Time) error {
+	bucket := now.UTC().Truncate(time.Minute)
+	_, err := tx.Exec(ctx, `INSERT INTO chain_watcher_gap_metric_minutes(
+		bucket_at,kind,priority,created_count,completed_count,merged_count,failed_count,fairness_selected_count
+	) VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+	ON CONFLICT(bucket_at,kind,priority) DO UPDATE SET
+		created_count=chain_watcher_gap_metric_minutes.created_count+excluded.created_count,
+		completed_count=chain_watcher_gap_metric_minutes.completed_count+excluded.completed_count,
+		merged_count=chain_watcher_gap_metric_minutes.merged_count+excluded.merged_count,
+		failed_count=chain_watcher_gap_metric_minutes.failed_count+excluded.failed_count,
+		fairness_selected_count=chain_watcher_gap_metric_minutes.fairness_selected_count+excluded.fairness_selected_count`,
+		bucket, kind, priority, created, completed, merged, failed, fairness)
+	return err
 }
 
 func (s *Store) NormalizeChainWatcherGapBacklog(ctx context.Context, now time.Time) (int, error) {
@@ -5547,7 +5738,7 @@ func (s *Store) NormalizeChainWatcherGapBacklog(ctx context.Context, now time.Ti
 		return 0, err
 	}
 	defer rollback(ctx, tx)
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('chain_watcher_window_gap'))`); err != nil {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('chain_watcher_gap_merge'))`); err != nil {
 		return 0, err
 	}
 	if _, err := tx.Exec(ctx, `UPDATE chain_watcher_gap_tasks SET status='pending', lease_owner='', lease_until=NULL, updated_at=$1
@@ -5587,7 +5778,7 @@ func (s *Store) NormalizeChainWatcherGapBacklog(ctx context.Context, now time.Ti
 		end := start + 1
 		groupTo := windows[start].to
 		priority := windows[start].priority
-		for end < len(windows) && sameWindowGapClass(windows[start], windows[end]) && windows[end].from < groupTo {
+		for end < len(windows) && sameWindowGapClass(windows[start], windows[end]) && windows[end].from <= groupTo {
 			if windows[end].to > groupTo {
 				groupTo = windows[end].to
 			}
@@ -5606,16 +5797,97 @@ func (s *Store) NormalizeChainWatcherGapBacklog(ctx context.Context, now time.Ti
 			}
 			if _, err := tx.Exec(ctx, `DELETE FROM chain_watcher_gap_tasks
 				WHERE id<>$1 AND kind='window' AND source=$2 AND status='completed'
-				  AND from_timestamp=$3 AND to_timestamp=$4 AND start_page=$5 AND end_page=$6
-				  AND anchor_event_id=$7 AND head_event_id=$8`,
+				  AND from_timestamp=$3 AND to_timestamp=$4 AND start_page=$5 AND end_page=$6`,
 				windows[start].id, windows[start].source, windows[start].from, groupTo,
-				windows[start].startPage, windows[start].endPage, windows[start].anchorID,
-				windows[start].headEventID); err != nil {
+				windows[start].startPage, windows[start].endPage); err != nil {
 				return 0, err
 			}
 			if _, err := tx.Exec(ctx, `UPDATE chain_watcher_gap_tasks SET
-				priority=$2,to_timestamp=$3,next_page=start_page,updated_at=$4 WHERE id=$1`,
+				priority=$2,to_timestamp=$3,next_page=start_page,anchor_event_id='',head_event_id='',updated_at=$4 WHERE id=$1`,
 				windows[start].id, priority, groupTo, now); err != nil {
+				return 0, err
+			}
+			if err := recordChainWatcherGapMetric(ctx, tx, "window", priority, 0, 0, int64(len(ids)), 0, 0, now); err != nil {
+				return 0, err
+			}
+			merged += len(ids)
+		}
+		start = end
+	}
+	expandRows, err := tx.Query(ctx, `SELECT id,source,priority,reason,from_timestamp,to_timestamp,
+		start_page,end_page,anchor_event_id,created_at
+		FROM chain_watcher_gap_tasks WHERE kind='expand' AND status='pending'
+		ORDER BY source,from_timestamp,to_timestamp,created_at,id FOR UPDATE`)
+	if err != nil {
+		return 0, err
+	}
+	type expandRow struct {
+		id                           int64
+		source, reason, anchorID     string
+		priority, startPage, endPage int
+		from, to                     int64
+		createdAt                    time.Time
+	}
+	var expands []expandRow
+	for expandRows.Next() {
+		var item expandRow
+		if err := expandRows.Scan(&item.id, &item.source, &item.priority, &item.reason,
+			&item.from, &item.to, &item.startPage, &item.endPage, &item.anchorID, &item.createdAt); err != nil {
+			expandRows.Close()
+			return 0, err
+		}
+		expands = append(expands, item)
+	}
+	if err := expandRows.Err(); err != nil {
+		expandRows.Close()
+		return 0, err
+	}
+	expandRows.Close()
+	for start := 0; start < len(expands); {
+		end := start + 1
+		groupTo := expands[start].to
+		for end < len(expands) && expands[end].source == expands[start].source && expands[end].from <= groupTo {
+			if expands[end].to > groupTo {
+				groupTo = expands[end].to
+			}
+			end++
+		}
+		if end-start > 1 {
+			canonicalIndex := start
+			priority := expands[start].priority
+			startPage, endPage := expands[start].startPage, expands[start].endPage
+			ids := make([]int64, 0, end-start-1)
+			for index := start + 1; index < end; index++ {
+				if expands[index].createdAt.Before(expands[canonicalIndex].createdAt) ||
+					(expands[index].createdAt.Equal(expands[canonicalIndex].createdAt) && expands[index].id < expands[canonicalIndex].id) {
+					canonicalIndex = index
+				}
+				if expands[index].priority < priority {
+					priority = expands[index].priority
+				}
+				if expands[index].startPage < startPage {
+					startPage = expands[index].startPage
+				}
+				if expands[index].endPage > endPage {
+					endPage = expands[index].endPage
+				}
+			}
+			canonical := expands[canonicalIndex]
+			for index := start; index < end; index++ {
+				if index != canonicalIndex {
+					ids = append(ids, expands[index].id)
+				}
+			}
+			if _, err := tx.Exec(ctx, `DELETE FROM chain_watcher_gap_tasks WHERE id=ANY($1)`, ids); err != nil {
+				return 0, err
+			}
+			if _, err := tx.Exec(ctx, `UPDATE chain_watcher_gap_tasks SET
+				priority=$2,from_timestamp=$3,to_timestamp=$4,start_page=$5,end_page=$6,next_page=$5,
+				retry_after=NULL,last_error='',updated_at=$7 WHERE id=$1`, canonical.id, priority,
+				expands[start].from, groupTo, startPage, endPage, now); err != nil {
+				return 0, err
+			}
+			if err := recordChainWatcherGapMetric(ctx, tx, "expand", priority, 0, 0, int64(len(ids)), 0, 0, now); err != nil {
 				return 0, err
 			}
 			merged += len(ids)
@@ -5634,8 +5906,7 @@ func sameWindowGapClass(left, right struct {
 	priority, startPage, endPage          int
 	from, to                              int64
 }) bool {
-	return left.source == right.source && left.startPage == right.startPage &&
-		left.endPage == right.endPage && left.anchorID == right.anchorID && left.headEventID == right.headEventID
+	return left.source == right.source && left.startPage == right.startPage && left.endPage == right.endPage
 }
 
 func (s *Store) ClaimChainWatcherGap(ctx context.Context, owner, workerClass string, lease time.Duration, now time.Time) (ChainWatcherGapTask, bool, error) {
@@ -5643,31 +5914,51 @@ func (s *Store) ClaimChainWatcherGap(ctx context.Context, owner, workerClass str
 		lease = 15 * time.Second
 	}
 	fallback := workerClass == "fallback"
-	row := s.pool.QueryRow(ctx, `WITH candidate AS (
-		SELECT id FROM chain_watcher_gap_tasks
+	fair := workerClass == "watcher_fair"
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return ChainWatcherGapTask{}, false, err
+	}
+	defer rollback(ctx, tx)
+	row := tx.QueryRow(ctx, `WITH candidate AS (
+		SELECT id,($3 AND (kind='window' OR priority>1)) AS fairness_selected
+		FROM chain_watcher_gap_tasks
 		WHERE (status='pending' OR (status='leased' AND lease_until <= $1))
 		  AND ((NOT $2) OR source='fallback')
-		ORDER BY priority ASC, from_timestamp ASC, id ASC
+		  AND (retry_after IS NULL OR retry_after <= $1)
+		ORDER BY CASE WHEN $3 AND (kind='window' OR priority>1) THEN 0 WHEN $3 THEN 1 ELSE 0 END,
+			CASE WHEN $3 THEN created_at END ASC, priority ASC, from_timestamp ASC, id ASC
 		LIMIT 1 FOR UPDATE SKIP LOCKED
 	)
-	UPDATE chain_watcher_gap_tasks g SET status='leased', lease_owner=$3,
-		lease_generation=g.lease_generation+1, lease_until=$1+($4 * interval '1 second'),
-		attempts=g.attempts+1, updated_at=$1
+	UPDATE chain_watcher_gap_tasks g SET status='leased', lease_owner=$4,
+		lease_generation=g.lease_generation+1, lease_until=$1+($5 * interval '1 second'),
+		retry_after=NULL,attempts=g.attempts+1, updated_at=$1
 	FROM candidate WHERE g.id=candidate.id
 	RETURNING g.id,g.kind,g.source,g.priority,g.reason,g.from_timestamp,g.to_timestamp,
 		g.start_page,g.end_page,g.next_page,g.anchor_event_id,g.head_event_id,g.status,g.lease_owner,
-		g.lease_generation,g.lease_until,g.attempts,g.last_error,g.created_at,g.updated_at`,
-		now, fallback, owner, lease.Seconds())
+		g.lease_generation,g.lease_until,COALESCE(g.retry_after,'epoch'::timestamptz),g.attempts,g.last_error,g.created_at,g.updated_at,
+		candidate.fairness_selected`, now, fallback, fair, owner, lease.Seconds())
 	var task ChainWatcherGapTask
-	err := row.Scan(&task.ID, &task.Kind, &task.Source, &task.Priority, &task.Reason,
+	err = row.Scan(&task.ID, &task.Kind, &task.Source, &task.Priority, &task.Reason,
 		&task.FromTimestamp, &task.ToTimestamp, &task.StartPage, &task.EndPage,
 		&task.NextPage, &task.AnchorEventID, &task.HeadEventID, &task.Status, &task.LeaseOwner,
-		&task.LeaseGeneration, &task.LeaseUntil, &task.Attempts, &task.LastError,
-		&task.CreatedAt, &task.UpdatedAt)
+		&task.LeaseGeneration, &task.LeaseUntil, &task.RetryAfter, &task.Attempts, &task.LastError,
+		&task.CreatedAt, &task.UpdatedAt, &task.FairnessSelected)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return task, false, nil
 	}
-	return task, err == nil, err
+	if err != nil {
+		return task, false, err
+	}
+	if task.FairnessSelected {
+		if err := recordChainWatcherGapMetric(ctx, tx, task.Kind, task.Priority, 0, 0, 0, 0, 1, now); err != nil {
+			return task, false, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return task, false, err
+	}
+	return task, true, nil
 }
 
 func (s *Store) AdvanceChainWatcherGapPage(ctx context.Context, id, generation int64, owner string, nextPage int, lease time.Duration, now time.Time) (bool, error) {
@@ -5680,7 +5971,7 @@ func (s *Store) AdvanceChainWatcherGapPage(ctx context.Context, id, generation i
 
 func (s *Store) YieldChainWatcherGap(ctx context.Context, id, generation int64, owner string, nextPage int, lastError string, now time.Time) (bool, error) {
 	tag, err := s.pool.Exec(ctx, `UPDATE chain_watcher_gap_tasks SET next_page=$4,
-		status='pending',lease_owner='',lease_until=NULL,last_error=$5,updated_at=$6
+		status='pending',lease_owner='',lease_until=NULL,retry_after=NULL,last_error=$5,updated_at=$6
 		WHERE id=$1 AND lease_generation=$2 AND lease_owner=$3 AND status='leased'`,
 		id, generation, owner, nextPage, lastError, now)
 	return tag.RowsAffected() == 1, err
@@ -5695,7 +5986,7 @@ func (s *Store) SplitChainWatcherGapWindow(ctx context.Context, task ChainWatche
 		return false, err
 	}
 	defer rollback(ctx, tx)
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('chain_watcher_window_gap'))`); err != nil {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('chain_watcher_gap_merge'))`); err != nil {
 		return false, err
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM chain_watcher_gap_tasks
@@ -5707,7 +5998,7 @@ func (s *Store) SplitChainWatcherGapWindow(ctx context.Context, task ChainWatche
 		return false, err
 	}
 	tag, err := tx.Exec(ctx, `UPDATE chain_watcher_gap_tasks SET to_timestamp=$4,
-		next_page=start_page, status='pending', lease_owner='', lease_until=NULL, updated_at=$5
+		next_page=start_page, status='pending', lease_owner='', lease_until=NULL, retry_after=NULL, updated_at=$5
 		WHERE id=$1 AND lease_generation=$2 AND lease_owner=$3 AND status='leased'`,
 		task.ID, task.LeaseGeneration, task.LeaseOwner, middle, now)
 	if err != nil || tag.RowsAffected() != 1 {
@@ -5724,6 +6015,7 @@ func (s *Store) SplitChainWatcherGapWindow(ctx context.Context, task ChainWatche
 		head_event_id=CASE WHEN chain_watcher_gap_tasks.status='completed' THEN excluded.head_event_id ELSE chain_watcher_gap_tasks.head_event_id END,
 		lease_owner=CASE WHEN chain_watcher_gap_tasks.status='completed' THEN '' ELSE chain_watcher_gap_tasks.lease_owner END,
 		lease_until=CASE WHEN chain_watcher_gap_tasks.status='completed' THEN NULL ELSE chain_watcher_gap_tasks.lease_until END,
+		retry_after=CASE WHEN chain_watcher_gap_tasks.status='completed' THEN NULL ELSE chain_watcher_gap_tasks.retry_after END,
 		completed_at=CASE WHEN chain_watcher_gap_tasks.status='completed' THEN NULL ELSE chain_watcher_gap_tasks.completed_at END,
 		updated_at=excluded.updated_at`,
 		task.Kind, task.Source, task.Priority, task.Reason, middle, task.ToTimestamp,
@@ -5735,19 +6027,70 @@ func (s *Store) SplitChainWatcherGapWindow(ctx context.Context, task ChainWatche
 }
 
 func (s *Store) CompleteChainWatcherGap(ctx context.Context, id, generation int64, owner string, now time.Time) (bool, error) {
-	tag, err := s.pool.Exec(ctx, `UPDATE chain_watcher_gap_tasks SET status='completed',
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer rollback(ctx, tx)
+	var kind string
+	var priority int
+	err = tx.QueryRow(ctx, `UPDATE chain_watcher_gap_tasks SET status='completed',
 		lease_owner='',lease_until=NULL,completed_at=$4,updated_at=$4
-		WHERE id=$1 AND lease_generation=$2 AND lease_owner=$3 AND status='leased'`,
-		id, generation, owner, now)
-	return tag.RowsAffected() == 1, err
+		WHERE id=$1 AND lease_generation=$2 AND lease_owner=$3 AND status='leased'
+		RETURNING kind,priority`,
+		id, generation, owner, now).Scan(&kind, &priority)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if err := recordChainWatcherGapMetric(ctx, tx, kind, priority, 0, 1, 0, 0, 0, now); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *Store) ReleaseChainWatcherGap(ctx context.Context, id, generation int64, owner, lastError string, now time.Time) (bool, error) {
+	return s.ReleaseChainWatcherGapUntil(ctx, id, generation, owner, lastError, now, now)
+}
+
+func (s *Store) DeferChainWatcherGapUntil(ctx context.Context, id, generation int64, owner, reason string, retryAfter, now time.Time) (bool, error) {
 	tag, err := s.pool.Exec(ctx, `UPDATE chain_watcher_gap_tasks SET status='pending',
-		lease_owner='',lease_until=NULL,last_error=$4,updated_at=$5
+		lease_owner='',lease_until=NULL,retry_after=$4,last_error=$5,updated_at=$6
 		WHERE id=$1 AND lease_generation=$2 AND lease_owner=$3 AND status='leased'`,
-		id, generation, owner, lastError, now)
+		id, generation, owner, nullableTime(retryAfter), reason, now)
 	return tag.RowsAffected() == 1, err
+}
+
+func (s *Store) ReleaseChainWatcherGapUntil(ctx context.Context, id, generation int64, owner, lastError string, retryAfter, now time.Time) (bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer rollback(ctx, tx)
+	var kind string
+	var priority int
+	err = tx.QueryRow(ctx, `UPDATE chain_watcher_gap_tasks SET status='pending',
+		lease_owner='',lease_until=NULL,retry_after=$4,last_error=$5,updated_at=$6
+		WHERE id=$1 AND lease_generation=$2 AND lease_owner=$3 AND status='leased'
+		RETURNING kind,priority`, id, generation, owner, nullableTime(retryAfter), lastError, now).Scan(&kind, &priority)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if err := recordChainWatcherGapMetric(ctx, tx, kind, priority, 0, 0, 0, 1, 0, now); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *Store) ChainWatcherGapStats(ctx context.Context, now time.Time) (ChainWatcherGapStats, error) {
@@ -5765,6 +6108,98 @@ func (s *Store) ChainWatcherGapStats(ctx context.Context, now time.Time) (ChainW
 		}
 	}
 	return stats, err
+}
+
+func (s *Store) ChainWatcherGapDiagnostics(ctx context.Context, now time.Time) (ChainWatcherGapDiagnostics, error) {
+	var diagnostics ChainWatcherGapDiagnostics
+	rows, err := s.pool.Query(ctx, `SELECT kind,priority,
+		COUNT(*) FILTER (WHERE status='pending' OR (status='leased' AND lease_until <= $1)),
+		COUNT(*) FILTER (WHERE status='leased' AND lease_until > $1),MIN(created_at)
+		FROM chain_watcher_gap_tasks WHERE status IN ('pending','leased')
+		GROUP BY kind,priority ORDER BY priority,kind`, now)
+	if err != nil {
+		return diagnostics, err
+	}
+	for rows.Next() {
+		var group ChainWatcherGapGroup
+		var oldest time.Time
+		if err := rows.Scan(&group.Kind, &group.Priority, &group.Pending, &group.Leased, &oldest); err != nil {
+			rows.Close()
+			return diagnostics, err
+		}
+		group.OldestAgeMS = now.Sub(oldest).Milliseconds()
+		if group.OldestAgeMS < 0 {
+			group.OldestAgeMS = 0
+		}
+		diagnostics.Groups = append(diagnostics.Groups, group)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return diagnostics, err
+	}
+	rows.Close()
+
+	metricRows, err := s.pool.Query(ctx, `SELECT bucket_at,kind,priority,created_count,completed_count,
+		merged_count,failed_count,fairness_selected_count
+		FROM chain_watcher_gap_metric_minutes WHERE bucket_at >= $1
+		ORDER BY bucket_at`, now.Add(-60*time.Minute).UTC().Truncate(time.Minute))
+	if err != nil {
+		return diagnostics, err
+	}
+	type metricKey struct {
+		window, priority int
+		kind             string
+	}
+	aggregates := make(map[metricKey]*ChainWatcherGapMetric)
+	for metricRows.Next() {
+		var bucket time.Time
+		var kind string
+		var priority int
+		var created, completed, merged, failed, fairness int64
+		if err := metricRows.Scan(&bucket, &kind, &priority, &created, &completed, &merged, &failed, &fairness); err != nil {
+			metricRows.Close()
+			return diagnostics, err
+		}
+		for _, window := range []int{1, 5, 60} {
+			if bucket.Before(now.Add(-time.Duration(window) * time.Minute).UTC().Truncate(time.Minute)) {
+				continue
+			}
+			key := metricKey{window: window, kind: kind, priority: priority}
+			aggregate := aggregates[key]
+			if aggregate == nil {
+				aggregate = &ChainWatcherGapMetric{WindowMinutes: window, Kind: kind, Priority: priority}
+				aggregates[key] = aggregate
+			}
+			aggregate.CreatedCount += created
+			aggregate.CompletedCount += completed
+			aggregate.MergedCount += merged
+			aggregate.FailedCount += failed
+			aggregate.FairnessSelections += fairness
+		}
+	}
+	if err := metricRows.Err(); err != nil {
+		metricRows.Close()
+		return diagnostics, err
+	}
+	metricRows.Close()
+	for _, window := range []int{1, 5, 60} {
+		for _, aggregate := range aggregates {
+			if aggregate.WindowMinutes == window {
+				diagnostics.Metrics = append(diagnostics.Metrics, *aggregate)
+			}
+		}
+	}
+	sort.Slice(diagnostics.Metrics, func(i, j int) bool {
+		left, right := diagnostics.Metrics[i], diagnostics.Metrics[j]
+		if left.WindowMinutes != right.WindowMinutes {
+			return left.WindowMinutes < right.WindowMinutes
+		}
+		if left.Priority != right.Priority {
+			return left.Priority < right.Priority
+		}
+		return left.Kind < right.Kind
+	})
+	return diagnostics, nil
 }
 
 func (s *Store) GetChainWatcherReadiness(ctx context.Context, now time.Time) (ChainWatcherReadiness, error) {
@@ -6037,7 +6472,7 @@ func scanChainWatcherFallbackLease(scanner recordScanner) (ChainWatcherFallbackL
 
 func (s *Store) ReserveTronscanKeyRequest(ctx context.Context, fingerprint, budgetDay string, source tron.RequestSource, failover bool, dailyLimit int, now time.Time) (tron.KeyUsageRecord, bool, error) {
 	mainInc := source == tron.RequestSourceMain
-	compInc := source == tron.RequestSourceCompensation
+	compInc := source == tron.RequestSourceCompensation || source == tron.RequestSourceExpand
 	otherInc := !mainInc && !compInc
 	row := s.pool.QueryRow(ctx, `INSERT INTO chain_watcher_key_usage(
 		fingerprint, budget_day, request_count, main_request_count, comp_request_count,
@@ -6070,6 +6505,43 @@ func (s *Store) ReserveTronscanKeyRequest(ctx context.Context, fingerprint, budg
 		FROM chain_watcher_key_usage WHERE fingerprint=$1 AND budget_day=$2::date`, fingerprint, budgetDay)
 	record, err = scanTronscanKeyUsage(row)
 	return record, false, err
+}
+
+func (s *Store) PersistTronscanKeyUsage(ctx context.Context, records []tron.KeyUsageRecord, now time.Time) error {
+	if len(records) == 0 {
+		return nil
+	}
+	batch := &pgx.Batch{}
+	for _, record := range records {
+		batch.Queue(`INSERT INTO chain_watcher_key_usage(
+			fingerprint,budget_day,request_count,main_request_count,comp_request_count,
+			other_request_count,failover_count,rate_limit_count,auth_error_count,
+			last_http_status,last_429_at,cooldown_until,disabled_until,updated_at
+		) VALUES($1,$2::date,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+		ON CONFLICT(fingerprint,budget_day) DO UPDATE SET
+			request_count=GREATEST(chain_watcher_key_usage.request_count,excluded.request_count),
+			main_request_count=GREATEST(chain_watcher_key_usage.main_request_count,excluded.main_request_count),
+			comp_request_count=GREATEST(chain_watcher_key_usage.comp_request_count,excluded.comp_request_count),
+			other_request_count=GREATEST(chain_watcher_key_usage.other_request_count,excluded.other_request_count),
+			failover_count=GREATEST(chain_watcher_key_usage.failover_count,excluded.failover_count),
+			rate_limit_count=GREATEST(chain_watcher_key_usage.rate_limit_count,excluded.rate_limit_count),
+			auth_error_count=GREATEST(chain_watcher_key_usage.auth_error_count,excluded.auth_error_count),
+			last_http_status=excluded.last_http_status,last_429_at=excluded.last_429_at,
+			cooldown_until=excluded.cooldown_until,disabled_until=excluded.disabled_until,
+			updated_at=excluded.updated_at`, record.Fingerprint, record.BudgetDay,
+			record.RequestCount, record.MainRequestCount, record.CompRequestCount,
+			record.OtherRequestCount, record.FailoverCount, record.RateLimitCount,
+			record.AuthErrorCount, record.LastHTTPStatus, nullableTime(record.Last429At),
+			nullableTime(record.CooldownUntil), nullableTime(record.DisabledUntil), now)
+	}
+	results := s.pool.SendBatch(ctx, batch)
+	defer results.Close()
+	for range records {
+		if _, err := results.Exec(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) RecordTronscanKeyResult(ctx context.Context, fingerprint, budgetDay string, status int, last429At, cooldownUntil, disabledUntil time.Time) (tron.KeyUsageRecord, error) {
@@ -6140,6 +6612,9 @@ func (s *Store) CleanupChainWatcherRetention(ctx context.Context, maxAge time.Du
 		return stats, err
 	}
 	if _, err := s.pool.Exec(ctx, `DELETE FROM chain_watcher_metric_minutes WHERE bucket_at < $1`, now.Add(-72*time.Hour)); err != nil {
+		return stats, err
+	}
+	if _, err := s.pool.Exec(ctx, `DELETE FROM chain_watcher_gap_metric_minutes WHERE bucket_at < $1`, now.Add(-72*time.Hour)); err != nil {
 		return stats, err
 	}
 	if _, err := s.pool.Exec(ctx, `DELETE FROM chain_watcher_gap_tasks WHERE status='completed' AND updated_at < $1`, now.Add(-72*time.Hour)); err != nil {

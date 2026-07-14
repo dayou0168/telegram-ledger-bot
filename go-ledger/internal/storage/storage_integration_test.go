@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func postgresTestSchema(t *testing.T, ctx context.Context, dsn, prefix string) (string, *pgx.Conn, string) {
@@ -119,6 +120,7 @@ func TestPostgresV242ToV243MigrationIsIdempotent(t *testing.T) {
 		"DELETE FROM " + quotedSchema + ".schema_migrations WHERE version LIKE '2.4.3%'",
 		"DELETE FROM " + quotedSchema + ".schema_migrations WHERE version LIKE '2.4.4%'",
 		"DELETE FROM " + quotedSchema + ".schema_migrations WHERE version LIKE '2.4.5%'",
+		"DELETE FROM " + quotedSchema + ".schema_migrations WHERE version='" + latestSchemaMigrationVersion + "'",
 		"DROP INDEX IF EXISTS " + quotedSchema + ".idx_chain_watcher_gap_retention",
 		"DROP INDEX IF EXISTS " + quotedSchema + ".idx_chain_watcher_gap_window_overlap",
 		"ALTER TABLE " + quotedSchema + ".chain_watcher_gap_tasks DROP COLUMN IF EXISTS head_event_id",
@@ -250,7 +252,7 @@ func TestPostgresBroadcastGroupOwnershipMigrationUsesVerifiedCreatorEvidence(t *
 		t.Fatal(err)
 	}
 	if _, err := store.pool.Exec(ctx, `DELETE FROM schema_migrations
-		WHERE version LIKE '2.4.4%' OR version LIKE '2.4.5%'`); err != nil {
+		WHERE version LIKE '2.4.4%' OR version LIKE '2.4.5%' OR version=$1`, latestSchemaMigrationVersion); err != nil {
 		t.Fatal(err)
 	}
 	store.Close()
@@ -361,7 +363,7 @@ func TestPostgresGlobalOperatorHierarchyRepair(t *testing.T) {
 	chatID := -base
 
 	if _, err := store.pool.Exec(ctx, `DELETE FROM schema_migrations
-		WHERE version LIKE '2.4.3%' OR version LIKE '2.4.4%' OR version LIKE '2.4.5%'`); err != nil {
+		WHERE version LIKE '2.4.3%' OR version LIKE '2.4.4%' OR version LIKE '2.4.5%' OR version=$1`, latestSchemaMigrationVersion); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.pool.Exec(ctx, `TRUNCATE global_operator_level_repair_candidates`); err != nil {
@@ -845,7 +847,7 @@ func TestPostgresBroadcastGroupOwnerTransferMigrationFromV244IsIdempotent(t *tes
 		t.Fatal(err)
 	}
 	store.Close()
-	if _, err := admin.Exec(ctx, "DELETE FROM "+quotedSchema+".schema_migrations WHERE version='2.4.5-broadcast-group-owner-transfer'"); err != nil {
+	if _, err := admin.Exec(ctx, "DELETE FROM "+quotedSchema+".schema_migrations WHERE version IN ('2.4.5-broadcast-group-owner-transfer','"+latestSchemaMigrationVersion+"')"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := admin.Exec(ctx, "DROP TABLE "+quotedSchema+".broadcast_group_owner_transfer_events CASCADE"); err != nil {
@@ -1689,15 +1691,98 @@ func TestChainWatcherConcurrentSourcesCreateOneDelivery(t *testing.T) {
 	if total != 1 {
 		t.Fatalf("inserted deliveries = %d, want 1", total)
 	}
+	lateDelivery := delivery
+	lateDelivery.DeliveryID += "-second-subscriber"
+	lateDelivery.OwnerUserID = 2
+	lateDelivery.ChatID = 2
+	inserted, err := store.RecordChainWatcherMatches(ctx, event, []ChainWatcherMatchedEvent{lateDelivery}, time.Now())
+	if err != nil || inserted != 1 {
+		t.Fatalf("existing event new subscriber delivery = %d/%v, want 1/nil", inserted, err)
+	}
 
 	second := event
 	second.EventID += "-log1"
 	second.EventIndex = "1"
 	secondDelivery := delivery
 	secondDelivery.EventID, secondDelivery.DeliveryID = second.EventID, delivery.DeliveryID+"-log1"
-	inserted, err := store.RecordChainWatcherMatches(ctx, second, []ChainWatcherMatchedEvent{secondDelivery}, time.Now())
+	inserted, err = store.RecordChainWatcherMatches(ctx, second, []ChainWatcherMatchedEvent{secondDelivery}, time.Now())
 	if err != nil || inserted != 1 {
 		t.Fatalf("second log event = %d/%v", inserted, err)
+	}
+}
+
+func TestChainNotificationOutboxIsAtomicCriticalAndEventDeduplicated(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	migrationURL, _, _ := postgresTestSchema(t, ctx, dsn, "chain_outbox_critical")
+	store, err := Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now().UTC()
+	suffix := fmt.Sprint(now.UnixNano())
+	inserted, err := store.RecordChainNotificationOutboxEvent(ctx, 1001, "TAddress", "tx-"+suffix, "event-"+suffix, "income", now.UnixMilli(), 1001, "notice", "HTML", true, now)
+	if err != nil || !inserted {
+		t.Fatalf("first chain outbox insert = %v/%v", inserted, err)
+	}
+	inserted, err = store.RecordChainNotificationOutboxEvent(ctx, 1001, "TAddress", "tx-"+suffix, "event-"+suffix, "income", now.UnixMilli(), 1001, "duplicate", "HTML", true, now.Add(time.Second))
+	if err != nil || inserted {
+		t.Fatalf("duplicate chain outbox insert = %v/%v", inserted, err)
+	}
+	var count int
+	var priority int
+	var status, text string
+	if err := store.pool.QueryRow(ctx, `SELECT COUNT(*),MIN(priority),MIN(status),MIN(text)
+		FROM notification_outbox WHERE kind='chain' AND dedupe_key=$1`,
+		"chain:1001:TAddress:event-"+suffix+":income").Scan(&count, &priority, &status, &text); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 || priority != 0 || status != "pending" || text != "notice" {
+		t.Fatalf("chain outbox row = count %d priority %d status %s text %s", count, priority, status, text)
+	}
+}
+
+func TestChainWatcherPriorityPersistenceUsesReservedPool(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	migrationURL, _, _ := postgresTestSchema(t, ctx, dsn, "watcher_priority_pool")
+	store, err := OpenChainWatcher(ctx, migrationURL, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	held := make([]*pgxpool.Conn, 0, 32)
+	for index := 0; index < 32; index++ {
+		conn, acquireErr := store.pool.Acquire(ctx)
+		if acquireErr != nil {
+			t.Fatalf("acquire normal connection %d: %v", index, acquireErr)
+		}
+		held = append(held, conn)
+	}
+	defer func() {
+		for _, conn := range held {
+			conn.Release()
+		}
+	}()
+
+	suffix := fmt.Sprint(time.Now().UnixNano())
+	event := ChainWatcherEvent{EventID: "priority-event-" + suffix, TxHash: "priority-tx-" + suffix, From: "A", To: "B", Value: "1", Source: "realtime"}
+	delivery := ChainWatcherMatchedEvent{DeliveryID: "priority-delivery-" + suffix, EventID: event.EventID, BotID: "bot", ChatID: 1, OwnerUserID: 1, WatchAddress: "B", Direction: "income"}
+	priorityCtx, priorityCancel := context.WithTimeout(context.Background(), time.Second)
+	defer priorityCancel()
+	inserted, err := store.RecordChainWatcherMatchesPriority(priorityCtx, event, []ChainWatcherMatchedEvent{delivery}, time.Now())
+	if err != nil || inserted != 1 {
+		t.Fatalf("priority persistence while normal pool saturated = %d/%v", inserted, err)
 	}
 }
 
@@ -1843,6 +1928,47 @@ func TestChainWatcherGapLeaseFencingRejectsExpiredWorker(t *testing.T) {
 		t.Fatalf("reopened completed gap = %+v/%v/%v", reopened, ok, err)
 	}
 	_, _ = store.CompleteChainWatcherGap(ctx, reopened.ID, reopened.LeaseGeneration, reopened.LeaseOwner, now.Add(3*time.Second))
+}
+
+func TestChainWatcherGapClaimAgesOldLowerPriorityWork(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	migrationURL, _, _ := postgresTestSchema(t, ctx, dsn, "gap_aging_fairness")
+	store, err := Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	base := now.UnixMilli()
+	oldCreatedAt := now.Add(-15 * time.Minute)
+	oldID, err := store.EnqueueChainWatcherGap(ctx, ChainWatcherGapTask{
+		Kind: "window", Source: "watcher", Priority: 2, Reason: "old-window",
+		FromTimestamp: base - 60_000, ToTimestamp: base - 30_000,
+	}, oldCreatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.EnqueueChainWatcherGap(ctx, ChainWatcherGapTask{
+		Kind: "expand", Source: "watcher", Priority: 1, Reason: "new-expand",
+		FromTimestamp: base - 10_000, ToTimestamp: base,
+		StartPage: 3, EndPage: 20, NextPage: 3, AnchorEventID: "new-anchor",
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+
+	claimed, ok, err := store.ClaimChainWatcherGap(ctx, "fair-worker", "watcher_fair", time.Minute, now)
+	if err != nil || !ok {
+		t.Fatalf("claim = %+v/%v/%v", claimed, ok, err)
+	}
+	if claimed.ID != oldID || claimed.Reason != "old-window" {
+		t.Fatalf("claimed %+v, want aged lower-priority gap %d", claimed, oldID)
+	}
 }
 
 func TestChainWatcherOverlappingWindowsCoalesceConcurrentlyAndSurviveRestart(t *testing.T) {
@@ -2001,7 +2127,7 @@ func TestNormalizeChainWatcherGapBacklogCollapsesLegacyOverlap(t *testing.T) {
 	}
 }
 
-func TestNormalizeChainWatcherGapBacklogKeepsDifferentHeadsSeparate(t *testing.T) {
+func TestOverlappingWindowGapsMergeAcrossTransientHeadLabels(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("TEST_DATABASE_URL is not set")
@@ -2032,27 +2158,57 @@ func TestNormalizeChainWatcherGapBacklogKeepsDifferentHeadsSeparate(t *testing.T
 		t.Fatal(err)
 	}
 	stats, err := store.ChainWatcherGapStats(ctx, now.Add(time.Second))
-	if err != nil || merged != 0 || stats.PendingCount != 2 {
-		t.Fatalf("different heads merged/stats = %d/%+v/%v, want two pending", merged, stats, err)
+	if err != nil || stats.PendingCount != 1 {
+		t.Fatalf("overlapping head-labelled windows = %d/%+v/%v, want one pending", merged, stats, err)
 	}
-
-	heads := map[string]bool{}
-	for worker := 0; worker < 2; worker++ {
-		task, ok, err := store.ClaimChainWatcherGap(ctx, fmt.Sprintf("head-worker-%d", worker), "watcher", time.Minute, now.Add(2*time.Second))
-		if err != nil || !ok {
-			t.Fatalf("claim head %d = %+v/%v/%v", worker, task, ok, err)
-		}
-		heads[task.HeadEventID] = true
-		if completed, err := store.CompleteChainWatcherGap(ctx, task.ID, task.LeaseGeneration, task.LeaseOwner, now.Add(2*time.Second)); err != nil || !completed {
-			t.Fatalf("complete head %d = %v/%v", worker, completed, err)
-		}
-	}
-	if !heads["head-a"] || !heads["head-b"] || len(heads) != 2 {
-		t.Fatalf("claimed head identities = %#v", heads)
+	task, ok, err := store.ClaimChainWatcherGap(ctx, "head-worker", "watcher", time.Minute, now.Add(2*time.Second))
+	if err != nil || !ok || task.HeadEventID != "" {
+		t.Fatalf("merged window task = %+v/%v/%v", task, ok, err)
 	}
 }
 
-func TestThreeTimedOutMainRoundsCreateAtMostNinePrecisePageGaps(t *testing.T) {
+func TestLeasedAnchorGapKeepsAtMostOnePendingOverlapSuccessor(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	migrationURL, _, _ := postgresTestSchema(t, ctx, dsn, "gap_leased_successor")
+	store, err := Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now().UTC()
+	base := now.UnixMilli()
+	if _, err := store.EnqueueChainWatcherGap(ctx, ChainWatcherGapTask{
+		Kind: "expand", Source: "watcher", Priority: 1, Reason: "first-anchor",
+		FromTimestamp: base - 600_000, ToTimestamp: base,
+		StartPage: 2, EndPage: 4096, NextPage: 2, AnchorEventID: "anchor-0",
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+	leased, ok, err := store.ClaimChainWatcherGap(ctx, "leased-worker", "watcher_priority", time.Minute, now)
+	if err != nil || !ok || leased.Kind != "expand" {
+		t.Fatalf("leased anchor = %+v/%v/%v", leased, ok, err)
+	}
+	for round := 1; round <= 100; round++ {
+		if _, err := store.EnqueueChainWatcherGap(ctx, ChainWatcherGapTask{
+			Kind: "expand", Source: "watcher", Priority: 1, Reason: "next-anchor",
+			FromTimestamp: base - 600_000 + int64(round), ToTimestamp: base + int64(round),
+			StartPage: 2, EndPage: 4096, NextPage: 2, AnchorEventID: fmt.Sprintf("anchor-%d", round),
+		}, now.Add(time.Duration(round)*time.Millisecond)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stats, err := store.ChainWatcherGapStats(ctx, now.Add(time.Second))
+	if err != nil || stats.LeasedCount != 1 || stats.PendingCount != 1 {
+		t.Fatalf("leased/pending overlap stats = %+v/%v, want 1/1", stats, err)
+	}
+}
+
+func TestRepeatedDynamicPageFailuresRemainPreciselyDeduplicated(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("TEST_DATABASE_URL is not set")
@@ -2067,10 +2223,11 @@ func TestThreeTimedOutMainRoundsCreateAtMostNinePrecisePageGaps(t *testing.T) {
 	defer store.Close()
 	now := time.Now().UTC()
 	base := now.UnixMilli()
+	pagesByRound := []int{1, 4, 2}
 	for replay := 0; replay < 10; replay++ {
-		for round := 0; round < 3; round++ {
+		for round, pages := range pagesByRound {
 			cutoff := base + int64(round+1)*1000
-			for page := 0; page < 3; page++ {
+			for page := 0; page < pages; page++ {
 				if _, err := store.EnqueueChainWatcherGap(ctx, ChainWatcherGapTask{
 					Kind: "page", Source: "watcher", Priority: 0, Reason: "deadline",
 					FromTimestamp: base - 600_000, ToTimestamp: cutoff,
@@ -2082,8 +2239,8 @@ func TestThreeTimedOutMainRoundsCreateAtMostNinePrecisePageGaps(t *testing.T) {
 		}
 	}
 	stats, err := store.ChainWatcherGapStats(ctx, now)
-	if err != nil || stats.PendingCount != 9 {
-		t.Fatalf("three timeout rounds gap stats = %+v/%v, want 9 pending", stats, err)
+	if err != nil || stats.PendingCount != 7 {
+		t.Fatalf("dynamic timeout gap stats = %+v/%v, want 7 pending", stats, err)
 	}
 }
 

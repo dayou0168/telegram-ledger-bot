@@ -3,12 +3,16 @@ package tron
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -203,6 +207,9 @@ func TestDailyUsagePersistsAcrossClientRestartWithoutLocalStop(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if err := first.FlushKeyUsage(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	second := NewClientWithKeys(server.URL, []string{"key1"}, time.Second, opts)
 	if err := second.RestoreKeyPool(context.Background()); err != nil {
 		t.Fatal(err)
@@ -213,6 +220,53 @@ func TestDailyUsagePersistsAcrossClientRestartWithoutLocalStop(t *testing.T) {
 	}
 	if _, err := second.FetchGlobalUSDTTransfersWithMetrics(context.Background(), "TR7", 1, 1); err != nil {
 		t.Fatalf("local usage counter stopped requests: %v", err)
+	}
+}
+
+func TestPlanningDayResetsAtUTCZero(t *testing.T) {
+	now := time.Date(2026, 7, 12, 23, 59, 59, 0, time.UTC)
+	pool := newKeyPool([]string{"key1"}, KeyPoolOptions{BudgetZone: time.UTC})
+	pool.now = func() time.Time { return now }
+	lease, err := pool.lease(context.Background(), RequestSourceMain, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.reserve(context.Background(), lease, RequestSourceMain, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := pool.status(now).TodayMainRequests; got != 1 {
+		t.Fatalf("requests before reset = %d", got)
+	}
+	now = now.Add(2 * time.Second)
+	status := pool.status(now)
+	if status.TodayMainRequests != 0 || status.Keys[0].TodayRequests != 0 {
+		t.Fatalf("usage did not reset at UTC 00:00: %+v", status)
+	}
+	if status.NextBudgetResetAt.Hour() != 0 || status.NextBudgetResetAt.Location() != time.UTC {
+		t.Fatalf("next reset = %v, want UTC midnight", status.NextBudgetResetAt)
+	}
+}
+
+func TestAsyncUsageFlushKeepsBothSidesOfUTCReset(t *testing.T) {
+	store := newMemoryUsageStore()
+	now := time.Date(2026, 7, 12, 23, 59, 59, 0, time.UTC)
+	pool := newKeyPool([]string{"key1"}, KeyPoolOptions{BudgetZone: time.UTC, UsageStore: store})
+	pool.now = func() time.Time { return now }
+	for request := 0; request < 2; request++ {
+		lease, err := pool.lease(context.Background(), RequestSourceMain, nil, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.reserve(context.Background(), lease, RequestSourceMain, false); err != nil {
+			t.Fatal(err)
+		}
+		now = now.Add(2 * time.Second)
+	}
+	if err := pool.flushUsage(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.records) != 2 {
+		t.Fatalf("persisted usage days = %d, want 2: %+v", len(store.records), store.records)
 	}
 }
 
@@ -250,12 +304,274 @@ func TestKeyPoolConcurrentReservationsAreSafe(t *testing.T) {
 	}
 }
 
-func TestMainCapacityUsesPerKeyFiveRPS(t *testing.T) {
-	pool := newKeyPool([]string{"key1"}, KeyPoolOptions{MinInterval: 200 * time.Millisecond})
-	pool.configureMainBudget(3, time.Second)
-	status := pool.status(time.Now())
-	if status.RequiredMainKeyCount != 1 || !status.MainCapacitySafe || status.CapacityWarning != "" {
-		t.Fatalf("status = %+v", status)
+func TestMainCapacityReservesOneSustainedRPSPerKey(t *testing.T) {
+	now := time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)
+	pool := newKeyPool([]string{"key1"}, KeyPoolOptions{MinInterval: 200 * time.Millisecond, BudgetZone: time.UTC})
+	pool.now = func() time.Time { return now }
+	status := pool.status(now)
+	if math.Abs(status.BaseBudgetRPS-1) > 0.0001 || math.Abs(status.CompensationBudgetRPS-(100000.0/86400.0-1)) > 0.0001 {
+		t.Fatalf("single-key sustainable budget = base %.6f surplus %.6f", status.BaseBudgetRPS, status.CompensationBudgetRPS)
+	}
+}
+
+func TestTenKeySustainableBudgetMatchesDailyPlanningMath(t *testing.T) {
+	now := time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)
+	keys := make([]string, 10)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("key-%d", i)
+	}
+	pool := newKeyPool(keys, KeyPoolOptions{BudgetZone: time.UTC, DailyQuotaPerKey: 100000})
+	pool.now = func() time.Time { return now }
+	status := pool.status(now)
+	wantSurplus := 10 * (100000.0/86400.0 - 1)
+	if math.Abs(status.BaseBudgetRPS-10) > 0.0001 || math.Abs(status.CompensationBudgetRPS-wantSurplus) > 0.0001 {
+		t.Fatalf("ten-key budget = base %.6f surplus %.6f, want 10/%.6f", status.BaseBudgetRPS, status.CompensationBudgetRPS, wantSurplus)
+	}
+	if status.TodayRemainingEstimate != 1_000_000 {
+		t.Fatalf("daily remaining = %d, want 1000000", status.TodayRemainingEstimate)
+	}
+}
+
+func TestFractionalBaseTokensAccumulateAndSurplusBurstIsCapped(t *testing.T) {
+	now := time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
+	pool := newKeyPool([]string{"key1"}, KeyPoolOptions{BudgetZone: time.UTC, DailyQuotaPerKey: 1000, SurplusBurstWindow: 60 * time.Second})
+	pool.now = func() time.Time { return now }
+	status := pool.status(now)
+	if status.BaseBudgetRPS <= 0 || status.BaseBudgetRPS >= 1 {
+		t.Fatalf("fractional base rps = %v", status.BaseBudgetRPS)
+	}
+	if _, err := pool.scheduledMainLeases(context.Background(), 8); err != nil {
+		t.Fatalf("emergency head must remain available: %v", err)
+	}
+	burstPool := newKeyPool([]string{"key2"}, KeyPoolOptions{BudgetZone: time.UTC, DailyQuotaPerKey: 100000, SurplusBurstWindow: 60 * time.Second})
+	burstPool.now = func() time.Time { return now }
+	_ = burstPool.status(now)
+	now = now.Add(10 * time.Minute)
+	status = burstPool.status(now)
+	if status.CompensationTokens > status.CompensationBudgetRPS*60+0.0001 {
+		t.Fatalf("surplus tokens %.6f exceed 60s cap %.6f", status.CompensationTokens, status.CompensationBudgetRPS*60)
+	}
+}
+
+func TestScheduledMainPersistenceLanesKeepHeadReservedAndBoundNormalConcurrency(t *testing.T) {
+	const keyCount = 30
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page, _ := strconv.Atoi(r.URL.Query().Get("start"))
+		page /= 50
+		if page == 0 {
+			time.Sleep(120 * time.Millisecond)
+		}
+		if page == 7 || page == 19 {
+			http.Error(w, "upstream failure", http.StatusInternalServerError)
+			return
+		}
+		writeFullTransferPage(w)
+	}))
+	defer server.Close()
+	keys := make([]string, keyCount)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("key-%02d", i)
+	}
+	client := NewClientWithKeys(server.URL, keys, 2*time.Second, KeyPoolOptions{BudgetZone: time.UTC})
+	normalRelease := make(chan struct{})
+	normalStarted := make(chan int, keyCount)
+	headDone := make(chan struct{}, 1)
+	var activeNormal atomic.Int32
+	var maxNormal atomic.Int32
+	var seenMu sync.Mutex
+	seen := make(map[int]error, keyCount)
+	done := make(chan error, 1)
+	go func() {
+		result, err := client.FetchScheduledMainPagesAt(context.Background(), "TR7", 1, 1000, keyCount, 4, func(page TransferPageResult) error {
+			seenMu.Lock()
+			seen[page.Page] = page.Err
+			seenMu.Unlock()
+			if page.Page == 0 {
+				headDone <- struct{}{}
+				return nil
+			}
+			current := activeNormal.Add(1)
+			for {
+				maximum := maxNormal.Load()
+				if current <= maximum || maxNormal.CompareAndSwap(maximum, current) {
+					break
+				}
+			}
+			normalStarted <- page.Page
+			<-normalRelease
+			activeNormal.Add(-1)
+			if page.Page == 11 {
+				return errors.New("database saturated")
+			}
+			return nil
+		})
+		if len(result.FailedPages) != 3 {
+			done <- fmt.Errorf("failed pages = %v, want 3", result.FailedPages)
+			return
+		}
+		foundPersistFailure := false
+		for _, failure := range result.FailedPages {
+			foundPersistFailure = foundPersistFailure || (failure.Page == 11 && strings.Contains(failure.Error, "persist:"))
+		}
+		if !foundPersistFailure {
+			done <- fmt.Errorf("missing exact persistence failure: %v", result.FailedPages)
+			return
+		}
+		done <- err
+	}()
+	for i := 0; i < 4; i++ {
+		select {
+		case <-normalStarted:
+		case <-time.After(time.Second):
+			t.Fatal("normal persistence workers did not saturate")
+		}
+	}
+	select {
+	case <-headDone:
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("P1 persistence lane was blocked by saturated normal workers")
+	}
+	if got := maxNormal.Load(); got != 4 {
+		t.Fatalf("normal persistence concurrency = %d, want 4", got)
+	}
+	close(normalRelease)
+	if err := <-done; err == nil {
+		t.Fatal("partial upstream failures must be returned")
+	}
+	seenMu.Lock()
+	defer seenMu.Unlock()
+	if len(seen) != keyCount {
+		t.Fatalf("persist callbacks = %d, want %d", len(seen), keyCount)
+	}
+	if seen[7] == nil || seen[19] == nil {
+		t.Fatalf("failed pages were not independently reported: p7=%v p19=%v", seen[7], seen[19])
+	}
+}
+
+func TestScheduledMainFailedHeadDoesNotBlockReturnedPages(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("start") == "0" {
+			time.Sleep(150 * time.Millisecond)
+			http.Error(w, "head failed", http.StatusInternalServerError)
+			return
+		}
+		writeShortTransferPage(w)
+	}))
+	defer server.Close()
+	client := NewClientWithKeys(server.URL, []string{"key1", "key2", "key3"}, time.Second, KeyPoolOptions{BudgetZone: time.UTC})
+	normalDone := make(chan time.Duration, 1)
+	started := time.Now()
+	_, err := client.FetchScheduledMainPagesAt(context.Background(), "TR7", 1, 1000, 3, 2, func(page TransferPageResult) error {
+		if page.Page == 1 {
+			normalDone <- time.Since(started)
+		}
+		return nil
+	})
+	if err == nil {
+		t.Fatal("expected failed P1")
+	}
+	select {
+	case delay := <-normalDone:
+		if delay >= 120*time.Millisecond {
+			t.Fatalf("P2 waited for failed P1: %v", delay)
+		}
+	default:
+		t.Fatal("P2 callback was lost")
+	}
+}
+
+func TestScheduledMainTimedOutHeadDoesNotBlockReturnedPages(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("start") == "0" {
+			<-r.Context().Done()
+			return
+		}
+		writeShortTransferPage(w)
+	}))
+	defer server.Close()
+	client := NewClientWithKeys(server.URL, []string{"key1", "key2", "key3"}, time.Second, KeyPoolOptions{BudgetZone: time.UTC})
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer cancel()
+	normalDone := make(chan time.Duration, 1)
+	started := time.Now()
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.FetchScheduledMainPagesAt(ctx, "TR7", 1, 1000, 3, 2, func(page TransferPageResult) error {
+			if page.Page == 2 {
+				normalDone <- time.Since(started)
+			}
+			return nil
+		})
+		done <- err
+	}()
+	select {
+	case delay := <-normalDone:
+		if delay >= 80*time.Millisecond {
+			t.Fatalf("PN waited for timed-out P1: %v", delay)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("PN callback was blocked by timed-out P1")
+	}
+	if err := <-done; err == nil {
+		t.Fatal("expected P1 timeout")
+	}
+}
+
+func TestSaturatedOldRoundNormalPersistenceDoesNotBlockNextHead(t *testing.T) {
+	const keyCount = 30
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeShortTransferPage(w)
+	}))
+	defer server.Close()
+	keys := make([]string, keyCount)
+	for index := range keys {
+		keys[index] = fmt.Sprintf("key-%02d", index)
+	}
+	client := NewClientWithKeys(server.URL, keys, 2*time.Second, KeyPoolOptions{RealtimeInterval: time.Second})
+	releaseOld := make(chan struct{})
+	firstHead := make(chan struct{}, 1)
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := client.FetchScheduledMainPagesAt(context.Background(), "TR7", 1, 1000, keyCount, 4, func(page TransferPageResult) error {
+			if page.Page == 0 {
+				firstHead <- struct{}{}
+				return nil
+			}
+			<-releaseOld
+			return nil
+		})
+		firstDone <- err
+	}()
+	select {
+	case <-firstHead:
+	case <-time.After(time.Second):
+		t.Fatal("first head did not persist")
+	}
+	// The first round consumed the base tokens. After the per-key 5 RPS
+	// interval, the emergency hot-head token must still start a new round.
+	time.Sleep(220 * time.Millisecond)
+	secondHead := make(chan struct{}, 1)
+	started := time.Now()
+	_, secondErr := client.FetchScheduledMainPagesAt(context.Background(), "TR7", 1, 2000, keyCount, 4, func(page TransferPageResult) error {
+		if page.Page == 0 {
+			secondHead <- struct{}{}
+		}
+		return nil
+	})
+	if secondErr != nil {
+		t.Fatal(secondErr)
+	}
+	select {
+	case <-secondHead:
+		if delay := time.Since(started); delay > 500*time.Millisecond {
+			t.Fatalf("next head delayed by saturated old normal lane: %v", delay)
+		}
+	default:
+		t.Fatal("next head callback was not executed")
+	}
+	close(releaseOld)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -287,7 +603,7 @@ func TestCompensationCursorDoesNotChangeMainRoundOrder(t *testing.T) {
 		if _, err := pool.lease(context.Background(), RequestSourceCompensation, nil, false); err != nil {
 			t.Fatal(err)
 		}
-		now = now.Add(time.Second)
+		now = now.Add(10 * time.Second)
 	}
 	main2, err := pool.lease(context.Background(), RequestSourceMain, nil, false)
 	if err != nil {
@@ -489,7 +805,7 @@ func TestServerFailureFailsOverAndProbeRestoresKey(t *testing.T) {
 	}
 }
 
-func TestTenKeyPoolFairnessAndFixedThreeRequestsPerRound(t *testing.T) {
+func TestTenKeyPoolFairlyDistributesExplicitMultiPageRequests(t *testing.T) {
 	keys := make([]string, 10)
 	for i := range keys {
 		keys[i] = fmt.Sprintf("key-%d", i)
@@ -499,6 +815,8 @@ func TestTenKeyPoolFairnessAndFixedThreeRequestsPerRound(t *testing.T) {
 	client := NewClientWithKeys(server.URL, keys, time.Second, KeyPoolOptions{})
 	const rounds = 100
 	for i := 0; i < rounds; i++ {
+		// This helper call explicitly asks for three pages; realtime main-scan
+		// depth is independently derived from accumulated sustainable tokens.
 		result, err := client.FetchGlobalUSDTTransfersWithMetrics(context.Background(), "TR7", 1, 3)
 		if err != nil {
 			t.Fatal(err)
@@ -515,34 +833,32 @@ func TestTenKeyPoolFairnessAndFixedThreeRequestsPerRound(t *testing.T) {
 	}
 }
 
-func TestDynamicKeyCountsKeepExactlyThreePageJobs(t *testing.T) {
-	for _, count := range []int{0, 1, 2, 3, 4, 9, 10} {
+func TestDynamicKeyCountsProduceTokenBasedMainPages(t *testing.T) {
+	for _, count := range []int{0, 1, 2, 3, 6, 10, 20, 30} {
 		t.Run(fmt.Sprint(count), func(t *testing.T) {
 			keys := make([]string, count)
 			for i := range keys {
 				keys[i] = fmt.Sprintf("key-%d", i)
 			}
 			pool := newKeyPool(keys, KeyPoolOptions{})
-			leases, err := pool.mainLeases(context.Background(), 3)
+			now := time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)
+			pool.now = func() time.Time { return now }
+			leases, err := pool.scheduledMainLeases(context.Background(), 64)
 			if count == 0 {
 				if err == nil {
 					t.Fatal("zero-key pool returned leases")
 				}
 				return
 			}
-			if err != nil || len(leases) != 3 {
+			if err != nil || len(leases) != count {
 				t.Fatalf("leases = %d/%v", len(leases), err)
 			}
 			unique := make(map[string]struct{})
 			for _, lease := range leases {
 				unique[lease.fingerprint] = struct{}{}
 			}
-			wantUnique := count
-			if wantUnique > 3 {
-				wantUnique = 3
-			}
-			if len(unique) != wantUnique {
-				t.Fatalf("unique keys = %d, want %d", len(unique), wantUnique)
+			if len(unique) != count {
+				t.Fatalf("unique keys = %d, want %d", len(unique), count)
 			}
 		})
 	}
@@ -586,8 +902,7 @@ func TestSlowExpandDoesNotBlockNextHotHead(t *testing.T) {
 		writeShortTransferPage(w)
 	}))
 	defer server.Close()
-	client := NewClientWithKeys(server.URL, []string{"k1", "k2", "k3", "k4"}, 2*time.Second, KeyPoolOptions{})
-	client.ConfigureMainBudget(3, time.Second)
+	client := NewClientWithKeys(server.URL, []string{"k1", "k2", "k3", "k4"}, 2*time.Second, KeyPoolOptions{RealtimeInterval: time.Second})
 	go client.FetchGlobalUSDTTransfersRangeWithMetrics(context.Background(), "TR7", 1, 1000, 3, 1)
 	select {
 	case <-expandStarted:
@@ -606,9 +921,8 @@ func TestSlowExpandDoesNotBlockNextHotHead(t *testing.T) {
 
 func TestRealtimePriorityDefersCompensationWithoutLosingCursor(t *testing.T) {
 	now := time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)
-	pool := newKeyPool([]string{"key1", "key2", "key3"}, KeyPoolOptions{MinInterval: 100 * time.Millisecond})
+	pool := newKeyPool([]string{"key1", "key2", "key3"}, KeyPoolOptions{MinInterval: 100 * time.Millisecond, RealtimeInterval: time.Second})
 	pool.now = func() time.Time { return now }
-	pool.configureMainBudget(3, time.Second)
 	leases, err := pool.mainLeases(context.Background(), 3)
 	if err != nil || len(leases) != 3 {
 		t.Fatalf("main leases = %d/%v", len(leases), err)
@@ -621,7 +935,7 @@ func TestRealtimePriorityDefersCompensationWithoutLosingCursor(t *testing.T) {
 			t.Fatalf("main reserve delayed by compensation: %v", err)
 		}
 	}
-	now = now.Add(500 * time.Millisecond)
+	now = now.Add(10 * time.Second)
 	if _, err := pool.lease(context.Background(), RequestSourceCompensation, nil, false); err != nil {
 		t.Fatalf("compensation did not resume between main rounds: %v", err)
 	}
@@ -683,22 +997,58 @@ func TestRegistryHotAddDeleteDisableAndInflightLease(t *testing.T) {
 	}
 }
 
-func TestRegistryRejectsEleventhKeyAndDisabledConsumesSlot(t *testing.T) {
+func TestRegistryAcceptsMoreThanTenKeys(t *testing.T) {
 	store := newMemoryRegistryStore()
-	for i := 0; i < MaxConfiguredKeys; i++ {
+	for i := 0; i < 30; i++ {
 		key := fmt.Sprintf("key-%d", i)
 		if err := store.UpsertTronscanAPIKey(context.Background(), keyFingerprint(key), key, i%2 == 0, time.Now()); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := store.UpsertTronscanAPIKey(context.Background(), keyFingerprint("key-11"), "key-11", true, time.Now()); err == nil {
-		t.Fatal("eleventh key was accepted")
+	if got := len(store.records); got != 30 {
+		t.Fatalf("registry size = %d, want 30", got)
 	}
-	if err := store.DeleteTronscanAPIKey(context.Background(), keyFingerprint("key-1")); err != nil {
-		t.Fatal(err)
+}
+
+func TestCompensationBudgetGrowsWithHealthyKeyCapacity(t *testing.T) {
+	statusFor := func(keyCount int, hardCap float64) KeyPoolStatus {
+		keys := make([]string, keyCount)
+		for index := range keys {
+			keys[index] = fmt.Sprintf("key-%d", index)
+		}
+		client := NewClientWithKeys("http://example.invalid", keys, time.Second, KeyPoolOptions{CompensationMaxRPS: hardCap, RealtimeInterval: time.Second})
+		return client.KeyPoolStatus(time.Now())
 	}
-	if err := store.UpsertTronscanAPIKey(context.Background(), keyFingerprint("replacement"), "replacement", true, time.Now()); err != nil {
-		t.Fatalf("replacement after delete failed: %v", err)
+
+	six := statusFor(6, 0)
+	eight := statusFor(8, 0)
+	if six.CompensationBudgetRPS <= 0 || eight.CompensationBudgetRPS <= six.CompensationBudgetRPS {
+		t.Fatalf("dynamic compensation budgets = %.3f/%.3f, want positive growth with healthy keys", six.CompensationBudgetRPS, eight.CompensationBudgetRPS)
+	}
+	capped := statusFor(8, 0.5)
+	if capped.CompensationBudgetRPS != 0.5 {
+		t.Fatalf("hard-capped compensation budget = %.3f, want 0.5", capped.CompensationBudgetRPS)
+	}
+}
+
+func TestDailyQuotaIsCapacityEstimateNotLocalHardStop(t *testing.T) {
+	store := newMemoryUsageStore()
+	pool := newKeyPool([]string{"key1"}, KeyPoolOptions{UsageStore: store, DailyQuotaPerKey: 2})
+	for request := 0; request < 2; request++ {
+		leases, err := pool.mainLeases(context.Background(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.reserve(context.Background(), leases[0], RequestSourceMain, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := pool.mainLeases(context.Background(), 1); err != nil {
+		t.Fatalf("quota estimate disabled a key that the upstream still accepts: %v", err)
+	}
+	status := pool.status(time.Now())
+	if status.AvailableCount != 1 || status.TodayRemainingEstimate != 0 || status.ExhaustedCount != 0 {
+		t.Fatalf("quota-estimate status = %+v", status)
 	}
 }
 
@@ -748,9 +1098,6 @@ func (s *memoryRegistryStore) ListTronscanAPIKeys(_ context.Context) ([]KeyRegis
 func (s *memoryRegistryStore) UpsertTronscanAPIKey(_ context.Context, fingerprint, key string, enabled bool, now time.Time) error {
 	s.muRegistry.Lock()
 	defer s.muRegistry.Unlock()
-	if _, exists := s.records[fingerprint]; !exists && len(s.records) >= MaxConfiguredKeys {
-		return fmt.Errorf("maximum is %d", MaxConfiguredKeys)
-	}
 	s.records[fingerprint] = KeyRegistryRecord{Fingerprint: fingerprint, APIKey: key, Enabled: enabled, Health: "suspect", NextProbeAt: now}
 	return nil
 }
@@ -803,7 +1150,7 @@ func (s *memoryUsageStore) ReserveTronscanKeyRequest(_ context.Context, fingerpr
 	switch source {
 	case RequestSourceMain:
 		record.MainRequestCount++
-	case RequestSourceCompensation:
+	case RequestSourceCompensation, RequestSourceExpand:
 		record.CompRequestCount++
 	default:
 		record.OtherRequestCount++
@@ -834,4 +1181,17 @@ func (s *memoryUsageStore) RecordTronscanKeyResult(_ context.Context, fingerprin
 	record.DisabledUntil = disabledUntil
 	s.records[id] = record
 	return record, nil
+}
+
+func (s *memoryUsageStore) PersistTronscanKeyUsage(_ context.Context, records []KeyUsageRecord, _ time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, record := range records {
+		id := s.id(record.Fingerprint, record.BudgetDay)
+		current := s.records[id]
+		if current.RequestCount <= record.RequestCount {
+			s.records[id] = record
+		}
+	}
+	return nil
 }

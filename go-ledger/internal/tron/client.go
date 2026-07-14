@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -65,6 +66,14 @@ type TransferFetchResult struct {
 type PageFailure struct {
 	Page  int
 	Error string
+}
+
+type TransferPageResult struct {
+	Page      int
+	Transfers []Transfer
+	Rows      int
+	Metrics   RequestMetrics
+	Err       error
 }
 
 type RequestMetrics struct {
@@ -138,10 +147,141 @@ func (c *Client) KeyPoolStatus(now time.Time) KeyPoolStatus {
 	return c.keys.status(now)
 }
 
-func (c *Client) ConfigureMainBudget(pages int, interval time.Duration) {
-	if c != nil {
-		c.keys.configureMainBudget(pages, interval)
+// FetchScheduledMainPagesAt streams completed realtime pages to onPage. The
+// key pool decides the base page count from accumulated sustainable tokens;
+// maximum is only a process-safety/concurrency ceiling.
+func (c *Client) FetchScheduledMainPagesAt(ctx context.Context, contract string, minTimestamp, cutoff int64, maximum, persistConcurrency int, onPage func(TransferPageResult) error) (TransferFetchResult, error) {
+	var result TransferFetchResult
+	leases, err := c.keys.scheduledMainLeases(ctx, maximum)
+	if err != nil {
+		return result, err
 	}
+	pageCount := len(leases)
+	results := make(chan TransferPageResult, pageCount)
+	for page, lease := range leases {
+		page, lease := page, lease
+		go func() {
+			transfers, rows, metrics, fetchErr := c.fetchTransferPageWithLease(ctx, contract, minTimestamp, cutoff, page, RequestSourceMain, lease)
+			results <- TransferPageResult{Page: page, Transfers: transfers, Rows: rows, Metrics: metrics, Err: fetchErr}
+		}()
+	}
+	if persistConcurrency < 1 {
+		persistConcurrency = 1
+	}
+	if persistConcurrency > pageCount {
+		persistConcurrency = pageCount
+	}
+	var callbackWG sync.WaitGroup
+	var callbackMu sync.Mutex
+	var callbackErr error
+	var callbackFailures []PageFailure
+	recordCallbackError := func(page int, callbackCallErr error) {
+		if callbackCallErr != nil {
+			callbackMu.Lock()
+			if callbackErr == nil {
+				callbackErr = callbackCallErr
+			}
+			callbackFailures = append(callbackFailures, PageFailure{Page: page, Error: "persist: " + callbackCallErr.Error()})
+			callbackMu.Unlock()
+		}
+	}
+	normalPages := make(chan TransferPageResult, pageCount)
+	if onPage != nil {
+		for range persistConcurrency {
+			callbackWG.Add(1)
+			go func() {
+				defer callbackWG.Done()
+				for page := range normalPages {
+					recordCallbackError(page.Page, onPage(page))
+				}
+			}()
+		}
+	}
+	var headWG sync.WaitGroup
+	for range leases {
+		page := <-results
+		result.Metrics.addRequest(page.Metrics)
+		result.Metrics.Pages++
+		if page.Page == pageCount-1 {
+			result.Metrics.LastPageRows = page.Rows
+		}
+		if page.Err != nil {
+			result.FailedPages = append(result.FailedPages, PageFailure{Page: page.Page, Error: page.Err.Error()})
+			if err == nil {
+				err = page.Err
+			}
+		} else {
+			result.SuccessfulPages = append(result.SuccessfulPages, page.Page)
+		}
+		result.Transfers = append(result.Transfers, page.Transfers...)
+		if onPage != nil {
+			if page.Page == 0 {
+				// P1 has a reserved persistence lane and never waits behind the
+				// bounded P2..PN worker pool.
+				headWG.Add(1)
+				go func() {
+					defer headWG.Done()
+					recordCallbackError(page.Page, onPage(page))
+				}()
+			} else {
+				normalPages <- page
+			}
+		}
+	}
+	close(normalPages)
+	headWG.Wait()
+	callbackWG.Wait()
+	result.Transfers = uniqueSortedTransfers(result.Transfers)
+	callbackMu.Lock()
+	defer callbackMu.Unlock()
+	result.FailedPages = append(result.FailedPages, callbackFailures...)
+	sort.Ints(result.SuccessfulPages)
+	sort.Slice(result.FailedPages, func(i, j int) bool { return result.FailedPages[i].Page < result.FailedPages[j].Page })
+	if callbackErr != nil {
+		return result, callbackErr
+	}
+	return result, err
+}
+
+func (c *Client) fetchTransferPageWithLease(ctx context.Context, contract string, minTimestamp, endTimestamp int64, page int, source RequestSource, lease apiKeyLease) ([]Transfer, int, RequestMetrics, error) {
+	values := url.Values{}
+	values.Set("contract_address", contract)
+	values.Set("limit", "50")
+	values.Set("start", strconv.Itoa(page*50))
+	values.Set("sort", "-timestamp")
+	if minTimestamp > 0 {
+		values.Set("start_timestamp", strconv.FormatInt(minTimestamp, 10))
+	}
+	if endTimestamp > 0 {
+		values.Set("end_timestamp", strconv.FormatInt(endTimestamp, 10))
+	}
+	var response tronscanTransferResponse
+	metrics, err := c.getTimedWithLease(ctx, "/token_trc20/transfers", values, &response, source, &lease)
+	transfers := make([]Transfer, 0, len(response.TokenTransfers))
+	for _, row := range response.TokenTransfers {
+		transfers = append(transfers, row.toTransfer())
+	}
+	return transfers, len(response.TokenTransfers), metrics, err
+}
+
+func uniqueSortedTransfers(transfers []Transfer) []Transfer {
+	seen := make(map[string]struct{}, len(transfers))
+	out := make([]Transfer, 0, len(transfers))
+	for _, transfer := range transfers {
+		identity := TransferIdentity(transfer)
+		if _, ok := seen[identity]; ok {
+			continue
+		}
+		seen[identity] = struct{}{}
+		out = append(out, transfer)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].BlockTimestamp == out[j].BlockTimestamp {
+			return TransferIdentity(out[i]) < TransferIdentity(out[j])
+		}
+		return out[i].BlockTimestamp > out[j].BlockTimestamp
+	})
+	return out
 }
 
 func (c *Client) SetCompensationPressure(lag, target, maximum time.Duration) {
@@ -155,6 +295,13 @@ func (c *Client) RestoreKeyPool(ctx context.Context) error {
 		return nil
 	}
 	return c.keys.restore(ctx)
+}
+
+func (c *Client) FlushKeyUsage(ctx context.Context) error {
+	if c == nil {
+		return nil
+	}
+	return c.keys.flushUsage(ctx)
 }
 
 func (c *Client) SeedAndRefreshKeyRegistry(ctx context.Context, configured []string) error {
@@ -331,7 +478,9 @@ func (c *Client) FetchAddressUSDTTransfersSincePagesWithMetrics(ctx context.Cont
 		pages = 1
 	}
 	var result TransferFetchResult
-	lease, err := c.keys.lease(ctx, RequestSourceCompensation, nil, false)
+	// Address queries are baseline/diagnostic operations, not the shared global
+	// catch-up lane. They must not consume or block the global surplus bucket.
+	lease, err := c.keys.lease(ctx, RequestSourceOther, nil, false)
 	if err != nil {
 		return result, err
 	}
@@ -366,7 +515,7 @@ func (c *Client) fetchAddressUSDTTransfersPage(ctx context.Context, address, con
 		values.Set("start_timestamp", strconv.FormatInt(minTimestamp, 10))
 	}
 	var result tronscanTransferResponse
-	metrics, err := c.getTimedWithLease(ctx, "/transfer/trc20", values, &result, RequestSourceCompensation, lease)
+	metrics, err := c.getTimedWithLease(ctx, "/transfer/trc20", values, &result, RequestSourceOther, lease)
 	if err != nil {
 		return nil, metrics, err
 	}

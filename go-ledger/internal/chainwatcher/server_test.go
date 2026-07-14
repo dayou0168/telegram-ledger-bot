@@ -184,13 +184,14 @@ func TestReadyResponseDoesNotExposeDetailedDiagnostics(t *testing.T) {
 }
 
 func TestStatusIncludesSegmentTimingsAndAPICounts(t *testing.T) {
-	server := NewServer(config.ChainWatcherConfig{PollInterval: time.Second}, nil, nil)
+	server := NewServer(config.ChainWatcherConfig{PollInterval: time.Second, HeadMaxConcurrency: 32, HeadPersistConcurrency: 8}, nil, nil)
 	server.status.recordScanSuccess("global", scanResult{
 		TransferCount:    3,
 		MatchCount:       2,
 		AddressCount:     2,
 		APICallCount:     3,
 		PageCount:        3,
+		PageLimit:        6,
 		APIWaitDuration:  5 * time.Millisecond,
 		APIFetchDuration: 20 * time.Millisecond,
 		ParseDuration:    2 * time.Millisecond,
@@ -198,14 +199,17 @@ func TestStatusIncludesSegmentTimingsAndAPICounts(t *testing.T) {
 		WriteDuration:    4 * time.Millisecond,
 	}, 40*time.Millisecond, time.Now())
 	status := server.statusResponse(contextWithoutCancel{}, time.Now())
-	if status.Global.APICallCount != 3 || status.Global.PageCount != 3 {
-		t.Fatalf("api counts = %d/%d, want 3/3", status.Global.APICallCount, status.Global.PageCount)
+	if status.Global.APICallCount != 3 || status.Global.PageCount != 3 || status.Global.PageLimit != 6 {
+		t.Fatalf("api counts/limit = %d/%d/%d, want 3/3/6", status.Global.APICallCount, status.Global.PageCount, status.Global.PageLimit)
 	}
 	if status.Global.APIFetchMS != 20 || status.Global.ParseMS != 2 || status.Global.WriteMS != 4 {
 		t.Fatalf("timings = api:%d parse:%d write:%d", status.Global.APIFetchMS, status.Global.ParseMS, status.Global.WriteMS)
 	}
 	if len(status.Global.Recent) != 1 || status.Global.Recent[0].APICallCount != 3 {
 		t.Fatalf("recent status missing metrics: %#v", status.Global.Recent)
+	}
+	if status.HeadAPIMaxConcurrency != 32 || status.HeadPersistWorkers != 8 || status.HeadPriorityDBLanes != 1 {
+		t.Fatalf("head lanes = api %d normal %d priority %d", status.HeadAPIMaxConcurrency, status.HeadPersistWorkers, status.HeadPriorityDBLanes)
 	}
 }
 
@@ -242,7 +246,7 @@ func TestGlobalCatchupRequestCountDoesNotGrowWithWatchAddresses(t *testing.T) {
 		fmt.Fprint(w, `{"token_transfers":[]}`)
 	}))
 	defer api.Close()
-	for _, count := range []int{10, 1000} {
+	for _, count := range []int{10, 1000, 10000} {
 		client := tron.NewClient(api.URL, "", time.Second)
 		server := NewServer(config.ChainWatcherConfig{CatchupPages: 1, CatchupMaxRequests: 3}, nil, client)
 		addresses := make(map[string][]storage.ChainWatcherSubscription, count)
@@ -290,24 +294,22 @@ func TestCatchupSplitsSaturatedWindowWithoutSkippingGap(t *testing.T) {
 	server := NewServer(config.ChainWatcherConfig{CatchupPages: 1, USDTContract: "TR7"}, nil, client)
 	budget := 20
 	advanced, result, err := server.scanCatchupWindow(context.Background(), 1000, 5000, map[string][]storage.ChainWatcherSubscription{}, &budget)
-	if err != nil {
-		t.Fatal(err)
+	if !tron.IsCompensationDeferred(err) {
+		t.Fatalf("error = %v, want surplus deferral", err)
 	}
-	if advanced != 5000 {
-		t.Fatalf("advanced = %d, want 5000", advanced)
-	}
-	if result.APICallCount != 7 {
-		t.Fatalf("api calls = %d, want 7 split-window calls", result.APICallCount)
+	if advanced != 1000 || result.APICallCount != 1 {
+		t.Fatalf("advanced/calls = %d/%d, want cursor preserved after one request", advanced, result.APICallCount)
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(windows) != 7 || windows[0] != [2]int64{1000, 5000} {
+	if len(windows) != 1 || windows[0] != [2]int64{1000, 5000} {
 		t.Fatalf("windows = %#v", windows)
 	}
 }
 
 func TestCatchupOverlapIsCountedSeparately(t *testing.T) {
-	server := NewServer(config.ChainWatcherConfig{}, nil, nil)
+	client := tron.NewClientWithKeys("http://example.invalid", []string{"k1"}, time.Second, tron.KeyPoolOptions{})
+	server := NewServer(config.ChainWatcherConfig{CatchupMaxInflight: 1}, nil, client)
 	if !server.tryStartScan("catchup") || server.tryStartScan("catchup") {
 		t.Fatal("catchup overlap guard failed")
 	}
@@ -319,19 +321,44 @@ func TestCatchupOverlapIsCountedSeparately(t *testing.T) {
 	}
 }
 
-func TestCatchupAllowsAtMostThreeInflightWorkers(t *testing.T) {
-	server := NewServer(config.ChainWatcherConfig{CatchupMaxInflight: 3}, nil, nil)
-	for worker := 0; worker < 3; worker++ {
-		if !server.tryStartScan("catchup") {
-			t.Fatalf("catchup worker %d rejected before limit", worker+1)
+func TestCatchupInflightTracksAvailableKeys(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		available int
+		budgetRPS float64
+		maximum   int
+		want      int
+	}{
+		{"no keys", 0, 8, 8, 0},
+		{"one key", 1, 0.3, 8, 1},
+		{"three keys", 3, 2.2, 8, 3},
+		{"six keys", 6, 3.8, 8, 4},
+		{"ten keys", 10, 8, 8, 8},
+		{"twenty keys capped", 20, 18, 8, 8},
+	} {
+		status := tron.KeyPoolStatus{AvailableCount: test.available, CompensationBudgetRPS: test.budgetRPS}
+		if got := effectiveCatchupConcurrency(status, test.maximum); got != test.want {
+			t.Fatalf("%s: effective concurrency=%d, want %d", test.name, got, test.want)
 		}
 	}
-	if server.tryStartScan("catchup") {
-		t.Fatal("fourth catchup worker should be rejected")
+}
+
+func TestGapSchedulerGivesFairLaneBoundedClaimOpportunity(t *testing.T) {
+	const fairnessEvery = 4
+	for round := 1; round <= fairnessEvery; round++ {
+		class := gapWorkerClass(1, 0, round, fairnessEvery)
+		if round < fairnessEvery && class != "watcher_priority" {
+			t.Fatalf("round %d class = %s, want priority", round, class)
+		}
+		if round == fairnessEvery && class != "watcher_fair" {
+			t.Fatalf("round %d class = %s, want fair", round, class)
+		}
 	}
-	server.finishScan("catchup")
-	if !server.tryStartScan("catchup") {
-		t.Fatal("catchup slot did not reopen")
+	if class := gapWorkerClass(6, 5, 1, fairnessEvery); class != "watcher_fair" {
+		t.Fatalf("last worker class = %s, want dedicated fair lane", class)
+	}
+	if class := gapWorkerClass(6, 4, 1, fairnessEvery); class != "watcher_priority" {
+		t.Fatalf("priority worker class = %s", class)
 	}
 }
 
@@ -363,27 +390,27 @@ func TestAnchorCoverageFindsPreviousHead(t *testing.T) {
 	}
 }
 
-func TestExpandStartsAtPageFourAndFindsAnchor(t *testing.T) {
+func TestExpandResumesExactContinuationPageAndFindsAnchor(t *testing.T) {
 	anchorTransfer := tron.Transfer{Hash: "anchor", EventIndex: "7", TokenAddress: "TR7", BlockTimestamp: 1000}
 	anchor := EventID(anchorTransfer)
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("start") != "150" {
-			t.Errorf("start = %s, want 150", r.URL.Query().Get("start"))
+		if r.URL.Query().Get("start") != "300" {
+			t.Errorf("start = %s, want 300", r.URL.Query().Get("start"))
 		}
 		fmt.Fprint(w, `{"token_transfers":[{"transaction_id":"anchor","event_index":7,"from_address":"A","to_address":"B","quant":"1","block_ts":1000,"tokenInfo":{"tokenId":"TR7","tokenAbbr":"USDT"}}]}`)
 	}))
 	defer api.Close()
 	client := tron.NewClientWithKeys(api.URL, []string{"k1", "k2", "k3", "k4"}, time.Second, tron.KeyPoolOptions{})
-	server := NewServer(config.ChainWatcherConfig{GlobalExpandPageLimit: 20, USDTContract: "TR7"}, nil, client)
+	server := NewServer(config.ChainWatcherConfig{RecoverySafetyMaxPages: 256, USDTContract: "TR7"}, nil, client)
 	server.subDirty = false
 	server.subByAddress = map[string][]storage.ChainWatcherSubscription{}
-	result, err := server.pollExpandOnce(context.Background(), expandTask{AnchorID: anchor, Cutoff: 2000, MinTimestamp: 1, StartPage: 3})
+	result, err := server.pollExpandOnce(context.Background(), expandTask{AnchorID: anchor, Cutoff: 2000, MinTimestamp: 1, StartPage: 6})
 	if err != nil || !result.AnchorFound || result.PageCount != 1 {
 		t.Fatalf("expand = %+v/%v", result, err)
 	}
 }
 
-func TestExpandTwentyPageLimitBecomesObservable(t *testing.T) {
+func TestExpandYieldsWhenSurplusBudgetIsExhausted(t *testing.T) {
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(25 * time.Millisecond)
 		writeFullTransferPageForExpand(w, r.URL.Query().Get("start"))
@@ -391,11 +418,11 @@ func TestExpandTwentyPageLimitBecomesObservable(t *testing.T) {
 	defer api.Close()
 	keys := []string{"k1", "k2", "k3", "k4", "k5", "k6", "k7", "k8", "k9", "k10"}
 	client := tron.NewClientWithKeys(api.URL, keys, 2*time.Second, tron.KeyPoolOptions{CompensationMaxRPS: 50})
-	server := NewServer(config.ChainWatcherConfig{GlobalExpandPageLimit: 20, USDTContract: "TR7"}, nil, client)
+	server := NewServer(config.ChainWatcherConfig{RecoverySafetyMaxPages: 8, USDTContract: "TR7"}, nil, client)
 	server.subDirty = false
 	server.subByAddress = map[string][]storage.ChainWatcherSubscription{}
 	result, err := server.pollExpandOnce(context.Background(), expandTask{AnchorID: "missing", Cutoff: 2000, MinTimestamp: 1, StartPage: 3})
-	if err != nil || result.AnchorFound || !result.PageLimitReached || result.PageCount != 17 {
+	if !tron.IsCompensationDeferred(err) || result.AnchorFound || result.PageCount != 1 {
 		t.Fatalf("expand = %+v/%v", result, err)
 	}
 }

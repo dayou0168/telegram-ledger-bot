@@ -198,24 +198,31 @@ CHAIN_WATCHER_TRON_API_KEY=
 CHAIN_WATCHER_SOURCE_POLL_SECONDS=1
 CHAIN_WATCHER_MAIN_SCAN_TIMEOUT_MS=3000
 CHAIN_WATCHER_MAIN_MAX_INFLIGHT_ROUNDS=3
-CHAIN_WATCHER_GLOBAL_SCAN_PAGES=3
-CHAIN_WATCHER_GLOBAL_EXPAND_PAGE_LIMIT=20
+# 旧 CHAIN_WATCHER_GLOBAL_SCAN_PAGES 仅兼容读取并忽略，不再控制固定页数
+CHAIN_WATCHER_HEAD_TIME_BUDGET_MS=850
+CHAIN_WATCHER_HEAD_SAFETY_MAX_PAGES=256
+CHAIN_WATCHER_HEAD_MAX_CONCURRENCY=32
+CHAIN_WATCHER_HEAD_PERSIST_CONCURRENCY=8
+CHAIN_WATCHER_RECOVERY_SAFETY_MAX_PAGES=4096
+CHAIN_WATCHER_SURPLUS_BURST_SECONDS=60
 CHAIN_WATCHER_CATCHUP_ENABLED=true
 CHAIN_WATCHER_CATCHUP_STATE_INTERVAL_SECONDS=30
 CHAIN_WATCHER_CATCHUP_PAGE_LIMIT=3
 CHAIN_WATCHER_CATCHUP_MAX_REQUESTS_PER_TICK=6
-CHAIN_WATCHER_CATCHUP_MAX_INFLIGHT=3
+CHAIN_WATCHER_CATCHUP_MAX_INFLIGHT=8
 CHAIN_WATCHER_CATCHUP_WINDOW_SECONDS=30
 CHAIN_WATCHER_CATCHUP_OVERLAP_SECONDS=2
-CHAIN_WATCHER_CATCHUP_MAX_RPS=8
+# 0 表示按健康 Key 的剩余容量自动计算；正数表示额外硬上限
+CHAIN_WATCHER_CATCHUP_MAX_RPS=0
 CHAIN_WATCHER_TRONSCAN_KEY_INTERVAL_MS=200
+CHAIN_WATCHER_TRONSCAN_DAILY_LIMIT_PER_KEY=100000
 CHAIN_WATCHER_LOOKBACK_SECONDS=600
 CHAIN_WATCHER_CLAIM_LEASE_SECONDS=30
 ```
 
-watcher 每秒用同一个 cutoff 并行读取 P1-P3，并保存上一轮稳定 event identity 锚点。找到锚点即连续；找不到则异步读取 P4-P20，实时下一轮仍按时执行。20 页仍未覆盖或页面失败时才置位全局 catch-up，从持久化 cursor 补到 realtime head 前 2 秒。没有缺口时定时器只检查状态，不请求链 API；逐地址扫描默认关闭。
+watcher 每秒用同一个 cutoff 扫描，并保存上一轮稳定 event identity 锚点。每个健康 Key 按 `剩余额度/距离 UTC 00:00 的秒数` 产生可持续令牌：完整额度下每 Key 每秒约贡献 1 个基础页，页数不是固定值，也不由旧 `GLOBAL_SCAN_PAGES` 控制。基础页并发返回后立即匹配和持久化；P1 使用独立高优先持久化 lane，P2..PN 进入默认 8 worker 的普通池，不会让慢页形成全局串行瓶颈。找到锚点或非满页后停止继续扩页；未覆盖范围进入精确持久化 gap/catch-up，从 cursor 补到 realtime head 前 2 秒。没有缺口时不请求补偿 API；逐地址扫描默认关闭。
 
-Key 注册表最多保存 10 个 Key，禁用项也占槽；每 Key 独立限制为 5 requests/sec，P1-P3 按当日实际用量最少和公平轮转分配。没有本地 95k/100k 停扫线，本地 UTC 日计数只做均衡和观测，服务端实际 429 才触发冷却。Key 使用 AES-256-GCM 加密保存，`CHAIN_WATCHER_KEY_ENCRYPTION_KEY` 必须由运维独立保管；日志与 status 只显示短指纹。
+Key 注册表不设固定数量上限，可通过管理接口随时热增删、启停；调度按当时健康状态和可持续 RPS 动态降档或恢复。默认每 Key 日规划额度为 100,000 次，重置点 UTC 00:00（北京时间 08:00）；完整额度下基础主扫约 86,400 次/Key/天，约余 13,600 次进入共享 surplus。10 个完整健康 Key 的基础能力约 10 页/秒，surplus 合计约 136,000 次/天（1.574 RPS）。`CHAIN_WATCHER_CATCHUP_MAX_RPS=0` 表示不再施加额外固定上限，但补洞仍只能消费 surplus token；60 秒突发桶限制空闲后的集中请求。本地计数只用于规划、均衡和观测，不静默硬停实时头部；服务端实际 429/额度响应才是权威。单 Key 200ms 间隔继续保证不超过 5 RPS。Key 使用 AES-256-GCM 加密保存，日志与 status 只显示短指纹。
 
 watcher 有两种部署模式：
 
@@ -228,9 +235,9 @@ watcher 有两种部署模式：
 
 `/healthz` 只表示 watcher 进程存活；`/readyz` 综合链源新鲜度、连续 watermark 和未闭合 gap，cursor 未建立时明确显示 `catchup_lag_unknown=true`。`/status` 受 `CHAIN_WATCHER_ADMIN_TOKEN` 保护，包含 round ID、最多 3 个在途主轮次、分段耗时、429/key 状态、pending/claim lag、gap 和 retention 统计；最近轮次明细有界保存，分钟聚合保留 72 小时。bot 自动 fallback 依据 `/readyz` 的链源状态，不把“没有新交易”误判为故障。
 
-主扫描仍固定每秒一轮、每轮最新 3 页。`CHAIN_WATCHER_MAIN_SCAN_TIMEOUT_MS=3000` 是独立 API deadline，不再由 1 秒轮询间隔乘系数推导；`CHAIN_WATCHER_MAIN_MAX_INFLIGHT_ROUNDS=3` 允许慢轮次有界流水并发。成功页会立即落库，失败页形成持久化、带 lease generation 的精确 gap；高优先扩页和低优先时间窗补偿不按监听地址发请求，低优先任务会给下一秒实时 deadline 让路。`CHAIN_WATCHER_CATCHUP_MAX_INFLIGHT=3` 只增加受 compensation token、每 Key 5 RPS 和实时预留约束的补洞 worker，不增加每秒实时 3 页请求量；启动时会事务化合并遗留的重叠时间窗 gap。
+主扫描固定每秒一轮，实际基础页数由小数 base token 累积产生。`CHAIN_WATCHER_MAIN_SCAN_TIMEOUT_MS=3000` 是整轮独立 API deadline；`CHAIN_WATCHER_MAIN_MAX_INFLIGHT_ROUNDS=3` 允许慢轮次有界流水并发。`HEAD_MAX_CONCURRENCY=32` 只限制 API 页任务，`HEAD_PERSIST_CONCURRENCY=8` 只限制 P2..PN 普通持久化 worker，P1 另有保留 lane。成功页立即落库，失败页形成带 lease generation 的精确 gap。`CHAIN_WATCHER_CATCHUP_MAX_INFLIGHT=8` 是独立 worker 安全天花板，实际并发按健康 Key 和 surplus 自动伸缩。重叠时间窗会合并，公平调度保证旧低优先级 window 在持续高优先级流量下仍被领取。
 
-自动 fallback 使用 `PRIMARY -> FAILOVER_PENDING -> FALLBACK_ACTIVE -> RECOVERING` 状态机；watcher 连续异常 3 秒后，多个 bot 通过 PostgreSQL lease 只选出一个无 Key公共扫描 leader。leader 每轮同 cutoff 扫最新 3 页并使用共享锚点/事件幂等，429 时按 1/2/3/5/10 秒退避；不再按 600 秒强制停止。watcher 恢复并补齐共享 cursor，ready/claim 连续成功且 lag 归零后才释放 lease。未配置共享 DSN 时明确 DEGRADED，不会退回每 bot 逐地址扫描。
+自动 fallback 使用 `PRIMARY -> FAILOVER_PENDING -> FALLBACK_ACTIVE -> RECOVERING` 状态机；watcher 连续异常 3 秒后，多个 bot 通过 PostgreSQL lease 只选出一个无 Key 公共扫描 leader。leader 使用同 cutoff、共享锚点和精确 continuation 动态扫描，既不是固定 3 页也不是逐地址扫描；429 时按 1/2/3/5/10 秒退避。watcher 恢复并补齐共享 cursor，ready/claim 连续成功且 lag 归零后才释放 lease。未配置共享 DSN 时明确 DEGRADED，不会退回每 bot 逐地址扫描。
 
 部署时每个 bot 还必须配置唯一且重启后保持不变的 `BOT_FALLBACK_INSTANCE_ID`。它与 `BOT_FALLBACK_SHARED_DATABASE_URL` 共同用于 leader lease；任一缺失都只报告降级，不启动旧本地扫描。
 

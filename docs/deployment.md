@@ -76,30 +76,35 @@ CHAIN_WATCHER_TRON_API_KEY: ""
 CHAIN_WATCHER_SOURCE_POLL_SECONDS: "1"
 CHAIN_WATCHER_MAIN_SCAN_TIMEOUT_MS: "3000"
 CHAIN_WATCHER_MAIN_MAX_INFLIGHT_ROUNDS: "3"
-CHAIN_WATCHER_GLOBAL_SCAN_PAGES: "3"
-CHAIN_WATCHER_GLOBAL_EXPAND_PAGE_LIMIT: "20"
+CHAIN_WATCHER_HEAD_TIME_BUDGET_MS: "850"
+CHAIN_WATCHER_HEAD_SAFETY_MAX_PAGES: "256"
+CHAIN_WATCHER_HEAD_MAX_CONCURRENCY: "32"
+CHAIN_WATCHER_HEAD_PERSIST_CONCURRENCY: "8"
+CHAIN_WATCHER_RECOVERY_SAFETY_MAX_PAGES: "4096"
+CHAIN_WATCHER_SURPLUS_BURST_SECONDS: "60"
 CHAIN_WATCHER_CATCHUP_ENABLED: "true"
 CHAIN_WATCHER_CATCHUP_STATE_INTERVAL_SECONDS: "30"
 CHAIN_WATCHER_CATCHUP_PAGE_LIMIT: "3"
 CHAIN_WATCHER_CATCHUP_MAX_REQUESTS_PER_TICK: "6"
-CHAIN_WATCHER_CATCHUP_MAX_INFLIGHT: "3"
+CHAIN_WATCHER_CATCHUP_MAX_INFLIGHT: "8"
 CHAIN_WATCHER_CATCHUP_WINDOW_SECONDS: "30"
 CHAIN_WATCHER_CATCHUP_OVERLAP_SECONDS: "2"
-CHAIN_WATCHER_CATCHUP_MAX_RPS: "8"
+CHAIN_WATCHER_CATCHUP_MAX_RPS: "0"
 CHAIN_WATCHER_TRONSCAN_KEY_INTERVAL_MS: "200"
+CHAIN_WATCHER_TRONSCAN_DAILY_LIMIT_PER_KEY: "100000"
 CHAIN_WATCHER_KEY_ENCRYPTION_KEY: "base64_encoded_32_byte_key"
 CHAIN_WATCHER_LOOKBACK_SECONDS: "600"
 ```
 
-`CHAIN_WATCHER_TRONSCAN_API_KEYS` 只用于首次填充 watcher Key 注册表；旧单 Key 配置继续兼容。注册表最多保存 10 个 Key，禁用项也占槽；之后可通过受 `CHAIN_WATCHER_ADMIN_TOKEN` 保护的 `/v1/admin/keys*` 接口热增删、启停和立即复检。第 11 个 Key 会明确拒绝。
+`CHAIN_WATCHER_TRONSCAN_API_KEYS` 只用于首次填充 watcher Key 注册表；旧单 Key 配置继续兼容。注册表不设固定 Key 数量上限，之后可通过受 `CHAIN_WATCHER_ADMIN_TOKEN` 保护的 `/v1/admin/keys*` 接口热增删、启停和立即复检。运行容量只按当前健康可用 Key 计算，禁用、冷却、invalid 或已删除的 Key 不贡献扩页和 catch-up 容量。
 
 实际二进制变量名是 `CHAIN_WATCHER_MAIN_MAX_INFLIGHT_ROUNDS`；`CHAIN_WATCHER_MAIN_SCAN_MAX_INFLIGHT` 不受支持，不要写入生产 env。
 
-watcher 是唯一主扫描中心：每秒以同一个 cutoff 并行读取 P1-P3，独立 API deadline 默认 3000ms，并允许最多 3 个有界在途轮次。成功页立即持久化，失败页生成精确 gap；锚点缺失时 P4-P20 由高优先 gap worker 扩页，低优先时间窗 catch-up 临近下一秒实时 deadline 时让路。cursor 只在封闭窗口完整落库后推进，safe head 默认落后实时头部 2 秒。逐地址轮询默认关闭，地址数只影响内存 hash 匹配。
+watcher 是唯一主扫描中心：每秒以同一个 cutoff 扫描，基础页数由所有健康 Key 的小数 base token 累积产生，不存在固定 3 页、P1-only 或 Key 数量硬上限。完整额度下每个健康 Key 约贡献 1 页/秒；找到锚点或非满页后不再继续扩页。独立 API deadline 默认 3000ms，最多 3 个有界在途轮次。API 页并发上限 32；P1 使用独立持久化 lane，P2..PN 由默认 8 个普通 DB worker 并行处理。失败页生成精确 gap；重叠时间窗会合并，公平调度避免历史 window 饥饿。cursor 只在封闭窗口完整落库后推进，safe head 默认落后实时头部 2 秒。逐地址轮询默认关闭，地址数只影响内存 hash 匹配。
 
 每个 bot 必须设置唯一且稳定的 `BOT_FALLBACK_INSTANCE_ID`，并把 `BOT_FALLBACK_SHARED_DATABASE_URL` 指向 watcher 的共享 PostgreSQL。缺少任一项时公共 fallback 会明确进入 DEGRADED，不会退回每 bot 逐地址扫描。正常状态下公共无 Key通道完全不发请求；只有 watcher 连续异常 3 秒后，跨 bot 的共享 lease 才选出一个 leader 接管。
 
-每 Key 独立限制 5 requests/sec；UTC 日计数持久化但不设置本地软停或硬停，只用于最少用量调度和容量观测。401/403 首次 suspect、5 秒独立探测，连续两次认证失败才 invalid；invalid 每 30 分钟探测，连续两次成功恢复。429 尊重 `Retry-After`，无头按 60/120/300/900/3600 秒退避；明确 daily exhausted 在北京时间 08:00 后探测。5xx/timeout 按 1/2/4/8/15/30 秒退避。Key 密文使用 AES-256-GCM；首次部署执行 `openssl rand -base64 32`，把结果仅写入 watcher 的受限 env，丢失该密钥将无法解密已注册 Key。
+默认每 Key 日规划额度为 100,000 次，重置点 UTC 00:00（北京时间 08:00）。完整额度下每 Key 基础主扫约 86,400 次/天，剩余约 13,600 次进入共享 surplus；10 Key 时基础约 10 页/秒，surplus 合计约 136,000 次/天（1.574 RPS）。`CHAIN_WATCHER_CATCHUP_MAX_RPS=0` 表示不施加额外固定上限，但补洞仍只能消费 surplus token；突发桶默认最多积累 60 秒。本地计数仅用于规划、均衡和观测，不是硬停阈值，服务端实际 429 才是权威。200ms 单 Key 间隔确保每 Key 不超过 5 RPS。401/403 首次 suspect、5 秒独立探测，连续两次认证失败才 invalid；invalid 每 30 分钟探测，连续两次成功恢复。429 尊重 `Retry-After`。Key 密文使用 AES-256-GCM；首次部署执行 `openssl rand -base64 32`，把结果仅写入 watcher 的受限 env，丢失该密钥将无法解密已注册 Key。
 
 `/healthz` 只表示进程存活，Docker/systemd 健康检查继续用它；`/readyz` 综合链源新鲜度、连续 watermark 和未闭合 gap，cursor=0 时返回 `catchup_lag_unknown=true` 而不是伪装 lag=0。`/status` 受 `CHAIN_WATCHER_ADMIN_TOKEN` Bearer 鉴权，显示 round/in-flight、API/parse/match/write 分段耗时、精确 gap、Key 状态、pending/delivering 和最近 5 轮摘要；分钟聚合及完成 gap 明细保留 72 小时。
 
@@ -267,19 +272,27 @@ CHAIN_WATCHER_TRON_API_KEY=
 CHAIN_WATCHER_SOURCE_POLL_SECONDS=1
 CHAIN_WATCHER_MAIN_SCAN_TIMEOUT_MS=3000
 CHAIN_WATCHER_MAIN_MAX_INFLIGHT_ROUNDS=3
-CHAIN_WATCHER_CATCHUP_MAX_INFLIGHT=3
-CHAIN_WATCHER_GLOBAL_SCAN_PAGES=3
-CHAIN_WATCHER_GLOBAL_EXPAND_PAGE_LIMIT=20
+CHAIN_WATCHER_HEAD_TIME_BUDGET_MS=850
+CHAIN_WATCHER_HEAD_SAFETY_MAX_PAGES=256
+CHAIN_WATCHER_HEAD_MAX_CONCURRENCY=32
+CHAIN_WATCHER_HEAD_PERSIST_CONCURRENCY=8
+CHAIN_WATCHER_RECOVERY_SAFETY_MAX_PAGES=4096
+CHAIN_WATCHER_SURPLUS_BURST_SECONDS=60
+CHAIN_WATCHER_CATCHUP_MAX_INFLIGHT=8
 CHAIN_WATCHER_CATCHUP_ENABLED=true
 CHAIN_WATCHER_CATCHUP_STATE_INTERVAL_SECONDS=30
 CHAIN_WATCHER_CATCHUP_OVERLAP_SECONDS=2
+CHAIN_WATCHER_CATCHUP_MAX_RPS=0
 CHAIN_WATCHER_TRONSCAN_KEY_INTERVAL_MS=200
+CHAIN_WATCHER_TRONSCAN_DAILY_LIMIT_PER_KEY=100000
 CHAIN_WATCHER_LOOKBACK_SECONDS=600
 CHAIN_WATCHER_CLAIM_LEASE_SECONDS=30
 CHAIN_WATCHER_DELIVERY_RETRY_SECONDS=2
 BOT_TIMEZONE=Asia/Shanghai
 BOT_REQUEST_TIMEOUT=70
 ```
+
+从旧版本升级时，删除 `CHAIN_WATCHER_GLOBAL_SCAN_PAGES` 和 `CHAIN_WATCHER_GLOBAL_EXPAND_PAGE_LIMIT`；二进制只会把前者报告为 deprecated，不再恢复固定页数。`CHAIN_WATCHER_CATCHUP_MAX_RPS=0` 使用动态 surplus，`CHAIN_WATCHER_CATCHUP_MAX_INFLIGHT=8` 是与 Key 数量解耦的保守 worker 安全天花板。
 
 如后续确需统一 watcher 版本，正式 Release 可用后可下载 v2.4.5 发布包并安装二进制到固定路径；本轮 watcher 代码未变，升级 bot 不依赖该步骤：
 

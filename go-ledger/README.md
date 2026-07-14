@@ -97,7 +97,7 @@ BOT_FALLBACK_SHARED_DATABASE_URL=postgres://chainwatcher:***@chain-postgres:5432
 
 每个 bot 的 `BOT_FALLBACK_INSTANCE_ID` 必须唯一且稳定，并与 `BOT_FALLBACK_SHARED_DATABASE_URL` 一起配置；缺少任一项时 fallback 只报告 DEGRADED。
 
-watcher 支持最多 10 个动态 Tronscan Key。每秒以同一 cutoff 扫 P1-P3，Key 按实际用量最少和公平轮转分配，每 Key最多 5 RPS。没有本地额度停扫线；服务端 429 才触发冷却。Key 用 AES-256-GCM 加密保存，`/status` 只显示短指纹和脱敏状态。
+watcher 的动态 Tronscan Key 注册表不设固定数量上限。主扫每秒按健康 Key 的可持续小数 base token 动态生成页数，完整额度下约为 1 页/Key/秒，但不会按 Key 数机械发请求。P1 使用独立持久化 lane，P2..PN 进入有界普通 worker 池。每 Key 默认日规划额度 100,000 次，重置点 UTC 00:00；基础约 86,400 次/天，剩余约 13,600 次进入共享 surplus。数据库计数不硬停实时头部，服务端 429 才触发对应 Key 冷却。Key 用 AES-256-GCM 加密保存，`/status` 只显示短指纹和脱敏状态。
 
 ## 推荐默认并发
 
