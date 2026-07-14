@@ -254,3 +254,28 @@ func TestLoadOutboxRetentionDefaultsAndEnv(t *testing.T) {
 		t.Fatalf("BroadcastDeliveryRetention env = %.0f hours, want 240", got)
 	}
 }
+
+func TestLoadLedgerPerformanceGatesAndRollbackValues(t *testing.T) {
+	t.Setenv("TELEGRAM_BOT_TOKEN", "token")
+	for _, key := range []string{"BOT_LEDGER_SUMMARY_WRITE_MODE", "BOT_LEDGER_SUMMARY_READ_MODE", "BOT_GROUP_ROUTE_MODE", "BOT_CRITICAL_OUTBOX_FASTPATH"} {
+		t.Setenv(key, "")
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LedgerSummaryWriteMode != "shadow" || cfg.LedgerSummaryReadMode != "safe" || cfg.GroupRouteMode != "split" || !cfg.CriticalOutboxFastpath {
+		t.Fatalf("performance defaults = write=%s read=%s route=%s critical=%v", cfg.LedgerSummaryWriteMode, cfg.LedgerSummaryReadMode, cfg.GroupRouteMode, cfg.CriticalOutboxFastpath)
+	}
+	t.Setenv("BOT_LEDGER_SUMMARY_WRITE_MODE", "off")
+	t.Setenv("BOT_LEDGER_SUMMARY_READ_MODE", "legacy")
+	t.Setenv("BOT_GROUP_ROUTE_MODE", "legacy")
+	t.Setenv("BOT_CRITICAL_OUTBOX_FASTPATH", "0")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LedgerSummaryWriteMode != "off" || cfg.LedgerSummaryReadMode != "legacy" || cfg.GroupRouteMode != "legacy" || cfg.CriticalOutboxFastpath {
+		t.Fatalf("rollback gates = write=%s read=%s route=%s critical=%v", cfg.LedgerSummaryWriteMode, cfg.LedgerSummaryReadMode, cfg.GroupRouteMode, cfg.CriticalOutboxFastpath)
+	}
+}

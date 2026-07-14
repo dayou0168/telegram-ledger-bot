@@ -22,7 +22,8 @@ func TestInvalidateGroupCacheRemovesCachedSettings(t *testing.T) {
 
 func TestInvalidateBillSummaryCacheRemovesCachedDay(t *testing.T) {
 	b := &Bot{billSummaryCache: newTTLCache[storage.BillSummaryData](time.Minute)}
-	key := billSummaryCacheKey(123, "2026-07-11", groupBillDefaultRecordLimit)
+	periodStart := time.Date(2026, 7, 11, 8, 0, 0, 0, time.UTC)
+	key := billSummaryCacheKey(123, "2026-07-11", periodStart, groupBillDefaultRecordLimit)
 	b.billSummaryCache.Set(key, storage.BillSummaryData{
 		Summary: storage.RecordDaySummary{DepositCount: 1, TotalDepositUSDT: "100"},
 	})
@@ -97,12 +98,14 @@ func TestPerfTraceSlowLogRedactsMessageText(t *testing.T) {
 	ctx := contextWithPerfTrace(context.Background(), trace)
 	setPerfCommand(ctx, "ledger_record")
 	markPerfCache(ctx, "group", true)
+	markPerfQueue(ctx, "ledger:-100123", 7)
+	addPerfStage(ctx, "queue_wait", 25*time.Millisecond)
 	done := measurePerfStage(ctx, "db_record_write")
 	done()
 
 	finishPerfTrace(trace, time.Nanosecond)
 	out := buf.String()
-	for _, want := range []string{`"kind":"slow_update"`, `"chat_id":-100123`, `"command":"ledger_record"`, `"group":"hit"`} {
+	for _, want := range []string{`"kind":"slow_update"`, `"chat_id":-100123`, `"command":"ledger_record"`, `"group":"hit"`, `"queue_key":"ledger:-100123"`, `"queue_depth":7`, `"queue_wait":25`} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("slow log missing %q: %s", want, out)
 		}

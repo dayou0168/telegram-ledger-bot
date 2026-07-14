@@ -20,30 +20,36 @@ type Config struct {
 	HostUserID         int64
 	DefaultOperatorIDs map[int64]struct{}
 
-	LedgerWorkers              int
-	ControlWorkers             int
-	ChainWorkers               int
-	RateWorkers                int
-	BroadcastWorkers           int
-	QueryWorkers               int
-	NotifyWorkers              int
-	QueueSize                  int
-	OutboxSentRetention        time.Duration
-	OutboxFailedRetention      time.Duration
-	OutboxStatsWindow          time.Duration
-	BroadcastDeliveryRetention time.Duration
-	GroupCacheTTL              time.Duration
-	BillSummaryCacheTTL        time.Duration
-	UserTouchCacheTTL          time.Duration
-	OperatorCacheTTL           time.Duration
-	GlobalPermissionCacheTTL   time.Duration
-	GlobalPermissionCacheSize  int
-	WatchCacheTTL              time.Duration
-	SlowUpdateThreshold        time.Duration
-	PollTimeout                time.Duration
-	RequestTimeout             time.Duration
-	TronBackfillEvery          time.Duration
-	TronLookbackMinutes        int
+	LedgerWorkers               int
+	ControlWorkers              int
+	ChainWorkers                int
+	RateWorkers                 int
+	BroadcastWorkers            int
+	QueryWorkers                int
+	NotifyWorkers               int
+	QueueSize                   int
+	OutboxSentRetention         time.Duration
+	OutboxFailedRetention       time.Duration
+	OutboxStatsWindow           time.Duration
+	BroadcastDeliveryRetention  time.Duration
+	GroupCacheTTL               time.Duration
+	BillSummaryCacheTTL         time.Duration
+	UserTouchCacheTTL           time.Duration
+	OperatorCacheTTL            time.Duration
+	GlobalPermissionCacheTTL    time.Duration
+	GlobalPermissionCacheSize   int
+	WatchCacheTTL               time.Duration
+	SlowUpdateThreshold         time.Duration
+	LedgerSummaryWriteMode      string
+	LedgerSummaryReadMode       string
+	LedgerSummaryCompareEvery   int
+	LedgerSummaryReconcileEvery time.Duration
+	GroupRouteMode              string
+	CriticalOutboxFastpath      bool
+	PollTimeout                 time.Duration
+	RequestTimeout              time.Duration
+	TronBackfillEvery           time.Duration
+	TronLookbackMinutes         int
 
 	TronAPIBase                   string
 	TronAPIKey                    string
@@ -115,6 +121,12 @@ func Load() (Config, error) {
 		GlobalPermissionCacheSize:     intEnv("BOT_GLOBAL_PERMISSION_CACHE_SIZE", 4096),
 		WatchCacheTTL:                 secondsEnv("BOT_WATCH_CACHE_TTL_SECONDS", 3),
 		SlowUpdateThreshold:           millisEnv("BOT_SLOW_UPDATE_THRESHOLD_MS", 800),
+		LedgerSummaryWriteMode:        strings.ToLower(env("BOT_LEDGER_SUMMARY_WRITE_MODE", "shadow")),
+		LedgerSummaryReadMode:         strings.ToLower(env("BOT_LEDGER_SUMMARY_READ_MODE", "safe")),
+		LedgerSummaryCompareEvery:     intEnv("BOT_LEDGER_SUMMARY_COMPARE_EVERY", 100),
+		LedgerSummaryReconcileEvery:   secondsEnv("BOT_LEDGER_SUMMARY_RECONCILE_SECONDS", 60),
+		GroupRouteMode:                strings.ToLower(env("BOT_GROUP_ROUTE_MODE", "split")),
+		CriticalOutboxFastpath:        boolEnv("BOT_CRITICAL_OUTBOX_FASTPATH", true),
 		PollTimeout:                   secondsEnv("BOT_POLL_TIMEOUT", 50),
 		RequestTimeout:                secondsEnv("BOT_REQUEST_TIMEOUT", 70),
 		TronBackfillEvery:             secondsEnv("TRON_ADDRESS_BACKFILL_SECONDS", 60),
@@ -230,6 +242,21 @@ func Load() (Config, error) {
 	}
 	if cfg.SlowUpdateThreshold <= 0 {
 		cfg.SlowUpdateThreshold = 800 * time.Millisecond
+	}
+	if cfg.LedgerSummaryWriteMode != "off" && cfg.LedgerSummaryWriteMode != "shadow" {
+		cfg.LedgerSummaryWriteMode = "shadow"
+	}
+	if cfg.LedgerSummaryReadMode != "legacy" && cfg.LedgerSummaryReadMode != "safe" {
+		cfg.LedgerSummaryReadMode = "safe"
+	}
+	if cfg.LedgerSummaryCompareEvery < 1 {
+		cfg.LedgerSummaryCompareEvery = 100
+	}
+	if cfg.LedgerSummaryReconcileEvery <= 0 {
+		cfg.LedgerSummaryReconcileEvery = time.Minute
+	}
+	if cfg.GroupRouteMode != "legacy" && cfg.GroupRouteMode != "split" {
+		cfg.GroupRouteMode = "split"
 	}
 	if cfg.BillSummaryCacheTTL <= 0 {
 		cfg.BillSummaryCacheTTL = 30 * time.Second

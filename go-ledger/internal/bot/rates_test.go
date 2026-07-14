@@ -60,3 +60,24 @@ func TestRateBookWithoutSnapshotFailsFast(t *testing.T) {
 		t.Fatal("rateBook without snapshot should fail fast instead of cold fetching")
 	}
 }
+
+func TestFormatZ0ExactAlignedHTMLAndPrompt(t *testing.T) {
+	entries := make([]p2p.OrderBookEntry, 10)
+	for i := range entries {
+		entries[i] = p2p.OrderBookEntry{Rank: i + 1, Price: "6.73", MerchantName: "商户"}
+	}
+	entries[9] = p2p.OrderBookEntry{Rank: 10, Price: "6.74", MerchantName: "红杉<&贸易"}
+	text := formatZ0Book(cachedRateBook{Entries: entries, UpdatedAt: time.Now()}, time.UTC)
+	for _, want := range []string{
+		"<pre>Z1 :   6.73   商户\n",
+		"Z10 : 6.74   红杉&lt;&amp;贸易\n</pre>",
+		"发送 Z1 -0.1\n或 设置汇率 Z1 -0.1 可按第1档偏移后设置汇率。",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("Z0 output missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "缓存更新时间") {
+		t.Fatalf("Z0 output must not expose cache timestamp:\n%s", text)
+	}
+}

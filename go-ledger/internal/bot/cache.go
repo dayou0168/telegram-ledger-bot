@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"strings"
 	"sync"
 	"time"
 )
@@ -55,6 +56,16 @@ func (c *ttlCache[T]) Set(key string, value T) {
 func (c *ttlCache[T]) Delete(key string) {
 	c.mu.Lock()
 	delete(c.items, key)
+	c.mu.Unlock()
+}
+
+func (c *ttlCache[T]) DeletePrefix(prefix string) {
+	c.mu.Lock()
+	for key := range c.items {
+		if strings.HasPrefix(key, prefix) {
+			delete(c.items, key)
+		}
+	}
 	c.mu.Unlock()
 }
 

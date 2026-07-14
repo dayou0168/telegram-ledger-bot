@@ -39,3 +39,68 @@ func TestHistoricalCutoffZeroStillMeansMidnight(t *testing.T) {
 		t.Fatal("cutoff_hour=0 must retain midnight-cutoff semantics")
 	}
 }
+
+func TestResumeDayKeyReusesPausedPeriodUntilMidnightCutoff(t *testing.T) {
+	loc := time.FixedZone("Asia/Shanghai", 8*3600)
+	periodStart := time.Date(2026, 7, 14, 9, 0, 0, 0, loc)
+	group := storage.Group{
+		Active:                false,
+		ActiveDayKey:          "2026-07-14",
+		ActiveExpiresDayKey:   "2026-07-14",
+		ActivePeriodStartedAt: periodStart,
+		CutoffHour:            0,
+	}
+	if got := ResumeDayKey(group, time.Date(2026, 7, 14, 23, 59, 59, 0, loc)); got != "2026-07-14" {
+		t.Fatalf("same-day resume key = %q", got)
+	}
+	if got := ResumeDayKey(group, time.Date(2026, 7, 15, 0, 0, 0, 0, loc)); got != "2026-07-15" {
+		t.Fatalf("post-cutoff resume key = %q", got)
+	}
+}
+
+func TestResumeDayKeyHonorsFourAMBoundary(t *testing.T) {
+	loc := time.FixedZone("Asia/Shanghai", 8*3600)
+	group := storage.Group{
+		ActiveDayKey:          "2026-07-14",
+		ActiveExpiresDayKey:   "2026-07-14",
+		ActivePeriodStartedAt: time.Date(2026, 7, 14, 12, 0, 0, 0, loc),
+		CutoffHour:            4,
+	}
+	if got := ResumeDayKey(group, time.Date(2026, 7, 15, 3, 59, 59, 0, loc)); got != "2026-07-14" {
+		t.Fatalf("pre-cutoff resume key = %q", got)
+	}
+	if got := ResumeDayKey(group, time.Date(2026, 7, 15, 4, 0, 0, 0, loc)); got != "2026-07-15" {
+		t.Fatalf("post-cutoff resume key = %q", got)
+	}
+}
+
+func TestResumeDayKeyDisabledCutoffReusesPausedPeriodAcrossDays(t *testing.T) {
+	loc := time.FixedZone("Asia/Shanghai", 8*3600)
+	group := storage.Group{
+		ActiveDayKey:          "2026-07-01",
+		ActivePeriodStartedAt: time.Date(2026, 7, 1, 8, 0, 0, 0, loc),
+		CutoffHour:            CutoffDisabledHour,
+	}
+	if got := ResumeDayKey(group, time.Date(2026, 8, 1, 12, 0, 0, 0, loc)); got != "2026-07-01" {
+		t.Fatalf("disabled-cutoff resume key = %q", got)
+	}
+}
+
+func TestStateAfterCutoffSettingPreservesOnlyResumablePausedPeriod(t *testing.T) {
+	loc := time.FixedZone("Asia/Shanghai", 8*3600)
+	periodStart := time.Date(2026, 7, 14, 9, 0, 0, 0, loc)
+	group := storage.Group{
+		ActiveDayKey:          "2026-07-14",
+		ActiveExpiresDayKey:   "2026-07-14",
+		ActivePeriodStartedAt: periodStart,
+		CutoffHour:            0,
+	}
+	active, dayKey, expires := StateAfterCutoffSetting(group, CutoffDisabledHour, time.Date(2026, 7, 14, 20, 0, 0, 0, loc))
+	if active || dayKey != "2026-07-14" || expires != "" {
+		t.Fatalf("resumable paused state = %v %q %q", active, dayKey, expires)
+	}
+	active, dayKey, expires = StateAfterCutoffSetting(group, CutoffDisabledHour, time.Date(2026, 7, 15, 1, 0, 0, 0, loc))
+	if active || dayKey != "" || expires != "" {
+		t.Fatalf("expired paused state = %v %q %q", active, dayKey, expires)
+	}
+}

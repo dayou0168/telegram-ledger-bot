@@ -11,23 +11,44 @@ import (
 type perfTraceKey struct{}
 
 type perfTrace struct {
-	mu        sync.Mutex
-	updateID  int64
-	chatID    int64
-	command   string
-	startedAt time.Time
-	stages    map[string]time.Duration
-	caches    map[string]string
+	mu         sync.Mutex
+	updateID   int64
+	chatID     int64
+	command    string
+	startedAt  time.Time
+	stages     map[string]time.Duration
+	caches     map[string]string
+	queueKey   string
+	queueDepth int
 }
 
 type perfLog struct {
-	Kind    string            `json:"kind"`
-	Update  int64             `json:"update_id"`
-	ChatID  int64             `json:"chat_id"`
-	Command string            `json:"command"`
-	TotalMS int64             `json:"total_ms"`
-	Stages  map[string]int64  `json:"stages_ms,omitempty"`
-	Caches  map[string]string `json:"caches,omitempty"`
+	Kind       string            `json:"kind"`
+	Update     int64             `json:"update_id"`
+	ChatID     int64             `json:"chat_id"`
+	Command    string            `json:"command"`
+	TotalMS    int64             `json:"total_ms"`
+	Stages     map[string]int64  `json:"stages_ms,omitempty"`
+	Caches     map[string]string `json:"caches,omitempty"`
+	QueueKey   string            `json:"queue_key,omitempty"`
+	QueueDepth int               `json:"queue_depth,omitempty"`
+}
+
+func addPerfStage(ctx context.Context, stage string, duration time.Duration) {
+	if trace := perfTraceFromContext(ctx); trace != nil {
+		trace.mu.Lock()
+		trace.stages[stage] += duration
+		trace.mu.Unlock()
+	}
+}
+
+func markPerfQueue(ctx context.Context, key string, depth int) {
+	if trace := perfTraceFromContext(ctx); trace != nil {
+		trace.mu.Lock()
+		trace.queueKey = key
+		trace.queueDepth = depth
+		trace.mu.Unlock()
+	}
 }
 
 func newPerfTrace(updateID, chatID int64) *perfTrace {
@@ -106,15 +127,19 @@ func finishPerfTrace(trace *perfTrace, threshold time.Duration) {
 		caches[name] = value
 	}
 	command := trace.command
+	queueKey := trace.queueKey
+	queueDepth := trace.queueDepth
 	trace.mu.Unlock()
 	payload := perfLog{
-		Kind:    "slow_update",
-		Update:  trace.updateID,
-		ChatID:  trace.chatID,
-		Command: command,
-		TotalMS: total.Milliseconds(),
-		Stages:  stages,
-		Caches:  caches,
+		Kind:       "slow_update",
+		Update:     trace.updateID,
+		ChatID:     trace.chatID,
+		Command:    command,
+		TotalMS:    total.Milliseconds(),
+		Stages:     stages,
+		Caches:     caches,
+		QueueKey:   queueKey,
+		QueueDepth: queueDepth,
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {

@@ -22,7 +22,7 @@ type Store struct {
 	keyCipher    *keyCipher
 }
 
-const latestSchemaMigrationVersion = "2.4.10-global-permission-epoch"
+const latestSchemaMigrationVersion = "2.4.11-ledger-period-summary"
 
 const (
 	PermissionScopeGlobalOperator = "global_operator"
@@ -863,9 +863,11 @@ func (s *Store) migrate(ctx context.Context) error {
 			source_message_id BIGINT NOT NULL DEFAULT 0,
 			bot_message_id BIGINT NOT NULL DEFAULT 0,
 			remark TEXT NOT NULL DEFAULT '',
+			period_started_at TIMESTAMPTZ NOT NULL DEFAULT '1970-01-01 00:00:00+00',
 			created_at TIMESTAMPTZ NOT NULL,
 			deleted_at TIMESTAMPTZ
 		)`,
+		`ALTER TABLE records ADD COLUMN IF NOT EXISTS period_started_at TIMESTAMPTZ NOT NULL DEFAULT '1970-01-01 00:00:00+00'`,
 		`CREATE INDEX IF NOT EXISTS idx_records_chat_day_active
 			ON records(chat_id, day_key, id)
 			WHERE deleted_at IS NULL`,
@@ -892,6 +894,39 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_records_chat_bot_message
 			ON records(chat_id, bot_message_id, id DESC)
 			WHERE deleted_at IS NULL AND bot_message_id <> 0`,
+		`CREATE INDEX IF NOT EXISTS idx_records_chat_period_kind_active
+			ON records(chat_id, day_key, period_started_at, kind, id DESC)
+			WHERE deleted_at IS NULL`,
+		`CREATE TABLE IF NOT EXISTS ledger_period_summaries (
+			chat_id BIGINT NOT NULL,
+			day_key TEXT NOT NULL,
+			period_started_at TIMESTAMPTZ NOT NULL,
+			deposit_count BIGINT NOT NULL DEFAULT 0,
+			payout_count BIGINT NOT NULL DEFAULT 0,
+			total_deposit_cny NUMERIC NOT NULL DEFAULT 0,
+			total_deposit_usdt NUMERIC NOT NULL DEFAULT 0,
+			total_payout_usdt NUMERIC NOT NULL DEFAULT 0,
+			high_watermark_id BIGINT NOT NULL DEFAULT 0,
+			dirty BOOLEAN NOT NULL DEFAULT TRUE,
+			reconciled_at TIMESTAMPTZ,
+			updated_at TIMESTAMPTZ NOT NULL,
+			PRIMARY KEY(chat_id, day_key, period_started_at),
+			CHECK(deposit_count >= 0),
+			CHECK(payout_count >= 0)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_ledger_period_summaries_dirty
+			ON ledger_period_summaries(dirty, updated_at, chat_id, day_key, period_started_at)
+			WHERE dirty`,
+		`CREATE INDEX IF NOT EXISTS idx_ledger_period_summaries_reconcile
+			ON ledger_period_summaries(dirty DESC, reconciled_at ASC NULLS FIRST, updated_at, chat_id, day_key, period_started_at)`,
+		`CREATE TABLE IF NOT EXISTS ledger_summary_backfill_state (
+			id SMALLINT PRIMARY KEY DEFAULT 1 CHECK(id=1),
+			last_record_id BIGINT NOT NULL DEFAULT 0,
+			completed_at TIMESTAMPTZ,
+			updated_at TIMESTAMPTZ NOT NULL
+		)`,
+		`INSERT INTO ledger_summary_backfill_state(id,last_record_id,updated_at)
+			VALUES(1,0,NOW()) ON CONFLICT(id) DO NOTHING`,
 		`CREATE TABLE IF NOT EXISTS address_watches (
 			owner_user_id BIGINT NOT NULL,
 			address TEXT NOT NULL,
@@ -1415,40 +1450,43 @@ func scanGroup(scanner recordScanner) (Group, error) {
 
 func (s *Store) SetGroupActive(ctx context.Context, chatID int64, active bool, activeDayKey string, now time.Time) error {
 	activeExpiresDayKey := activeDayKey
-	if !active {
-		activeExpiresDayKey = ""
-	}
 	return s.SetGroupActivePeriod(ctx, chatID, active, activeDayKey, activeExpiresDayKey, now)
 }
 
 func (s *Store) SetGroupActivePeriod(ctx context.Context, chatID int64, active bool, activeDayKey, activeExpiresDayKey string, now time.Time) error {
-	if !active {
-		activeDayKey = ""
-		activeExpiresDayKey = ""
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
 	}
-	_, err := s.pool.Exec(ctx, `UPDATE groups SET
+	defer rollback(ctx, tx)
+	_, err = tx.Exec(ctx, `UPDATE groups SET
 		active=$1,
-		active_day_key=$2,
-		active_expires_day_key=$3,
+		active_day_key=CASE WHEN $1 THEN $2 ELSE active_day_key END,
+		active_expires_day_key=CASE WHEN $1 THEN $3 ELSE active_expires_day_key END,
 		active_period_started_at=CASE
-			WHEN $1 AND (NOT active OR active_day_key<>$2 OR active_period_started_at='1970-01-01 00:00:00+00'::timestamptz) THEN $4
-			WHEN NOT $1 THEN '1970-01-01 00:00:00+00'::timestamptz
+			WHEN $1 AND (active_day_key<>$2 OR active_period_started_at='1970-01-01 00:00:00+00'::timestamptz) THEN $4
 			ELSE active_period_started_at
 		END,
 		updated_at=$4 WHERE chat_id=$5`,
 		active, activeDayKey, activeExpiresDayKey, now, chatID)
-	return err
+	if err != nil {
+		return err
+	}
+	// A confirmation issued before pause/resume must never become valid again,
+	// even when the stable accounting period itself is intentionally reused.
+	if _, err := tx.Exec(ctx, `DELETE FROM ledger_clear_tickets WHERE chat_id=$1`, chatID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *Store) SetGroupCutoffState(ctx context.Context, chatID int64, cutoffHour int, active bool, activeDayKey, activeExpiresDayKey string, now time.Time) error {
-	if !active {
-		activeDayKey = ""
-		activeExpiresDayKey = ""
-	}
-	_, err := s.pool.Exec(ctx, `UPDATE groups SET cutoff_hour=$1, active=$2, active_day_key=$3, active_expires_day_key=$4,
+	_, err := s.pool.Exec(ctx, `UPDATE groups SET cutoff_hour=$1, active=$2,
+		active_day_key=CASE WHEN $3<>'' THEN $3 WHEN NOT $2 THEN '' ELSE active_day_key END,
+		active_expires_day_key=CASE WHEN $3<>'' THEN $4 WHEN NOT $2 THEN '' ELSE active_expires_day_key END,
 		active_period_started_at=CASE
-			WHEN $2 AND active_period_started_at<='1970-01-01 00:00:00+00'::timestamptz THEN $5
-			WHEN NOT $2 THEN '1970-01-01 00:00:00+00'::timestamptz
+			WHEN $2 AND (active_day_key<>$3 OR active_period_started_at<='1970-01-01 00:00:00+00'::timestamptz) THEN $5
+			WHEN NOT $2 AND $3='' THEN '1970-01-01 00:00:00+00'::timestamptz
 			ELSE active_period_started_at
 		END,
 		updated_at=$5 WHERE chat_id=$6`,
@@ -3049,19 +3087,47 @@ func (s *Store) ConsumeLedgerClearTicketAndDelete(ctx context.Context, tokenHash
 		result.Status = LedgerClearTicketPeriodChanged
 		return result, tx.Commit(ctx)
 	}
+	if err := lockLedgerPeriod(ctx, tx, LedgerPeriodSummaryKey{
+		ChatID: chatID, DayKey: ticket.DayKey, PeriodStartedAt: ticket.ActivePeriodStartedAt,
+	}); err != nil {
+		return result, err
+	}
 	if _, err := tx.Exec(ctx, `UPDATE ledger_clear_tickets SET consumed_at=$1
 		WHERE token_hash=$2 AND consumed_at IS NULL`, now, ticket.TokenHash); err != nil {
 		return result, err
 	}
-	tag, err := tx.Exec(ctx, `UPDATE records SET deleted_at=$1
-		WHERE chat_id=$2 AND day_key=$3 AND created_at >= $4 AND deleted_at IS NULL`,
-		now, chatID, ticket.DayKey, ticket.ActivePeriodStartedAt)
+	var deletedCount, depositCount, payoutCount int64
+	var depositCNY, depositUSDT, payoutUSDT string
+	err = tx.QueryRow(ctx, `WITH deleted AS (
+		UPDATE records SET deleted_at=$1
+		WHERE chat_id=$2 AND day_key=$3
+		  AND (period_started_at=$4 OR (period_started_at='1970-01-01 00:00:00+00'::timestamptz AND created_at >= $4))
+		  AND deleted_at IS NULL
+		RETURNING kind,currency,amount,result_usdt
+	) SELECT COUNT(*),
+		COUNT(*) FILTER (WHERE kind='deposit'),
+		COUNT(*) FILTER (WHERE kind='payout'),
+		COALESCE(SUM(CASE WHEN kind='deposit' AND upper(currency)='CNY' THEN amount::numeric ELSE 0 END),0)::text,
+		COALESCE(SUM(CASE WHEN kind='deposit' THEN result_usdt::numeric ELSE 0 END),0)::text,
+		COALESCE(SUM(CASE WHEN kind='payout' THEN result_usdt::numeric ELSE 0 END),0)::text
+	FROM deleted`, now, chatID, ticket.DayKey, ticket.ActivePeriodStartedAt).Scan(
+		&deletedCount, &depositCount, &payoutCount, &depositCNY, &depositUSDT, &payoutUSDT)
 	if err != nil {
+		return result, err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE ledger_period_summaries SET
+		deposit_count=deposit_count-$4,payout_count=payout_count-$5,
+		total_deposit_cny=total_deposit_cny-$6::numeric,
+		total_deposit_usdt=total_deposit_usdt-$7::numeric,
+		total_payout_usdt=total_payout_usdt-$8::numeric,updated_at=$9
+	WHERE chat_id=$1 AND day_key=$2 AND period_started_at=$3 AND NOT dirty`,
+		chatID, ticket.DayKey, ticket.ActivePeriodStartedAt, depositCount, payoutCount,
+		depositCNY, depositUSDT, payoutUSDT, now); err != nil {
 		return result, err
 	}
 	result.Status = LedgerClearTicketApplied
 	result.DayKey = ticket.DayKey
-	result.DeletedCount = tag.RowsAffected()
+	result.DeletedCount = deletedCount
 	return result, tx.Commit(ctx)
 }
 
@@ -4265,14 +4331,17 @@ func (s *Store) SaveBroadcastReplaceSetting(ctx context.Context, setting Broadca
 }
 
 func (s *Store) InsertRecord(ctx context.Context, r Record) (int64, error) {
+	if r.PeriodStartedAt.IsZero() {
+		r.PeriodStartedAt = time.Unix(0, 0).UTC()
+	}
 	var id int64
 	err := s.pool.QueryRow(ctx, `INSERT INTO records(
 		chat_id, day_key, kind, currency, amount, rate, fee_rate, result_usdt, subject_user_id, subject_name, actor_user_id, actor_name,
-		source_message_id, bot_message_id, remark, created_at
-	) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+		source_message_id, bot_message_id, remark, period_started_at, created_at
+	) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 	RETURNING id`,
 		r.ChatID, r.DayKey, r.Kind, r.Currency, r.Amount, r.Rate, r.FeeRate, r.ResultUSDT, r.SubjectUserID,
-		r.SubjectName, r.ActorUserID, r.ActorName, r.SourceMessageID, r.BotMessageID, r.Remark, r.CreatedAt).Scan(&id)
+		r.SubjectName, r.ActorUserID, r.ActorName, r.SourceMessageID, r.BotMessageID, r.Remark, r.PeriodStartedAt, r.CreatedAt).Scan(&id)
 	return id, err
 }
 
@@ -4283,7 +4352,7 @@ func (s *Store) SetRecordBotMessage(ctx context.Context, recordID, botMessageID 
 
 func (s *Store) GetRecord(ctx context.Context, recordID int64) (Record, bool, error) {
 	row := s.pool.QueryRow(ctx, `SELECT id, chat_id, day_key, kind, currency, amount, rate, fee_rate, result_usdt,
-		subject_user_id, subject_name, actor_user_id, actor_name, source_message_id, bot_message_id, remark, created_at, deleted_at
+		subject_user_id, subject_name, actor_user_id, actor_name, source_message_id, bot_message_id, remark, period_started_at, created_at, deleted_at
 		FROM records
 		WHERE id=$1`, recordID)
 	record, err := scanRecord(row)
@@ -4297,7 +4366,7 @@ func (s *Store) GetRecord(ctx context.Context, recordID int64) (Record, bool, er
 }
 
 const recordSelectColumns = `id, chat_id, day_key, kind, currency, amount, rate, fee_rate, result_usdt,
-	subject_user_id, subject_name, actor_user_id, actor_name, source_message_id, bot_message_id, remark, created_at, deleted_at`
+	subject_user_id, subject_name, actor_user_id, actor_name, source_message_id, bot_message_id, remark, period_started_at, created_at, deleted_at`
 
 func (s *Store) ListRecordsForDayPage(ctx context.Context, chatID int64, dayKey string, filter RecordFilter, beforeID, afterID int64, limit int) (RecordPage, error) {
 	if limit < 1 {
@@ -4455,10 +4524,10 @@ func (s *Store) GetBillSummaryForDay(ctx context.Context, chatID int64, dayKey s
 		return BillSummaryData{}, err
 	}
 	rows, err := s.pool.Query(ctx, `SELECT id, chat_id, day_key, kind, currency, amount, rate, fee_rate, result_usdt,
-			subject_user_id, subject_name, actor_user_id, actor_name, source_message_id, bot_message_id, remark, created_at, deleted_at
+			subject_user_id, subject_name, actor_user_id, actor_name, source_message_id, bot_message_id, remark, period_started_at, created_at, deleted_at
 		FROM (
 			SELECT id, chat_id, day_key, kind, currency, amount, rate, fee_rate, result_usdt,
-				subject_user_id, subject_name, actor_user_id, actor_name, source_message_id, bot_message_id, remark, created_at, deleted_at
+				subject_user_id, subject_name, actor_user_id, actor_name, source_message_id, bot_message_id, remark, period_started_at, created_at, deleted_at
 			FROM records
 			WHERE chat_id=$1 AND day_key=$2 AND deleted_at IS NULL AND kind='deposit'
 			ORDER BY id DESC
@@ -4466,10 +4535,10 @@ func (s *Store) GetBillSummaryForDay(ctx context.Context, chatID int64, dayKey s
 		) deposits
 		UNION ALL
 		SELECT id, chat_id, day_key, kind, currency, amount, rate, fee_rate, result_usdt,
-			subject_user_id, subject_name, actor_user_id, actor_name, source_message_id, bot_message_id, remark, created_at, deleted_at
+			subject_user_id, subject_name, actor_user_id, actor_name, source_message_id, bot_message_id, remark, period_started_at, created_at, deleted_at
 		FROM (
 			SELECT id, chat_id, day_key, kind, currency, amount, rate, fee_rate, result_usdt,
-				subject_user_id, subject_name, actor_user_id, actor_name, source_message_id, bot_message_id, remark, created_at, deleted_at
+				subject_user_id, subject_name, actor_user_id, actor_name, source_message_id, bot_message_id, remark, period_started_at, created_at, deleted_at
 			FROM records
 			WHERE chat_id=$1 AND day_key=$2 AND deleted_at IS NULL AND kind='payout'
 			ORDER BY id DESC
@@ -4514,7 +4583,7 @@ func (s *Store) ListBillDays(ctx context.Context, chatID int64) ([]string, error
 
 func (s *Store) FindRecordByMessage(ctx context.Context, chatID, messageID int64) (Record, bool, error) {
 	rows, err := s.pool.Query(ctx, `SELECT id, chat_id, day_key, kind, currency, amount, rate, fee_rate, result_usdt,
-		subject_user_id, subject_name, actor_user_id, actor_name, source_message_id, bot_message_id, remark, created_at, deleted_at
+		subject_user_id, subject_name, actor_user_id, actor_name, source_message_id, bot_message_id, remark, period_started_at, created_at, deleted_at
 		FROM records
 		WHERE chat_id=$1
 		  AND deleted_at IS NULL
@@ -4546,13 +4615,17 @@ func (s *Store) SoftDeleteRecord(ctx context.Context, chatID, recordID int64, no
 func (s *Store) CountRecordsForPeriod(ctx context.Context, chatID int64, dayKey string, startedAt time.Time) (int64, error) {
 	var count int64
 	err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM records
-		WHERE chat_id=$1 AND day_key=$2 AND created_at >= $3 AND deleted_at IS NULL`, chatID, dayKey, startedAt).Scan(&count)
+		WHERE chat_id=$1 AND day_key=$2
+		  AND (period_started_at=$3 OR (period_started_at='1970-01-01 00:00:00+00'::timestamptz AND created_at >= $3))
+		  AND deleted_at IS NULL`, chatID, dayKey, startedAt).Scan(&count)
 	return count, err
 }
 
 func (s *Store) SoftDeleteRecordsForPeriod(ctx context.Context, chatID int64, dayKey string, startedAt, now time.Time) (int64, error) {
 	tag, err := s.pool.Exec(ctx, `UPDATE records SET deleted_at=$1
-		WHERE chat_id=$2 AND day_key=$3 AND created_at >= $4 AND deleted_at IS NULL`, now, chatID, dayKey, startedAt)
+		WHERE chat_id=$2 AND day_key=$3
+		  AND (period_started_at=$4 OR (period_started_at='1970-01-01 00:00:00+00'::timestamptz AND created_at >= $4))
+		  AND deleted_at IS NULL`, now, chatID, dayKey, startedAt)
 	return tag.RowsAffected(), err
 }
 
@@ -4882,12 +4955,17 @@ func (s *Store) ClaimDueNotifications(ctx context.Context, limit int, maxAttempt
 		return nil, err
 	}
 	rows, err := s.pool.Query(ctx, `WITH next AS (
-			SELECT id
-			FROM notification_outbox
-			WHERE ((status IN ('pending', 'failed') AND next_attempt_at <= $1)
-				OR (status = 'sending' AND updated_at <= $3))
-				AND attempts < $4
-			ORDER BY priority ASC, next_attempt_at ASC, id ASC
+			SELECT n.id
+			FROM notification_outbox n
+			WHERE ((n.status IN ('pending', 'failed') AND n.next_attempt_at <= $1)
+				OR (n.status = 'sending' AND n.updated_at <= $3))
+				AND n.attempts < $4
+				AND (n.priority<>0 OR NOT EXISTS (
+					SELECT 1 FROM notification_outbox earlier
+					WHERE earlier.chat_id=n.chat_id AND earlier.priority=0 AND earlier.id<n.id
+					  AND earlier.status<>'sent' AND earlier.attempts<$4
+				))
+			ORDER BY n.priority ASC, n.next_attempt_at ASC, n.id ASC
 			LIMIT $2
 			FOR UPDATE SKIP LOCKED
 		)
@@ -5043,6 +5121,12 @@ func (s *Store) NotificationOutboxStats(ctx context.Context, since time.Time) (N
 		stats.FailureClasses = append(stats.FailureClasses, item)
 	}
 	return stats, rows.Err()
+}
+
+func (s *Store) NotificationOutboxCountForChat(ctx context.Context, chatID int64) (int64, error) {
+	var count int64
+	err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM notification_outbox WHERE chat_id=$1`, chatID).Scan(&count)
+	return count, err
 }
 
 func (s *Store) CleanupNotificationOutbox(ctx context.Context, sentBefore time.Time, failedBefore time.Time) (NotificationOutboxCleanupStats, error) {
@@ -6781,6 +6865,7 @@ func scanRecord(scanner recordScanner) (Record, error) {
 		&record.SourceMessageID,
 		&record.BotMessageID,
 		&record.Remark,
+		&record.PeriodStartedAt,
 		&record.CreatedAt,
 		&record.DeletedAt,
 	)

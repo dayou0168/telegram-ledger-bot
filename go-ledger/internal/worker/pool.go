@@ -59,6 +59,7 @@ func (p *Pool) Submit(job Job) bool {
 	p.maybeScale()
 	select {
 	case p.jobs <- job:
+		p.maybeScale()
 		return true
 	default:
 		p.maybeScale()
@@ -67,13 +68,21 @@ func (p *Pool) Submit(job Job) bool {
 }
 
 func (p *Pool) SubmitBlocking(ctx context.Context, job Job) bool {
+	if ctx.Err() != nil {
+		return false
+	}
 	p.maybeScale()
 	select {
 	case p.jobs <- job:
+		p.maybeScale()
 		return true
 	case <-ctx.Done():
 		return false
 	}
+}
+
+func (p *Pool) Wait() {
+	p.wg.Wait()
 }
 
 func (p *Pool) maybeScale() {

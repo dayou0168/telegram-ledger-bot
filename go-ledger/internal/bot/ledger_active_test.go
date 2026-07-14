@@ -208,20 +208,21 @@ func TestUndoOnlyAllowsCurrentActiveLedgerPeriod(t *testing.T) {
 		ActivePeriodStartedAt: now.Add(-time.Hour),
 		CutoffHour:            0,
 	}
-	if !recordInCurrentLedgerPeriod(group, "2026-07-11", now.Add(-time.Minute), now) {
+	if !recordInCurrentLedgerPeriod(group, "2026-07-11", group.ActivePeriodStartedAt, now.Add(-time.Minute), now) {
 		t.Fatal("current active period should be undoable")
 	}
-	if recordInCurrentLedgerPeriod(group, "2026-07-10", now.Add(-time.Minute), now) {
+	if recordInCurrentLedgerPeriod(group, "2026-07-10", group.ActivePeriodStartedAt, now.Add(-time.Minute), now) {
 		t.Fatal("previous period should not be undoable")
 	}
 	afterCutoff := time.Date(2026, 7, 12, 0, 0, 0, 0, loc)
-	if recordInCurrentLedgerPeriod(group, "2026-07-11", now.Add(-time.Minute), afterCutoff) {
+	if recordInCurrentLedgerPeriod(group, "2026-07-11", group.ActivePeriodStartedAt, now.Add(-time.Minute), afterCutoff) {
 		t.Fatal("period should close exactly at cutoff")
 	}
+	priorPeriodStart := group.ActivePeriodStartedAt
 	group.ActiveDayKey = "2026-07-12"
 	group.ActiveExpiresDayKey = "2026-07-12"
 	group.ActivePeriodStartedAt = afterCutoff
-	if recordInCurrentLedgerPeriod(group, "2026-07-11", now.Add(-time.Minute), afterCutoff) {
+	if recordInCurrentLedgerPeriod(group, "2026-07-11", priorPeriodStart, now.Add(-time.Minute), afterCutoff) {
 		t.Fatal("starting a new period must not reopen the prior period")
 	}
 }
@@ -235,15 +236,15 @@ func TestUndoWithDisabledCutoffUsesContinuousActiveDayKey(t *testing.T) {
 		CutoffHour:            cutoffDisabledHour,
 	}
 	later := time.Date(2026, 7, 20, 12, 0, 0, 0, loc)
-	if !recordInCurrentLedgerPeriod(group, "2026-07-01", later.Add(-time.Hour), later) {
+	if !recordInCurrentLedgerPeriod(group, "2026-07-01", group.ActivePeriodStartedAt, later.Add(-time.Hour), later) {
 		t.Fatal("disabled cutoff should preserve the continuous active period")
 	}
-	if recordInCurrentLedgerPeriod(group, "2026-06-30", later.Add(-time.Hour), later) {
+	if recordInCurrentLedgerPeriod(group, "2026-06-30", group.ActivePeriodStartedAt, later.Add(-time.Hour), later) {
 		t.Fatal("a different saved period must remain closed")
 	}
 	group.Active = false
 	group.ActiveDayKey = ""
-	if recordInCurrentLedgerPeriod(group, "2026-07-01", later.Add(-time.Hour), later) {
+	if recordInCurrentLedgerPeriod(group, "2026-07-01", group.ActivePeriodStartedAt, later.Add(-time.Hour), later) {
 		t.Fatal("stopped or saved period must not allow undo")
 	}
 }
@@ -257,10 +258,13 @@ func TestUndoRejectsRecordFromEarlierContinuousPeriodWithSameDayKey(t *testing.T
 		ActivePeriodStartedAt: periodStart,
 		CutoffHour:            cutoffDisabledHour,
 	}
-	if recordInCurrentLedgerPeriod(group, "2026-07-11", periodStart.Add(-time.Minute), periodStart.Add(time.Hour)) {
+	if recordInCurrentLedgerPeriod(group, "2026-07-11", periodStart.Add(-time.Hour), periodStart.Add(time.Minute), periodStart.Add(time.Hour)) {
 		t.Fatal("same day key from an earlier closed continuous period must remain sealed")
 	}
-	if !recordInCurrentLedgerPeriod(group, "2026-07-11", periodStart.Add(time.Minute), periodStart.Add(time.Hour)) {
+	if !recordInCurrentLedgerPeriod(group, "2026-07-11", periodStart, periodStart.Add(time.Minute), periodStart.Add(time.Hour)) {
 		t.Fatal("record from the current continuous period should be undoable")
+	}
+	if recordInCurrentLedgerPeriod(group, "2026-07-11", time.Time{}, periodStart.Add(-time.Minute), periodStart.Add(time.Hour)) {
+		t.Fatal("legacy record before the current period start must remain sealed")
 	}
 }

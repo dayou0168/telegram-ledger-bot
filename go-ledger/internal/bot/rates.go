@@ -198,9 +198,7 @@ func rateBookStale(now, updatedAt time.Time, lastError string, refreshEvery time
 
 func formatZ0Book(book cachedRateBook, loc *time.Location) string {
 	text := formatZ0(book.Entries)
-	if !book.UpdatedAt.IsZero() {
-		text += "\n\n缓存更新时间：" + rateBookUpdatedLabel(book.UpdatedAt, loc)
-	}
+	_ = loc
 	if book.Stale {
 		text += "\n状态：使用上一版缓存，数据可能陈旧"
 		if book.LastError != "" {
@@ -220,17 +218,22 @@ func rateBookUpdatedLabel(updatedAt time.Time, loc *time.Location) string {
 func formatZ0(entries []p2p.OrderBookEntry) string {
 	var out strings.Builder
 	out.WriteString("<b>OKX OTC商家所有实时汇率 TOP 10</b>\n\n")
+	out.WriteString("<pre>")
 	for i, entry := range entries {
 		rank := i + 1
 		out.WriteString("Z")
 		out.WriteString(strconv.Itoa(rank))
-		out.WriteByte(' ')
-		out.WriteString(entry.Price)
-		out.WriteByte(' ')
+		if rank < 10 {
+			out.WriteString(" :   ")
+		} else {
+			out.WriteString(" : ")
+		}
+		out.WriteString(html.EscapeString(entry.Price))
+		out.WriteString("   ")
 		out.WriteString(html.EscapeString(trimRunes(entry.MerchantName, 10)))
 		out.WriteByte('\n')
 	}
-	out.WriteString("\n发送 Z1 -0.1 或 设置汇率 Z1 -0.1 可按第1档偏移后设置汇率。")
+	out.WriteString("</pre>\n发送 Z1 -0.1\n或 设置汇率 Z1 -0.1 可按第1档偏移后设置汇率。")
 	return strings.TrimSpace(out.String())
 }
 

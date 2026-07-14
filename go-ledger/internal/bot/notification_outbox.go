@@ -46,6 +46,46 @@ func (b *Bot) kickNotificationOutbox() {
 	}
 }
 
+func (b *Bot) wakeCriticalOutbox(id int64) {
+	if id <= 0 || !b.cfg.CriticalOutboxFastpath {
+		b.kickNotificationOutbox()
+		return
+	}
+	select {
+	case b.criticalOutboxWake <- id:
+	default:
+		// The generic scheduler remains the durable lost-wake recovery path.
+		b.kickNotificationOutbox()
+	}
+}
+
+func (b *Bot) criticalOutboxScheduler(ctx context.Context) {
+	if !b.cfg.CriticalOutboxFastpath {
+		return
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case id := <-b.criticalOutboxWake:
+			item, ok, err := b.store.ClaimNotificationByID(ctx, id, notificationOutboxMaxAttempt, time.Now().In(b.loc))
+			if err != nil {
+				log.Printf("claim critical outbox %d: %v", id, err)
+				b.kickNotificationOutbox()
+				continue
+			}
+			if !ok {
+				continue
+			}
+			if !b.criticalPool.Submit(func(sendCtx context.Context) { b.sendOutboxNotification(sendCtx, item) }) {
+				now := time.Now().In(b.loc)
+				_ = b.store.MarkNotificationFailed(ctx, item.ID, "critical notification queue is full", now.Add(time.Second), now)
+				b.kickNotificationOutbox()
+			}
+		}
+	}
+}
+
 func (b *Bot) cleanupNotificationOutbox(ctx context.Context) {
 	if b == nil || b.store == nil {
 		return
@@ -94,7 +134,11 @@ func (b *Bot) drainNotificationOutbox(ctx context.Context) {
 		}
 		for _, item := range items {
 			item := item
-			if !b.notifyPool.Submit(func(sendCtx context.Context) {
+			pool := b.notifyPool
+			if outboxSendPriority(item.Priority) == sendPriorityCritical {
+				pool = b.criticalPool
+			}
+			if !pool.Submit(func(sendCtx context.Context) {
 				b.sendOutboxNotification(sendCtx, item)
 			}) {
 				next := time.Now().In(b.loc).Add(2 * time.Second)
@@ -195,7 +239,7 @@ func (b *Bot) renderOutboxMessage(ctx context.Context, item storage.Notification
 		if !ok {
 			return "", nil, fmt.Errorf("ledger record %d not found", item.ReferenceID)
 		}
-		return b.renderBillMessage(ctx, record.ChatID, record.DayKey, "")
+		return b.renderBillMessageForRecord(ctx, record, item.Text)
 	}
 	opts := notificationOptions(item)
 	return item.Text, opts, nil

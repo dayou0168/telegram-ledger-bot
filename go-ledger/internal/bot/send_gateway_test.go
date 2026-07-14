@@ -111,6 +111,26 @@ func TestSendGatewayRetries5xxAndSucceeds(t *testing.T) {
 	}
 }
 
+func TestSendGatewayRetriesNetworkErrorAndSucceeds(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	gateway := newTelegramSendGateway(nil, nil, 3, 8)
+	gateway.retryBaseDelay = time.Millisecond
+	gateway.retryMaxDelay = time.Millisecond
+	gateway.Start(ctx)
+	attempts := 0
+	msg, err := gateway.Do(ctx, sendPriorityCritical, -1001, func(context.Context) (telegram.Message, error) {
+		attempts++
+		if attempts == 1 {
+			return telegram.Message{}, errors.New("connection reset by peer")
+		}
+		return telegram.Message{MessageID: 10}, nil
+	})
+	if err != nil || attempts != 2 || msg.MessageID != 10 {
+		t.Fatalf("network retry = message %d attempts %d error %v", msg.MessageID, attempts, err)
+	}
+}
+
 func TestSendGatewayReportsMetrics(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

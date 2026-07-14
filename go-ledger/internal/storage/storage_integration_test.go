@@ -706,7 +706,7 @@ func TestPostgresLedgerClearTicketSecurity(t *testing.T) {
 	if err := storeA.SetGroupActivePeriod(ctx, chatID, true, dayKey, dayKey, now.Add(2*time.Minute+time.Second)); err != nil {
 		t.Fatalf("restart period: %v", err)
 	}
-	if got, err := storeB.ConsumeLedgerClearTicketAndDelete(ctx, oldPeriod.TokenHash, chatID, requesterID, true, group, now.Add(30*time.Second)); err != nil || got.Status != LedgerClearTicketPeriodChanged {
+	if got, err := storeB.ConsumeLedgerClearTicketAndDelete(ctx, oldPeriod.TokenHash, chatID, requesterID, true, group, now.Add(30*time.Second)); err != nil || got.Status != LedgerClearTicketNotFound {
 		t.Fatalf("old period result = %+v, %v", got, err)
 	}
 }
@@ -1302,8 +1302,8 @@ func TestPostgresStoreBasicFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get restarted group: %v", err)
 	}
-	if !group.ActivePeriodStartedAt.After(firstPeriodStart) {
-		t.Fatalf("restarted period did not advance start time: %v <= %v", group.ActivePeriodStartedAt, firstPeriodStart)
+	if !group.ActivePeriodStartedAt.Equal(firstPeriodStart) {
+		t.Fatalf("same-day restart changed period start: %v != %v", group.ActivePeriodStartedAt, firstPeriodStart)
 	}
 	now = restartAt
 

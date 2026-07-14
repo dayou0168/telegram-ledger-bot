@@ -31,3 +31,47 @@ func TestElasticPoolRunsJobs(t *testing.T) {
 	}
 	t.Fatalf("count = %d", count)
 }
+
+func TestElasticPoolScalesWhenFirstWorkerIsBusy(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pool := NewPool("cross-chat", 4, 16)
+	pool.StartN(ctx, 4)
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	if !pool.SubmitBlocking(ctx, func(context.Context) {
+		close(firstStarted)
+		<-releaseFirst
+	}) {
+		t.Fatal("submit first job")
+	}
+	<-firstStarted
+	secondDone := make(chan struct{})
+	if !pool.SubmitBlocking(ctx, func(context.Context) { close(secondDone) }) {
+		t.Fatal("submit second job")
+	}
+	select {
+	case <-secondDone:
+		close(releaseFirst)
+	case <-time.After(time.Second):
+		close(releaseFirst)
+		t.Fatal("queued job did not trigger elastic worker growth")
+	}
+}
+
+func TestPoolStopsAllWorkersAfterContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	pool := NewPool("stop", 4, 16)
+	pool.Start(ctx)
+	cancel()
+	done := make(chan struct{})
+	go func() {
+		pool.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("workers did not stop after context cancellation")
+	}
+}

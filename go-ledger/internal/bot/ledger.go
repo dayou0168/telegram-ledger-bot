@@ -3,9 +3,7 @@ package bot
 import (
 	"context"
 	"fmt"
-	"log"
 	"math/big"
-	"strconv"
 	"strings"
 	"time"
 
@@ -45,7 +43,7 @@ func (b *Bot) startAccounting(ctx context.Context, msg telegram.Message, user st
 	if err != nil {
 		return err
 	}
-	activeDayKey := startLedgerDayKey(group, now)
+	activeDayKey := ledgerperiod.ResumeDayKey(group, now)
 	activeExpiresDayKey := cutoffExpiresDayKey(now, group.CutoffHour)
 	if err := b.store.SetGroupActivePeriod(ctx, msg.Chat.ID, true, activeDayKey, activeExpiresDayKey, now); err != nil {
 		return err
@@ -124,9 +122,10 @@ func (b *Bot) handleLedger(ctx context.Context, msg telegram.Message, user stora
 	dayKey := currentLedgerDayKey(group, now)
 	subject := ledgerSubjectFromMessage(msg, user)
 	doneWrite := measurePerfStage(ctx, "db_record_write")
-	recordID, err := b.store.InsertRecord(ctx, storage.Record{
+	_, outboxID, err := b.store.InsertLedgerRecordWithOutbox(ctx, storage.Record{
 		ChatID:          msg.Chat.ID,
 		DayKey:          dayKey,
+		PeriodStartedAt: group.ActivePeriodStartedAt,
 		Kind:            cmd.Kind,
 		Currency:        currency,
 		Amount:          formatAmount(effectiveAmount),
@@ -140,13 +139,21 @@ func (b *Bot) handleLedger(ctx context.Context, msg telegram.Message, user stora
 		SourceMessageID: msg.MessageID,
 		Remark:          cmd.Remark,
 		CreatedAt:       now,
-	})
+	}, storage.NotificationOutbox{
+		Kind:           "ledger_bill",
+		DedupeKey:      fmt.Sprintf("ledger_bill_record:%d:%d", msg.Chat.ID, msg.MessageID),
+		ChatID:         msg.Chat.ID,
+		ParseMode:      "HTML",
+		DisablePreview: true,
+		ReferenceKind:  "ledger_record",
+		Priority:       int(sendPriorityHigh),
+	}, now, b.cfg.LedgerSummaryWriteMode == "shadow")
 	doneWrite()
 	if err != nil {
 		return err
 	}
 	b.invalidateBillSummaryCache(msg.Chat.ID, dayKey)
-	b.sendBillForRecordAsync(ctx, msg.Chat.ID, recordID, now)
+	b.wakeCriticalOutbox(outboxID)
 	return nil
 }
 
@@ -188,7 +195,7 @@ func (b *Bot) handleSetting(ctx context.Context, msg telegram.Message, user stor
 			return err
 		}
 		b.invalidateGroupCache(msg.Chat.ID)
-		return b.enqueueLedgerSuccessText(ctx, sendPriorityNormal, "ledger_setting_fee", msg.Chat.ID, msg.MessageID, "操作成功：设置费率="+rate+"%", nil, now)
+		return b.enqueueLedgerSuccessText(ctx, sendPriorityNormal, "ledger_setting_fee", msg.Chat.ID, msg.MessageID, "费率设置成功，当前交易费率为："+rate+"%", nil, now)
 	case "exchange_rate":
 		if cmd.Value == nil || cmd.Value.Sign() <= 0 {
 			return b.enqueueLedgerTraceText(ctx, sendPriorityNormal, "ledger_setting_rate_invalid", msg.Chat.ID, msg.MessageID, "汇率必须大于0。", nil, now)
@@ -198,7 +205,7 @@ func (b *Bot) handleSetting(ctx context.Context, msg telegram.Message, user stor
 			return err
 		}
 		b.invalidateGroupCache(msg.Chat.ID)
-		return b.enqueueLedgerSuccessText(ctx, sendPriorityNormal, "ledger_setting_rate", msg.Chat.ID, msg.MessageID, "操作成功：设置汇率="+rate, nil, now)
+		return b.enqueueLedgerSuccessText(ctx, sendPriorityNormal, "ledger_setting_rate", msg.Chat.ID, msg.MessageID, "固定汇率设置成功，当前固定汇率为： "+rate+" 。", nil, now)
 	case "cutoff":
 		group, err := b.getGroupCached(ctx, msg.Chat.ID)
 		if err != nil {
@@ -242,7 +249,7 @@ func (b *Bot) handleUndo(ctx context.Context, msg telegram.Message, user storage
 	if !allowed {
 		return b.enqueueLedgerTraceText(ctx, sendPriorityNormal, "ledger_undo_permission_denied", msg.Chat.ID, msg.MessageID, ledgerPermissionDeniedText, nil, now)
 	}
-	if !recordInCurrentLedgerPeriod(group, record.DayKey, record.CreatedAt, now) {
+	if !recordInCurrentLedgerPeriod(group, record.DayKey, record.PeriodStartedAt, record.CreatedAt, now) {
 		return b.enqueueLedgerTraceText(ctx, sendPriorityNormal, "ledger_undo_period_closed", msg.Chat.ID, msg.MessageID, "只能撤销当前有效账期的记录，上一账期已经封账。", nil, now)
 	}
 	if record.ActorUserID != user.ID {
@@ -255,7 +262,18 @@ func (b *Bot) handleUndo(ctx context.Context, msg telegram.Message, user storage
 		}
 	}
 	doneDelete := measurePerfStage(ctx, "db_record_delete")
-	deleted, err := b.store.SoftDeleteRecord(ctx, msg.Chat.ID, record.ID, now, kind)
+	prefix := "已撤销"
+	if record.Kind == "deposit" {
+		prefix = "已撤销入款"
+	} else if record.Kind == "payout" {
+		prefix = "已撤销下发"
+	}
+	_, outboxID, deleted, err := b.store.SoftDeleteRecordWithSummaryAndOutbox(ctx, msg.Chat.ID, record.ID, now, kind,
+		group.ActivePeriodStartedAt, b.cfg.LedgerSummaryWriteMode == "shadow", storage.NotificationOutbox{
+			Kind: "ledger_bill", DedupeKey: fmt.Sprintf("ledger_bill_undo:%d:%d", msg.Chat.ID, msg.MessageID),
+			ChatID: msg.Chat.ID, Text: prefix, ParseMode: "HTML", DisablePreview: true,
+			ReferenceKind: "ledger_record", Priority: int(sendPriorityHigh),
+		})
 	doneDelete()
 	if err != nil {
 		return err
@@ -264,21 +282,19 @@ func (b *Bot) handleUndo(ctx context.Context, msg telegram.Message, user storage
 		return b.enqueueLedgerTraceText(ctx, sendPriorityNormal, "ledger_undo_failed", msg.Chat.ID, msg.MessageID, "撤销失败，记录类型不匹配或已撤销。", nil, now)
 	}
 	b.invalidateBillSummaryCache(msg.Chat.ID, record.DayKey)
-	prefix := "已撤销"
-	if record.Kind == "deposit" {
-		prefix = "已撤销入款"
-	} else if record.Kind == "payout" {
-		prefix = "已撤销下发"
-	}
-	return b.sendBill(ctx, msg.Chat.ID, msg.MessageID, now, prefix)
+	b.wakeCriticalOutbox(outboxID)
+	return nil
 }
 
-func recordInCurrentLedgerPeriod(group storage.Group, recordDayKey string, recordCreatedAt time.Time, now time.Time) bool {
-	return groupAccountingActive(group, now) &&
-		recordDayKey != "" &&
-		recordDayKey == currentLedgerDayKey(group, now) &&
-		!group.ActivePeriodStartedAt.IsZero() &&
-		!recordCreatedAt.Before(group.ActivePeriodStartedAt)
+func recordInCurrentLedgerPeriod(group storage.Group, recordDayKey string, recordPeriodStartedAt, recordCreatedAt, now time.Time) bool {
+	if !groupAccountingActive(group, now) || recordDayKey == "" ||
+		recordDayKey != currentLedgerDayKey(group, now) || group.ActivePeriodStartedAt.IsZero() {
+		return false
+	}
+	if recordPeriodStartedAt.After(time.Unix(0, 0)) {
+		return recordPeriodStartedAt.Equal(group.ActivePeriodStartedAt)
+	}
+	return !recordCreatedAt.Before(group.ActivePeriodStartedAt)
 }
 
 func (b *Bot) handleOperatorCommand(ctx context.Context, msg telegram.Message, user storage.User, text string, now time.Time) error {
@@ -399,30 +415,6 @@ func (b *Bot) operatorTargets(ctx context.Context, msg telegram.Message, text st
 	return targets, missing, nil
 }
 
-func (b *Bot) sendBillForRecordAsync(ctx context.Context, chatID, recordID int64, now time.Time) {
-	key := "send:" + strconv.FormatInt(chatID, 10)
-	b.dispatcher.Submit(ctx, key, b.notifyPool, func(sendCtx context.Context) {
-		item := storage.NotificationOutbox{
-			Kind:           "ledger_bill",
-			DedupeKey:      fmt.Sprintf("ledger_bill_record:%d", recordID),
-			ChatID:         chatID,
-			ParseMode:      "HTML",
-			DisablePreview: true,
-			ReferenceKind:  "ledger_record",
-			ReferenceID:    recordID,
-			Priority:       int(sendPriorityHigh),
-		}
-		inserted, err := b.store.EnqueueNotification(sendCtx, item, now)
-		if err != nil {
-			log.Printf("enqueue bill for record %d: %v", recordID, err)
-			return
-		}
-		if inserted {
-			b.kickNotificationOutbox()
-		}
-	})
-}
-
 func (b *Bot) sendBill(ctx context.Context, chatID, replyTo int64, now time.Time, prefix string) error {
 	text, opts, err := b.renderBillMessageForTime(ctx, chatID, now, prefix)
 	if err != nil {
@@ -445,21 +437,24 @@ func (b *Bot) renderBillMessageForTime(ctx context.Context, chatID int64, now ti
 		return "", nil, err
 	}
 	dayKey := currentLedgerDayKey(group, now)
+	b.invalidateBillSummaryCache(chatID, dayKey)
 	return b.renderBillMessageWithGroup(ctx, group, dayKey, prefix)
 }
 
-func (b *Bot) renderBillMessage(ctx context.Context, chatID int64, dayKey string, prefix string) (string, map[string]any, error) {
-	group, err := b.getGroupCached(ctx, chatID)
+func (b *Bot) renderBillMessageForRecord(ctx context.Context, record storage.Record, prefix string) (string, map[string]any, error) {
+	group, err := b.getGroupCached(ctx, record.ChatID)
 	if err != nil {
 		return "", nil, err
 	}
-	return b.renderBillMessageWithGroup(ctx, group, dayKey, prefix)
+	group.ActivePeriodStartedAt = record.PeriodStartedAt
+	b.invalidateBillSummaryCache(record.ChatID, record.DayKey)
+	return b.renderBillMessageWithGroup(ctx, group, record.DayKey, prefix)
 }
 
 func (b *Bot) renderBillMessageWithGroup(ctx context.Context, group storage.Group, dayKey string, prefix string) (string, map[string]any, error) {
 	chatID := group.ChatID
 	doneDB := measurePerfStage(ctx, "db_bill_summary")
-	data, err := b.getBillSummaryCached(ctx, chatID, dayKey, groupBillDefaultRecordLimit)
+	data, err := b.getBillSummaryCached(ctx, group, dayKey, groupBillDefaultRecordLimit)
 	doneDB()
 	if err != nil {
 		return "", nil, err

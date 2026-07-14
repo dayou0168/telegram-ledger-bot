@@ -40,6 +40,27 @@ func StartDayKey(group storage.Group, now time.Time) string {
 	return BusinessDayKey(now, group.CutoffHour)
 }
 
+func ResumeDayKey(group storage.Group, now time.Time) string {
+	if periodCanResume(group, now) {
+		return group.ActiveDayKey
+	}
+	return StartDayKey(group, now)
+}
+
+func periodCanResume(group storage.Group, now time.Time) bool {
+	if group.ActiveDayKey == "" || group.ActivePeriodStartedAt.IsZero() || !group.ActivePeriodStartedAt.After(time.Unix(0, 0)) {
+		return false
+	}
+	if group.CutoffHour == CutoffDisabledHour {
+		return true
+	}
+	expiresDayKey := group.ActiveExpiresDayKey
+	if expiresDayKey == "" {
+		expiresDayKey = group.ActiveDayKey
+	}
+	return expiresDayKey == BusinessDayKey(now, group.CutoffHour)
+}
+
 func CurrentDayKey(group storage.Group, now time.Time) string {
 	if AccountingActive(group, now) {
 		return group.ActiveDayKey
@@ -48,8 +69,11 @@ func CurrentDayKey(group storage.Group, now time.Time) string {
 }
 
 func StateAfterCutoffSetting(group storage.Group, cutoffHour int, now time.Time) (bool, string, string) {
-	if !AccountingActive(group, now) {
-		return false, "", ""
+	if AccountingActive(group, now) {
+		return true, CurrentDayKey(group, now), ExpiresDayKey(now, cutoffHour)
 	}
-	return true, CurrentDayKey(group, now), ExpiresDayKey(now, cutoffHour)
+	if !group.Active && periodCanResume(group, now) {
+		return false, group.ActiveDayKey, ExpiresDayKey(now, cutoffHour)
+	}
+	return false, "", ""
 }

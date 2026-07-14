@@ -39,6 +39,7 @@ type Bot struct {
 	broadcastPool *worker.Pool
 	queryPool     *worker.Pool
 	notifyPool    *worker.Pool
+	criticalPool  *worker.Pool
 
 	groupTouchCache       *ttlCache[string]
 	groupCache            *ttlCache[storage.Group]
@@ -52,6 +53,7 @@ type Bot struct {
 	rateBookState         rateBookState
 	privateStates         *ttlCache[privateState]
 	notificationWake      chan struct{}
+	criticalOutboxWake    chan int64
 	telegramLimiter       *telegramRateLimiter
 	sendGateway           *telegramSendGateway
 	watchRunning          atomic.Bool
@@ -61,6 +63,7 @@ type Bot struct {
 	fallbackBackoff       atomic.Int32
 	fallbackLeaderActive  atomic.Bool
 	globalPermissionEpoch atomic.Int64
+	ledgerSummaryCompare  atomic.Uint64
 	globalOperatorLookup  func(context.Context, int64) (permissions.UserCapabilities, bool, error)
 	permissionEpochLookup func(context.Context) (int64, error)
 	groupOperatorLookup   func(context.Context, int64, int64) (bool, error)
@@ -75,6 +78,10 @@ func New(cfg config.Config, store *storage.Store, tg *telegram.Client, tronClien
 	if len(fallbackStores) > 0 {
 		fallbackStore = fallbackStores[0]
 	}
+	criticalWorkers := cfg.NotifyWorkers / 2
+	if criticalWorkers < 2 {
+		criticalWorkers = 2
+	}
 	bot := &Bot{
 		cfg:                   cfg,
 		store:                 store,
@@ -86,7 +93,7 @@ func New(cfg config.Config, store *storage.Store, tg *telegram.Client, tronClien
 		watcher:               chainclient.New(cfg.ChainWatcherURL, cfg.ChainWatcherBotID, cfg.ChainWatcherSecret, cfg.RequestTimeout),
 		perms:                 permissions.NewPolicy(cfg.HostUserID, cfg.DefaultOperatorIDs),
 		loc:                   loc,
-		dispatcher:            worker.NewDispatcher(),
+		dispatcher:            worker.NewDispatcher(cfg.QueueSize),
 		ledgerPool:            worker.NewPool("ledger", cfg.LedgerWorkers, cfg.QueueSize),
 		controlPool:           worker.NewPool("control", cfg.ControlWorkers, cfg.QueueSize),
 		chainPool:             worker.NewPool("chain", cfg.ChainWorkers, cfg.QueueSize),
@@ -94,6 +101,7 @@ func New(cfg config.Config, store *storage.Store, tg *telegram.Client, tronClien
 		broadcastPool:         worker.NewPool("broadcast", cfg.BroadcastWorkers, cfg.QueueSize),
 		queryPool:             worker.NewPool("query", cfg.QueryWorkers, cfg.QueueSize),
 		notifyPool:            worker.NewPool("notify", cfg.NotifyWorkers, cfg.QueueSize),
+		criticalPool:          worker.NewPool("critical-notify", criticalWorkers, cfg.QueueSize),
 		groupTouchCache:       newTTLCache[string](cfg.GroupCacheTTL),
 		groupCache:            newTTLCache[storage.Group](cfg.GroupCacheTTL),
 		billSummaryCache:      newTTLCache[storage.BillSummaryData](cfg.BillSummaryCacheTTL),
@@ -105,6 +113,7 @@ func New(cfg config.Config, store *storage.Store, tg *telegram.Client, tronClien
 		rateBookCache:         newTTLCache[[]p2p.OrderBookEntry](cfg.P2PCacheTTL),
 		privateStates:         newTTLCache[privateState](30 * time.Minute),
 		notificationWake:      make(chan struct{}, 1),
+		criticalOutboxWake:    make(chan int64, cfg.QueueSize),
 		telegramLimiter:       newTelegramRateLimiter(),
 		watcherFallback:       newWatcherFallbackControllerWithRecovery(cfg.BotWatcherFailThreshold, cfg.BotFallbackRecoverySuccesses, cfg.BotFallbackRecoveryLag),
 	}
@@ -121,6 +130,7 @@ func (b *Bot) Run(ctx context.Context) error {
 	b.broadcastPool.StartN(ctx, b.cfg.BroadcastWorkers)
 	b.queryPool.StartN(ctx, b.cfg.QueryWorkers)
 	b.notifyPool.StartN(ctx, b.cfg.NotifyWorkers)
+	b.criticalPool.Start(ctx)
 	b.sendGateway.Start(ctx)
 
 	if b.cfg.ChainWatcherEnabled() {
@@ -133,6 +143,8 @@ func (b *Bot) Run(ctx context.Context) error {
 		go b.chainWatcherFallbackScheduler(ctx)
 	}
 	go b.notificationOutboxScheduler(ctx)
+	go b.criticalOutboxScheduler(ctx)
+	go b.ledgerSummaryReconcileScheduler(ctx)
 	go b.privateCleanupScheduler(ctx)
 	go b.rateScheduler(ctx)
 	go b.permissionInvalidationScheduler(ctx)
@@ -165,9 +177,12 @@ func (b *Bot) Run(ctx context.Context) error {
 			}
 			key, pool := b.updateRoute(update)
 			u := update
+			queuedAt := time.Now()
 			b.dispatcher.Submit(ctx, key, pool, func(jobCtx context.Context) {
 				trace := newPerfTrace(u.UpdateID, updateChatID(u))
 				traceCtx := contextWithPerfTrace(jobCtx, trace)
+				addPerfStage(traceCtx, "queue_wait", time.Since(queuedAt))
+				markPerfQueue(traceCtx, key, b.dispatcher.Depth(key))
 				if err := b.handleUpdate(traceCtx, u); err != nil {
 					log.Printf("handle update %d: %v", u.UpdateID, err)
 				}
@@ -238,6 +253,12 @@ func classifyMessageCommand(text string, chatType string) string {
 	if isOperatorListCommand(text) {
 		return "operator_list"
 	}
+	if _, ok := parseTRXAddressQuery(text); ok {
+		return "trx_query"
+	}
+	if isTRC20Address(text) {
+		return "address_validation"
+	}
 	if _, ok := parseLedger(text); ok {
 		return "ledger_record"
 	}
@@ -256,19 +277,27 @@ func (b *Bot) updateRoute(update telegram.Update) (string, worker.Executor) {
 			}
 			return "private:" + strconv.FormatInt(userID, 10), b.controlPool
 		}
-		return "chat:" + strconv.FormatInt(update.Message.Chat.ID, 10), b.ledgerPool
+		chatID := update.Message.Chat.ID
+		if b.cfg.GroupRouteMode == "split" {
+			command := classifyMessageCommand(update.Message.TextOrCaption(), update.Message.Chat.Type)
+			switch command {
+			case "other", "non_text", "calculator", "z0":
+				return fmt.Sprintf("bypass:%d:%d", chatID, update.UpdateID), b.queryPool
+			}
+		}
+		return "ledger:" + strconv.FormatInt(chatID, 10), b.ledgerPool
 	}
 	if update.CallbackQuery != nil {
 		if update.CallbackQuery.Message != nil && update.CallbackQuery.Message.Chat.Type == "private" {
 			return "private:" + strconv.FormatInt(update.CallbackQuery.From.ID, 10), b.controlPool
 		}
 		if update.CallbackQuery.Message != nil {
-			return "chat:" + strconv.FormatInt(update.CallbackQuery.Message.Chat.ID, 10), b.ledgerPool
+			return "ledger:" + strconv.FormatInt(update.CallbackQuery.Message.Chat.ID, 10), b.ledgerPool
 		}
 		return "private:" + strconv.FormatInt(update.CallbackQuery.From.ID, 10), b.controlPool
 	}
 	if update.MyChatMember != nil {
-		return "chat:" + strconv.FormatInt(update.MyChatMember.Chat.ID, 10), b.ledgerPool
+		return "ledger:" + strconv.FormatInt(update.MyChatMember.Chat.ID, 10), b.ledgerPool
 	}
 	return "update:" + strconv.FormatInt(update.UpdateID, 10), b.controlPool
 }
@@ -377,7 +406,7 @@ func (b *Bot) handleMessage(ctx context.Context, msg telegram.Message) error {
 			if err != nil {
 				return nil
 			}
-			return b.enqueueReplyText(ctx, sendPriorityNormal, "calc_result", msg.Chat.ID, msg.MessageID, strings.TrimSpace(text)+"="+formatCalculationResult(result), nil, now)
+			return b.enqueueReliableText(ctx, sendPriorityNormal, "calc_result", messageScopedDedupe("calc_result", msg.Chat.ID, msg.MessageID), msg.Chat.ID, strings.TrimSpace(text)+"="+formatCalculationResult(result), nil, reliableMessageRef{}, now)
 		}
 		return nil
 	}
@@ -599,17 +628,19 @@ func (b *Bot) invalidateGroupCache(chatID int64) {
 	}
 }
 
-func (b *Bot) getBillSummaryCached(ctx context.Context, chatID int64, dayKey string, limit int) (storage.BillSummaryData, error) {
+func (b *Bot) getBillSummaryCached(ctx context.Context, group storage.Group, dayKey string, limit int) (storage.BillSummaryData, error) {
+	chatID := group.ChatID
+	periodStart := group.ActivePeriodStartedAt
 	if b.billSummaryCache == nil {
-		return b.store.GetBillSummaryForDay(ctx, chatID, dayKey, limit)
+		return b.getBillSummaryForPeriod(ctx, chatID, dayKey, periodStart, limit)
 	}
-	key := billSummaryCacheKey(chatID, dayKey, limit)
+	key := billSummaryCacheKey(chatID, dayKey, periodStart, limit)
 	if data, ok := b.billSummaryCache.Get(key); ok {
 		markPerfCache(ctx, "bill_summary", true)
 		return data, nil
 	}
 	markPerfCache(ctx, "bill_summary", false)
-	data, err := b.store.GetBillSummaryForDay(ctx, chatID, dayKey, limit)
+	data, err := b.getBillSummaryForPeriod(ctx, chatID, dayKey, periodStart, limit)
 	if err != nil {
 		return storage.BillSummaryData{}, err
 	}
@@ -619,7 +650,7 @@ func (b *Bot) getBillSummaryCached(ctx context.Context, chatID int64, dayKey str
 
 func (b *Bot) invalidateBillSummaryCache(chatID int64, dayKey string) {
 	if b.billSummaryCache != nil {
-		b.billSummaryCache.Delete(billSummaryCacheKey(chatID, dayKey, groupBillDefaultRecordLimit))
+		b.billSummaryCache.DeletePrefix(strconv.FormatInt(chatID, 10) + ":" + dayKey + ":")
 	}
 }
 
@@ -629,8 +660,19 @@ func (b *Bot) clearBillSummaryCache() {
 	}
 }
 
-func billSummaryCacheKey(chatID int64, dayKey string, limit int) string {
-	return strconv.FormatInt(chatID, 10) + ":" + dayKey + ":" + strconv.Itoa(limit)
+func billSummaryCacheKey(chatID int64, dayKey string, periodStart time.Time, limit int) string {
+	return strconv.FormatInt(chatID, 10) + ":" + dayKey + ":" + strconv.FormatInt(periodStart.UnixNano(), 10) + ":" + strconv.Itoa(limit)
+}
+
+func (b *Bot) getBillSummaryForPeriod(ctx context.Context, chatID int64, dayKey string, periodStart time.Time, limit int) (storage.BillSummaryData, error) {
+	useSummary := b.cfg.LedgerSummaryWriteMode == "shadow" && b.cfg.LedgerSummaryReadMode == "safe"
+	compare := false
+	if useSummary && b.cfg.LedgerSummaryCompareEvery > 0 {
+		compare = b.ledgerSummaryCompare.Add(1)%uint64(b.cfg.LedgerSummaryCompareEvery) == 0
+	}
+	return b.store.GetBillSummaryForPeriod(ctx, storage.LedgerPeriodSummaryKey{
+		ChatID: chatID, DayKey: dayKey, PeriodStartedAt: periodStart,
+	}, limit, useSummary, compare, time.Now().In(b.loc))
 }
 
 func (b *Bot) canInvite(ctx context.Context, userID int64) (bool, error) {

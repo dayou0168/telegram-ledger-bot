@@ -215,6 +215,7 @@ type Record struct {
 	SourceMessageID int64
 	BotMessageID    int64
 	Remark          string
+	PeriodStartedAt time.Time
 	CreatedAt       time.Time
 	DeletedAt       *time.Time
 }
@@ -230,6 +231,21 @@ type RecordDaySummary struct {
 type BillSummaryData struct {
 	Records []Record
 	Summary RecordDaySummary
+	Source  string
+}
+
+type LedgerPeriodSummaryKey struct {
+	ChatID          int64
+	DayKey          string
+	PeriodStartedAt time.Time
+}
+
+type LedgerSummaryReconcileStats struct {
+	Scanned    int64
+	Inserted   int64
+	Corrected  int64
+	Unchanged  int64
+	LastRecord int64
 }
 
 type RecordFilter struct {

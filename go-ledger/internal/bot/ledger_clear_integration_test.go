@@ -37,7 +37,7 @@ func TestPostgresClearLedgerCallbackRechecksPermissionAndPeriod(t *testing.T) {
 			Text string `json:"text"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		answers <- strings.TrimPrefix(r.URL.Path, "/bot-test/") + ":" + body.Text
+		answers <- strings.TrimPrefix(r.URL.Path, "/bottest/") + ":" + body.Text
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true,"result":true}`))
 	}))
