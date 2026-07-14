@@ -2,7 +2,11 @@ package bot
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,7 +26,7 @@ func (b *Bot) handleClearLedgerRequest(ctx context.Context, msg telegram.Message
 	if scope != "current" {
 		return nil
 	}
-	now := time.Now().In(b.loc)
+	now := telegramUpdateNow(ctx, b.loc)
 	group, err := b.getGroupCached(ctx, msg.Chat.ID)
 	if err != nil {
 		return err
@@ -34,7 +38,7 @@ func (b *Bot) handleClearLedgerRequest(ctx context.Context, msg telegram.Message
 	if err != nil {
 		return err
 	}
-	token, err := adminauth.NewToken()
+	token, err := b.ledgerClearToken(ctx, msg.Chat.ID, user.ID)
 	if err != nil {
 		return err
 	}
@@ -58,6 +62,17 @@ func (b *Bot) handleClearLedgerRequest(ctx context.Context, msg telegram.Message
 	return b.enqueueLedgerSuccessText(ctx, sendPriorityNormal, "clear_ledger_confirm", msg.Chat.ID, msg.MessageID, title+"\n"+desc, map[string]any{
 		"reply_markup": keyboard,
 	}, time.Now().In(b.loc))
+}
+
+func (b *Bot) ledgerClearToken(ctx context.Context, chatID, userID int64) (string, error) {
+	updateID, _ := ctx.Value(telegramUpdateIDContextKey{}).(int64)
+	if updateID <= 0 {
+		return adminauth.NewToken()
+	}
+	mac := hmac.New(sha256.New, []byte(b.cfg.TelegramBotToken))
+	_, _ = mac.Write([]byte("ledger-clear:" + strconv.FormatInt(updateID, 10) + ":" +
+		strconv.FormatInt(chatID, 10) + ":" + strconv.FormatInt(userID, 10)))
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil)), nil
 }
 
 func ledgerClearCallbackData(token string) string {

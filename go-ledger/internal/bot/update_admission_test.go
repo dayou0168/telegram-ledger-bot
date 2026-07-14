@@ -141,10 +141,11 @@ func TestUpdateAdmissionBackpressureIsBoundedAndCancelable(t *testing.T) {
 	var returned atomic.Bool
 	result := make(chan bool, 1)
 	go func() {
-		result <- admission.Submit(ctx, updateAdmissionBypass, updateAdmissionJob{
+		accepted := admission.Submit(ctx, updateAdmissionBypass, updateAdmissionJob{
 			key: "backpressured", executor: pool, job: func(context.Context) {},
 		})
 		returned.Store(true)
+		result <- accepted
 	}()
 	select {
 	case <-result:

@@ -161,6 +161,47 @@ func (s *Store) softDeleteRecordWithSummaryAndOutbox(ctx context.Context, chatID
 		return Record{}, 0, false, err
 	}
 	defer rollback(ctx, tx)
+	var outboxID int64
+	if item != nil {
+		item.Kind = strings.TrimSpace(item.Kind)
+		item.DedupeKey = strings.TrimSpace(item.DedupeKey)
+		if item.Kind == "" || item.DedupeKey == "" {
+			return Record{}, 0, false, errors.New("notification kind and dedupe key are required")
+		}
+		item.ReferenceID = recordID
+		err = tx.QueryRow(ctx, `INSERT INTO notification_outbox(
+			kind,dedupe_key,chat_id,text,parse_mode,disable_preview,reply_to_message_id,
+			reply_markup_json,reference_kind,reference_id,priority,status,attempts,
+			next_attempt_at,created_at,updated_at)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'pending',0,$12,$12,$12)
+			ON CONFLICT(dedupe_key) DO NOTHING
+			RETURNING id`, item.Kind, item.DedupeKey, item.ChatID, item.Text, item.ParseMode,
+			item.DisablePreview, item.ReplyToMessageID, item.ReplyMarkupJSON,
+			item.ReferenceKind, item.ReferenceID, item.Priority, now).Scan(&outboxID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			var existingChatID, existingRecordID int64
+			var existingKind, existingReferenceKind string
+			if err := tx.QueryRow(ctx, `SELECT id,chat_id,kind,reference_kind,reference_id
+				FROM notification_outbox WHERE dedupe_key=$1`, item.DedupeKey).Scan(
+				&outboxID, &existingChatID, &existingKind, &existingReferenceKind, &existingRecordID); err != nil {
+				return Record{}, 0, false, err
+			}
+			if existingRecordID <= 0 || existingChatID != item.ChatID || existingKind != item.Kind || existingReferenceKind != item.ReferenceKind {
+				return Record{}, 0, false, errors.New("notification dedupe key belongs to a different undo receipt")
+			}
+			existing, err := scanRecord(tx.QueryRow(ctx, `SELECT `+recordSelectColumns+` FROM records WHERE id=$1`, existingRecordID))
+			if err != nil {
+				return Record{}, 0, false, err
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return Record{}, 0, false, err
+			}
+			return existing, outboxID, true, nil
+		}
+		if err != nil {
+			return Record{}, 0, false, err
+		}
+	}
 	query := `UPDATE records SET deleted_at=$1 WHERE chat_id=$2 AND id=$3 AND deleted_at IS NULL`
 	args := []any{now, chatID, recordID}
 	if kind != "" {
@@ -170,6 +211,9 @@ func (s *Store) softDeleteRecordWithSummaryAndOutbox(ctx context.Context, chatID
 	query += ` RETURNING ` + recordSelectColumns
 	record, err := scanRecord(tx.QueryRow(ctx, query, args...))
 	if errors.Is(err, pgx.ErrNoRows) {
+		if item != nil {
+			return Record{}, 0, false, errors.New("undo target changed before durable receipt was committed")
+		}
 		return Record{}, 0, false, tx.Commit(ctx)
 	}
 	if err != nil {
@@ -186,27 +230,6 @@ func (s *Store) softDeleteRecordWithSummaryAndOutbox(ctx context.Context, chatID
 			return Record{}, 0, false, err
 		}
 		if err := applyLedgerSummaryDelete(ctx, tx, record, now); err != nil {
-			return Record{}, 0, false, err
-		}
-	}
-	var outboxID int64
-	if item != nil {
-		item.Kind = strings.TrimSpace(item.Kind)
-		item.DedupeKey = strings.TrimSpace(item.DedupeKey)
-		if item.Kind == "" || item.DedupeKey == "" {
-			return Record{}, 0, false, errors.New("notification kind and dedupe key are required")
-		}
-		item.ReferenceID = record.ID
-		err = tx.QueryRow(ctx, `INSERT INTO notification_outbox(
-			kind,dedupe_key,chat_id,text,parse_mode,disable_preview,reply_to_message_id,
-			reply_markup_json,reference_kind,reference_id,priority,status,attempts,
-			next_attempt_at,created_at,updated_at)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'pending',0,$12,$12,$12)
-		ON CONFLICT(dedupe_key) DO UPDATE SET dedupe_key=excluded.dedupe_key
-		RETURNING id`, item.Kind, item.DedupeKey, item.ChatID, item.Text, item.ParseMode,
-			item.DisablePreview, item.ReplyToMessageID, item.ReplyMarkupJSON,
-			item.ReferenceKind, item.ReferenceID, item.Priority, now).Scan(&outboxID)
-		if err != nil {
 			return Record{}, 0, false, err
 		}
 	}

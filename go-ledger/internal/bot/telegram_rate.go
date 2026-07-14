@@ -6,7 +6,10 @@ import (
 	"time"
 )
 
-const telegramRateFairnessBurst = 16
+const (
+	telegramRateFairnessBurst       = 16
+	telegramRateNormalFairnessBurst = 4
+)
 
 type telegramRateWaiter struct {
 	ctx      context.Context
@@ -29,6 +32,7 @@ type telegramRateLimiter struct {
 	notify        chan struct{}
 	nextSequence  uint64
 	criticalBurst int
+	normalBurst   int
 }
 
 func newTelegramRateLimiter() *telegramRateLimiter {
@@ -72,6 +76,11 @@ func (l *telegramRateLimiter) Wait(ctx context.Context, priority sendPriority, c
 				l.criticalBurst++
 			} else {
 				l.criticalBurst = 0
+			}
+			if waiter.priority == sendPriorityNormal {
+				l.normalBurst++
+			} else if waiter.priority == sendPriorityBulk {
+				l.normalBurst = 0
 			}
 			l.signalLocked()
 			l.mu.Unlock()
@@ -140,17 +149,14 @@ func (l *telegramRateLimiter) selectWaiterLocked(now time.Time) (*telegramRateWa
 
 func (l *telegramRateLimiter) selectEligibleLocked(waiters []*telegramRateWaiter) *telegramRateWaiter {
 	if l.criticalBurst >= telegramRateFairnessBurst {
-		var fair *telegramRateWaiter
-		for _, waiter := range waiters {
-			if waiter.priority == sendPriorityCritical {
-				continue
-			}
-			if fair == nil || waiter.sequence < fair.sequence {
-				fair = waiter
-			}
-		}
+		fair := l.selectNonCriticalLocked(waiters)
 		if fair != nil {
 			return fair
+		}
+	}
+	if l.normalBurst >= telegramRateNormalFairnessBurst {
+		if bulk := oldestRateWaiter(waiters, sendPriorityBulk); bulk != nil {
+			return bulk
 		}
 	}
 	selected := waiters[0]
@@ -160,6 +166,31 @@ func (l *telegramRateLimiter) selectEligibleLocked(waiters []*telegramRateWaiter
 		}
 	}
 	return selected
+}
+
+func (l *telegramRateLimiter) selectNonCriticalLocked(waiters []*telegramRateWaiter) *telegramRateWaiter {
+	if l.normalBurst >= telegramRateNormalFairnessBurst {
+		if bulk := oldestRateWaiter(waiters, sendPriorityBulk); bulk != nil {
+			return bulk
+		}
+	}
+	if normal := oldestRateWaiter(waiters, sendPriorityNormal); normal != nil {
+		return normal
+	}
+	return oldestRateWaiter(waiters, sendPriorityBulk)
+}
+
+func oldestRateWaiter(waiters []*telegramRateWaiter, priority sendPriority) *telegramRateWaiter {
+	var oldest *telegramRateWaiter
+	for _, waiter := range waiters {
+		if waiter.priority != priority {
+			continue
+		}
+		if oldest == nil || waiter.sequence < oldest.sequence {
+			oldest = waiter
+		}
+	}
+	return oldest
 }
 
 func rateWaiterBefore(left, right *telegramRateWaiter) bool {

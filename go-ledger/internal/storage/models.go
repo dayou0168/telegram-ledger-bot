@@ -161,6 +161,34 @@ type BroadcastDelivery struct {
 	ReplacedAt      *time.Time
 }
 
+type TelegramInboxUpdate struct {
+	StreamKey     string
+	UpdateID      int64
+	Payload       []byte
+	Lane          string
+	RouteKey      string
+	Status        string
+	Attempts      int
+	NextAttemptAt time.Time
+	LeaseOwner    string
+	LeaseUntil    *time.Time
+	LastError     string
+	LeaseReclaims int
+	HandledAt     *time.Time
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+	DoneAt        *time.Time
+}
+
+type TelegramInboxStats struct {
+	Pending       int64         `json:"pending"`
+	Processing    int64         `json:"processing"`
+	Retry         int64         `json:"retry"`
+	Dead          int64         `json:"dead"`
+	OldestAge     time.Duration `json:"oldest_age"`
+	LeaseReclaims int64         `json:"lease_reclaims"`
+}
+
 type BroadcastReplaceSetting struct {
 	Enabled   bool
 	Text      string

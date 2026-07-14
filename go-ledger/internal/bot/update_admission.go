@@ -2,14 +2,30 @@ package bot
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/telegram"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/worker"
 )
+
+const (
+	telegramInboxClaimLimit  = 32
+	telegramInboxMaxAttempts = 8
+	telegramInboxLease       = 2 * time.Minute
+	telegramInboxDoneKeep    = 72 * time.Hour
+)
+
+type durableTelegramPayload struct {
+	Version      int             `json:"version"`
+	Update       telegram.Update `json:"update"`
+	PrivateState *privateState   `json:"private_state,omitempty"`
+}
 
 type updateAdmissionLane int
 
@@ -187,47 +203,156 @@ func (a *updateAdmission) signal(ch chan struct{}) {
 	}
 }
 
-func (b *Bot) admitUpdateBatch(ctx context.Context, updates []telegram.Update, offset *int64) bool {
-	if len(updates) == 0 {
-		return true
-	}
-	startOffset := *offset
-	nextOffset := startOffset
-	for _, lane := range []updateAdmissionLane{updateAdmissionLedger, updateAdmissionBypass} {
-		for _, update := range updates {
-			if update.UpdateID < startOffset {
-				continue
-			}
-			key, pool := b.updateRoute(update)
-			updateLane := updateAdmissionLedger
-			if pool == b.queryPool {
-				updateLane = updateAdmissionBypass
-			}
-			if updateLane != lane {
-				continue
-			}
-			u := update
-			queuedAt := time.Now()
-			item := updateAdmissionJob{
-				key:      key,
-				executor: pool,
-				job: func(jobCtx context.Context) {
-					b.handleAdmittedUpdate(jobCtx, u, key, updateLane, queuedAt)
-				},
-			}
-			if !b.updateAdmission.Submit(ctx, updateLane, item) {
-				return false
-			}
-			if update.UpdateID >= nextOffset {
-				nextOffset = update.UpdateID + 1
+func (b *Bot) persistTelegramUpdateBatch(ctx context.Context, updates []telegram.Update) (int64, error) {
+	now := time.Now().In(b.loc)
+	items := make([]storage.TelegramInboxUpdate, 0, len(updates))
+	for _, update := range updates {
+		durable := durableTelegramPayload{Version: 1, Update: update}
+		if userID := telegramUpdatePrivateUserID(update); userID > 0 {
+			if state, ok := b.privateStates.Get(formatID(userID)); ok {
+				stateCopy := state
+				durable.PrivateState = &stateCopy
 			}
 		}
+		payload, err := json.Marshal(durable)
+		if err != nil {
+			return 0, fmt.Errorf("marshal update %d: %w", update.UpdateID, err)
+		}
+		key, pool := b.updateRoute(update)
+		lane := "ledger"
+		if pool == b.queryPool {
+			lane = "bypass"
+		}
+		items = append(items, storage.TelegramInboxUpdate{
+			UpdateID: update.UpdateID,
+			Payload:  payload,
+			Lane:     lane,
+			RouteKey: key,
+		})
 	}
-	*offset = nextOffset
-	return true
+	return b.store.PersistTelegramUpdateBatch(ctx, b.telegramInboxStreamKey(), items, now)
 }
 
-func (b *Bot) handleAdmittedUpdate(ctx context.Context, update telegram.Update, key string, lane updateAdmissionLane, queuedAt time.Time) {
+func (b *Bot) startTelegramInbox(ctx context.Context) {
+	owner := fmt.Sprintf("%s:%d", b.telegramInboxStreamKey(), time.Now().UnixNano())
+	go b.runTelegramInboxLane(ctx, "ledger", owner, b.telegramLedgerWake)
+	go b.runTelegramInboxLane(ctx, "bypass", owner, b.telegramBypassWake)
+	go b.telegramInboxMaintenance(ctx)
+}
+
+func (b *Bot) wakeTelegramInbox() {
+	for _, wake := range []chan struct{}{b.telegramLedgerWake, b.telegramBypassWake} {
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (b *Bot) runTelegramInboxLane(ctx context.Context, lane, owner string, wake <-chan struct{}) {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for ctx.Err() == nil {
+		claimed, err := b.store.ClaimTelegramUpdates(ctx, b.telegramInboxStreamKey(), lane, owner,
+			telegramInboxClaimLimit, telegramInboxMaxAttempts, telegramInboxLease, time.Now().In(b.loc))
+		if err != nil {
+			if ctx.Err() == nil {
+				log.Printf("claim telegram inbox lane=%s: %v", lane, err)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+			}
+			continue
+		}
+		queueStops := make([]chan struct{}, len(claimed))
+		for index, item := range claimed {
+			queueStops[index] = make(chan struct{})
+			go b.renewTelegramInboxLease(ctx, item, owner, queueStops[index])
+		}
+		for index, item := range claimed {
+			if !b.submitTelegramInboxItem(ctx, item, owner, queueStops[index]) {
+				close(queueStops[index])
+				for remaining := index + 1; remaining < len(queueStops); remaining++ {
+					close(queueStops[remaining])
+				}
+				return
+			}
+		}
+		if len(claimed) == telegramInboxClaimLimit {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-wake:
+		case <-ticker.C:
+		}
+	}
+}
+
+func (b *Bot) submitTelegramInboxItem(ctx context.Context, item storage.TelegramInboxUpdate, owner string, queueStop chan struct{}) bool {
+	var durable durableTelegramPayload
+	if err := json.Unmarshal(item.Payload, &durable); err != nil {
+		_, retryErr := b.store.RetryTelegramUpdate(ctx, item.StreamKey, item.UpdateID, owner,
+			telegramInboxMaxAttempts, time.Now().In(b.loc), time.Now().In(b.loc), fmt.Errorf("decode inbox payload: %w", err))
+		if retryErr != nil {
+			log.Printf("dead-letter malformed telegram update %d: %v", item.UpdateID, retryErr)
+		}
+		close(queueStop)
+		return true
+	}
+	update := durable.Update
+	if durable.Version == 0 {
+		if err := json.Unmarshal(item.Payload, &update); err != nil {
+			_, _ = b.store.RetryTelegramUpdate(ctx, item.StreamKey, item.UpdateID, owner,
+				telegramInboxMaxAttempts, time.Now().In(b.loc), time.Now().In(b.loc), fmt.Errorf("decode legacy inbox payload: %w", err))
+			close(queueStop)
+			return true
+		}
+	}
+	lane := updateAdmissionLedger
+	executor := worker.Executor(b.ledgerPool)
+	if item.Lane == "bypass" {
+		lane = updateAdmissionBypass
+		executor = b.queryPool
+	} else if len(item.RouteKey) >= len("private:") && item.RouteKey[:len("private:")] == "private:" {
+		executor = b.controlPool
+	} else if len(item.RouteKey) >= len("update:") && item.RouteKey[:len("update:")] == "update:" {
+		executor = b.controlPool
+	}
+	queuedAt := time.Now()
+	return b.updateAdmission.Submit(ctx, lane, updateAdmissionJob{
+		key:      item.RouteKey,
+		executor: executor,
+		job: func(jobCtx context.Context) {
+			close(queueStop)
+			b.handleAdmittedUpdateWithState(jobCtx, item, update, durable.PrivateState, owner, lane, queuedAt)
+		},
+	})
+}
+
+func telegramUpdatePrivateUserID(update telegram.Update) int64 {
+	if update.Message != nil && update.Message.Chat.Type == "private" && update.Message.From != nil {
+		return update.Message.From.ID
+	}
+	if update.CallbackQuery != nil && (update.CallbackQuery.Message == nil || update.CallbackQuery.Message.Chat.Type == "private") {
+		return update.CallbackQuery.From.ID
+	}
+	return 0
+}
+
+func (b *Bot) handleAdmittedUpdateWithState(ctx context.Context, item storage.TelegramInboxUpdate, update telegram.Update, state *privateState, owner string, lane updateAdmissionLane, queuedAt time.Time) {
+	if state != nil {
+		if userID := telegramUpdatePrivateUserID(update); userID > 0 {
+			b.privateStates.Set(formatID(userID), *state)
+		}
+	}
+	b.handleAdmittedUpdate(ctx, item, update, owner, lane, queuedAt)
+}
+
+func (b *Bot) handleAdmittedUpdate(ctx context.Context, item storage.TelegramInboxUpdate, update telegram.Update, owner string, lane updateAdmissionLane, queuedAt time.Time) {
 	trace := newPerfTrace(update.UpdateID, updateChatID(update))
 	traceCtx := contextWithPerfTrace(ctx, trace)
 	addPerfStage(traceCtx, "queue_wait", time.Since(queuedAt))
@@ -235,30 +360,136 @@ func (b *Bot) handleAdmittedUpdate(ctx context.Context, update telegram.Update, 
 	if lane == updateAdmissionBypass {
 		dispatcher = b.updateAdmission.bypass
 	}
-	markPerfQueue(traceCtx, key, dispatcher.Depth(key))
+	markPerfQueue(traceCtx, item.RouteKey, dispatcher.Depth(item.RouteKey))
 
-	for attempt := 1; ; attempt++ {
-		done := measurePerfStage(traceCtx, "db_claim_update")
-		claimed, err := b.store.ClaimUpdate(traceCtx, update.UpdateID, time.Now().In(b.loc))
-		done()
-		if err == nil {
-			if claimed {
-				if err := b.handleUpdate(traceCtx, update); err != nil {
-					log.Printf("handle update %d: %v", update.UpdateID, err)
-				}
+	if item.HandledAt == nil {
+		stopRenew := make(chan struct{})
+		go b.renewTelegramInboxLease(traceCtx, item, owner, stopRenew)
+		handleCtx := context.WithValue(traceCtx, telegramUpdateReceivedAtContextKey{}, item.CreatedAt.In(b.loc))
+		handleErr := func() error {
+			defer close(stopRenew)
+			return b.executeUpdate(handleCtx, update)
+		}()
+		if handleErr != nil {
+			retryAt := time.Now().In(b.loc).Add(telegramInboxRetryDelay(item.Attempts))
+			status, retryErr := b.store.RetryTelegramUpdate(traceCtx, item.StreamKey, item.UpdateID, owner,
+				telegramInboxMaxAttempts, retryAt, time.Now().In(b.loc), handleErr)
+			if retryErr != nil {
+				log.Printf("retry telegram update %d after handler error %v: %v", item.UpdateID, handleErr, retryErr)
+			} else {
+				log.Printf("telegram update %d handler failed status=%s attempt=%d: %v", item.UpdateID, status, item.Attempts, handleErr)
 			}
 			finishPerfTrace(trace, b.cfg.SlowUpdateThreshold)
 			return
 		}
-		if attempt == 1 || attempt%10 == 0 {
-			log.Printf("claim update %d attempt %d: %v", update.UpdateID, attempt, err)
+		if !b.persistTelegramHandled(traceCtx, item, owner) {
+			finishPerfTrace(trace, b.cfg.SlowUpdateThreshold)
+			return
 		}
-		timer := time.NewTimer(100 * time.Millisecond)
+	}
+	b.persistTelegramDone(traceCtx, item, owner)
+	finishPerfTrace(trace, b.cfg.SlowUpdateThreshold)
+}
+
+func (b *Bot) renewTelegramInboxLease(ctx context.Context, item storage.TelegramInboxUpdate, owner string, stop <-chan struct{}) {
+	ticker := time.NewTicker(telegramInboxLease / 3)
+	defer ticker.Stop()
+	for {
 		select {
 		case <-ctx.Done():
-			timer.Stop()
 			return
-		case <-timer.C:
+		case <-stop:
+			return
+		case now := <-ticker.C:
+			ok, err := b.store.RenewTelegramUpdateLease(ctx, item.StreamKey, item.UpdateID, owner, telegramInboxLease, now.In(b.loc))
+			if err != nil {
+				log.Printf("renew telegram update %d lease: %v", item.UpdateID, err)
+			} else if !ok {
+				return
+			}
+		}
+	}
+}
+
+func (b *Bot) persistTelegramHandled(ctx context.Context, item storage.TelegramInboxUpdate, owner string) bool {
+	for attempt := 1; ctx.Err() == nil; attempt++ {
+		ok, err := b.store.MarkTelegramUpdateHandled(ctx, item.StreamKey, item.UpdateID, owner, time.Now().In(b.loc))
+		if err == nil {
+			return ok
+		}
+		if attempt == 1 || attempt%10 == 0 {
+			log.Printf("mark telegram update %d handled attempt=%d: %v", item.UpdateID, attempt, err)
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	return false
+}
+
+func (b *Bot) persistTelegramDone(ctx context.Context, item storage.TelegramInboxUpdate, owner string) {
+	for attempt := 1; ctx.Err() == nil; attempt++ {
+		ok, err := b.store.CompleteTelegramUpdate(ctx, item.StreamKey, item.UpdateID, owner, time.Now().In(b.loc))
+		if err == nil {
+			if !ok {
+				log.Printf("telegram update %d completion lost lease", item.UpdateID)
+			}
+			return
+		}
+		if attempt == 1 || attempt%10 == 0 {
+			log.Printf("complete telegram update %d attempt=%d: %v", item.UpdateID, attempt, err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+func telegramInboxRetryDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	if attempt > 8 {
+		attempt = 8
+	}
+	delay := 250 * time.Millisecond * time.Duration(1<<uint(attempt-1))
+	if delay > 30*time.Second {
+		return 30 * time.Second
+	}
+	return delay
+}
+
+func (b *Bot) telegramInboxMaintenance(ctx context.Context) {
+	statsTicker := time.NewTicker(5 * time.Second)
+	cleanupTicker := time.NewTicker(time.Hour)
+	defer statsTicker.Stop()
+	defer cleanupTicker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-statsTicker.C:
+			stats, err := b.store.TelegramInboxStats(ctx, b.telegramInboxStreamKey(), time.Now().In(b.loc))
+			if err != nil {
+				log.Printf("telegram inbox stats: %v", err)
+			} else {
+				b.telegramInboxStats.Store(stats)
+			}
+		case now := <-cleanupTicker.C:
+			for {
+				removed, err := b.store.CleanupDoneTelegramUpdates(ctx, b.telegramInboxStreamKey(), now.Add(-telegramInboxDoneKeep), 2000)
+				if err != nil {
+					log.Printf("cleanup telegram inbox: %v", err)
+					break
+				}
+				if removed < 2000 {
+					break
+				}
+			}
 		}
 	}
 }
@@ -267,5 +498,8 @@ func (b *Bot) UpdateAdmissionStats() any {
 	if b == nil || b.updateAdmission == nil {
 		return nil
 	}
-	return b.updateAdmission.Stats()
+	return struct {
+		Memory UpdateAdmissionStats `json:"memory"`
+		Inbox  any                  `json:"inbox,omitempty"`
+	}{Memory: b.updateAdmission.Stats(), Inbox: b.telegramInboxStats.Load()}
 }

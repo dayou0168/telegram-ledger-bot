@@ -22,7 +22,7 @@ type Store struct {
 	keyCipher    *keyCipher
 }
 
-const latestSchemaMigrationVersion = "2.4.12-update-admission-priority"
+const latestSchemaMigrationVersion = "2.4.13-telegram-durable-inbox"
 
 const (
 	PermissionScopeGlobalOperator = "global_operator"
@@ -157,6 +157,44 @@ func (s *Store) migrate(ctx context.Context) error {
 			update_id BIGINT PRIMARY KEY,
 			processed_at TIMESTAMPTZ NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS telegram_poll_state (
+			stream_key TEXT PRIMARY KEY,
+			next_offset BIGINT NOT NULL DEFAULT 0,
+			updated_at TIMESTAMPTZ NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS telegram_update_inbox (
+			stream_key TEXT NOT NULL,
+			update_id BIGINT NOT NULL,
+			payload JSONB NOT NULL,
+			lane TEXT NOT NULL,
+			route_key TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'pending',
+			attempts INTEGER NOT NULL DEFAULT 0,
+			next_attempt_at TIMESTAMPTZ NOT NULL,
+			lease_owner TEXT NOT NULL DEFAULT '',
+			lease_until TIMESTAMPTZ,
+			last_error TEXT NOT NULL DEFAULT '',
+			lease_reclaims INTEGER NOT NULL DEFAULT 0,
+			handled_at TIMESTAMPTZ,
+			created_at TIMESTAMPTZ NOT NULL,
+			updated_at TIMESTAMPTZ NOT NULL,
+			done_at TIMESTAMPTZ,
+			PRIMARY KEY(stream_key, update_id),
+			CHECK(lane IN ('ledger', 'bypass')),
+			CHECK(status IN ('pending', 'processing', 'retry', 'done', 'dead'))
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_telegram_inbox_due
+			ON telegram_update_inbox(stream_key, lane, next_attempt_at, update_id)
+			WHERE status IN ('pending', 'retry', 'processing')`,
+		`CREATE INDEX IF NOT EXISTS idx_telegram_inbox_route_open
+			ON telegram_update_inbox(stream_key, lane, route_key, update_id)
+			WHERE status NOT IN ('done', 'dead')`,
+		`CREATE INDEX IF NOT EXISTS idx_telegram_inbox_lease
+			ON telegram_update_inbox(lease_until)
+			WHERE status='processing'`,
+		`CREATE INDEX IF NOT EXISTS idx_telegram_inbox_done_cleanup
+			ON telegram_update_inbox(done_at, stream_key, update_id)
+			WHERE status='done'`,
 		`CREATE TABLE IF NOT EXISTS groups (
 			chat_id BIGINT PRIMARY KEY,
 			title TEXT NOT NULL DEFAULT '',
@@ -839,6 +877,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			ON broadcast_deliveries(target_chat_id, target_message_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_broadcast_deliveries_operator_created
 			ON broadcast_deliveries(operator_user_id, created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_broadcast_deliveries_source_target
+			ON broadcast_deliveries(source_chat_id, source_message_id, target_chat_id, id DESC)`,
 		`CREATE TABLE IF NOT EXISTS broadcast_replace_settings (
 			id INTEGER PRIMARY KEY DEFAULT 1,
 			enabled BOOLEAN NOT NULL DEFAULT FALSE,
@@ -3039,7 +3079,8 @@ func (s *Store) CreateLedgerClearTicket(ctx context.Context, ticket LedgerClearT
 	_, err := s.pool.Exec(ctx, `INSERT INTO ledger_clear_tickets(
 			token_hash, chat_id, requested_by_user_id, day_key, active_period_started_at,
 			expires_at, created_at
-		) VALUES($1,$2,$3,$4,$5,$6,$7)`,
+		) VALUES($1,$2,$3,$4,$5,$6,$7)
+		ON CONFLICT(token_hash) DO NOTHING`,
 		ticket.TokenHash, ticket.ChatID, ticket.RequestedByUserID, ticket.DayKey,
 		ticket.ActivePeriodStartedAt, ticket.ExpiresAt, ticket.CreatedAt)
 	return err
@@ -4306,6 +4347,15 @@ func (s *Store) FindBroadcastDeliveryByTarget(ctx context.Context, chatID, messa
 		target_chat_id, target_title, target_message_id, mode, target_name, created_at, replaced_at
 		FROM broadcast_deliveries
 		WHERE target_chat_id=$1 AND target_message_id=$2`, chatID, messageID)
+	return scanBroadcastDelivery(row)
+}
+
+func (s *Store) FindBroadcastDeliveryBySourceTarget(ctx context.Context, sourceChatID, sourceMessageID, targetChatID int64) (BroadcastDelivery, bool, error) {
+	row := s.pool.QueryRow(ctx, `SELECT id, operator_user_id, source_chat_id, source_message_id,
+		target_chat_id, target_title, target_message_id, mode, target_name, created_at, replaced_at
+		FROM broadcast_deliveries
+		WHERE source_chat_id=$1 AND source_message_id=$2 AND target_chat_id=$3
+		ORDER BY id DESC LIMIT 1`, sourceChatID, sourceMessageID, targetChatID)
 	return scanBroadcastDelivery(row)
 }
 

@@ -404,6 +404,63 @@ func TestTelegramRateLimiterFairnessAfterCriticalBurst(t *testing.T) {
 	}
 }
 
+func TestTelegramRateLimiterSustainedMixMakesEveryLaneProgress(t *testing.T) {
+	limiter := newTelegramRateLimiter()
+	limiter.globalInterval = 0
+	limiter.chatInterval = 0
+	limiter.bulkInterval = 0
+	sequence := uint64(0)
+	add := func(priority sendPriority, count int, chatBase int64) {
+		for i := 0; i < count; i++ {
+			sequence++
+			limiter.waiters = append(limiter.waiters, &telegramRateWaiter{
+				ctx: context.Background(), priority: priority, chatID: chatBase + int64(i), sequence: sequence,
+			})
+		}
+	}
+	add(sendPriorityCritical, 64, 1000)
+	add(sendPriorityNormal, 16, 2000)
+	add(sendPriorityBulk, 16, 3000)
+
+	seen := map[sendPriority]int{}
+	firstNormal := -1
+	firstBulk := -1
+	for slot := 0; len(limiter.waiters) > 0; slot++ {
+		selected, readyAt := limiter.selectWaiterLocked(time.Now())
+		if selected == nil || readyAt.After(time.Now().Add(time.Millisecond)) {
+			t.Fatalf("slot %d selected=%v ready_at=%v", slot, selected, readyAt)
+		}
+		seen[selected.priority]++
+		if selected.priority == sendPriorityNormal && firstNormal < 0 {
+			firstNormal = slot
+		}
+		if selected.priority == sendPriorityBulk && firstBulk < 0 {
+			firstBulk = slot
+		}
+		limiter.removeWaiterLocked(selected)
+		if selected.priority == sendPriorityCritical {
+			limiter.criticalBurst++
+		} else {
+			limiter.criticalBurst = 0
+		}
+		if selected.priority == sendPriorityNormal {
+			limiter.normalBurst++
+		} else if selected.priority == sendPriorityBulk {
+			limiter.normalBurst = 0
+		}
+	}
+	if firstNormal > telegramRateFairnessBurst || firstNormal < 0 {
+		t.Fatalf("normal first slot = %d, bound=%d", firstNormal, telegramRateFairnessBurst)
+	}
+	if firstBulk < 0 || seen[sendPriorityBulk] != 16 || seen[sendPriorityNormal] != 16 || seen[sendPriorityCritical] != 64 {
+		t.Fatalf("sustained limiter progress=%v first_bulk=%d", seen, firstBulk)
+	}
+	bulkBound := (telegramRateFairnessBurst + 1) * (telegramRateNormalFairnessBurst + 1)
+	if firstBulk > bulkBound {
+		t.Fatalf("bulk first slot=%d bound=%d", firstBulk, bulkBound)
+	}
+}
+
 func waitForLimiterWaiters(t *testing.T, limiter *telegramRateLimiter, priority sendPriority, count int) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)

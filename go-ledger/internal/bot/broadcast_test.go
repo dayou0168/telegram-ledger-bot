@@ -155,12 +155,12 @@ func TestBroadcastQueueFullRunsFailureFallback(t *testing.T) {
 	for pool.Submit(func(context.Context) {}) {
 	}
 	called := false
-	err := submitBroadcastJob(pool, func(context.Context) {}, func() error {
+	submitted, err := submitBroadcastJob(pool, func(context.Context) {}, func() error {
 		called = true
 		return nil
 	})
-	if err != nil || !called {
-		t.Fatalf("queue-full fallback called=%t err=%v", called, err)
+	if err != nil || submitted || !called {
+		t.Fatalf("queue-full submitted=%t fallback called=%t err=%v", submitted, called, err)
 	}
 }
 

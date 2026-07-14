@@ -2,6 +2,8 @@ package bot
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"strconv"
@@ -55,6 +57,8 @@ type Bot struct {
 	privateStates         *ttlCache[privateState]
 	notificationWake      chan struct{}
 	criticalOutboxWake    chan int64
+	telegramLedgerWake    chan struct{}
+	telegramBypassWake    chan struct{}
 	telegramLimiter       *telegramRateLimiter
 	sendGateway           *telegramSendGateway
 	watchRunning          atomic.Bool
@@ -64,10 +68,19 @@ type Bot struct {
 	fallbackBackoff       atomic.Int32
 	fallbackLeaderActive  atomic.Bool
 	globalPermissionEpoch atomic.Int64
+	telegramInboxStats    atomic.Value
 	ledgerSummaryCompare  atomic.Uint64
 	globalOperatorLookup  func(context.Context, int64) (permissions.UserCapabilities, bool, error)
 	permissionEpochLookup func(context.Context) (int64, error)
 	groupOperatorLookup   func(context.Context, int64, int64) (bool, error)
+	updateHandler         func(context.Context, telegram.Update) error
+}
+
+func (b *Bot) executeUpdate(ctx context.Context, update telegram.Update) error {
+	if b.updateHandler != nil {
+		return b.updateHandler(ctx, update)
+	}
+	return b.handleUpdate(ctx, update)
 }
 
 func New(cfg config.Config, store *storage.Store, tg *telegram.Client, tronClient *tron.Client, p2pClient *p2p.Client, fallbackStores ...*storage.Store) *Bot {
@@ -116,6 +129,8 @@ func New(cfg config.Config, store *storage.Store, tg *telegram.Client, tronClien
 		privateStates:         newTTLCache[privateState](30 * time.Minute),
 		notificationWake:      make(chan struct{}, 1),
 		criticalOutboxWake:    make(chan int64, cfg.QueueSize),
+		telegramLedgerWake:    make(chan struct{}, 1),
+		telegramBypassWake:    make(chan struct{}, 1),
 		telegramLimiter:       newTelegramRateLimiter(),
 		watcherFallback:       newWatcherFallbackControllerWithRecovery(cfg.BotWatcherFailThreshold, cfg.BotFallbackRecoverySuccesses, cfg.BotFallbackRecoveryLag),
 	}
@@ -151,8 +166,12 @@ func (b *Bot) Run(ctx context.Context) error {
 	go b.privateCleanupScheduler(ctx)
 	go b.rateScheduler(ctx)
 	go b.permissionInvalidationScheduler(ctx)
+	b.startTelegramInbox(ctx)
 
-	var offset int64
+	offset, err := b.store.GetTelegramPollOffset(ctx, b.telegramInboxStreamKey())
+	if err != nil {
+		return fmt.Errorf("load telegram poll offset: %w", err)
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -165,13 +184,25 @@ func (b *Bot) Run(ctx context.Context) error {
 			time.Sleep(time.Second)
 			continue
 		}
-		if !b.admitUpdateBatch(ctx, updates, &offset) {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			return fmt.Errorf("update admission stopped")
+		if len(updates) == 0 {
+			continue
 		}
+		offset, err = b.persistTelegramUpdateBatch(ctx, updates)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			log.Printf("persist telegram update batch: %v", err)
+			time.Sleep(time.Second)
+			continue
+		}
+		b.wakeTelegramInbox()
 	}
+}
+
+func (b *Bot) telegramInboxStreamKey() string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(b.cfg.TelegramBotToken)))
+	return "bot:" + hex.EncodeToString(sum[:16])
 }
 
 func updateChatID(update telegram.Update) int64 {
@@ -304,7 +335,7 @@ func (b *Bot) handleMessage(ctx context.Context, msg telegram.Message) error {
 		return nil
 	}
 	user := userFromTelegram(*msg.From)
-	now := time.Now().In(b.loc)
+	now := telegramUpdateNow(ctx, b.loc)
 	text := strings.TrimSpace(msg.TextOrCaption())
 	doneParse := measurePerfStage(ctx, "command_parse")
 	command := classifyMessageCommand(text, msg.Chat.Type)
@@ -487,7 +518,7 @@ func (b *Bot) handleCallback(ctx context.Context, cb telegram.CallbackQuery) err
 }
 
 func (b *Bot) handleMyChatMember(ctx context.Context, upd telegram.ChatMemberUpd) error {
-	now := time.Now().In(b.loc)
+	now := telegramUpdateNow(ctx, b.loc)
 	if upd.Chat.Type != "group" && upd.Chat.Type != "supergroup" {
 		return nil
 	}
@@ -600,6 +631,14 @@ func (b *Bot) touchUserCached(ctx context.Context, chatID int64, user storage.Us
 }
 
 type telegramUpdateIDContextKey struct{}
+type telegramUpdateReceivedAtContextKey struct{}
+
+func telegramUpdateNow(ctx context.Context, loc *time.Location) time.Time {
+	if value, ok := ctx.Value(telegramUpdateReceivedAtContextKey{}).(time.Time); ok && !value.IsZero() {
+		return value.In(loc)
+	}
+	return time.Now().In(loc)
+}
 
 func (b *Bot) getGroupCached(ctx context.Context, chatID int64) (storage.Group, error) {
 	key := strconv.FormatInt(chatID, 10)

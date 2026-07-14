@@ -414,6 +414,7 @@ func (b *Bot) handleBroadcastMaterial(ctx context.Context, msg telegram.Message,
 	if err != nil {
 		return err
 	}
+	jobDone := make(chan error, 1)
 	job := func(jobCtx context.Context) {
 		success, failed := b.copyBroadcast(jobCtx, operatorID, sourceChatID, sourceMessageID, targets, mode, targetName, notifyAll)
 		text := formatBroadcastResultText(mode, success, failed, notifyAll)
@@ -422,10 +423,13 @@ func (b *Bot) handleBroadcastMaterial(ctx context.Context, msg telegram.Message,
 			b.deleteMessageBestEffort(jobCtx, sourceChatID, status.MessageID)
 			if err := b.enqueueReliableText(jobCtx, sendPriorityLow, "broadcast_result", fmt.Sprintf("broadcast_result:%d:%d", sourceChatID, sourceMessageID), sourceChatID, text, map[string]any{"reply_markup": sessionKeyboard}, reliableMessageRef{}, time.Now().In(b.loc)); err != nil {
 				log.Printf("enqueue broadcast result fallback: %v", err)
+				jobDone <- err
+				return
 			}
 		}
+		jobDone <- nil
 	}
-	return submitBroadcastJob(b.broadcastPool, job, func() error {
+	submitted, err := submitBroadcastJob(b.broadcastPool, job, func() error {
 		text := "发送失败：广播队列繁忙，请稍后重试。"
 		if _, err := b.editText(ctx, sourceChatID, status.MessageID, text, nil); err != nil {
 			b.deleteMessageBestEffort(ctx, sourceChatID, status.MessageID)
@@ -433,16 +437,28 @@ func (b *Bot) handleBroadcastMaterial(ctx context.Context, msg telegram.Message,
 		}
 		return nil
 	})
-}
-
-func submitBroadcastJob(pool *worker.Pool, job worker.Job, onFull func() error) error {
-	if pool != nil && pool.Submit(job) {
+	if err != nil {
+		return err
+	}
+	if !submitted {
 		return nil
 	}
-	if onFull != nil {
-		return onFull()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-jobDone:
+		return err
 	}
-	return nil
+}
+
+func submitBroadcastJob(pool *worker.Pool, job worker.Job, onFull func() error) (bool, error) {
+	if pool != nil && pool.Submit(job) {
+		return true, nil
+	}
+	if onFull != nil {
+		return false, onFull()
+	}
+	return false, nil
 }
 
 func (b *Bot) currentBroadcastTargets(ctx context.Context, userID int64, state privateState) ([]storage.Group, error) {
@@ -492,6 +508,14 @@ func (b *Bot) copyBroadcast(ctx context.Context, operatorID, fromChatID, message
 	failed := 0
 	now := time.Now().In(b.loc)
 	for _, target := range targets {
+		if _, delivered, err := b.store.FindBroadcastDeliveryBySourceTarget(ctx, fromChatID, messageID, target.ChatID); err != nil {
+			failed++
+			log.Printf("check replayed broadcast delivery to %d: %v", target.ChatID, err)
+			continue
+		} else if delivered {
+			success++
+			continue
+		}
 		targetMsg, err := b.copyMessageWithPriority(ctx, sendPriorityBulk, target.ChatID, fromChatID, messageID, nil)
 		if err != nil {
 			failed++
