@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# v2.4.6 production rollout helper. The default action is read-only preflight.
+# v2.4.7 production rollout helper. The default action is read-only preflight.
 # Secrets and DSNs are read from existing runtime configuration or environment;
 # never put them in this file or pass them as positional command arguments.
 
@@ -71,6 +71,13 @@ admin_token() {
   read_env_value CHAIN_WATCHER_ADMIN_TOKEN "$WATCHER_ENV_FILE"
 }
 
+watcher_source_ready() {
+  local token="$1" status
+  status="$(curl -fsS --max-time 5 -H "Authorization: Bearer $token" "$WATCHER_URL/status")" || return 1
+  grep -Eq '"source_ready"[[:space:]]*:[[:space:]]*true' <<<"$status" \
+    && grep -Eq '"continuity_ready"[[:space:]]*:[[:space:]]*(true|false)' <<<"$status"
+}
+
 preflight() {
   for cmd in docker systemctl curl sha256sum awk grep stat; do need "$cmd"; done
   discover_pg_tools
@@ -89,11 +96,10 @@ preflight() {
   printf 'watcher_env_mode='; stat -c '%a %U:%G' "$WATCHER_ENV_FILE"
 
   curl -fsS --max-time 5 "$WATCHER_URL/healthz" >/dev/null || die "watcher healthz failed"
-  curl -fsS --max-time 5 "$WATCHER_URL/readyz" >/dev/null || die "watcher readyz failed"
   local token
   token="$(admin_token)"
   [[ -n "$token" ]] || die "CHAIN_WATCHER_ADMIN_TOKEN is missing"
-  curl -fsS --max-time 5 -H "Authorization: Bearer $token" "$WATCHER_URL/status" >/dev/null || die "authenticated watcher status failed"
+  watcher_source_ready "$token" || die "watcher status unavailable, source_ready is false, or continuity_ready is missing"
 
   PGDATABASE="$BOT_DATABASE_URL" "$PSQL" -Atqc 'select current_database(), now()' >/dev/null || die "bot database unavailable"
   PGDATABASE="$WATCHER_DATABASE_URL" "$PSQL" -Atqc 'select current_database(), now()' >/dev/null || die "watcher database unavailable"
@@ -105,7 +111,7 @@ backup_all() {
   discover_dsns
   discover_pg_tools
   umask 077
-  local dir="$BACKUP_ROOT/v2.4.6-$(date +%Y%m%d-%H%M%S)"
+  local dir="$BACKUP_ROOT/v2.4.7-$(date +%Y%m%d-%H%M%S)"
   install -d -m 0700 "$dir"
   log "creating verified backup: $dir"
 
@@ -130,8 +136,7 @@ wait_watcher() {
   for _ in $(seq 1 30); do
     if systemctl is-active --quiet "$WATCHER_SERVICE" \
       && curl -fsS --max-time 3 "$WATCHER_URL/healthz" >/dev/null \
-      && curl -fsS --max-time 3 "$WATCHER_URL/readyz" >/dev/null \
-      && curl -fsS --max-time 3 -H "Authorization: Bearer $token" "$WATCHER_URL/status" >/dev/null; then
+      && watcher_source_ready "$token"; then
       return 0
     fi
     sleep 2
@@ -207,12 +212,12 @@ acceptance() {
   discover_dsns
   [[ -n "${EXPECTED_BOT_REPO_DIGEST:-}" ]] || die "set EXPECTED_BOT_REPO_DIGEST from the Release"
   [[ -n "${EXPECTED_WATCHER_SHA256:-}" ]] || die "set EXPECTED_WATCHER_SHA256 from the Release"
-  log "checking v2.4.6 schema"
+  log "checking v2.4.7 schema"
   local bot_schema watcher_schema image_id repo_digests actual_watcher_sha unauth_code
-  bot_schema="$(PGDATABASE="$BOT_DATABASE_URL" "$PSQL" -Atqc "select count(*) from schema_migrations where version='2.4.4-broadcast-group-ownership'; select count(*) from schema_migrations where version='2.4.5-broadcast-group-owner-transfer'; select count(*) from schema_migrations where version='2.4.6-chain-gap-scheduler'; select count(*) from information_schema.columns where table_schema='public' and table_name='broadcast_groups' and column_name='owner_user_id'; select count(*) from information_schema.tables where table_schema='public' and table_name in ('broadcast_group_owner_repair_candidates','broadcast_group_audit_events'); select count(*) from information_schema.tables where table_schema='public' and table_name='broadcast_group_owner_transfer_events'; select count(*) from information_schema.tables where table_schema='public' and table_name='chain_watcher_gap_metric_minutes'; select count(*) from pg_indexes where schemaname='public' and indexname='idx_broadcast_groups_owner'; select count(*) from pg_indexes where schemaname='public' and indexname in ('idx_broadcast_group_owner_transfer_group','idx_broadcast_group_owner_transfer_actor','idx_broadcast_group_owner_transfer_new_owner'); select count(*) from pg_trigger where tgname='trg_broadcast_group_owner_transfer_immutable' and not tgisinternal;")"
-  [[ "$bot_schema" == $'1\n1\n1\n1\n2\n1\n1\n1\n3\n1' ]] || die "bot v2.4.6 migration objects missing"
-  watcher_schema="$(PGDATABASE="$WATCHER_DATABASE_URL" "$PSQL" -Atqc "select count(*) from schema_migrations where version='2.4.3'; select count(*) from schema_migrations where version='2.4.6-chain-gap-scheduler'; select count(*) from information_schema.columns where table_schema='public' and table_name='chain_watcher_gap_tasks' and column_name in ('head_event_id','retry_after'); select count(*) from information_schema.tables where table_schema='public' and table_name='chain_watcher_gap_metric_minutes'; select count(*) from pg_indexes where schemaname='public' and indexname in ('idx_chain_watcher_gap_claim','idx_chain_watcher_gap_window_overlap','idx_chain_watcher_gap_ready_claim');")"
-  [[ "$watcher_schema" == $'1\n1\n2\n1\n3' ]] || die "watcher v2.4.6 gap scheduler migration/columns/indexes missing"
+  bot_schema="$(PGDATABASE="$BOT_DATABASE_URL" "$PSQL" -Atqc "select count(*) from schema_migrations where version='2.4.4-broadcast-group-ownership'; select count(*) from schema_migrations where version='2.4.5-broadcast-group-owner-transfer'; select count(*) from schema_migrations where version='2.4.6-chain-gap-scheduler'; select count(*) from schema_migrations where version='2.4.7-chain-gap-convergence'; select count(*) from information_schema.columns where table_schema='public' and table_name='broadcast_groups' and column_name='owner_user_id'; select count(*) from information_schema.tables where table_schema='public' and table_name in ('broadcast_group_owner_repair_candidates','broadcast_group_audit_events'); select count(*) from information_schema.tables where table_schema='public' and table_name='broadcast_group_owner_transfer_events'; select count(*) from information_schema.tables where table_schema='public' and table_name='chain_watcher_gap_metric_minutes'; select count(*) from pg_indexes where schemaname='public' and indexname='idx_broadcast_groups_owner'; select count(*) from pg_indexes where schemaname='public' and indexname='idx_chain_watcher_gap_fair_claim'; select count(*) from pg_indexes where schemaname='public' and indexname in ('idx_broadcast_group_owner_transfer_group','idx_broadcast_group_owner_transfer_actor','idx_broadcast_group_owner_transfer_new_owner'); select count(*) from pg_trigger where tgname='trg_broadcast_group_owner_transfer_immutable' and not tgisinternal;")"
+  [[ "$bot_schema" == $'1\n1\n1\n1\n1\n2\n1\n1\n1\n1\n3\n1' ]] || die "bot v2.4.7 migration objects missing"
+  watcher_schema="$(PGDATABASE="$WATCHER_DATABASE_URL" "$PSQL" -Atqc "select count(*) from schema_migrations where version='2.4.3'; select count(*) from schema_migrations where version='2.4.6-chain-gap-scheduler'; select count(*) from schema_migrations where version='2.4.7-chain-gap-convergence'; select count(*) from information_schema.columns where table_schema='public' and table_name='chain_watcher_gap_tasks' and column_name in ('head_event_id','retry_after'); select count(*) from information_schema.tables where table_schema='public' and table_name='chain_watcher_gap_metric_minutes'; select count(*) from pg_indexes where schemaname='public' and indexname in ('idx_chain_watcher_gap_claim','idx_chain_watcher_gap_window_overlap','idx_chain_watcher_gap_ready_claim','idx_chain_watcher_gap_fair_claim');")"
+  [[ "$watcher_schema" == $'1\n1\n1\n2\n1\n4' ]] || die "watcher v2.4.7 gap convergence migration/columns/indexes missing"
   unauth_code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$WATCHER_URL/status")"
   [[ "$unauth_code" == "401" ]] || die "unauthenticated /status returned $unauth_code, want 401"
   image_id="$(docker inspect "$BOT_CONTAINER" --format '{{.Image}}')"
@@ -231,8 +236,7 @@ acceptance() {
   token="$(admin_token)"; end=$((SECONDS + OBSERVE_SECONDS))
   while (( SECONDS < end )); do
     curl -fsS --max-time 5 "$WATCHER_URL/healthz" >/dev/null
-    curl -fsS --max-time 5 "$WATCHER_URL/readyz" >/dev/null
-    curl -fsS --max-time 5 -H "Authorization: Bearer $token" "$WATCHER_URL/status" >/dev/null
+    watcher_source_ready "$token"
     pid="$(systemctl show "$WATCHER_SERVICE" -p MainPID --value)"
     restarts="$(systemctl show "$WATCHER_SERVICE" -p NRestarts --value)"
     log "watcher pid=$pid restarts=$restarts bot_restarts=$(docker inspect "$BOT_CONTAINER" --format '{{.RestartCount}}')"

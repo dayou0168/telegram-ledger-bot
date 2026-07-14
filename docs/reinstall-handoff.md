@@ -9,15 +9,15 @@ This document is the recovery handoff for reinstalling the local system and cont
 - Repository: `dayou0168/telegram-ledger-bot`
 - Main line: Go + PostgreSQL
 - Deprecated line: the old Python runtime is retired. Do not restore, test, or publish it as the active product line.
-- Current source release candidate: `v2.4.6`
-- Last confirmed published release before this candidate: `v2.4.5`
-- The v2.4.6 release commit and URL do not exist until the explicit release workflow succeeds. Do not invent them from a local commit.
+- Current source release candidate: `v2.4.7`
+- Last confirmed published release before this candidate: `v2.4.6`
+- The v2.4.7 release commit and URL do not exist until the explicit release workflow succeeds. Do not invent them from a local commit.
 
-Intended v2.4.6 images after the explicit release workflow succeeds:
+Intended v2.4.7 images after the explicit release workflow succeeds:
 
 ```text
-ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.6
-ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.6
+ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.7
+ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.7
 ```
 
 ## Current Architecture
@@ -28,10 +28,10 @@ ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.6
 - In normal mode, the bot registers watched addresses with `ledger-chain-watcher` and claims watcher matched events.
 - Bot fallback is not the normal path. After sustained watcher failure, all bots compete for a PostgreSQL lease and only one shared no-key leader scans until the watcher has recovered and its watermark is caught up.
 - Shared no-key fallback requires the watcher PostgreSQL DSN and a unique stable `BOT_FALLBACK_INSTANCE_ID` per bot; there is no per-bot emergency scanner switch or fixed maximum active time.
-- v2.4.5 is the last confirmed GitHub release. The unpublished v2.4.6 candidate adds adaptive chain-source budgeting, a reserved realtime lane, persistent gap scheduling, and priority-zero bot notification delivery; use `docs/production-rollout-v2.4.6.md` only after the real Release exists.
+- v2.4.6 is the last confirmed GitHub release. The unpublished v2.4.7 candidate fixes gap convergence, fair-lane rotation, token-aware defer accounting, and source-versus-continuity readiness; use `docs/production-rollout-v2.4.7.md` only after the real Release exists.
 - Ignore deployment files from the outer legacy worktree. The only candidate baseline is the confirmed integration-repository commit.
 
-## v2.4.6 Candidate Runtime Configuration
+## v2.4.7 Candidate Runtime Configuration
 
 Expected watcher-side values:
 
@@ -170,11 +170,11 @@ docs/reinstall-handoff.md
 6. Pull and start the current images.
 
 ```powershell
-docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.6
-docker pull ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.6
+docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.7
+docker pull ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.7
 ```
 
-The v2.4.6 workflow publishes a required watcher update and a matching bot image. Verify the package checksum and `image-digests.txt`, back up both databases, upgrade the watcher first, require ready status, and then upgrade the bot.
+The v2.4.7 workflow publishes a required watcher update and a matching bot image. Verify the package checksum and `image-digests.txt`, back up both databases, upgrade the watcher first, require `source_ready=true`, and then upgrade the bot. Historical gaps may keep `continuity_ready=false` while they converge.
 
 7. Verify after startup.
 
