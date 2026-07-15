@@ -73,8 +73,12 @@ func (b *Bot) quickReplyOutboxScheduler(ctx context.Context) {
 
 func (b *Bot) drainQuickReplyOutbox(ctx context.Context, owner string) {
 	for round := 0; round < 3 && ctx.Err() == nil; round++ {
+		lease := b.quickReplyLease
+		if lease <= 0 {
+			lease = quickReplyOutboxLease
+		}
 		items, err := b.store.ClaimQuickReplyOutbox(ctx, owner, quickReplyOutboxBatchSize,
-			quickReplyOutboxMaxAttempt, quickReplyOutboxLease, time.Now().In(b.loc))
+			quickReplyOutboxMaxAttempt, lease, time.Now().In(b.loc))
 		if err != nil {
 			log.Printf("claim quick reply outbox: %v", err)
 			return
@@ -113,7 +117,7 @@ func (b *Bot) sendQuickReplyOutbox(ctx context.Context, item storage.QuickReplyO
 		return
 	}
 	opts := map[string]any{"reply_to_message_id": item.TargetMessageID}
-	_, err := b.sendGateway.Do(ctx, sendPriorityNormal, item.TargetChatID, func(opCtx context.Context) (telegram.Message, error) {
+	_, err := b.sendGateway.DoOnce(ctx, sendPriorityNormal, item.TargetChatID, func(opCtx context.Context) (telegram.Message, error) {
 		if guard.Lost() {
 			return telegram.Message{}, errQuickReplyLeaseLost
 		}
@@ -151,6 +155,13 @@ func (b *Bot) sendQuickReplyOutbox(ctx context.Context, item storage.QuickReplyO
 		return
 	}
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+		if !telegramGatewayRetryable(err) {
+			b.deadQuickReplyOutbox(ctx, item, owner, guard, err)
+			return
+		}
 		b.retryQuickReplyOutbox(ctx, item, owner, guard, err)
 		return
 	}
@@ -188,12 +199,33 @@ func (b *Bot) retryQuickReplyOutbox(ctx context.Context, item storage.QuickReply
 		return
 	}
 	if status == "dead" {
-		if enqueueErr := b.enqueueReliableText(ctx, sendPriorityNormal, "quick_reply_failed",
-			fmt.Sprintf("quick_reply_dead:%d", item.ID), item.SourceChatID,
-			"快速回复发送失败："+cause.Error(),
-			map[string]any{"reply_to_message_id": item.SourceMessageID}, reliableMessageRef{}, now); enqueueErr != nil {
-			log.Printf("enqueue dead quick reply notice %d: %v", item.ID, enqueueErr)
-		}
+		b.enqueueQuickReplyDeadNotice(ctx, item, cause, now)
+	}
+}
+
+func (b *Bot) deadQuickReplyOutbox(ctx context.Context, item storage.QuickReplyOutbox, owner string, guard *quickReplyOutboxLeaseGuard, cause error) {
+	if guard.Lost() {
+		return
+	}
+	now := time.Now().In(b.loc)
+	ok, err := b.store.MarkQuickReplyOutboxDead(ctx, item.ID, owner, now, cause)
+	if err != nil {
+		log.Printf("mark quick reply outbox %d dead: %v", item.ID, err)
+		return
+	}
+	if !ok {
+		guard.MarkLost()
+		return
+	}
+	b.enqueueQuickReplyDeadNotice(ctx, item, cause, now)
+}
+
+func (b *Bot) enqueueQuickReplyDeadNotice(ctx context.Context, item storage.QuickReplyOutbox, cause error, now time.Time) {
+	if enqueueErr := b.enqueueReliableText(ctx, sendPriorityNormal, "quick_reply_failed",
+		fmt.Sprintf("quick_reply_dead:%d", item.ID), item.SourceChatID,
+		"快速回复发送失败："+cause.Error(),
+		map[string]any{"reply_to_message_id": item.SourceMessageID}, reliableMessageRef{}, now); enqueueErr != nil {
+		log.Printf("enqueue dead quick reply notice %d: %v", item.ID, enqueueErr)
 	}
 }
 
@@ -215,12 +247,16 @@ func (b *Bot) cleanupQuickReplyOutbox(ctx context.Context, now time.Time) {
 }
 
 func (b *Bot) startQuickReplyOutboxLeaseGuard(ctx context.Context, item storage.QuickReplyOutbox, owner string) *quickReplyOutboxLeaseGuard {
-	deadline := time.Now().Add(quickReplyOutboxLease)
+	lease := b.quickReplyLease
+	if lease <= 0 {
+		lease = quickReplyOutboxLease
+	}
+	deadline := time.Now().Add(lease)
 	if item.LeaseUntil != nil {
 		deadline = *item.LeaseUntil
 	}
 	guard := &quickReplyOutboxLeaseGuard{
-		bot: b, itemID: item.ID, owner: owner, lease: quickReplyOutboxLease,
+		bot: b, itemID: item.ID, owner: owner, lease: lease,
 		stop: make(chan struct{}), lost: make(chan struct{}), deadline: deadline,
 	}
 	go guard.run(ctx)

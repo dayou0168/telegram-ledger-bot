@@ -686,6 +686,10 @@ func (b *Bot) persistTelegramHandled(ctx context.Context, item storage.TelegramI
 			}
 			return ok
 		}
+		if errors.Is(err, storage.ErrTelegramInboxLeaseLost) {
+			guard.MarkLost()
+			return false
+		}
 		if attempt == 1 || attempt%10 == 0 {
 			log.Printf("mark telegram update %d handled attempt=%d: %v", item.UpdateID, attempt, err)
 		}

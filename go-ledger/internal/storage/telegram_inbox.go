@@ -14,6 +14,8 @@ import (
 
 const telegramInboxErrorLimit = 2000
 
+var ErrTelegramInboxLeaseLost = errors.New("telegram inbox owner or lease lost")
+
 func (s *Store) GetTelegramPollOffset(ctx context.Context, streamKey string) (int64, error) {
 	streamKey = strings.TrimSpace(streamKey)
 	if streamKey == "" {
@@ -238,16 +240,22 @@ func (s *Store) CommitTelegramPrivateStateHandledAndQuickReply(ctx context.Conte
 		return false, err
 	}
 	defer rollback(ctx, tx)
-	var owned int
-	err = tx.QueryRow(ctx, `SELECT 1 FROM telegram_update_inbox
-		WHERE stream_key=$1 AND update_id=$2 AND status='processing' AND lease_owner=$3
-		  AND lease_until > $4 AND handled_at IS NULL
-		FOR UPDATE`, item.StreamKey, item.UpdateID, strings.TrimSpace(owner), now).Scan(&owned)
+	var status, currentOwner string
+	var leaseUntil, handledAt pgtype.Timestamptz
+	err = tx.QueryRow(ctx, `SELECT status,lease_owner,lease_until,handled_at FROM telegram_update_inbox
+		WHERE stream_key=$1 AND update_id=$2 FOR UPDATE`, item.StreamKey, item.UpdateID).
+		Scan(&status, &currentOwner, &leaseUntil, &handledAt)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, tx.Commit(ctx)
+		return false, ErrTelegramInboxLeaseLost
 	}
 	if err != nil {
 		return false, err
+	}
+	if handledAt.Valid {
+		return false, tx.Commit(ctx)
+	}
+	if status != "processing" || currentOwner != strings.TrimSpace(owner) || !leaseUntil.Valid || !leaseUntil.Time.After(now) {
+		return false, ErrTelegramInboxLeaseLost
 	}
 	var currentVersion int64
 	err = tx.QueryRow(ctx, `SELECT version_update_id FROM telegram_private_route_states
@@ -281,7 +289,7 @@ func (s *Store) CommitTelegramPrivateStateHandledAndQuickReply(ctx context.Conte
 		return false, err
 	}
 	if tag.RowsAffected() != 1 {
-		return false, tx.Commit(ctx)
+		return false, ErrTelegramInboxLeaseLost
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return false, err

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -327,7 +328,7 @@ func TestPostgresTelegramPrivateRouteStateCASAndLeaseOwnership(t *testing.T) {
 		t.Fatalf("stale handled=%v err=%v", ok, err)
 	}
 	if ok, err := storeA.CommitTelegramPrivateStateAndMarkHandled(ctx, third[0], "owner-old", userID, 201,
-		[]byte(`{"Mode":"stale"}`), true, reclaimAt); err != nil || ok {
+		[]byte(`{"Mode":"stale"}`), true, reclaimAt); !errors.Is(err, ErrTelegramInboxLeaseLost) || ok {
 		t.Fatalf("stale private commit=%v err=%v", ok, err)
 	}
 	if ok, err := storeB.CommitTelegramPrivateStateAndMarkHandled(ctx, reclaimed[0], "owner-new", userID, 201,

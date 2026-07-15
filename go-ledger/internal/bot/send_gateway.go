@@ -171,7 +171,20 @@ func (g *telegramSendGateway) Do(ctx context.Context, priority sendPriority, cha
 	return message, err
 }
 
+func (g *telegramSendGateway) DoOnce(ctx context.Context, priority sendPriority, chatID int64, operation telegramSendOperation) (telegram.Message, error) {
+	message, err, _ := g.doWithMetrics(ctx, priority, chatID, 1, operation)
+	return message, err
+}
+
 func (g *telegramSendGateway) DoWithMetrics(ctx context.Context, priority sendPriority, chatID int64, operation telegramSendOperation) (telegram.Message, error, telegramSendMetrics) {
+	maxAttempts := 1
+	if g != nil {
+		maxAttempts = g.maxAttempts
+	}
+	return g.doWithMetrics(ctx, priority, chatID, maxAttempts, operation)
+}
+
+func (g *telegramSendGateway) doWithMetrics(ctx context.Context, priority sendPriority, chatID int64, maxAttempts int, operation telegramSendOperation) (telegram.Message, error, telegramSendMetrics) {
 	if g == nil {
 		return telegram.Message{}, errTelegramSendGatewayNotConfigured, telegramSendMetrics{}
 	}
@@ -187,7 +200,7 @@ func (g *telegramSendGateway) DoWithMetrics(ctx context.Context, priority sendPr
 		chatID:      chatID,
 		operation:   operation,
 		result:      make(chan telegramSendResult, 1),
-		maxAttempts: g.maxAttempts,
+		maxAttempts: maxAttempts,
 		enqueuedAt:  time.Now(),
 		priority:    priority,
 	}
@@ -499,7 +512,7 @@ func telegramGatewayRetryable(err error) bool {
 	}
 	var netErr net.Error
 	if errors.As(err, &netErr) {
-		return netErr.Timeout()
+		return true
 	}
 	return true
 }

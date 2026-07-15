@@ -151,6 +151,21 @@ func (s *Store) RetryQuickReplyOutbox(ctx context.Context, id int64, owner strin
 	return status, err
 }
 
+func (s *Store) MarkQuickReplyOutboxDead(ctx context.Context, id int64, owner string, now time.Time, cause error) (bool, error) {
+	message := ""
+	if cause != nil {
+		message = strings.TrimSpace(cause.Error())
+		if len(message) > quickReplyOutboxErrorLimit {
+			message = message[:quickReplyOutboxErrorLimit]
+		}
+	}
+	tag, err := s.pool.Exec(ctx, `UPDATE telegram_quick_reply_outbox
+		SET status='dead',lease_owner='',lease_until=NULL,last_error=$3,completed_at=$4,updated_at=$4
+		WHERE id=$1 AND status='processing' AND lease_owner=$2 AND lease_until > $4`,
+		id, strings.TrimSpace(owner), message, now)
+	return tag.RowsAffected() == 1, err
+}
+
 func (s *Store) CancelQuickReplyOutboxRevoked(ctx context.Context, id int64, owner, reason string, now time.Time) (bool, bool, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {

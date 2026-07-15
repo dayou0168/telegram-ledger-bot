@@ -44,6 +44,7 @@ type Bot struct {
 	notifyPool      *worker.Pool
 	quickReplyPool  *worker.Pool
 	criticalPool    *worker.Pool
+	quickReplyLease time.Duration
 
 	groupTouchCache       *ttlCache[string]
 	groupCache            *ttlCache[storage.Group]
@@ -125,6 +126,7 @@ func New(cfg config.Config, store *storage.Store, tg *telegram.Client, tronClien
 		notifyPool:            worker.NewPool("notify", cfg.NotifyWorkers, cfg.QueueSize),
 		quickReplyPool:        worker.NewPool("quick-reply", cfg.NotifyWorkers, cfg.QueueSize),
 		criticalPool:          worker.NewPool("critical-notify", criticalWorkers, cfg.QueueSize),
+		quickReplyLease:       quickReplyOutboxLease,
 		groupTouchCache:       newTTLCache[string](cfg.GroupCacheTTL),
 		groupCache:            newTTLCache[storage.Group](cfg.GroupCacheTTL),
 		billSummaryCache:      newTTLCache[storage.BillSummaryData](cfg.BillSummaryCacheTTL),

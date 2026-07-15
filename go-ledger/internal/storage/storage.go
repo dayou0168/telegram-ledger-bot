@@ -22,7 +22,10 @@ type Store struct {
 	keyCipher    *keyCipher
 }
 
-const latestSchemaMigrationVersion = "2.4.14-telegram-private-route-state"
+const (
+	telegramPrivateRouteStateMigrationVersion = "2.4.14-telegram-private-route-state"
+	latestSchemaMigrationVersion              = "2.4.15-telegram-quick-reply-outbox"
+)
 
 const (
 	PermissionScopeGlobalOperator = "global_operator"
@@ -1423,6 +1426,11 @@ func (s *Store) migrate(ctx context.Context) error {
 		VALUES('2.4.7-chain-gap-convergence', NOW())
 		ON CONFLICT(version) DO NOTHING`); err != nil {
 		return fmt.Errorf("record chain gap convergence migration: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
+		VALUES($1, NOW())
+		ON CONFLICT(version) DO NOTHING`, telegramPrivateRouteStateMigrationVersion); err != nil {
+		return fmt.Errorf("record telegram private route state migration: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
 		VALUES($1, NOW())

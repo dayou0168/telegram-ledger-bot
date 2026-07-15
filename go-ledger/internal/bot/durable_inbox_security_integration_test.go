@@ -16,6 +16,7 @@ import (
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/config"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/telegram"
+	"github.com/jackc/pgx/v5"
 )
 
 func TestPostgresDurableInboxUndoUsesExecutionLedgerPeriod(t *testing.T) {
@@ -298,47 +299,186 @@ func TestPostgresDurableQuickReplyRestartsAfterCommitBeforeSend(t *testing.T) {
 	}
 }
 
-func TestPostgresDurableQuickReplyRetries429(t *testing.T) {
+func TestPostgresDurableQuickReplyClassifiesTelegramFailures(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	tests := []struct {
+		name      string
+		firstBody string
+		network   bool
+		permanent bool
+	}{
+		{name: "400", firstBody: `{"ok":false,"error_code":400,"description":"Bad Request"}`, permanent: true},
+		{name: "403", firstBody: `{"ok":false,"error_code":403,"description":"Forbidden"}`, permanent: true},
+		{name: "500", firstBody: `{"ok":false,"error_code":500,"description":"Server Error"}`},
+		{name: "network", network: true},
+		{name: "429", firstBody: `{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":1}}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			store, err := storage.Open(ctx, dsn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+
+			var copyCalls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				call := copyCalls.Add(1)
+				if call == 1 && tc.network {
+					panic(http.ErrAbortHandler)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				if call == 1 {
+					_, _ = w.Write([]byte(tc.firstBody))
+					return
+				}
+				_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":9201,"chat":{"id":-1,"type":"supergroup"}}}`))
+			}))
+			defer server.Close()
+			tg := telegram.NewClient(server.URL, "test", 2*time.Second)
+			fixture := prepareDurableQuickReplyFixture(t, ctx, store, tg)
+			seedDurablePrivateState(t, ctx, fixture.bot, store, fixture.seedUpdateID, fixture.userID, fixture.state)
+			update := privateMessageUpdate(fixture.seedUpdateID+1, fixture.userID, "classified payload")
+			persistAndHandleTelegramInboxUpdate(t, ctx, fixture.bot, store, update, time.Now(), "classified-owner")
+			dedupe := fmt.Sprintf("quick_reply:%s:%d", fixture.bot.telegramInboxStreamKey(), update.UpdateID)
+
+			runCtx, stop := context.WithCancel(ctx)
+			defer stop()
+			fixture.bot.quickReplyPool.Start(runCtx)
+			fixture.bot.sendGateway.Start(runCtx)
+			go fixture.bot.quickReplyOutboxScheduler(runCtx)
+			wantStatus := "sent"
+			if tc.permanent {
+				wantStatus = "dead"
+			}
+			outbox := waitQuickReplyOutboxStatus(t, ctx, store, dedupe, wantStatus)
+			wantCalls := int32(2)
+			wantAttempts := 2
+			if tc.permanent {
+				wantCalls = 1
+				wantAttempts = 1
+			}
+			if outbox.Attempts != wantAttempts || copyCalls.Load() != wantCalls {
+				t.Fatalf("classified outbox=%+v copies=%d", outbox, copyCalls.Load())
+			}
+			if tc.permanent {
+				successor := privateMessageUpdate(update.UpdateID+1, fixture.userID, "successor payload")
+				persistAndHandleTelegramInboxUpdate(t, ctx, fixture.bot, store, successor, time.Now(), "classified-successor")
+				successorDedupe := fmt.Sprintf("quick_reply:%s:%d", fixture.bot.telegramInboxStreamKey(), successor.UpdateID)
+				waitQuickReplyOutboxStatus(t, ctx, store, successorDedupe, "sent")
+				if copyCalls.Load() != 2 {
+					t.Fatalf("permanent failure blocked successor, copies=%d", copyCalls.Load())
+				}
+			}
+		})
+	}
+}
+
+func TestPostgresDurableQuickReplyLeaseReclaimSuppressesStaleQueuedCopy(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("TEST_DATABASE_URL is not set")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	store, err := storage.Open(ctx, dsn)
+	storeA, err := storage.Open(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer storeA.Close()
+	storeB, err := storage.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storeB.Close()
 
 	var copyCalls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		copyCalls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		call := copyCalls.Add(1)
-		if call == 1 {
-			_, _ = w.Write([]byte(`{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":1}}`))
-			return
-		}
-		_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":9201,"chat":{"id":-1,"type":"supergroup"}}}`))
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":9301,"chat":{"id":-1,"type":"supergroup"}}}`))
 	}))
 	defer server.Close()
 	tg := telegram.NewClient(server.URL, "test", 2*time.Second)
-	fixture := prepareDurableQuickReplyFixture(t, ctx, store, tg)
-	fixture.bot.sendGateway.maxAttempts = 1
-	seedDurablePrivateState(t, ctx, fixture.bot, store, fixture.seedUpdateID, fixture.userID, fixture.state)
-	update := privateMessageUpdate(fixture.seedUpdateID+1, fixture.userID, "retry payload")
-	persistAndHandleTelegramInboxUpdate(t, ctx, fixture.bot, store, update, time.Now(), "retry-owner")
-	dedupe := fmt.Sprintf("quick_reply:%s:%d", fixture.bot.telegramInboxStreamKey(), update.UpdateID)
+	fixture := prepareDurableQuickReplyFixture(t, ctx, storeA, tg)
+	fixture.bot.quickReplyLease = 2 * time.Second
+	seedDurablePrivateState(t, ctx, fixture.bot, storeA, fixture.seedUpdateID, fixture.userID, fixture.state)
+	update := privateMessageUpdate(fixture.seedUpdateID+1, fixture.userID, "lease payload")
+	persistAndHandleTelegramInboxUpdate(t, ctx, fixture.bot, storeA, update, time.Now(), "lease-inbox-owner")
 
+	ownerA, ownerB := "quick-owner-a", "quick-owner-b"
+	claimedA, err := storeA.ClaimQuickReplyOutbox(ctx, ownerA, 1, quickReplyOutboxMaxAttempt, 2*time.Second, time.Now())
+	if err != nil || len(claimedA) != 1 {
+		t.Fatalf("claim owner A=%v err=%v", claimedA, err)
+	}
 	runCtx, stop := context.WithCancel(ctx)
 	defer stop()
-	fixture.bot.quickReplyPool.Start(runCtx)
 	fixture.bot.sendGateway.Start(runCtx)
-	go fixture.bot.quickReplyOutboxScheduler(runCtx)
-	waitQuickReplyOutboxStatus(t, ctx, store, dedupe, "sent")
-	outbox, _, err := store.GetQuickReplyOutboxByDedupe(ctx, dedupe)
-	if err != nil || outbox.Attempts != 2 || copyCalls.Load() != 2 {
-		t.Fatalf("retry outbox=%+v copies=%d err=%v", outbox, copyCalls.Load(), err)
+	blockStarted, releaseBlock := make(chan struct{}), make(chan struct{})
+	go func() {
+		_, _ = fixture.bot.sendGateway.Do(runCtx, sendPriorityNormal, fixture.targetChatID, func(opCtx context.Context) (telegram.Message, error) {
+			close(blockStarted)
+			select {
+			case <-releaseBlock:
+			case <-opCtx.Done():
+			}
+			return telegram.Message{}, nil
+		})
+	}()
+	waitInboxTestSignal(t, blockStarted, "normal gateway blocker")
+	guardA := fixture.bot.startQuickReplyOutboxLeaseGuard(runCtx, claimedA[0], ownerA)
+	oldDone := make(chan struct{})
+	go func() {
+		defer close(oldDone)
+		defer guardA.Stop()
+		fixture.bot.sendQuickReplyOutbox(runCtx, claimedA[0], ownerA, guardA)
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for fixture.bot.sendGateway.Stats(time.Now()).Normal.Queued < 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("stale quick reply did not enter normal queue")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	admin, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close(context.Background())
+	if _, err := admin.Exec(ctx, `UPDATE telegram_quick_reply_outbox SET lease_until=$2 WHERE id=$1`,
+		claimedA[0].ID, time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	claimedB, err := storeB.ClaimQuickReplyOutbox(ctx, ownerB, 1, quickReplyOutboxMaxAttempt, 2*time.Second, time.Now())
+	if err != nil || len(claimedB) != 1 || claimedB[0].ID != claimedA[0].ID {
+		t.Fatalf("claim owner B=%v err=%v", claimedB, err)
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for !guardA.Lost() {
+		if time.Now().After(deadline) {
+			t.Fatal("stale owner did not observe lease loss")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	botB := New(fixture.cfg, storeB, tg, nil, nil)
+	botB.quickReplyLease = 2 * time.Second
+	botB.sendGateway.Start(runCtx)
+	guardB := botB.startQuickReplyOutboxLeaseGuard(runCtx, claimedB[0], ownerB)
+	botB.sendQuickReplyOutbox(runCtx, claimedB[0], ownerB, guardB)
+	guardB.Stop()
+	close(releaseBlock)
+	waitInboxTestSignal(t, oldDone, "stale queued sender")
+	dedupe := fmt.Sprintf("quick_reply:%s:%d", fixture.bot.telegramInboxStreamKey(), update.UpdateID)
+	outbox := waitQuickReplyOutboxStatus(t, ctx, storeB, dedupe, "sent")
+	if outbox.LeaseOwner != "" || copyCalls.Load() != 1 {
+		t.Fatalf("reclaimed outbox=%+v copies=%d", outbox, copyCalls.Load())
 	}
 }
 

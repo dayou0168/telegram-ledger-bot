@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -46,7 +47,16 @@ func TestPostgresQuickReplyOutboxAtomicLifecycle(t *testing.T) {
 	}
 	bad := QuickReplyOutboxInsert{DedupeKey: "quick-conflict", ActorUserID: 7001, SourceChatID: 7001,
 		SourceMessageID: 501, TargetChatID: -9001, TargetMessageID: 601}
-	ok, err := storeA.CommitTelegramPrivateStateHandledAndQuickReply(ctx, claimed[0], "inbox-owner", 7001, -1,
+	ok, err := storeA.CommitTelegramPrivateStateHandledAndQuickReply(ctx, claimed[0], "wrong-owner", 7001, -1,
+		[]byte(`{"Mode":"quick_reply"}`), true, &bad, now.Add(time.Millisecond))
+	if !errors.Is(err, ErrTelegramInboxLeaseLost) || ok {
+		t.Fatalf("wrong owner transaction ok=%v err=%v", ok, err)
+	}
+	if _, found, err := storeA.GetTelegramPrivateRouteState(ctx, stream, 7001); err != nil || found {
+		t.Fatalf("wrong owner transaction leaked private state found=%v err=%v", found, err)
+	}
+
+	ok, err = storeA.CommitTelegramPrivateStateHandledAndQuickReply(ctx, claimed[0], "inbox-owner", 7001, -1,
 		[]byte(`{"Mode":"quick_reply"}`), true, &bad, now.Add(time.Millisecond))
 	if err == nil || ok {
 		t.Fatalf("conflicting transaction ok=%v err=%v", ok, err)
@@ -59,10 +69,40 @@ func TestPostgresQuickReplyOutboxAtomicLifecycle(t *testing.T) {
 		t.Fatalf("failed transaction leaked handled=%v err=%v", handled, err)
 	}
 
+	if _, err := storeA.pool.Exec(ctx, `CREATE FUNCTION quick_reply_skip_handled_update() RETURNS trigger
+		LANGUAGE plpgsql AS $$ BEGIN IF NEW.handled_at IS NOT NULL THEN RETURN NULL; END IF; RETURN NEW; END $$`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storeA.pool.Exec(ctx, `CREATE TRIGGER quick_reply_skip_handled_update
+		BEFORE UPDATE OF handled_at ON telegram_update_inbox
+		FOR EACH ROW EXECUTE FUNCTION quick_reply_skip_handled_update()`); err != nil {
+		t.Fatal(err)
+	}
+	zeroRow := bad
+	zeroRow.DedupeKey = "quick-zero-row"
+	ok, err = storeA.CommitTelegramPrivateStateHandledAndQuickReply(ctx, claimed[0], "inbox-owner", 7001, -1,
+		[]byte(`{"Mode":"quick_reply"}`), true, &zeroRow, now.Add(2*time.Millisecond))
+	if !errors.Is(err, ErrTelegramInboxLeaseLost) || ok {
+		t.Fatalf("zero-row transaction ok=%v err=%v", ok, err)
+	}
+	if _, err := storeA.pool.Exec(ctx, `DROP TRIGGER quick_reply_skip_handled_update ON telegram_update_inbox;
+		DROP FUNCTION quick_reply_skip_handled_update()`); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := storeA.GetTelegramPrivateRouteState(ctx, stream, 7001); err != nil || found {
+		t.Fatalf("zero-row transaction leaked private state found=%v err=%v", found, err)
+	}
+	if _, found, err := storeA.GetQuickReplyOutboxByDedupe(ctx, zeroRow.DedupeKey); err != nil || found {
+		t.Fatalf("zero-row transaction leaked outbox found=%v err=%v", found, err)
+	}
+	if err := storeA.pool.QueryRow(ctx, `SELECT handled_at IS NOT NULL FROM telegram_update_inbox WHERE stream_key=$1 AND update_id=100`, stream).Scan(&handled); err != nil || handled {
+		t.Fatalf("zero-row transaction leaked handled=%v err=%v", handled, err)
+	}
+
 	good := bad
 	good.DedupeKey = "quick-valid"
 	ok, err = storeA.CommitTelegramPrivateStateHandledAndQuickReply(ctx, claimed[0], "inbox-owner", 7001, -1,
-		[]byte(`{"Mode":"quick_reply"}`), true, &good, now.Add(2*time.Millisecond))
+		[]byte(`{"Mode":"quick_reply"}`), true, &good, now.Add(3*time.Millisecond))
 	if err != nil || !ok {
 		t.Fatalf("atomic commit ok=%v err=%v", ok, err)
 	}

@@ -99,6 +99,63 @@ func TestPostgresConcurrentOpenSerializesMigration(t *testing.T) {
 	}
 }
 
+func TestPostgresQuickReplyOutboxMigrationUpgradesParentMarkerIdempotently(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	migrationURL, admin, quotedSchema := postgresTestSchema(t, ctx, dsn, "quick_reply_upgrade")
+	schemaName := strings.Trim(quotedSchema, `"`)
+
+	fresh, err := Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatalf("fresh Open: %v", err)
+	}
+	fresh.Close()
+	if _, err := admin.Exec(ctx, "DROP TABLE "+quotedSchema+".telegram_quick_reply_outbox"); err != nil {
+		t.Fatalf("drop quick reply outbox fixture: %v", err)
+	}
+	if _, err := admin.Exec(ctx, "DELETE FROM "+quotedSchema+".schema_migrations WHERE version=$1", latestSchemaMigrationVersion); err != nil {
+		t.Fatalf("remove child marker: %v", err)
+	}
+	var parentMarkers int
+	if err := admin.QueryRow(ctx, "SELECT count(*) FROM "+quotedSchema+".schema_migrations WHERE version=$1",
+		telegramPrivateRouteStateMigrationVersion).Scan(&parentMarkers); err != nil || parentMarkers != 1 {
+		t.Fatalf("parent marker count=%d err=%v", parentMarkers, err)
+	}
+
+	upgraded, err := Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatalf("upgrade Open: %v", err)
+	}
+	upgraded.Close()
+	reopened, err := Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatalf("idempotent Open: %v", err)
+	}
+	reopened.Close()
+
+	var tableCount, indexCount, markerCount int
+	if err := admin.QueryRow(ctx, `SELECT count(*) FROM pg_catalog.pg_tables
+		WHERE schemaname=$1 AND tablename='telegram_quick_reply_outbox'`, schemaName).Scan(&tableCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := admin.QueryRow(ctx, `SELECT count(*) FROM pg_catalog.pg_indexes WHERE schemaname=$1
+		AND indexname IN ('idx_quick_reply_outbox_due','idx_quick_reply_outbox_stream_actor_open',
+			'idx_quick_reply_outbox_lease','idx_quick_reply_outbox_cleanup')`, schemaName).Scan(&indexCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := admin.QueryRow(ctx, "SELECT count(*) FROM "+quotedSchema+".schema_migrations WHERE version=$1",
+		latestSchemaMigrationVersion).Scan(&markerCount); err != nil {
+		t.Fatal(err)
+	}
+	if tableCount != 1 || indexCount != 4 || markerCount != 1 {
+		t.Fatalf("upgrade table=%d indexes=%d marker=%d", tableCount, indexCount, markerCount)
+	}
+}
+
 func TestPostgresGlobalPermissionEpochNotifiesOtherStore(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
