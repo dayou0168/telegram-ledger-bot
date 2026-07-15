@@ -26,7 +26,7 @@ func (b *Bot) handleClearLedgerRequest(ctx context.Context, msg telegram.Message
 	if scope != "current" {
 		return nil
 	}
-	now := telegramUpdateNow(ctx, b.loc)
+	now := telegramExecutionTime(b.loc)
 	group, err := b.getGroupCached(ctx, msg.Chat.ID)
 	if err != nil {
 		return err

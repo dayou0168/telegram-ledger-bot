@@ -290,6 +290,14 @@ func (s *Store) DeleteAllTelegramPrivateRouteStates(ctx context.Context, streamK
 	return err
 }
 
+func (s *Store) ClearTelegramPrivateRouteStateVersion(ctx context.Context, streamKey string, userID, versionUpdateID int64, now time.Time) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `UPDATE telegram_private_route_states
+		SET state_json='{}'::jsonb,has_state=FALSE,updated_at=$4
+		WHERE stream_key=$1 AND user_id=$2 AND version_update_id=$3`,
+		strings.TrimSpace(streamKey), userID, versionUpdateID, now)
+	return tag.RowsAffected() == 1, err
+}
+
 func (s *Store) TelegramInboxStats(ctx context.Context, streamKey string, now time.Time) (TelegramInboxStats, error) {
 	var stats TelegramInboxStats
 	var oldest pgtype.Timestamptz

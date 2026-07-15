@@ -97,14 +97,36 @@ func (b *Bot) handleQuickReplyMaterial(ctx context.Context, msg telegram.Message
 	if isQuickReplyEndText(msg.Text) || msg.Text == "菜单" || msg.Text == "/start" {
 		return b.exitQuickReply(ctx, msg, user, state)
 	}
-	targetChatID := state.QuickReplyTargetChat
-	replyTo := state.QuickReplyMessageID
-	if targetChatID == 0 || replyTo == 0 {
+	_, allowed, err := b.quickReplyDeliveryFresh(ctx, user.ID, state)
+	if err != nil {
+		return err
+	}
+	if !allowed {
 		b.privateStates.Delete(formatID(user.ID))
 		return b.enqueueReplyText(ctx, sendPriorityNormal, "quick_reply_lost", msg.Chat.ID, msg.MessageID, "快速回复目标已失效，请重新点回复通知。", nil, time.Now().In(b.loc))
 	}
+	updateID, _ := ctx.Value(telegramUpdateIDContextKey{}).(int64)
+	commitSignal := telegramUpdateCommitSignalFromContext(ctx)
 	job := func(sendCtx context.Context) {
-		if _, err := b.copyMessage(sendCtx, targetChatID, msg.Chat.ID, msg.MessageID, map[string]any{"reply_to_message_id": replyTo}); err != nil {
+		if !commitSignal.Wait(sendCtx) {
+			return
+		}
+		current, stillAllowed, checkErr := b.quickReplyDeliveryFresh(sendCtx, user.ID, state)
+		if checkErr != nil {
+			log.Printf("recheck quick reply permission %d: %v", user.ID, checkErr)
+			_ = b.enqueueReplyText(sendCtx, sendPriorityNormal, "quick_reply_failed", msg.Chat.ID, msg.MessageID, "快速回复发送失败：权限检查失败，请稍后重试。", nil, time.Now().In(b.loc))
+			return
+		}
+		if !stillAllowed {
+			if updateID > 0 {
+				if _, clearErr := b.store.ClearTelegramPrivateRouteStateVersion(sendCtx, b.telegramInboxStreamKey(), user.ID, updateID, time.Now().In(b.loc)); clearErr != nil {
+					log.Printf("clear revoked quick reply state %d: %v", user.ID, clearErr)
+				}
+			}
+			_ = b.enqueueReplyText(sendCtx, sendPriorityNormal, "quick_reply_lost", msg.Chat.ID, msg.MessageID, "快速回复目标已失效，请重新点回复通知。", nil, time.Now().In(b.loc))
+			return
+		}
+		if _, err := b.copyMessage(sendCtx, current.TargetChatID, msg.Chat.ID, msg.MessageID, map[string]any{"reply_to_message_id": current.TargetMessageID}); err != nil {
 			log.Printf("send quick reply: %v", err)
 			_ = b.enqueueReplyText(sendCtx, sendPriorityNormal, "quick_reply_failed", msg.Chat.ID, msg.MessageID, "快速回复发送失败："+err.Error(), nil, time.Now().In(b.loc))
 			return
@@ -114,6 +136,38 @@ func (b *Bot) handleQuickReplyMaterial(ctx context.Context, msg telegram.Message
 		return b.enqueueReplyText(ctx, sendPriorityNormal, "quick_reply_queue_full", msg.Chat.ID, msg.MessageID, "快速回复发送失败：发送队列繁忙，请稍后重试。", nil, time.Now().In(b.loc))
 	}
 	return nil
+}
+
+func (b *Bot) quickReplyDeliveryFresh(ctx context.Context, userID int64, state privateState) (storage.BroadcastDelivery, bool, error) {
+	if state.QuickReplyTargetChat == 0 || state.QuickReplyMessageID == 0 {
+		return storage.BroadcastDelivery{}, false, nil
+	}
+	delivery, ok, err := b.store.FindBroadcastDeliveryByTarget(ctx, state.QuickReplyTargetChat, state.QuickReplyMessageID)
+	if err != nil || !ok {
+		return storage.BroadcastDelivery{}, false, err
+	}
+	allowed, err := b.canQuickReplyDeliveryFresh(ctx, userID, delivery)
+	return delivery, allowed, err
+}
+
+func (b *Bot) canQuickReplyDeliveryFresh(ctx context.Context, userID int64, delivery storage.BroadcastDelivery) (bool, error) {
+	if userID <= 0 || delivery.OperatorUserID != userID {
+		return false, nil
+	}
+	allowed, err := b.canUseBroadcastFresh(ctx, userID)
+	if err != nil || !allowed {
+		return false, err
+	}
+	groups, err := b.store.ListAllowedBroadcastChats(ctx, userID, b.perms.HasGlobalBroadcastAccess(userID))
+	if err != nil {
+		return false, err
+	}
+	for _, group := range groups {
+		if group.ChatID == delivery.TargetChatID {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (b *Bot) canQuickReplyDelivery(ctx context.Context, userID int64, delivery storage.BroadcastDelivery) bool {

@@ -341,22 +341,23 @@ func (b *Bot) handleMessage(ctx context.Context, msg telegram.Message) error {
 		return nil
 	}
 	user := userFromTelegram(*msg.From)
-	now := telegramUpdateNow(ctx, b.loc)
+	now := telegramExecutionTime(b.loc)
+	eventTime := telegramUpdateEventTime(ctx, b.loc)
 	text := strings.TrimSpace(msg.TextOrCaption())
 	doneParse := measurePerfStage(ctx, "command_parse")
 	command := classifyMessageCommand(text, msg.Chat.Type)
 	doneParse()
 	setPerfCommand(ctx, command)
 	if msg.Chat.Type == "private" {
-		return b.handlePrivateMessage(ctx, msg, user, text, now)
+		return b.handlePrivateMessage(ctx, msg, user, text, now, eventTime)
 	}
 	if msg.Chat.Type != "group" && msg.Chat.Type != "supergroup" {
 		return nil
 	}
-	if err := b.ensureGroupCached(ctx, msg.Chat.ID, msg.Chat.Title, now); err != nil {
+	if err := b.ensureGroupCached(ctx, msg.Chat.ID, msg.Chat.Title, eventTime); err != nil {
 		return err
 	}
-	if err := b.touchUserCached(ctx, msg.Chat.ID, user, now); err != nil {
+	if err := b.touchUserCached(ctx, msg.Chat.ID, user, eventTime); err != nil {
 		return err
 	}
 	if msg.ReplyTo != nil {
@@ -433,11 +434,11 @@ func (b *Bot) handleMessage(ctx context.Context, msg telegram.Message) error {
 	return b.handleLedger(ctx, msg, user, cmd, now)
 }
 
-func (b *Bot) handlePrivateMessage(ctx context.Context, msg telegram.Message, user storage.User, text string, now time.Time) error {
-	if err := b.touchUserCached(ctx, msg.Chat.ID, user, now); err != nil {
+func (b *Bot) handlePrivateMessage(ctx context.Context, msg telegram.Message, user storage.User, text string, now, eventTime time.Time) error {
+	if err := b.touchUserCached(ctx, msg.Chat.ID, user, eventTime); err != nil {
 		return err
 	}
-	b.recordIncomingPrivateChatMessage(ctx, msg, user, now)
+	b.recordIncomingPrivateChatMessage(ctx, msg, user, eventTime)
 	if msg.UsersShared != nil {
 		return b.handleUsersShared(ctx, msg)
 	}
@@ -524,7 +525,7 @@ func (b *Bot) handleCallback(ctx context.Context, cb telegram.CallbackQuery) err
 }
 
 func (b *Bot) handleMyChatMember(ctx context.Context, upd telegram.ChatMemberUpd) error {
-	now := telegramUpdateNow(ctx, b.loc)
+	eventTime := telegramUpdateEventTime(ctx, b.loc)
 	if upd.Chat.Type != "group" && upd.Chat.Type != "supergroup" {
 		return nil
 	}
@@ -538,7 +539,7 @@ func (b *Bot) handleMyChatMember(ctx context.Context, upd telegram.ChatMemberUpd
 			_, _ = b.sendText(ctx, sendPriorityNormal, upd.Chat.ID, "邀请人没有授权，机器人将自动退出。", nil)
 			return b.tg.LeaveChat(ctx, upd.Chat.ID)
 		}
-		if err := b.ensureGroupCached(ctx, upd.Chat.ID, upd.Chat.Title, now); err != nil {
+		if err := b.ensureGroupCached(ctx, upd.Chat.ID, upd.Chat.Title, eventTime); err != nil {
 			return err
 		}
 		return nil
@@ -639,11 +640,19 @@ func (b *Bot) touchUserCached(ctx context.Context, chatID int64, user storage.Us
 type telegramUpdateIDContextKey struct{}
 type telegramUpdateReceivedAtContextKey struct{}
 
-func telegramUpdateNow(ctx context.Context, loc *time.Location) time.Time {
+func telegramUpdateEventTime(ctx context.Context, loc *time.Location) time.Time {
 	if value, ok := ctx.Value(telegramUpdateReceivedAtContextKey{}).(time.Time); ok && !value.IsZero() {
 		return value.In(loc)
 	}
-	return time.Now().In(loc)
+	return telegramExecutionTime(loc)
+}
+
+func telegramExecutionTime(loc *time.Location) time.Time {
+	now := time.Now()
+	if loc != nil {
+		return now.In(loc)
+	}
+	return now
 }
 
 func (b *Bot) getGroupCached(ctx context.Context, chatID int64) (storage.Group, error) {

@@ -32,6 +32,14 @@ type telegramPrivateStateRevision struct {
 	expectedVersion int64
 }
 
+type telegramUpdateCommitSignal struct {
+	done      chan struct{}
+	committed atomic.Bool
+	once      sync.Once
+}
+
+type telegramUpdateCommitSignalContextKey struct{}
+
 type telegramInboxLeaseGuard struct {
 	b                  *Bot
 	item               storage.TelegramInboxUpdate
@@ -382,7 +390,10 @@ func (b *Bot) handleAdmittedUpdate(ctx context.Context, item storage.TelegramInb
 			finishPerfTrace(trace, b.cfg.SlowUpdateThreshold)
 			return
 		}
-		handleCtx, cancelHandle := context.WithCancel(context.WithValue(traceCtx, telegramUpdateReceivedAtContextKey{}, item.CreatedAt.In(b.loc)))
+		commitSignal := newTelegramUpdateCommitSignal()
+		handleCtx := context.WithValue(traceCtx, telegramUpdateReceivedAtContextKey{}, item.CreatedAt.In(b.loc))
+		handleCtx = context.WithValue(handleCtx, telegramUpdateCommitSignalContextKey{}, commitSignal)
+		handleCtx, cancelHandle := context.WithCancel(handleCtx)
 		cancelWatchDone := make(chan struct{})
 		go func() {
 			select {
@@ -395,17 +406,58 @@ func (b *Bot) handleAdmittedUpdate(ctx context.Context, item storage.TelegramInb
 		close(cancelWatchDone)
 		cancelHandle()
 		if handleErr != nil {
+			commitSignal.Abort()
 			b.persistTelegramRetry(traceCtx, item, owner, guard, handleErr)
 			finishPerfTrace(trace, b.cfg.SlowUpdateThreshold)
 			return
 		}
 		if guard.Lost() || !b.persistTelegramHandled(traceCtx, item, owner, guard, revision) {
+			commitSignal.Abort()
 			finishPerfTrace(trace, b.cfg.SlowUpdateThreshold)
 			return
 		}
+		commitSignal.Commit()
 	}
 	b.persistTelegramDone(traceCtx, item, owner, guard)
 	finishPerfTrace(trace, b.cfg.SlowUpdateThreshold)
+}
+
+func newTelegramUpdateCommitSignal() *telegramUpdateCommitSignal {
+	return &telegramUpdateCommitSignal{done: make(chan struct{})}
+}
+
+func (s *telegramUpdateCommitSignal) Commit() {
+	if s == nil {
+		return
+	}
+	s.once.Do(func() {
+		s.committed.Store(true)
+		close(s.done)
+	})
+}
+
+func (s *telegramUpdateCommitSignal) Abort() {
+	if s == nil {
+		return
+	}
+	s.once.Do(func() { close(s.done) })
+}
+
+func (s *telegramUpdateCommitSignal) Wait(ctx context.Context) bool {
+	if s == nil {
+		return true
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case <-s.done:
+		return s.committed.Load()
+	}
+}
+
+func telegramUpdateCommitSignalFromContext(ctx context.Context) *telegramUpdateCommitSignal {
+	signal, _ := ctx.Value(telegramUpdateCommitSignalContextKey{}).(*telegramUpdateCommitSignal)
+	return signal
 }
 
 func (b *Bot) telegramInboxLeaseDuration() time.Duration {

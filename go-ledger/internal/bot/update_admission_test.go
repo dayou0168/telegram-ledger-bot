@@ -32,6 +32,29 @@ func TestDurableTelegramPayloadLegacyPrivateStateRoundTrip(t *testing.T) {
 	}
 }
 
+func TestTelegramEventAndExecutionTimesAreSeparated(t *testing.T) {
+	loc := time.FixedZone("Asia/Shanghai", 8*3600)
+	eventTime := time.Date(2026, 7, 14, 23, 59, 59, 0, loc)
+	ctx := context.WithValue(context.Background(), telegramUpdateReceivedAtContextKey{}, eventTime)
+	if got := telegramUpdateEventTime(ctx, loc); !got.Equal(eventTime) {
+		t.Fatalf("event time=%s want=%s", got, eventTime)
+	}
+	before := time.Now().Add(-time.Second)
+	executionTime := telegramExecutionTime(loc)
+	if executionTime.Before(before) || executionTime.Equal(eventTime) {
+		t.Fatalf("execution time reused inbox event time: event=%s execution=%s", eventTime, executionTime)
+	}
+}
+
+func TestTelegramUpdateCommitSignalAbortWins(t *testing.T) {
+	signal := newTelegramUpdateCommitSignal()
+	signal.Abort()
+	signal.Commit()
+	if signal.Wait(context.Background()) {
+		t.Fatal("aborted update must not release asynchronous side effects")
+	}
+}
+
 func TestUpdateAdmissionBypassFloodDoesNotBlockLedgerAndLosesNoJobs(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	ledgerPool := worker.NewPool("admission-ledger", 1, 2)

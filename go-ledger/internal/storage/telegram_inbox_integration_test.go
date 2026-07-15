@@ -334,4 +334,14 @@ func TestPostgresTelegramPrivateRouteStateCASAndLeaseOwnership(t *testing.T) {
 		[]byte(`{"Mode":"broadcast","NotifyAll":true}`), true, reclaimAt.Add(time.Millisecond)); err != nil || !ok {
 		t.Fatalf("new owner state commit=%v err=%v", ok, err)
 	}
+	if cleared, err := storeA.ClearTelegramPrivateRouteStateVersion(ctx, stream, userID, 201, reclaimAt.Add(2*time.Millisecond)); err != nil || cleared {
+		t.Fatalf("stale state clear=%v err=%v", cleared, err)
+	}
+	if cleared, err := storeA.ClearTelegramPrivateRouteStateVersion(ctx, stream, userID, 202, reclaimAt.Add(3*time.Millisecond)); err != nil || !cleared {
+		t.Fatalf("current state clear=%v err=%v", cleared, err)
+	}
+	state, found, err = storeB.GetTelegramPrivateRouteState(ctx, stream, userID)
+	if err != nil || !found || state.HasState || state.VersionUpdateID != 202 {
+		t.Fatalf("cleared state=%+v found=%v err=%v", state, found, err)
+	}
 }

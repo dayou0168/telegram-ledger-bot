@@ -1,0 +1,332 @@
+package bot
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/adminauth"
+	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/config"
+	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
+	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/telegram"
+)
+
+func TestPostgresDurableInboxUndoUsesExecutionLedgerPeriod(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store, err := storage.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	loc := time.FixedZone("Asia/Shanghai", 8*3600)
+	executionNow := time.Now().In(loc).Truncate(time.Microsecond)
+	eventTime := executionNow.Add(-24 * time.Hour)
+	oldDay := eventTime.Format("2006-01-02")
+	base := executionNow.UnixNano()
+	chatID, userID := -base, base%1_000_000_000+100_000
+	sourceMessageID, undoMessageID := base+1, base+2
+	if err := store.EnsureGroup(ctx, chatID, "delayed undo", eventTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetGroupCutoffState(ctx, chatID, 0, true, oldDay, oldDay, eventTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddOperator(ctx, chatID, storage.User{ID: userID, DisplayName: "operator"}, userID, eventTime); err != nil {
+		t.Fatal(err)
+	}
+	recordID, err := store.InsertRecord(ctx, storage.Record{
+		ChatID: chatID, DayKey: oldDay, PeriodStartedAt: eventTime,
+		Kind: "deposit", Currency: "CNY", Amount: "100", Rate: "1", FeeRate: "0", ResultUSDT: "100",
+		ActorUserID: userID, ActorName: "operator", SubjectUserID: userID, SubjectName: "operator",
+		SourceMessageID: sourceMessageID, CreatedAt: eventTime.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	b := New(telegramInboxIntegrationConfig(fmt.Sprintf("delayed-undo-%d", base)), store, nil, nil, nil)
+	update := telegram.Update{UpdateID: base + 10, Message: &telegram.Message{
+		MessageID: undoMessageID, Chat: telegram.Chat{ID: chatID, Type: "supergroup", Title: "delayed undo"},
+		From: &telegram.User{ID: userID, FirstName: "operator"}, Text: "撤销",
+		ReplyTo: &telegram.Message{MessageID: sourceMessageID},
+	}}
+	persistAndHandleTelegramInboxUpdate(t, ctx, b, store, update, eventTime, "delayed-undo-owner")
+	record, ok, err := store.GetRecord(ctx, recordID)
+	if err != nil || !ok || record.DeletedAt != nil {
+		t.Fatalf("delayed undo crossed cutoff: record=%+v ok=%v err=%v", record, ok, err)
+	}
+	items, err := store.ClaimDueNotifications(ctx, 100, 5, time.Now().Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundClosed := false
+	for _, item := range items {
+		if item.ChatID == chatID && strings.Contains(item.DedupeKey, "ledger_undo_period_closed") {
+			foundClosed = true
+			break
+		}
+	}
+	if !foundClosed {
+		t.Fatalf("delayed undo did not emit closed-period result: %+v", items)
+	}
+}
+
+func TestPostgresDurableInboxClearTicketStartsAtExecutionTime(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store, err := storage.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	loc := time.FixedZone("Asia/Shanghai", 8*3600)
+	now := time.Now().In(loc).Truncate(time.Microsecond)
+	eventTime := now.Add(-5 * time.Minute)
+	dayKey := now.Format("2006-01-02")
+	base := now.UnixNano()
+	chatID, userID := -base-1, base%1_000_000_000+200_000
+	if err := store.EnsureGroup(ctx, chatID, "delayed clear", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetGroupCutoffState(ctx, chatID, cutoffDisabledHour, true, dayKey, "", now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddOperator(ctx, chatID, storage.User{ID: userID, DisplayName: "operator"}, userID, now); err != nil {
+		t.Fatal(err)
+	}
+	group, err := store.GetGroup(ctx, chatID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.InsertRecord(ctx, storage.Record{
+		ChatID: chatID, DayKey: dayKey, PeriodStartedAt: group.ActivePeriodStartedAt,
+		Kind: "deposit", Currency: "CNY", Amount: "1", Rate: "1", FeeRate: "0", ResultUSDT: "1",
+		ActorUserID: userID, SubjectUserID: userID, CreatedAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := telegramInboxIntegrationConfig(fmt.Sprintf("delayed-clear-%d", base))
+	b := New(cfg, store, nil, nil, nil)
+	update := privateLedgerUpdate(base+20, chatID, userID, "清除当前账期")
+	beforeExecution := time.Now().In(loc)
+	persistAndHandleTelegramInboxUpdate(t, ctx, b, store, update, eventTime, "delayed-clear-owner")
+	afterExecution := time.Now().In(loc)
+	tokenCtx := context.WithValue(ctx, telegramUpdateIDContextKey{}, update.UpdateID)
+	token, err := b.ledgerClearToken(tokenCtx, chatID, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket, ok, err := store.GetLedgerClearTicket(ctx, adminauth.HashToken(token))
+	if err != nil || !ok {
+		t.Fatalf("clear ticket found=%v err=%v", ok, err)
+	}
+	if ticket.CreatedAt.Before(beforeExecution.Add(-time.Second)) || ticket.CreatedAt.Before(eventTime.Add(4*time.Minute)) {
+		t.Fatalf("ticket used inbox time: event=%s created=%s", eventTime, ticket.CreatedAt)
+	}
+	if ttl := ticket.ExpiresAt.Sub(ticket.CreatedAt); ttl != ledgerClearTicketTTL {
+		t.Fatalf("ticket ttl=%s want=%s", ttl, ledgerClearTicketTTL)
+	}
+	if remaining := ticket.ExpiresAt.Sub(afterExecution); remaining < 59*time.Second {
+		t.Fatalf("delayed clear did not receive full confirmation window: %s", remaining)
+	}
+}
+
+func TestPostgresDurableQuickReplyRestartRevocationClearsState(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store, err := storage.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	fixture := prepareDurableQuickReplyFixture(t, ctx, store, nil)
+	seedDurablePrivateState(t, ctx, fixture.bot, store, fixture.seedUpdateID, fixture.userID, fixture.state)
+	if disabled, err := store.DisableGlobalOperator(ctx, fixture.userID, fixture.userID, time.Now()); err != nil || !disabled {
+		t.Fatalf("disable global operator=%v err=%v", disabled, err)
+	}
+	restarted := New(fixture.cfg, store, nil, nil, nil)
+	update := privateMessageUpdate(fixture.seedUpdateID+1, fixture.userID, "revoked payload")
+	persistAndHandleTelegramInboxUpdate(t, ctx, restarted, store, update, time.Now().Add(-time.Minute), "restart-revoked-owner")
+	state, found, err := store.GetTelegramPrivateRouteState(ctx, restarted.telegramInboxStreamKey(), fixture.userID)
+	if err != nil || !found || state.HasState || state.VersionUpdateID != update.UpdateID {
+		t.Fatalf("revoked restart state=%+v found=%v err=%v", state, found, err)
+	}
+}
+
+func TestPostgresDurableQuickReplyRechecksPermissionAfterQueueWait(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store, err := storage.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	var copyCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/copyMessage") {
+			copyCalls.Add(1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":9001,"chat":{"id":-1,"type":"supergroup"}}}`))
+	}))
+	defer server.Close()
+	tg := telegram.NewClient(server.URL, "test", 2*time.Second)
+	fixture := prepareDurableQuickReplyFixture(t, ctx, store, tg)
+	seedDurablePrivateState(t, ctx, fixture.bot, store, fixture.seedUpdateID, fixture.userID, fixture.state)
+
+	fixture.bot.notifyPool.Start(ctx)
+	fixture.bot.sendGateway.Start(ctx)
+	blockStarted, releaseBlock := make(chan struct{}), make(chan struct{})
+	if !fixture.bot.notifyPool.Submit(func(jobCtx context.Context) {
+		close(blockStarted)
+		select {
+		case <-releaseBlock:
+		case <-jobCtx.Done():
+		}
+	}) {
+		t.Fatal("submit notify blocker")
+	}
+	waitInboxTestSignal(t, blockStarted, "notify blocker")
+	update := privateMessageUpdate(fixture.seedUpdateID+1, fixture.userID, "queued payload")
+	persistAndHandleTelegramInboxUpdate(t, ctx, fixture.bot, store, update, time.Now(), "queued-revoked-owner")
+	if removed, err := store.RemoveBroadcastPermission(ctx, fixture.userID, "chat", fixture.targetChatID, "", fixture.userID, time.Now()); err != nil || !removed {
+		t.Fatalf("remove broadcast permission=%v err=%v", removed, err)
+	}
+	close(releaseBlock)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		state, found, err := store.GetTelegramPrivateRouteState(ctx, fixture.bot.telegramInboxStreamKey(), fixture.userID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if found && !state.HasState && state.VersionUpdateID == update.UpdateID {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("queued revocation did not clear state: %+v found=%v", state, found)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := copyCalls.Load(); got != 0 {
+		t.Fatalf("revoked queued quick reply copied %d messages", got)
+	}
+}
+
+type durableQuickReplyFixture struct {
+	bot          *Bot
+	cfg          config.Config
+	state        privateState
+	userID       int64
+	targetChatID int64
+	seedUpdateID int64
+}
+
+func prepareDurableQuickReplyFixture(t *testing.T, ctx context.Context, store *storage.Store, tg *telegram.Client) durableQuickReplyFixture {
+	t.Helper()
+	base := time.Now().UnixNano()
+	userID := base%1_000_000_000 + 300_000
+	targetChatID := -base - 100
+	seedUpdateID := base + 100
+	now := time.Now()
+	if err := store.UpsertGlobalOperator(ctx, userID, "primary", 0, userID, "quick reply fixture", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnsureGroup(ctx, targetChatID, "quick reply target", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddBroadcastPermission(ctx, userID, "chat", targetChatID, "", userID, now); err != nil {
+		t.Fatal(err)
+	}
+	targetMessageID := base + 101
+	if _, err := store.InsertBroadcastDelivery(ctx, storage.BroadcastDelivery{
+		OperatorUserID: userID, SourceChatID: userID, SourceMessageID: base + 99,
+		TargetChatID: targetChatID, TargetTitle: "quick reply target", TargetMessageID: targetMessageID,
+		Mode: "chat", TargetName: "quick reply target", CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := telegramInboxIntegrationConfig(fmt.Sprintf("quick-reply-security-%d", base))
+	cfg.NotifyWorkers = 1
+	cfg.TelegramAPIBase = ""
+	if tg != nil {
+		cfg.TelegramAPIBase = "test"
+	}
+	bot := New(cfg, store, tg, nil, nil)
+	return durableQuickReplyFixture{
+		bot: bot, cfg: cfg, userID: userID, targetChatID: targetChatID, seedUpdateID: seedUpdateID,
+		state: privateState{Mode: "quick_reply", TargetName: "quick reply target", QuickReplyTargetChat: targetChatID,
+			QuickReplyMessageID: targetMessageID, CreatedAt: now},
+	}
+}
+
+func seedDurablePrivateState(t *testing.T, ctx context.Context, b *Bot, store *storage.Store, updateID, userID int64, state privateState) {
+	t.Helper()
+	b.updateHandler = func(context.Context, telegram.Update) error {
+		b.privateStates.Set(formatID(userID), state)
+		return nil
+	}
+	persistAndHandleTelegramInboxUpdate(t, ctx, b, store, privateMessageUpdate(updateID, userID, "seed"), time.Now(), "private-state-seed")
+	b.updateHandler = nil
+}
+
+func persistAndHandleTelegramInboxUpdate(t *testing.T, ctx context.Context, b *Bot, store *storage.Store, update telegram.Update, persistedAt time.Time, owner string) {
+	t.Helper()
+	payload, err := json.Marshal(durableTelegramPayload{Version: 1, Update: update})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, pool := b.updateRoute(update)
+	lane := "ledger"
+	admissionLane := updateAdmissionLedger
+	if pool == b.queryPool {
+		lane = "bypass"
+		admissionLane = updateAdmissionBypass
+	}
+	if _, err := store.PersistTelegramUpdateBatch(ctx, b.telegramInboxStreamKey(), []storage.TelegramInboxUpdate{{
+		UpdateID: update.UpdateID, Payload: payload, Lane: lane, RouteKey: key,
+	}}, persistedAt); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimTelegramUpdates(ctx, b.telegramInboxStreamKey(), lane, owner, 1,
+		telegramInboxMaxAttempts, time.Minute, time.Now())
+	if err != nil || len(claimed) != 1 || claimed[0].UpdateID != update.UpdateID {
+		t.Fatalf("claim durable update=%v err=%v", telegramInboxUpdateIDs(claimed), err)
+	}
+	b.handleAdmittedUpdate(ctx, claimed[0], update, owner, admissionLane, time.Now())
+}
+
+func privateLedgerUpdate(updateID, chatID, userID int64, text string) telegram.Update {
+	return telegram.Update{UpdateID: updateID, Message: &telegram.Message{
+		MessageID: updateID, Chat: telegram.Chat{ID: chatID, Type: "supergroup"},
+		From: &telegram.User{ID: userID, FirstName: "operator"}, Text: text,
+	}}
+}

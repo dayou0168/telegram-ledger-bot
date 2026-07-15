@@ -686,6 +686,17 @@ func (b *Bot) canUseBroadcast(ctx context.Context, userID int64) bool {
 	return ok && b.perms.CanUsePrivateGlobalFeatures(userID, caps)
 }
 
+func (b *Bot) canUseBroadcastFresh(ctx context.Context, userID int64) (bool, error) {
+	if b.perms.HasGlobalBroadcastAccess(userID) {
+		return true, nil
+	}
+	caps, ok, err := b.globalOperatorCapabilitiesFresh(ctx, userID)
+	if err != nil || !ok {
+		return false, err
+	}
+	return b.perms.CanUsePrivateGlobalFeatures(userID, caps), nil
+}
+
 func (b *Bot) allowedChatsForBroadcastGroup(ctx context.Context, userID int64, name string) ([]storage.Group, error) {
 	groupChats, err := b.store.ListBroadcastGroupChats(ctx, name)
 	if err != nil {

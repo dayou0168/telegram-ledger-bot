@@ -56,6 +56,25 @@ func (b *Bot) globalOperatorCapabilities(ctx context.Context, userID int64) (per
 	return value.Capabilities, value.Active, nil
 }
 
+func (b *Bot) globalOperatorCapabilitiesFresh(ctx context.Context, userID int64) (permissions.UserCapabilities, bool, error) {
+	var (
+		caps   permissions.UserCapabilities
+		active bool
+		err    error
+	)
+	if b.globalOperatorLookup != nil {
+		caps, active, err = b.globalOperatorLookup(ctx, userID)
+	} else if b.store != nil {
+		var level string
+		level, active, err = b.store.GetGlobalOperatorLevel(ctx, userID)
+		if active {
+			caps = permissions.UserCapabilities{GlobalOperatorLevel: level}
+			active = caps.IsGlobalOperator()
+		}
+	}
+	return caps, active, err
+}
+
 func (b *Bot) currentGlobalPermissionEpoch(ctx context.Context, memo *updatePermissionMemo) (int64, error) {
 	if memo != nil && memo.epochLoaded {
 		return memo.epoch, nil
