@@ -206,6 +206,41 @@ func (s *Store) migrate(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_telegram_private_route_states_updated
 			ON telegram_private_route_states(updated_at, stream_key, user_id)`,
+		`CREATE TABLE IF NOT EXISTS telegram_quick_reply_outbox (
+			id BIGSERIAL PRIMARY KEY,
+			stream_key TEXT NOT NULL,
+			inbox_update_id BIGINT NOT NULL,
+			dedupe_key TEXT NOT NULL UNIQUE,
+			actor_user_id BIGINT NOT NULL,
+			source_chat_id BIGINT NOT NULL,
+			source_message_id BIGINT NOT NULL,
+			target_chat_id BIGINT NOT NULL,
+			target_message_id BIGINT NOT NULL,
+			state_version_update_id BIGINT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'pending',
+			attempts INTEGER NOT NULL DEFAULT 0,
+			next_attempt_at TIMESTAMPTZ NOT NULL,
+			lease_owner TEXT NOT NULL DEFAULT '',
+			lease_until TIMESTAMPTZ,
+			last_error TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL,
+			updated_at TIMESTAMPTZ NOT NULL,
+			completed_at TIMESTAMPTZ,
+			UNIQUE(stream_key, inbox_update_id),
+			CHECK(status IN ('pending', 'processing', 'retry', 'sent', 'cancelled', 'dead'))
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_quick_reply_outbox_due
+			ON telegram_quick_reply_outbox(next_attempt_at, id)
+			WHERE status IN ('pending', 'retry', 'processing')`,
+		`CREATE INDEX IF NOT EXISTS idx_quick_reply_outbox_stream_actor_open
+			ON telegram_quick_reply_outbox(stream_key, actor_user_id, id)
+			WHERE status IN ('pending', 'processing', 'retry')`,
+		`CREATE INDEX IF NOT EXISTS idx_quick_reply_outbox_lease
+			ON telegram_quick_reply_outbox(lease_until)
+			WHERE status='processing'`,
+		`CREATE INDEX IF NOT EXISTS idx_quick_reply_outbox_cleanup
+			ON telegram_quick_reply_outbox(completed_at, id)
+			WHERE status IN ('sent', 'cancelled', 'dead')`,
 		`CREATE TABLE IF NOT EXISTS groups (
 			chat_id BIGINT PRIMARY KEY,
 			title TEXT NOT NULL DEFAULT '',

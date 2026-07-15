@@ -42,6 +42,7 @@ type Bot struct {
 	broadcastPool   *worker.Pool
 	queryPool       *worker.Pool
 	notifyPool      *worker.Pool
+	quickReplyPool  *worker.Pool
 	criticalPool    *worker.Pool
 
 	groupTouchCache       *ttlCache[string]
@@ -56,6 +57,7 @@ type Bot struct {
 	rateBookState         rateBookState
 	privateStates         *ttlCache[privateState]
 	notificationWake      chan struct{}
+	quickReplyWake        chan struct{}
 	criticalOutboxWake    chan int64
 	telegramLedgerWake    chan struct{}
 	telegramBypassWake    chan struct{}
@@ -121,6 +123,7 @@ func New(cfg config.Config, store *storage.Store, tg *telegram.Client, tronClien
 		broadcastPool:         worker.NewPool("broadcast", cfg.BroadcastWorkers, cfg.QueueSize),
 		queryPool:             worker.NewPool("query", cfg.QueryWorkers, cfg.QueueSize),
 		notifyPool:            worker.NewPool("notify", cfg.NotifyWorkers, cfg.QueueSize),
+		quickReplyPool:        worker.NewPool("quick-reply", cfg.NotifyWorkers, cfg.QueueSize),
 		criticalPool:          worker.NewPool("critical-notify", criticalWorkers, cfg.QueueSize),
 		groupTouchCache:       newTTLCache[string](cfg.GroupCacheTTL),
 		groupCache:            newTTLCache[storage.Group](cfg.GroupCacheTTL),
@@ -133,6 +136,7 @@ func New(cfg config.Config, store *storage.Store, tg *telegram.Client, tronClien
 		rateBookCache:         newTTLCache[[]p2p.OrderBookEntry](cfg.P2PCacheTTL),
 		privateStates:         newTTLCache[privateState](privateStateTTL),
 		notificationWake:      make(chan struct{}, 1),
+		quickReplyWake:        make(chan struct{}, 1),
 		criticalOutboxWake:    make(chan int64, cfg.QueueSize),
 		telegramLedgerWake:    make(chan struct{}, 1),
 		telegramBypassWake:    make(chan struct{}, 1),
@@ -153,6 +157,7 @@ func (b *Bot) Run(ctx context.Context) error {
 	b.broadcastPool.StartN(ctx, b.cfg.BroadcastWorkers)
 	b.queryPool.StartN(ctx, b.cfg.QueryWorkers)
 	b.notifyPool.StartN(ctx, b.cfg.NotifyWorkers)
+	b.quickReplyPool.StartN(ctx, b.cfg.NotifyWorkers)
 	b.criticalPool.Start(ctx)
 	b.sendGateway.Start(ctx)
 	b.updateAdmission.Start(ctx)
@@ -167,6 +172,7 @@ func (b *Bot) Run(ctx context.Context) error {
 		go b.chainWatcherFallbackScheduler(ctx)
 	}
 	go b.notificationOutboxScheduler(ctx)
+	go b.quickReplyOutboxScheduler(ctx)
 	go b.criticalOutboxScheduler(ctx)
 	go b.ledgerSummaryReconcileScheduler(ctx)
 	go b.privateCleanupScheduler(ctx)

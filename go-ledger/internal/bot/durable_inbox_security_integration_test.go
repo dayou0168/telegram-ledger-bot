@@ -203,19 +203,25 @@ func TestPostgresDurableQuickReplyRechecksPermissionAfterQueueWait(t *testing.T)
 	fixture := prepareDurableQuickReplyFixture(t, ctx, store, tg)
 	seedDurablePrivateState(t, ctx, fixture.bot, store, fixture.seedUpdateID, fixture.userID, fixture.state)
 
-	fixture.bot.notifyPool.Start(ctx)
-	fixture.bot.sendGateway.Start(ctx)
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	fixture.bot.quickReplyPool.Start(runCtx)
+	fixture.bot.sendGateway.Start(runCtx)
 	blockStarted, releaseBlock := make(chan struct{}), make(chan struct{})
-	if !fixture.bot.notifyPool.Submit(func(jobCtx context.Context) {
-		close(blockStarted)
-		select {
-		case <-releaseBlock:
-		case <-jobCtx.Done():
-		}
-	}) {
-		t.Fatal("submit notify blocker")
-	}
+	blockDone := make(chan struct{})
+	go func() {
+		defer close(blockDone)
+		_, _ = fixture.bot.sendGateway.Do(runCtx, sendPriorityNormal, fixture.targetChatID, func(jobCtx context.Context) (telegram.Message, error) {
+			close(blockStarted)
+			select {
+			case <-releaseBlock:
+			case <-jobCtx.Done():
+			}
+			return telegram.Message{}, nil
+		})
+	}()
 	waitInboxTestSignal(t, blockStarted, "notify blocker")
+	go fixture.bot.quickReplyOutboxScheduler(runCtx)
 	update := privateMessageUpdate(fixture.seedUpdateID+1, fixture.userID, "queued payload")
 	persistAndHandleTelegramInboxUpdate(t, ctx, fixture.bot, store, update, time.Now(), "queued-revoked-owner")
 	if removed, err := store.RemoveBroadcastPermission(ctx, fixture.userID, "chat", fixture.targetChatID, "", fixture.userID, time.Now()); err != nil || !removed {
@@ -238,6 +244,119 @@ func TestPostgresDurableQuickReplyRechecksPermissionAfterQueueWait(t *testing.T)
 	}
 	if got := copyCalls.Load(); got != 0 {
 		t.Fatalf("revoked queued quick reply copied %d messages", got)
+	}
+	waitInboxTestSignal(t, blockDone, "gateway blocker")
+	outbox, found, err := store.GetQuickReplyOutboxByDedupe(ctx,
+		fmt.Sprintf("quick_reply:%s:%d", fixture.bot.telegramInboxStreamKey(), update.UpdateID))
+	if err != nil || !found || outbox.Status != "cancelled" {
+		t.Fatalf("revoked outbox=%+v found=%v err=%v", outbox, found, err)
+	}
+}
+
+func TestPostgresDurableQuickReplyRestartsAfterCommitBeforeSend(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store, err := storage.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	var copyCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/copyMessage") {
+			copyCalls.Add(1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":9101,"chat":{"id":-1,"type":"supergroup"}}}`))
+	}))
+	defer server.Close()
+	tg := telegram.NewClient(server.URL, "test", 2*time.Second)
+	fixture := prepareDurableQuickReplyFixture(t, ctx, store, tg)
+	seedDurablePrivateState(t, ctx, fixture.bot, store, fixture.seedUpdateID, fixture.userID, fixture.state)
+	update := privateMessageUpdate(fixture.seedUpdateID+1, fixture.userID, "restart payload")
+	persistAndHandleTelegramInboxUpdate(t, ctx, fixture.bot, store, update, time.Now(), "pre-crash-owner")
+	dedupe := fmt.Sprintf("quick_reply:%s:%d", fixture.bot.telegramInboxStreamKey(), update.UpdateID)
+	outbox, found, err := store.GetQuickReplyOutboxByDedupe(ctx, dedupe)
+	if err != nil || !found || outbox.Status != "pending" || copyCalls.Load() != 0 {
+		t.Fatalf("pre-restart outbox=%+v found=%v copies=%d err=%v", outbox, found, copyCalls.Load(), err)
+	}
+
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	restarted := New(fixture.cfg, store, tg, nil, nil)
+	restarted.quickReplyPool.Start(runCtx)
+	restarted.sendGateway.Start(runCtx)
+	go restarted.quickReplyOutboxScheduler(runCtx)
+	waitQuickReplyOutboxStatus(t, ctx, store, dedupe, "sent")
+	if got := copyCalls.Load(); got != 1 {
+		t.Fatalf("restart copies=%d want=1", got)
+	}
+}
+
+func TestPostgresDurableQuickReplyRetries429(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store, err := storage.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	var copyCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		call := copyCalls.Add(1)
+		if call == 1 {
+			_, _ = w.Write([]byte(`{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":1}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":9201,"chat":{"id":-1,"type":"supergroup"}}}`))
+	}))
+	defer server.Close()
+	tg := telegram.NewClient(server.URL, "test", 2*time.Second)
+	fixture := prepareDurableQuickReplyFixture(t, ctx, store, tg)
+	fixture.bot.sendGateway.maxAttempts = 1
+	seedDurablePrivateState(t, ctx, fixture.bot, store, fixture.seedUpdateID, fixture.userID, fixture.state)
+	update := privateMessageUpdate(fixture.seedUpdateID+1, fixture.userID, "retry payload")
+	persistAndHandleTelegramInboxUpdate(t, ctx, fixture.bot, store, update, time.Now(), "retry-owner")
+	dedupe := fmt.Sprintf("quick_reply:%s:%d", fixture.bot.telegramInboxStreamKey(), update.UpdateID)
+
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	fixture.bot.quickReplyPool.Start(runCtx)
+	fixture.bot.sendGateway.Start(runCtx)
+	go fixture.bot.quickReplyOutboxScheduler(runCtx)
+	waitQuickReplyOutboxStatus(t, ctx, store, dedupe, "sent")
+	outbox, _, err := store.GetQuickReplyOutboxByDedupe(ctx, dedupe)
+	if err != nil || outbox.Attempts != 2 || copyCalls.Load() != 2 {
+		t.Fatalf("retry outbox=%+v copies=%d err=%v", outbox, copyCalls.Load(), err)
+	}
+}
+
+func waitQuickReplyOutboxStatus(t *testing.T, ctx context.Context, store *storage.Store, dedupe, want string) storage.QuickReplyOutbox {
+	t.Helper()
+	deadline := time.Now().Add(8 * time.Second)
+	for {
+		item, found, err := store.GetQuickReplyOutboxByDedupe(ctx, dedupe)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if found && item.Status == want {
+			return item
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("quick reply outbox status=%q found=%v want=%q item=%+v", item.Status, found, want, item)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

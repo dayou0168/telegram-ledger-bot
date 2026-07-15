@@ -604,3 +604,34 @@ type NotificationFailureClassCount struct {
 	Class string `json:"class"`
 	Count int64  `json:"count"`
 }
+
+type QuickReplyOutboxInsert struct {
+	DedupeKey       string
+	ActorUserID     int64
+	SourceChatID    int64
+	SourceMessageID int64
+	TargetChatID    int64
+	TargetMessageID int64
+}
+
+type QuickReplyOutbox struct {
+	ID                   int64
+	StreamKey            string
+	InboxUpdateID        int64
+	DedupeKey            string
+	ActorUserID          int64
+	SourceChatID         int64
+	SourceMessageID      int64
+	TargetChatID         int64
+	TargetMessageID      int64
+	StateVersionUpdateID int64
+	Status               string
+	Attempts             int
+	NextAttemptAt        time.Time
+	LeaseOwner           string
+	LeaseUntil           *time.Time
+	LastError            string
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
+	CompletedAt          *time.Time
+}

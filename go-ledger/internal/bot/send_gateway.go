@@ -484,6 +484,9 @@ func telegramGatewayRetryable(err error) bool {
 	if errors.Is(err, context.Canceled) {
 		return false
 	}
+	if errors.Is(err, errQuickReplyPermissionRevoked) || errors.Is(err, errQuickReplyLeaseLost) {
+		return false
+	}
 	if _, ok := telegram.RetryAfter(err); ok {
 		return true
 	}

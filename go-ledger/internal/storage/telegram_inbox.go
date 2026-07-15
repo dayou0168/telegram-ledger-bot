@@ -220,6 +220,10 @@ func (s *Store) GetTelegramPrivateRouteState(ctx context.Context, streamKey stri
 }
 
 func (s *Store) CommitTelegramPrivateStateAndMarkHandled(ctx context.Context, item TelegramInboxUpdate, owner string, userID, expectedVersion int64, stateJSON []byte, hasState bool, now time.Time) (bool, error) {
+	return s.CommitTelegramPrivateStateHandledAndQuickReply(ctx, item, owner, userID, expectedVersion, stateJSON, hasState, nil, now)
+}
+
+func (s *Store) CommitTelegramPrivateStateHandledAndQuickReply(ctx context.Context, item TelegramInboxUpdate, owner string, userID, expectedVersion int64, stateJSON []byte, hasState bool, quickReply *QuickReplyOutboxInsert, now time.Time) (bool, error) {
 	if strings.TrimSpace(item.StreamKey) == "" || item.UpdateID < 0 || strings.TrimSpace(owner) == "" || userID <= 0 || item.UpdateID <= expectedVersion {
 		return false, errors.New("telegram private state commit is incomplete")
 	}
@@ -264,6 +268,11 @@ func (s *Store) CommitTelegramPrivateStateAndMarkHandled(ctx context.Context, it
 		version_update_id=excluded.version_update_id,updated_at=excluded.updated_at`,
 		item.StreamKey, userID, stateJSON, hasState, item.UpdateID, now); err != nil {
 		return false, err
+	}
+	if quickReply != nil {
+		if err := insertQuickReplyOutboxTx(ctx, tx, item, *quickReply, now); err != nil {
+			return false, err
+		}
 	}
 	tag, err := tx.Exec(ctx, `UPDATE telegram_update_inbox SET handled_at=$4,updated_at=$4
 		WHERE stream_key=$1 AND update_id=$2 AND status='processing' AND lease_owner=$3

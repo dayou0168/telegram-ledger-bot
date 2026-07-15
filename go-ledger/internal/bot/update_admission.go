@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -33,9 +34,11 @@ type telegramPrivateStateRevision struct {
 }
 
 type telegramUpdateCommitSignal struct {
-	done      chan struct{}
-	committed atomic.Bool
-	once      sync.Once
+	done       chan struct{}
+	committed  atomic.Bool
+	once       sync.Once
+	mu         sync.Mutex
+	quickReply *storage.QuickReplyOutboxInsert
 }
 
 type telegramUpdateCommitSignalContextKey struct{}
@@ -411,12 +414,15 @@ func (b *Bot) handleAdmittedUpdate(ctx context.Context, item storage.TelegramInb
 			finishPerfTrace(trace, b.cfg.SlowUpdateThreshold)
 			return
 		}
-		if guard.Lost() || !b.persistTelegramHandled(traceCtx, item, owner, guard, revision) {
+		if guard.Lost() || !b.persistTelegramHandled(traceCtx, item, owner, guard, revision, commitSignal) {
 			commitSignal.Abort()
 			finishPerfTrace(trace, b.cfg.SlowUpdateThreshold)
 			return
 		}
 		commitSignal.Commit()
+		if commitSignal.HasQuickReply() {
+			b.kickQuickReplyOutbox()
+		}
 	}
 	b.persistTelegramDone(traceCtx, item, owner, guard)
 	finishPerfTrace(trace, b.cfg.SlowUpdateThreshold)
@@ -453,6 +459,40 @@ func (s *telegramUpdateCommitSignal) Wait(ctx context.Context) bool {
 	case <-s.done:
 		return s.committed.Load()
 	}
+}
+
+func (s *telegramUpdateCommitSignal) StageQuickReply(input storage.QuickReplyOutboxInsert) error {
+	if s == nil {
+		return errors.New("telegram update commit signal is unavailable")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.quickReply != nil {
+		if *s.quickReply == input {
+			return nil
+		}
+		return errors.New("telegram update already staged a different quick reply")
+	}
+	value := input
+	s.quickReply = &value
+	return nil
+}
+
+func (s *telegramUpdateCommitSignal) QuickReply() *storage.QuickReplyOutboxInsert {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.quickReply == nil {
+		return nil
+	}
+	value := *s.quickReply
+	return &value
+}
+
+func (s *telegramUpdateCommitSignal) HasQuickReply() bool {
+	return s.QuickReply() != nil
 }
 
 func telegramUpdateCommitSignalFromContext(ctx context.Context) *telegramUpdateCommitSignal {
@@ -617,7 +657,7 @@ func (b *Bot) restoreTelegramPrivateState(ctx context.Context, item storage.Tele
 	return &telegramPrivateStateRevision{userID: userID, expectedVersion: expected}, nil
 }
 
-func (b *Bot) persistTelegramHandled(ctx context.Context, item storage.TelegramInboxUpdate, owner string, guard *telegramInboxLeaseGuard, revision *telegramPrivateStateRevision) bool {
+func (b *Bot) persistTelegramHandled(ctx context.Context, item storage.TelegramInboxUpdate, owner string, guard *telegramInboxLeaseGuard, revision *telegramPrivateStateRevision, commitSignal *telegramUpdateCommitSignal) bool {
 	for attempt := 1; ctx.Err() == nil && !guard.Lost(); attempt++ {
 		now := time.Now().In(b.loc)
 		var ok bool
@@ -636,8 +676,8 @@ func (b *Bot) persistTelegramHandled(ctx context.Context, item storage.TelegramI
 				hasState = true
 			}
 			if err == nil {
-				ok, err = b.store.CommitTelegramPrivateStateAndMarkHandled(ctx, item, owner, revision.userID,
-					revision.expectedVersion, stateJSON, hasState, now)
+				ok, err = b.store.CommitTelegramPrivateStateHandledAndQuickReply(ctx, item, owner, revision.userID,
+					revision.expectedVersion, stateJSON, hasState, commitSignal.QuickReply(), now)
 			}
 		}
 		if err == nil {

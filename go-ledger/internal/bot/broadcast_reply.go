@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"html"
 	"log"
@@ -107,35 +108,17 @@ func (b *Bot) handleQuickReplyMaterial(ctx context.Context, msg telegram.Message
 	}
 	updateID, _ := ctx.Value(telegramUpdateIDContextKey{}).(int64)
 	commitSignal := telegramUpdateCommitSignalFromContext(ctx)
-	job := func(sendCtx context.Context) {
-		if !commitSignal.Wait(sendCtx) {
-			return
-		}
-		current, stillAllowed, checkErr := b.quickReplyDeliveryFresh(sendCtx, user.ID, state)
-		if checkErr != nil {
-			log.Printf("recheck quick reply permission %d: %v", user.ID, checkErr)
-			_ = b.enqueueReplyText(sendCtx, sendPriorityNormal, "quick_reply_failed", msg.Chat.ID, msg.MessageID, "快速回复发送失败：权限检查失败，请稍后重试。", nil, time.Now().In(b.loc))
-			return
-		}
-		if !stillAllowed {
-			if updateID > 0 {
-				if _, clearErr := b.store.ClearTelegramPrivateRouteStateVersion(sendCtx, b.telegramInboxStreamKey(), user.ID, updateID, time.Now().In(b.loc)); clearErr != nil {
-					log.Printf("clear revoked quick reply state %d: %v", user.ID, clearErr)
-				}
-			}
-			_ = b.enqueueReplyText(sendCtx, sendPriorityNormal, "quick_reply_lost", msg.Chat.ID, msg.MessageID, "快速回复目标已失效，请重新点回复通知。", nil, time.Now().In(b.loc))
-			return
-		}
-		if _, err := b.copyMessage(sendCtx, current.TargetChatID, msg.Chat.ID, msg.MessageID, map[string]any{"reply_to_message_id": current.TargetMessageID}); err != nil {
-			log.Printf("send quick reply: %v", err)
-			_ = b.enqueueReplyText(sendCtx, sendPriorityNormal, "quick_reply_failed", msg.Chat.ID, msg.MessageID, "快速回复发送失败："+err.Error(), nil, time.Now().In(b.loc))
-			return
-		}
+	if updateID <= 0 {
+		return errors.New("quick reply update id is unavailable")
 	}
-	if !b.notifyPool.Submit(job) {
-		return b.enqueueReplyText(ctx, sendPriorityNormal, "quick_reply_queue_full", msg.Chat.ID, msg.MessageID, "快速回复发送失败：发送队列繁忙，请稍后重试。", nil, time.Now().In(b.loc))
-	}
-	return nil
+	return commitSignal.StageQuickReply(storage.QuickReplyOutboxInsert{
+		DedupeKey:       fmt.Sprintf("quick_reply:%s:%d", b.telegramInboxStreamKey(), updateID),
+		ActorUserID:     user.ID,
+		SourceChatID:    msg.Chat.ID,
+		SourceMessageID: msg.MessageID,
+		TargetChatID:    state.QuickReplyTargetChat,
+		TargetMessageID: state.QuickReplyMessageID,
+	})
 }
 
 func (b *Bot) quickReplyDeliveryFresh(ctx context.Context, userID int64, state privateState) (storage.BroadcastDelivery, bool, error) {
