@@ -141,8 +141,11 @@ func TestPostgresLedgerHandlerReplyAndPermissionContract(t *testing.T) {
 	if err := b.handleMessage(ctx, message(107, member, "Z0")); err != nil {
 		t.Fatal(err)
 	}
-	if item := claim(107); item.ReplyToMessageID != 0 {
-		t.Fatalf("Z0 cache result should not reply: %+v", item)
+	if item := claim(107); item.ReplyToMessageID != 0 ||
+		strings.Contains(item.Text, "<pre>") || strings.Contains(item.Text, "</pre>") ||
+		strings.Contains(item.Text, "<code>") || strings.Contains(item.Text, "</code>") ||
+		!strings.Contains(item.Text, "Z1 :   7.1   cached") {
+		t.Fatalf("Z0 cache result should be plain aligned text and not reply: %+v", item)
 	}
 	if err := b.handleMessage(ctx, message(108, owner, "设置汇率 Z1 -0.1")); err != nil {
 		t.Fatal(err)

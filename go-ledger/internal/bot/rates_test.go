@@ -61,20 +61,32 @@ func TestRateBookWithoutSnapshotFailsFast(t *testing.T) {
 	}
 }
 
-func TestFormatZ0ExactAlignedHTMLAndPrompt(t *testing.T) {
+func TestFormatZ0UsesPlainTelegramTextAndExactSpacing(t *testing.T) {
 	entries := make([]p2p.OrderBookEntry, 10)
 	for i := range entries {
 		entries[i] = p2p.OrderBookEntry{Rank: i + 1, Price: "6.73", MerchantName: "商户"}
 	}
 	entries[9] = p2p.OrderBookEntry{Rank: 10, Price: "6.74", MerchantName: "红杉<&贸易"}
 	text := formatZ0Book(cachedRateBook{Entries: entries, UpdatedAt: time.Now()}, time.UTC)
-	for _, want := range []string{
-		"<pre>Z1 :   6.73   商户\n",
-		"Z10 : 6.74   红杉&lt;&amp;贸易\n</pre>",
-		"发送 Z1 -0.1\n或 设置汇率 Z1 -0.1 可按第1档偏移后设置汇率。",
+	for _, forbidden := range []string{"<pre>", "</pre>", "<code>", "</code>"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("Z0 output must not contain %q:\n%s", forbidden, text)
+		}
+	}
+	lines := strings.Split(text, "\n")
+	if len(lines) != 14 {
+		t.Fatalf("Z0 output lines = %d, want 14:\n%s", len(lines), text)
+	}
+	for index, want := range map[int]string{
+		0:  "<b>OKX OTC商家所有实时汇率 TOP 10</b>",
+		1:  "",
+		2:  "Z1 :   6.73   商户",
+		11: "Z10 : 6.74   红杉&lt;&amp;贸易",
+		12: "发送 Z1 -0.1",
+		13: "或 设置汇率 Z1 -0.1 可按第1档偏移后设置汇率。",
 	} {
-		if !strings.Contains(text, want) {
-			t.Fatalf("Z0 output missing %q:\n%s", want, text)
+		if lines[index] != want {
+			t.Fatalf("Z0 line %d = %q, want %q:\n%s", index+1, lines[index], want, text)
 		}
 	}
 	if strings.Contains(text, "缓存更新时间") {

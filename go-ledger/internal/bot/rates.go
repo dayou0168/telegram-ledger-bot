@@ -218,7 +218,6 @@ func rateBookUpdatedLabel(updatedAt time.Time, loc *time.Location) string {
 func formatZ0(entries []p2p.OrderBookEntry) string {
 	var out strings.Builder
 	out.WriteString("<b>OKX OTC商家所有实时汇率 TOP 10</b>\n\n")
-	out.WriteString("<pre>")
 	for i, entry := range entries {
 		rank := i + 1
 		out.WriteString("Z")
@@ -233,7 +232,7 @@ func formatZ0(entries []p2p.OrderBookEntry) string {
 		out.WriteString(html.EscapeString(trimRunes(entry.MerchantName, 10)))
 		out.WriteByte('\n')
 	}
-	out.WriteString("</pre>\n发送 Z1 -0.1\n或 设置汇率 Z1 -0.1 可按第1档偏移后设置汇率。")
+	out.WriteString("发送 Z1 -0.1\n或 设置汇率 Z1 -0.1 可按第1档偏移后设置汇率。")
 	return strings.TrimSpace(out.String())
 }
 
