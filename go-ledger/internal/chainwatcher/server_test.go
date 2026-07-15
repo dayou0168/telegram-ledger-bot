@@ -69,6 +69,49 @@ func TestReadyzDoesNotFlapWhenOlderRoundTimesOutAfterNewerSuccess(t *testing.T) 
 	}
 }
 
+func TestReadyzToleratesOneFreshFailureThenDegradesAndRecovers(t *testing.T) {
+	now := time.Unix(10_000, 0)
+	server := NewServer(config.ChainWatcherConfig{PollInterval: time.Second, Lookback: 10 * time.Minute}, nil, nil)
+	server.status.recordScanSuccess("global", scanResult{RoundID: 1}, 20*time.Millisecond, now)
+	server.status.recordScanError("global", context.DeadlineExceeded, time.Time{}, scanResult{RoundID: 2}, time.Second, now.Add(time.Second))
+
+	isolated := server.readinessResponse(context.Background(), now.Add(time.Second))
+	if !isolated.Ready || !isolated.SourceReady || isolated.Status != "ready" {
+		t.Fatalf("isolated fresh failure readiness = %+v, want source ready", isolated)
+	}
+
+	server.status.recordScanError("global", context.DeadlineExceeded, time.Time{}, scanResult{RoundID: 3}, time.Second, now.Add(2*time.Second))
+	failed := server.readinessResponse(context.Background(), now.Add(2*time.Second))
+	if failed.Ready || failed.SourceReady || failed.Status != "degraded" {
+		t.Fatalf("consecutive failure readiness = %+v, want source degraded", failed)
+	}
+
+	server.status.recordScanSuccess("global", scanResult{RoundID: 4}, 20*time.Millisecond, now.Add(3*time.Second))
+	recovered := server.readinessResponse(context.Background(), now.Add(3*time.Second))
+	if !recovered.Ready || !recovered.SourceReady {
+		t.Fatalf("recovered readiness = %+v, want source ready", recovered)
+	}
+
+	stale := server.readinessResponse(context.Background(), now.Add(9*time.Second))
+	if stale.Ready || stale.SourceReady {
+		t.Fatalf("stale success readiness = %+v, want source degraded", stale)
+	}
+}
+
+func TestContinuityDegradationPreservesSourceReason(t *testing.T) {
+	continuityOnly := ReadyStatusResponse{Status: "ready", Ready: true, SourceReady: true}
+	applyContinuityReadiness(&continuityOnly)
+	if continuityOnly.Ready || !continuityOnly.SourceReady || continuityOnly.Status != "degraded/continuity" {
+		t.Fatalf("continuity-only readiness = %+v", continuityOnly)
+	}
+
+	sourceFailure := ReadyStatusResponse{Status: "degraded", Ready: false, SourceReady: false}
+	applyContinuityReadiness(&sourceFailure)
+	if sourceFailure.Status != "degraded" || sourceFailure.SourceReady {
+		t.Fatalf("continuity overwrote source failure = %+v", sourceFailure)
+	}
+}
+
 func TestGapWorkerPollingUsesTokensWithoutLockingToRealtimeSecond(t *testing.T) {
 	if got := gapWorkerPollInterval(30*time.Second, 10*time.Second, 0); got != 250*time.Millisecond {
 		t.Fatalf("priority worker interval = %v, want 250ms", got)
@@ -87,6 +130,7 @@ func TestReadyzDegradedWhenAllKeysRateLimited(t *testing.T) {
 	server := NewServer(config.ChainWatcherConfig{PollInterval: time.Second, Lookback: 10 * time.Minute}, nil, nil)
 	server.status.recordScanSuccess("global", scanResult{}, 10*time.Millisecond, now.Add(-time.Second))
 	server.status.recordScanError("global", &tron.HTTPError{StatusCode: http.StatusTooManyRequests, Body: "all keys unavailable"}, now.Add(30*time.Second), scanResult{}, 10*time.Millisecond, now)
+	server.status.recordScanError("global", &tron.HTTPError{StatusCode: http.StatusTooManyRequests, Body: "all keys unavailable"}, now.Add(30*time.Second), scanResult{}, 10*time.Millisecond, now.Add(time.Millisecond))
 	rec := httptest.NewRecorder()
 	server.handleReady(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
 	if rec.Code != http.StatusServiceUnavailable {
@@ -162,8 +206,12 @@ func TestOlderSlowRoundFailureDoesNotOverrideNewerSuccessReadiness(t *testing.T)
 		t.Fatal("older failed round overrode newer successful round")
 	}
 	server.status.recordScanError("global", context.DeadlineExceeded, time.Time{}, scanResult{RoundID: 3}, 3*time.Second, now.Add(2*time.Millisecond))
+	if ready := server.status.response(now.Add(time.Second), 5*time.Second, storage.ChainWatcherDeliveryStats{}).Ready; !ready {
+		t.Fatal("one newer failed round should not degrade a fresh source")
+	}
+	server.status.recordScanError("global", context.DeadlineExceeded, time.Time{}, scanResult{RoundID: 4}, 3*time.Second, now.Add(3*time.Millisecond))
 	if ready := server.status.response(now.Add(time.Second), 5*time.Second, storage.ChainWatcherDeliveryStats{}).Ready; ready {
-		t.Fatal("newer failed round should degrade readiness immediately")
+		t.Fatal("consecutive newer failed rounds should degrade readiness")
 	}
 }
 

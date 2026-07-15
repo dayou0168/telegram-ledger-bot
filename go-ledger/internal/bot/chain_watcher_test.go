@@ -129,19 +129,19 @@ func TestWatcherFallbackControllerStateMachineAndRecovery(t *testing.T) {
 	now := time.Unix(1000, 0)
 	controller := newWatcherFallbackControllerWithRecovery(3, 2, 5*time.Second)
 
-	controller.recordFailure("ready", now)
-	if mode := controller.snapshot(now).Mode; mode != fallbackModePending {
-		t.Fatalf("first failure mode = %s, want pending", mode)
+	first := controller.recordFailure("ready", now)
+	if mode := controller.snapshot(now).Mode; mode != fallbackModePrimary || first.ModeChanged || first.LeaseRequested {
+		t.Fatalf("first failure mode/notice = %s/%+v, want silent primary suspicion", mode, first)
 	}
 	controller.recordFailure("claim", now.Add(time.Second))
-	if mode := controller.snapshot(now.Add(time.Second)).Mode; mode != fallbackModePending {
-		t.Fatalf("second failure mode = %s, want pending", mode)
+	if mode := controller.snapshot(now.Add(time.Second)).Mode; mode != fallbackModePrimary {
+		t.Fatalf("independent isolated failures mode = %s, want primary", mode)
 	}
 	controller.recordFailure("ready", now.Add(2*time.Second))
-	controller.recordFailure("ready", now.Add(3*time.Second))
+	threshold := controller.recordFailure("ready", now.Add(3*time.Second))
 	state := controller.snapshot(now.Add(3 * time.Second))
-	if state.Mode != fallbackModePending || !state.LeaseRequested {
-		t.Fatalf("fallback before lease = %+v, want pending lease request", state)
+	if state.Mode != fallbackModePending || !state.LeaseRequested || !threshold.ModeChanged || !threshold.LeaseRequested {
+		t.Fatalf("fallback threshold state/notice = %+v/%+v, want pending lease request", state, threshold)
 	}
 	controller.activateLease(now.Add(3 * time.Second))
 	if mode := controller.snapshot(now.Add(time.Hour)).Mode; mode != fallbackModeActive {
@@ -263,11 +263,11 @@ func TestWatcherFallbackLeaseRequestLoggingIsBounded(t *testing.T) {
 	now := time.Unix(4000, 0)
 	controller := newWatcherFallbackControllerWithRecovery(2, 2, 5*time.Second)
 	first := controller.recordFailure("ready", now)
-	if !first.ModeChanged || first.Mode != fallbackModePending {
-		t.Fatalf("first notice = %+v", first)
+	if first.ModeChanged || first.LeaseRequested || first.Mode != fallbackModePrimary {
+		t.Fatalf("first isolated failure notice = %+v, want silent primary", first)
 	}
 	requested := controller.recordFailure("ready", now.Add(3*time.Second))
-	if !requested.LeaseRequested {
+	if !requested.ModeChanged || requested.Mode != fallbackModePending || !requested.LeaseRequested {
 		t.Fatalf("threshold notice = %+v", requested)
 	}
 	for second := 4; second < 63; second++ {
@@ -290,5 +290,27 @@ func TestWatcherFallbackLeaseRequestLoggingIsBounded(t *testing.T) {
 	activeSummary := controller.recordFailure("ready", now.Add(123*time.Second))
 	if activeSummary.SuppressedFailures != 60 {
 		t.Fatalf("active fallback summary = %+v, want 60", activeSummary)
+	}
+}
+
+func TestWatcherFallbackIsolatedFailureRecoveryClearsSuspicion(t *testing.T) {
+	now := time.Unix(5000, 0)
+	controller := newWatcherFallbackControllerWithRecovery(2, 2, 5*time.Second)
+	if notice := controller.recordFailure("ready", now); notice.ModeChanged || notice.LeaseRequested {
+		t.Fatalf("isolated failure notice = %+v", notice)
+	}
+	if changed := controller.recordSuccess("ready", now.Add(time.Second), 0); changed {
+		t.Fatal("silent suspicion recovery reported a public state change")
+	}
+	if state := controller.snapshot(now.Add(time.Second)); state.Mode != fallbackModePrimary || state.LeaseRequested {
+		t.Fatalf("state after isolated recovery = %+v", state)
+	}
+
+	if notice := controller.recordFailure("ready", now.Add(2*time.Second)); notice.ModeChanged {
+		t.Fatalf("new first failure after recovery changed mode: %+v", notice)
+	}
+	threshold := controller.recordFailure("ready", now.Add(5*time.Second))
+	if !threshold.ModeChanged || !threshold.LeaseRequested || threshold.Mode != fallbackModePending {
+		t.Fatalf("sustained failure did not reach fallback threshold: %+v", threshold)
 	}
 }

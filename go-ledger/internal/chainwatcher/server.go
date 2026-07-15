@@ -1404,47 +1404,53 @@ type watcherStatus struct {
 	catchupDeferredCount  int64
 }
 
+const (
+	minimumSourceStaleAfter = 5 * time.Second
+	sourceFailureThreshold  = 2
+)
+
 type scanStatus struct {
-	roundID            int64
-	latestOutcomeRound int64
-	latestOutcomeOK    bool
-	latestOutcomeAt    time.Time
-	lastStartedAt      time.Time
-	lastSuccessAt      time.Time
-	lastErrorAt        time.Time
-	lastError          string
-	lastErrorClass     string
-	lastDuration       time.Duration
-	backoffUntil       time.Time
-	lastBlockTimestamp int64
-	lag                time.Duration
-	scanCount          int64
-	errorCount         int64
-	overlapSkipped     int64
-	transferCount      int
-	matchCount         int
-	subscriptionCount  int
-	addressCount       int
-	apiCallCount       int
-	pageCount          int
-	pageLimit          int
-	pageLimitReached   bool
-	basePageCount      int
-	dynamicPageCount   int
-	continuationPage   int
-	yieldReason        string
-	cutoffTimestamp    int64
-	anchorFound        bool
-	anchorHitCount     int64
-	anchorMissCount    int64
-	previousAnchorID   string
-	headEventID        string
-	apiWaitDuration    time.Duration
-	apiFetchDuration   time.Duration
-	parseDuration      time.Duration
-	matchDuration      time.Duration
-	writeDuration      time.Duration
-	recent             []scanRound
+	roundID             int64
+	latestOutcomeRound  int64
+	latestOutcomeOK     bool
+	latestOutcomeAt     time.Time
+	consecutiveFailures int
+	lastStartedAt       time.Time
+	lastSuccessAt       time.Time
+	lastErrorAt         time.Time
+	lastError           string
+	lastErrorClass      string
+	lastDuration        time.Duration
+	backoffUntil        time.Time
+	lastBlockTimestamp  int64
+	lag                 time.Duration
+	scanCount           int64
+	errorCount          int64
+	overlapSkipped      int64
+	transferCount       int
+	matchCount          int
+	subscriptionCount   int
+	addressCount        int
+	apiCallCount        int
+	pageCount           int
+	pageLimit           int
+	pageLimitReached    bool
+	basePageCount       int
+	dynamicPageCount    int
+	continuationPage    int
+	yieldReason         string
+	cutoffTimestamp     int64
+	anchorFound         bool
+	anchorHitCount      int64
+	anchorMissCount     int64
+	previousAnchorID    string
+	headEventID         string
+	apiWaitDuration     time.Duration
+	apiFetchDuration    time.Duration
+	parseDuration       time.Duration
+	matchDuration       time.Duration
+	writeDuration       time.Duration
+	recent              []scanRound
 }
 
 type scanRound struct {
@@ -1823,15 +1829,15 @@ func scanReady(status scanStatus, staleAfter time.Duration, now time.Time) bool 
 		return false
 	}
 	if staleAfter <= 0 {
-		staleAfter = 5 * time.Second
+		staleAfter = minimumSourceStaleAfter
 	}
 	if now.Sub(status.lastSuccessAt) > staleAfter {
 		return false
 	}
-	if !status.latestOutcomeAt.IsZero() {
-		return status.latestOutcomeOK
+	if status.consecutiveFailures >= sourceFailureThreshold {
+		return false
 	}
-	return status.backoffUntil.IsZero() || !status.backoffUntil.After(now)
+	return true
 }
 
 func (s *scanStatus) recordOutcome(roundID int64, success bool, now time.Time) {
@@ -1843,6 +1849,11 @@ func (s *scanStatus) recordOutcome(roundID int64, success bool, now time.Time) {
 	}
 	s.latestOutcomeOK = success
 	s.latestOutcomeAt = now
+	if success {
+		s.consecutiveFailures = 0
+	} else {
+		s.consecutiveFailures++
+	}
 }
 
 func deliveryResponse(stats storage.ChainWatcherDeliveryStats) DeliveryStatusResponse {
@@ -1908,13 +1919,18 @@ func (s *Server) readinessResponse(ctx context.Context, now time.Time) ReadyStat
 		response.CatchupLagSeconds = (safeEnd - frontier) / 1000
 	}
 	response.ContinuityReady = state.WatchAddressCount == 0 || (state.CursorTimestamp > 0 && !state.CatchupRequired && state.OpenGapCount == 0 && state.LeasedGapCount == 0)
-	if !response.ContinuityReady {
-		response.Ready = false
-		if response.Status == "ready" {
-			response.Status = "degraded/continuity"
-		}
-	}
+	applyContinuityReadiness(&response)
 	return response
+}
+
+func applyContinuityReadiness(response *ReadyStatusResponse) {
+	if response.ContinuityReady {
+		return
+	}
+	response.Ready = false
+	if response.SourceReady && response.Status == "ready" {
+		response.Status = "degraded/continuity"
+	}
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -2111,8 +2127,8 @@ func (s *Server) sourceStaleAfter() time.Duration {
 		interval = time.Second
 	}
 	staleAfter := interval * 5
-	if staleAfter < 5*time.Second {
-		staleAfter = 5 * time.Second
+	if staleAfter < minimumSourceStaleAfter {
+		staleAfter = minimumSourceStaleAfter
 	}
 	if s.cfg.Lookback > 0 && staleAfter > s.cfg.Lookback {
 		staleAfter = s.cfg.Lookback

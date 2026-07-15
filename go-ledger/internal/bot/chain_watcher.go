@@ -629,6 +629,8 @@ const (
 	fallbackModeActive   fallbackMode = "FALLBACK_ACTIVE"
 	fallbackModeRecovery fallbackMode = "RECOVERING"
 	fallbackModeDegraded fallbackMode = "DEGRADED"
+
+	fallbackFailureMinDuration = 3 * time.Second
 )
 
 type watcherFallbackController struct {
@@ -732,21 +734,27 @@ func (c *watcherFallbackController) recordFailure(source string, now time.Time) 
 			c.firstClaimFailure = now
 		}
 	}
-	if c.mode == fallbackModePrimary {
-		c.mode = fallbackModePending
-		c.lastFailureSummary = now
-		notice.Mode = c.mode
-		notice.ModeChanged = true
-		return notice
-	}
 	if c.mode == fallbackModeRecovery {
 		c.mode = fallbackModeActive
 		notice.Mode = c.mode
 		notice.ModeChanged = true
 		return notice
 	}
-	readyFailed := c.readyFailures >= c.failThreshold && !c.firstReadyFailure.IsZero() && now.Sub(c.firstReadyFailure) >= 3*time.Second
-	claimFailed := c.claimFailures >= c.failThreshold && !c.firstClaimFailure.IsZero() && now.Sub(c.firstClaimFailure) >= 3*time.Second
+	readyFailed := c.readyFailures >= c.failThreshold && !c.firstReadyFailure.IsZero() && now.Sub(c.firstReadyFailure) >= fallbackFailureMinDuration
+	claimFailed := c.claimFailures >= c.failThreshold && !c.firstClaimFailure.IsZero() && now.Sub(c.firstClaimFailure) >= fallbackFailureMinDuration
+	if c.mode == fallbackModePrimary {
+		if !readyFailed && !claimFailed {
+			return notice
+		}
+		c.mode = fallbackModePending
+		c.leaseRequested = true
+		c.lastFailureSummary = now
+		c.suppressedFailures = 0
+		notice.Mode = c.mode
+		notice.ModeChanged = true
+		notice.LeaseRequested = true
+		return notice
+	}
 	if c.mode == fallbackModeActive || (!readyFailed && !claimFailed) {
 		return c.summarizeFailureLocked(now, notice)
 	}
