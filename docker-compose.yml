@@ -1,4 +1,4 @@
-# v2.4.9 发布候选模板；仅在显式发布 workflow 成功后用于生产升级。
+# v2.4.10 发布候选模板；仅在显式发布 workflow 成功后用于生产升级。
 #
 # 单机器人一体部署：
 # 1. 新建宝塔 Compose 项目，把本文件完整粘贴进去。
@@ -56,7 +56,7 @@ services:
       retries: 10
 
   ledger-chain-watcher:
-    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.9
+    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.10
     container_name: ledger-chain-watcher
     restart: unless-stopped
     logging:
@@ -122,7 +122,7 @@ services:
       retries: 10
 
   ledger-bot:
-    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.9
+    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.10
     container_name: ledger-bot-go
     restart: unless-stopped
     logging:
