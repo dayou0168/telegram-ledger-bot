@@ -174,6 +174,11 @@ func TestPostgresGlobalPermissionEpochNotifiesOtherStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer storeB.Close()
+	uniqueEpoch := time.Now().UnixNano()
+	if _, err := storeA.pool.Exec(ctx, `UPDATE permission_epochs
+		SET epoch=$1, updated_at=NOW() WHERE scope=$2`, uniqueEpoch, PermissionScopeGlobalOperator); err != nil {
+		t.Fatal(err)
+	}
 
 	events := make(chan PermissionInvalidation, 4)
 	listenCtx, stopListener := context.WithCancel(ctx)
@@ -192,7 +197,7 @@ func TestPostgresGlobalPermissionEpochNotifiesOtherStore(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("listener did not report initial epoch")
 	}
-	if initial.Scope != PermissionScopeGlobalOperator || initial.Epoch <= 0 {
+	if initial.Scope != PermissionScopeGlobalOperator || initial.Epoch != uniqueEpoch {
 		t.Fatalf("initial event = %+v", initial)
 	}
 	waitForEpoch := func(want int64) PermissionInvalidation {
@@ -200,7 +205,7 @@ func TestPostgresGlobalPermissionEpochNotifiesOtherStore(t *testing.T) {
 		for {
 			select {
 			case event := <-events:
-				if event.Scope == PermissionScopeGlobalOperator && event.Epoch >= want {
+				if event.Scope == PermissionScopeGlobalOperator && event.Epoch == want {
 					return event
 				}
 			case <-time.After(2 * time.Second):

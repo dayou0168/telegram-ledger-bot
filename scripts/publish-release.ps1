@@ -20,7 +20,7 @@ param(
     [string]$Version = '2.4.10',
 
     [ValidatePattern('^[0-9a-f]{40}$')]
-    [string]$ExpectedRemoteMaster = '2abe7f704621df18f5a978881c15f631d797ae76',
+    [string]$ExpectedRemoteMaster = 'f2694a4453082244fa807c67fbd6eed8c1d23d63',
 
     [string]$Repository = 'dayou0168/telegram-ledger-bot',
 
