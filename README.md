@@ -79,6 +79,34 @@ docker pull ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.10
 
 同一个机器人实例只使用一个 PostgreSQL 数据库同时保存广播/转发配置和记账数据；不要为同一个 bot 再拆“广播库”和“记账库”。共享 `ledger-chain-watcher` 仍然使用独立数据库。
 
+### 推荐：多机器人快速安装
+
+宿主机已经安装宝塔 PostgreSQL 和 systemd watcher 时，新机器人不再手写几十项 Compose 环境变量。配置分为三层：
+
+- `deploy/ledger-instance.env.example`：每个机器人只填写实例简称、Bot Token、Bot 用户名、宿主 UID、域名 5 项；
+- `deploy/ledger-instance-shared.env.example`：本机只初始化一次的 PostgreSQL、镜像和宝塔路径；
+- `deploy/config/`：机器人线程、超时、汇率以及 watcher 扫描、补偿等高级默认参数。
+
+初始化共享配置一次：
+
+```bash
+install -d -m 700 /etc/telegram-ledger /etc/telegram-ledger/config
+install -m 600 deploy/ledger-instance-shared.env.example /etc/telegram-ledger/shared.env
+install -m 644 deploy/config/ledger-bot.defaults.env /etc/telegram-ledger/config/bot-defaults.env
+vi /etc/telegram-ledger/shared.env
+```
+
+以后每个机器人只执行：
+
+```bash
+cp deploy/ledger-instance.env.example /root/new-bot.env
+vi /root/new-bot.env
+bash deploy/ledger-instance-manager.sh plan /root/new-bot.env
+bash deploy/ledger-instance-manager.sh install /root/new-bot.env --apply
+```
+
+安装器自动创建独立数据库、生成后台密码和 watcher 密钥、注册 watcher、选择端口、生成精简 Compose/Nginx 并启动验收。任一步失败会回滚本次创建的资源，不影响已有机器人。完整说明见 [docs/deployment.md](docs/deployment.md#多机器人快速安装)。
+
 本地源码构建和更完整的 Go 运行说明见 [go-ledger/README.md](go-ledger/README.md)。
 
 1. 复制配置：
@@ -182,43 +210,19 @@ TRON_USDT_CONTRACT=TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t
 TRONGRID_API_KEY=
 ```
 
-`ledger-chain-watcher` 第一版统一请求 Tronscan/TronGrid：
+宿主机 watcher 的短配置只保留数据库、管理密钥、API Key 和机器人注册信息：
 
 ```env
 CHAIN_WATCHER_DATABASE_URL=postgres://chainwatcher:change_this_chain_pg_password@chain-postgres:5432/ledger_chain_watcher?sslmode=disable
-CHAIN_WATCHER_ADDR=:8090
 CHAIN_WATCHER_ADMIN_TOKEN=change_this_watcher_admin_token
 CHAIN_WATCHER_KEY_ENCRYPTION_KEY=base64_encoded_32_byte_key
-CHAIN_WATCHER_BOTS=ledger-main:change_this_chain_watcher_secret
-CHAIN_WATCHER_TRONSCAN_API_BASE=https://apilist.tronscanapi.com/api
+CHAIN_WATCHER_BOTS=
 CHAIN_WATCHER_TRONSCAN_API_KEYS=key1,key2,key3
-# 单 Key 兼容项；配置 API_KEYS 时留空
 CHAIN_WATCHER_TRONSCAN_API_KEY=
 CHAIN_WATCHER_TRON_API_KEY=
-CHAIN_WATCHER_SOURCE_POLL_SECONDS=1
-CHAIN_WATCHER_MAIN_SCAN_TIMEOUT_MS=3000
-CHAIN_WATCHER_MAIN_MAX_INFLIGHT_ROUNDS=3
-# 旧 CHAIN_WATCHER_GLOBAL_SCAN_PAGES 仅兼容读取并忽略，不再控制固定页数
-CHAIN_WATCHER_HEAD_TIME_BUDGET_MS=850
-CHAIN_WATCHER_HEAD_SAFETY_MAX_PAGES=256
-CHAIN_WATCHER_HEAD_MAX_CONCURRENCY=32
-CHAIN_WATCHER_HEAD_PERSIST_CONCURRENCY=8
-CHAIN_WATCHER_RECOVERY_SAFETY_MAX_PAGES=4096
-CHAIN_WATCHER_SURPLUS_BURST_SECONDS=60
-CHAIN_WATCHER_CATCHUP_ENABLED=true
-CHAIN_WATCHER_CATCHUP_STATE_INTERVAL_SECONDS=30
-CHAIN_WATCHER_CATCHUP_PAGE_LIMIT=3
-CHAIN_WATCHER_CATCHUP_MAX_REQUESTS_PER_TICK=6
-CHAIN_WATCHER_CATCHUP_MAX_INFLIGHT=8
-CHAIN_WATCHER_CATCHUP_WINDOW_SECONDS=30
-CHAIN_WATCHER_CATCHUP_OVERLAP_SECONDS=2
-# 0 表示按健康 Key 的剩余容量自动计算；正数表示额外硬上限
-CHAIN_WATCHER_CATCHUP_MAX_RPS=0
-CHAIN_WATCHER_TRONSCAN_KEY_INTERVAL_MS=200
-CHAIN_WATCHER_TRONSCAN_DAILY_LIMIT_PER_KEY=100000
-CHAIN_WATCHER_LOOKBACK_SECONDS=600
-CHAIN_WATCHER_CLAIM_LEASE_SECONDS=30
 ```
+
+扫描并发、动态扩页、缺口补偿和 Key 状态机参数统一位于 [deploy/config/ledger-chain-watcher.defaults.env](deploy/config/ledger-chain-watcher.defaults.env)，不需要在每次新增机器人时重复填写。`CHAIN_WATCHER_BOTS` 由快速安装器自动追加和回滚。
 
 watcher 每秒用同一个 cutoff 扫描，并保存上一轮稳定 event identity 锚点。每个健康 Key 按 `剩余额度/距离 UTC 00:00 的秒数` 产生可持续令牌：完整额度下每 Key 每秒约贡献 1 个基础页，页数不是固定值，也不由旧 `GLOBAL_SCAN_PAGES` 控制。基础页并发返回后立即匹配和持久化；P1 使用独立高优先持久化 lane，P2..PN 进入默认 8 worker 的普通池，不会让慢页形成全局串行瓶颈。找到锚点或非满页后停止继续扩页；未覆盖范围进入精确持久化 gap/catch-up，从 cursor 补到 realtime head 前 2 秒。没有缺口时不请求补偿 API；逐地址扫描默认关闭。
 

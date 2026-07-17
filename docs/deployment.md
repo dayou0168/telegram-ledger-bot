@@ -252,6 +252,75 @@ deploy/ledger-chain-watcher.service
 ledgerchainwatcher
 ```
 
+### 多机器人快速安装
+
+同一台宝塔服务器已经安装宿主机 PostgreSQL 和 systemd watcher 后，不需要再为每个机器人手写完整 Compose、数据库连接和 watcher 凭据。仓库提供：
+
+```text
+deploy/ledger-instance-shared.env.example
+deploy/ledger-instance.env.example
+deploy/ledger-instance-manager.sh
+```
+
+共享配置只初始化一次：
+
+```bash
+install -d -m 700 /etc/telegram-ledger /etc/telegram-ledger/config
+install -m 600 deploy/ledger-instance-shared.env.example /etc/telegram-ledger/shared.env
+install -m 644 deploy/config/ledger-bot.defaults.env /etc/telegram-ledger/config/bot-defaults.env
+vi /etc/telegram-ledger/shared.env
+```
+
+共享配置通常只需要填写 `POSTGRES_PASSWORD`。每个新机器人复制一份短配置，只填写实例简称、Bot Token、Bot 用户名、宿主 UID 和域名：
+
+```bash
+cp deploy/ledger-instance.env.example /root/new-bot.env
+vi /root/new-bot.env
+
+bash deploy/ledger-instance-manager.sh plan /root/new-bot.env
+bash deploy/ledger-instance-manager.sh install /root/new-bot.env --apply
+```
+
+安装器自动完成：
+
+- 创建独立 PostgreSQL 数据库；
+- 生成后台密码和 watcher 内部密钥；
+- 把机器人幂等注册到宿主机 watcher；
+- 自动选择未占用的 `127.0.0.1` 后台端口；
+- 生成宝塔 Compose、运行时 env、Nginx 反向代理和源站证书；
+- 启动容器并等待 `/health` 通过。
+
+运行时密码统一保存在：
+
+```text
+/etc/telegram-ledger/instances/<实例简称>.env
+```
+
+Compose 只保留镜像、容器名、host 网络、日志上限和一个 `env_file`，不再重复几十项环境变量。检查现有实例：
+
+```bash
+bash deploy/ledger-instance-manager.sh status /root/new-bot.env
+```
+
+高级参数集中在独立目录，日常新增机器人不需要打开：
+
+```text
+/etc/telegram-ledger/config/bot-defaults.env
+/etc/ledger-chain-watcher/config/defaults.env
+```
+
+watcher 的 `/etc/ledger-chain-watcher/env` 只保留数据库 URL、管理密钥、Key 加密密钥、Tronscan Keys 和自动维护的机器人凭据。调度并发、扫描窗口、超时及补偿参数统一放在 `config/defaults.env`：
+
+```bash
+install -d -m 700 /etc/ledger-chain-watcher/config
+install -m 644 deploy/config/ledger-chain-watcher.defaults.env /etc/ledger-chain-watcher/config/defaults.env
+install -m 644 deploy/ledger-chain-watcher.service /etc/systemd/system/ledger-chain-watcher.service
+systemctl daemon-reload
+systemctl restart ledger-chain-watcher
+```
+
+旧 watcher env 中暂时保留的同名高级变量会覆盖 defaults，不影响运行；确认新默认值后再从短 env 中删除即可。安装失败时，快速安装器会恢复 watcher 凭据并删除本次创建的数据库、Compose、Nginx 站点和运行时配置，不会清理安装前已经存在的资源。
+
 复制 env 文件：
 
 ```bash
