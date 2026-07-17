@@ -1,4 +1,4 @@
-# v2.4.10 发布候选模板；仅在显式发布 workflow 成功后用于生产升级。
+# v2.4.11 发布候选模板；仅在显式发布 workflow 成功后用于生产升级。
 #
 # 适用场景：
 # - PostgreSQL 已经在宿主机/宝塔里安装好。
@@ -15,7 +15,7 @@
 
 services:
   ledger-chain-watcher:
-    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.10
+    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.11
     container_name: ledger-chain-watcher
     restart: unless-stopped
     logging:
@@ -90,7 +90,7 @@ services:
       retries: 10
 
   ledger-bot:
-    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.10
+    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.11
     container_name: ledger-bot-go
     restart: unless-stopped
     logging:

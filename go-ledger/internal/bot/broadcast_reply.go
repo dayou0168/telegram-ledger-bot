@@ -29,7 +29,7 @@ func (b *Bot) notifyBroadcastReplyAsync(ctx context.Context, msg telegram.Messag
 		if !ok || delivery.OperatorUserID == 0 {
 			return
 		}
-		delivery = b.tryReplaceBroadcastDelivery(jobCtx, delivery)
+		delivery = b.tryReplaceBroadcastDelivery(jobCtx, delivery, msg.ReplyTo.Caption)
 		text := formatBroadcastReplyNotice(msg, user, delivery)
 		operatorCanReply := b.canQuickReplyDelivery(jobCtx, delivery.OperatorUserID, delivery)
 		for recipient := range b.broadcastReplyRecipients(delivery.OperatorUserID) {

@@ -9,7 +9,7 @@ import (
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
 )
 
-func (b *Bot) tryReplaceBroadcastDelivery(ctx context.Context, delivery storage.BroadcastDelivery) storage.BroadcastDelivery {
+func (b *Bot) tryReplaceBroadcastDelivery(ctx context.Context, delivery storage.BroadcastDelivery, originalCaption string) storage.BroadcastDelivery {
 	if delivery.Mode != "chat" || delivery.ReplacedAt != nil {
 		return delivery
 	}
@@ -23,9 +23,10 @@ func (b *Bot) tryReplaceBroadcastDelivery(ctx context.Context, delivery storage.
 	}
 	text := strings.TrimSpace(setting.Text)
 	if len(setting.ImageData) > 0 {
-		if _, err := b.editPhotoBytes(ctx, delivery.TargetChatID, delivery.TargetMessageID, setting.ImageName, setting.ImageData, text, nil); err != nil {
+		caption := broadcastReplacementCaption(text, originalCaption)
+		if _, err := b.editPhotoBytes(ctx, delivery.TargetChatID, delivery.TargetMessageID, setting.ImageName, setting.ImageData, caption, nil); err != nil {
 			log.Printf("replace broadcast media in place: %v", err)
-			replacement, sendErr := b.sendPhotoBytes(ctx, delivery.TargetChatID, setting.ImageName, setting.ImageData, text, nil)
+			replacement, sendErr := b.sendPhotoBytes(ctx, delivery.TargetChatID, setting.ImageName, setting.ImageData, caption, nil)
 			if sendErr != nil {
 				log.Printf("send replacement broadcast media: %v", sendErr)
 				return delivery
@@ -64,6 +65,13 @@ func (b *Bot) tryReplaceBroadcastDelivery(ctx context.Context, delivery storage.
 	}
 	log.Printf("replace broadcast text/caption failed for delivery %d", delivery.ID)
 	return delivery
+}
+
+func broadcastReplacementCaption(configuredText, originalCaption string) string {
+	if text := strings.TrimSpace(configuredText); text != "" {
+		return text
+	}
+	return originalCaption
 }
 
 func (b *Bot) markBroadcastReplaced(ctx context.Context, deliveryID int64) {

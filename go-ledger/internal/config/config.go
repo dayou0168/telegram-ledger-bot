@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const Version = "2.4.10"
+const Version = "2.4.11"
 
 type Config struct {
 	TelegramBotToken string
