@@ -1,15 +1,15 @@
 # Telegram 记账机器人 Go 部署运维
 
-当前源码发布候选为 Go v2.4.12，正式 tag、Release 和 GHCR 镜像只能由显式发布 workflow 产生。生产部署使用 GHCR 预构建镜像、PostgreSQL 和共享链上监听服务 `ledger-chain-watcher`。服务器上不需要源码构建作为默认路径。v2.4.12 的发布说明见 [releases/v2.4.12.md](releases/v2.4.12.md)，生产预检、备份、升级、回滚和验收见 [production-rollout-v2.4.12.md](production-rollout-v2.4.12.md)。
+当前源码发布候选为 Go v2.4.13，正式 tag、Release 和 GHCR 镜像只能由显式发布 workflow 产生。生产部署使用 GHCR 预构建镜像、PostgreSQL 和共享链上监听服务 `ledger-chain-watcher`。服务器上不需要源码构建作为默认路径。v2.4.13 的发布说明见 [releases/v2.4.13.md](releases/v2.4.13.md)，生产预检、备份、升级、回滚和验收见 [production-rollout-v2.4.13.md](production-rollout-v2.4.13.md)。
 
-唯一候选基线是本集成仓库的已确认 v2.4.12 发布提交；外层旧工作区中的部署文件和未跟踪脚本已过时或尚未审查，不得直接合并或投产。
+唯一候选基线是本集成仓库的已确认 v2.4.13 发布提交；外层旧工作区中的部署文件和未跟踪脚本已过时或尚未审查，不得直接合并或投产。
 
 ## 部署基线
 
-- 机器人镜像：`ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.12`
-- watcher 镜像：`ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.12`
+- 机器人镜像：`ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.13`
+- watcher 镜像：`ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.13`
 
-v2.4.12 是机器人侧成员发现、操作员目标解析和广播回复通知权限发布。它新增 `2.4.16-chat-member-discovery` 与 `2.4.17-broadcast-reply-preferences` 数据库迁移，但不改变 watcher 协议；生产应先备份机器人数据库，再逐个升级机器人，现有 watcher 不重启。只有 Release 和机器人镜像 digest 实际可用后才能执行生产升级。
+v2.4.13 是机器人侧后台身份、观察授权、可靠广播媒体、持久广播目标和关闭日切兼容发布。它新增 `2.4.18-operator-message-observers-admin-identity` 与 `2.4.19-broadcast-delivery-state` 数据库迁移，但不改变 watcher 协议；生产应先备份机器人数据库并配置独立 `ADMIN_SESSION_SECRET`，再逐个升级机器人，现有 watcher 不重启。只有 Release 和机器人镜像 digest 实际可用后才能执行生产升级。
 - 数据库：每个机器人实例独立 PostgreSQL 16
 - 链上监听：多个机器人共享 `ledger-chain-watcher`，watcher 使用独立 PostgreSQL 保存订阅、匹配事件和投递游标
 - 推荐入口：宝塔 Docker Compose
@@ -112,12 +112,13 @@ gap 合并只能改写尚未开始的 pending successor；已推进 `next_page` 
 
 自动热备要求所有 bot 配置同一个 `BOT_FALLBACK_SHARED_DATABASE_URL`；PostgreSQL lease 保证只有一个实例执行无 Key 全局扫描，其他 bot 只领取共享 matched events。恢复时进入 RECOVERING，私有 Key 池补齐 watermark，连续 ready/claim 成功且 lag 归零后才释放 leader lease。没有共享 DSN 时明确 DEGRADED，不启动旧本机扫描。
 
-常用选填：
+后台与常用配置：
 
 ```yaml
 DEFAULT_OPERATOR_USER_IDS: ""
 PUBLIC_BILL_BASE_URL: "https://bot.example.com"
-ADMIN_WEB_TOKEN: "change_this_admin_password"
+ADMIN_SESSION_SECRET: "change_this_independent_session_secret"
+ADMIN_WEB_TOKEN: ""
 ADDRESS_WATCH_FREE_LIMIT: "2"
 ```
 
@@ -225,8 +226,9 @@ CHAIN_WATCHER_SECRET: "change_this_chain_watcher_secret"
 ```text
 ledger-chain-watcher 只 expose 8090，不映射公网端口。
 ledger-bot 映射 8080:8080，用于宝塔/Nginx 反向代理后台和网页账单。
-ADMIN_WEB_TOKEN 不要和 CHAIN_WATCHER_SECRET 共用。
-多个机器人实例仍然要使用不同数据库、不同端口、不同 PUBLIC_BILL_BASE_URL、不同 ADMIN_WEB_TOKEN。
+ADMIN_SESSION_SECRET 是每个机器人必填的独立随机会话签名密钥，缺失时后台 fail-closed。
+ADMIN_WEB_TOKEN 仅是 Telegram ticket 登录的可选第二因素，不能单独登录或签发会话。
+多个机器人实例仍然要使用不同数据库、不同端口、不同 PUBLIC_BILL_BASE_URL、不同 ADMIN_SESSION_SECRET。
 ```
 
 广播和记账是一体能力，不需要为“广播群”单独关闭机器人记账模块。每个群默认未开始记账，只保存群名并支持广播/转发回复通知；需要记账的群，由宿主、默认操作人、active 一级/下级全局操作人或本群操作员在群内发送 `开始`。普通成员发送 `开始` 会收到 `没有操作权限。请管理员添加操作员。`
@@ -369,14 +371,14 @@ BOT_REQUEST_TIMEOUT=70
 
 从旧版本升级时，删除 `CHAIN_WATCHER_GLOBAL_SCAN_PAGES` 和 `CHAIN_WATCHER_GLOBAL_EXPAND_PAGE_LIMIT`；二进制只会把前者报告为 deprecated，不再恢复固定页数。`CHAIN_WATCHER_CATCHUP_MAX_RPS=0` 使用动态 surplus，`CHAIN_WATCHER_CATCHUP_MAX_INFLIGHT=8` 是与 Key 数量解耦的保守 worker 安全天花板。
 
-Release 仍提供 v2.4.12 watcher 宿主机包供全新安装使用；已有生产环境执行本次升级时不要替换或重启 watcher：
+Release 仍提供 v2.4.13 watcher 宿主机包供全新安装使用；已有生产环境执行本次升级时不要替换或重启 watcher：
 
 ```bash
 cd /tmp
-wget -O ledger-chain-watcher-v2.4.12-linux-amd64.tar.gz \
-  https://github.com/dayou0168/telegram-ledger-bot/releases/download/v2.4.12/ledger-chain-watcher-v2.4.12-linux-amd64.tar.gz
-tar -xzf ledger-chain-watcher-v2.4.12-linux-amd64.tar.gz
-install -m 0755 ledger-chain-watcher-v2.4.12-linux-amd64/ledger-chain-watcher /usr/local/bin/ledger-chain-watcher
+wget -O ledger-chain-watcher-v2.4.13-linux-amd64.tar.gz \
+  https://github.com/dayou0168/telegram-ledger-bot/releases/download/v2.4.13/ledger-chain-watcher-v2.4.13-linux-amd64.tar.gz
+tar -xzf ledger-chain-watcher-v2.4.13-linux-amd64.tar.gz
+install -m 0755 ledger-chain-watcher-v2.4.13-linux-amd64/ledger-chain-watcher /usr/local/bin/ledger-chain-watcher
 /usr/local/bin/ledger-chain-watcher --help
 ```
 
@@ -459,7 +461,7 @@ CHAIN_WATCHER_URL=http://172.17.0.1:8090
 ```text
 8090 不开放公网。
 宝塔安全组、云安全组和系统防火墙只允许本机/Docker 网段访问 8090。
-CHAIN_WATCHER_SECRET、ADMIN_WEB_TOKEN、PostgreSQL 密码三者不要混用。
+CHAIN_WATCHER_SECRET、ADMIN_SESSION_SECRET、ADMIN_WEB_TOKEN、PostgreSQL 密码都不要混用。
 CHAIN_WATCHER_BOTS 泄露后，要同时更换 watcher env 和所有机器人 Compose 配置。
 ```
 
@@ -486,7 +488,7 @@ journalctl -u ledger-chain-watcher -f
 ```text
 ledger-chain-watcher        共享链上监听服务和 watcher PostgreSQL
 ledger-main                 当前记账机器人实例
-ledger-ops                  第二个独立 Go v2.4.12 机器人实例
+ledger-ops                  第二个独立 Go v2.4.13 机器人实例
 ```
 
 先创建共享 Docker 网络：
@@ -544,6 +546,7 @@ CHAIN_WATCHER_BOT_ID
 container_name
 宿主机端口
 PUBLIC_BILL_BASE_URL
+ADMIN_SESSION_SECRET
 ADMIN_WEB_TOKEN
 ```
 
@@ -593,14 +596,14 @@ ports:
 每个机器人实例使用唯一 CHAIN_WATCHER_BOT_ID
 每个 CHAIN_WATCHER_BOT_ID 在 watcher 的 CHAIN_WATCHER_BOTS 中配置一条 bot_id:secret
 不要放公网
-不要和 ADMIN_WEB_TOKEN 共用
+不要和 ADMIN_SESSION_SECRET 或 ADMIN_WEB_TOKEN 共用
 多个机器人可共用 watcher 服务，但不建议共用同一个 bot_id
 泄露后应同时更换 watcher 和所有机器人实例配置
 ```
 
 ## 未来接 TRON Lite FullNode + Kafka
 
-当前已发布 watcher 统一请求 Tronscan/TronGrid。未来切换自建节点时，机器人配置不变，只调整 watcher；跨服务器网络和安全验收必须先按 [production-rollout-v2.4.12.md](production-rollout-v2.4.12.md) 的事件服务器清单完成：
+当前已发布 watcher 统一请求 Tronscan/TronGrid。未来切换自建节点时，机器人配置不变，只调整 watcher；跨服务器网络和安全验收必须先按 [production-rollout-v2.4.13.md](production-rollout-v2.4.13.md) 的事件服务器清单完成：
 
 ```yaml
 CHAIN_WATCHER_SOURCE: "kafka"
@@ -632,7 +635,7 @@ default.replication.factor=1
 - 宿主可创建/禁用一级或下级全局操作人；一级只能管理自己的下级，下级不能授权。active 下级必须绑定 active 一级父级。
 - 默认操作人可不受范围限制地分配广播权限；一级只能把自己已有的分组/单群范围分配给自己的下级。
 - 普通用户可以在私聊使用地址监听，默认最多 2 个 active 地址；通过 `ADDRESS_WATCH_FREE_LIMIT` 调整。宿主、默认操作人和 active 一级/下级全局操作人不受此数量限制。
-- 后台入口优先通过私聊机器人生成 5 分钟有效的 Telegram 身份登录链接；`ADMIN_WEB_TOKEN` 仍作为宿主紧急入口和会话签名密钥。
+- 后台入口只接受私聊机器人生成的 5 分钟 Telegram 身份 ticket；ticket UID 决定身份，登录和后续请求都会实时重查角色。`ADMIN_SESSION_SECRET` 独立签名会话，`ADMIN_WEB_TOKEN` 仅可作为可选第二因素。
 - 普通用户发送 `开始` 会被拒绝，不会激活记账，也不会变成宿主或默认操作人。
 - 单群操作员是群级记账权限，由宿主、默认操作人或本群最高权限在群内管理；私聊时按普通用户处理。
 - 邀请机器人进群的人如果不是宿主、默认操作人或 active 一级/下级全局操作人，机器人会自动退出。
@@ -649,7 +652,7 @@ default.replication.factor=1
 2. SSL/TLS 模式建议使用 `Full` 或 `Full (strict)`。
 3. 宝塔创建站点 `bot.example.com`，申请 SSL。
 4. 宝塔反向代理到对应实例端口，例如 `http://127.0.0.1:8080` 或 `http://127.0.0.1:8081`。
-5. 对应实例填写独立的 `PUBLIC_BILL_BASE_URL` 和 `ADMIN_WEB_TOKEN`。
+5. 对应实例填写独立的 `PUBLIC_BILL_BASE_URL` 和强随机 `ADMIN_SESSION_SECRET`；需要额外第二因素时再填写 `ADMIN_WEB_TOKEN`。
 
 每个机器人实例一个独立域名或子域名：
 
@@ -696,7 +699,7 @@ gzip backups/*.sql
 
 建议把 `backups/` 同步到服务器外部位置，例如另一台机器、对象存储或网盘。
 
-仓库提供 [deploy/offsite-backup.sh](../deploy/offsite-backup.sh) 作为默认只读、显式 `push --apply` 才上传的异地 rsync 模板。异地备份和季度恢复演练步骤见 [production-rollout-v2.4.12.md](production-rollout-v2.4.12.md)。没有完成异地下载与临时库恢复前，不应把本机压缩文件视为完整灾备。
+仓库提供 [deploy/offsite-backup.sh](../deploy/offsite-backup.sh) 作为默认只读、显式 `push --apply` 才上传的异地 rsync 模板。异地备份和季度恢复演练步骤见 [production-rollout-v2.4.13.md](production-rollout-v2.4.13.md)。没有完成异地下载与临时库恢复前，不应把本机压缩文件视为完整灾备。
 
 ## 日志保留和磁盘保护
 

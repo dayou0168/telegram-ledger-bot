@@ -1,6 +1,6 @@
 # Reinstall Handoff and Current State
 
-Last updated: 2026-07-18
+Last updated: 2026-07-19
 
 This document is the recovery handoff for reinstalling the local system and continuing work from the current GitHub state. It intentionally does not contain any real token, password, API key, or SSH credential.
 
@@ -9,15 +9,15 @@ This document is the recovery handoff for reinstalling the local system and cont
 - Repository: `dayou0168/telegram-ledger-bot`
 - Main line: Go + PostgreSQL
 - Deprecated line: the old Python runtime is retired. Do not restore, test, or publish it as the active product line.
-- Current source release candidate: `v2.4.12`
-- Last confirmed published release before this candidate: `v2.4.11`
-- The v2.4.12 release commit and URL do not exist until the explicit release workflow succeeds. Do not invent them from a local commit.
+- Current source release candidate: `v2.4.13`
+- Last confirmed published release before this candidate: `v2.4.12`
+- The v2.4.13 release commit and URL do not exist until the explicit release workflow succeeds. Do not invent them from a local commit.
 
-Intended v2.4.12 images after the explicit release workflow succeeds:
+Intended v2.4.13 images after the explicit release workflow succeeds:
 
 ```text
-ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.12
-ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.12
+ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.13
+ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.13
 ```
 
 ## Current Architecture
@@ -28,10 +28,10 @@ ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.12
 - In normal mode, the bot registers watched addresses with `ledger-chain-watcher` and claims watcher matched events.
 - Bot fallback is not the normal path. After sustained watcher failure, all bots compete for a PostgreSQL lease and only one shared no-key leader scans until the watcher has recovered and its watermark is caught up.
 - Shared no-key fallback requires the watcher PostgreSQL DSN and a unique stable `BOT_FALLBACK_INSTANCE_ID` per bot; there is no per-bot emergency scanner switch or fixed maximum active time.
-- v2.4.11 is the last confirmed GitHub release. The unpublished v2.4.12 candidate adds member discovery and per-user broadcast reply preferences through migrations `2.4.16-chat-member-discovery` and `2.4.17-broadcast-reply-preferences`; it does not change the watcher protocol. Use `docs/production-rollout-v2.4.12.md` only after the real Release exists.
+- v2.4.12 is the last confirmed GitHub release. The unpublished v2.4.13 candidate adds hardened admin identity, host-only observer grants, reliable media broadcast delivery, durable targets, and disabled-cutoff compatibility through migrations `2.4.18-operator-message-observers-admin-identity` and `2.4.19-broadcast-delivery-state`; it does not change the watcher protocol. Use `docs/production-rollout-v2.4.13.md` only after the real Release exists.
 - Ignore deployment files from the outer legacy worktree. The only candidate baseline is the confirmed integration-repository commit.
 
-## v2.4.12 Candidate Runtime Configuration
+## v2.4.13 Candidate Runtime Configuration
 
 Expected watcher-side values:
 
@@ -170,11 +170,11 @@ docs/reinstall-handoff.md
 6. Pull and start the current images.
 
 ```powershell
-docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.12
-docker pull ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.12
+docker pull ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.13
+docker pull ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.13
 ```
 
-The v2.4.12 workflow publishes matching bot and watcher artifacts. For an existing v2.4.11 production installation, back up each bot database, verify the bot digest, and recreate each bot on v2.4.12; do not restart the watcher for this bot-only release.
+The v2.4.13 workflow publishes matching bot and watcher artifacts. For an existing v2.4.12 production installation, back up each bot database, set a unique strong `ADMIN_SESSION_SECRET` per bot, verify the bot digest, and recreate each bot on v2.4.13; do not restart the watcher for this bot-only release.
 
 7. Verify after startup.
 

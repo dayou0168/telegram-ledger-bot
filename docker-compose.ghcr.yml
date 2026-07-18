@@ -1,10 +1,10 @@
-# v2.4.12 发布候选模板；仅在显式发布 workflow 成功后用于生产升级。
+# v2.4.13 发布候选模板；仅在显式发布 workflow 成功后用于生产升级。
 #
 # 宝塔 GHCR 模板：
 # 1. 单机器人一体部署可直接粘贴本文件。
 # 2. 多机器人共享 watcher 时，请先部署 docker-compose.chain-watcher.yml，再让每个机器人加入 ledger-chain-net。
 # 3. CHAIN_WATCHER_BOT_ID 必须出现在 watcher 的 CHAIN_WATCHER_BOTS 中。
-# 4. 每个机器人实例都要使用独立 container_name、volume、host port、PUBLIC_BILL_BASE_URL、ADMIN_WEB_TOKEN。
+# 4. 每个机器人实例都要使用独立 container_name、volume、host port、PUBLIC_BILL_BASE_URL、ADMIN_SESSION_SECRET；ADMIN_WEB_TOKEN 仅是可选第二因素。
 # 5. 默认使用 Docker json-file 日志上限 max-size=20m/max-file=5，单容器约 100MB。
 #    Docker json-file 不能严格按时间保留 72 小时；这里用大小上限近似最近日志并防止撑爆硬盘。
 
@@ -54,7 +54,7 @@ services:
       retries: 10
 
   ledger-chain-watcher:
-    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.12
+    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.13
     container_name: ledger-chain-watcher
     restart: unless-stopped
     logging:
@@ -112,7 +112,7 @@ services:
       retries: 10
 
   ledger-bot:
-    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.12
+    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.13
     container_name: ledger-bot-go
     restart: unless-stopped
     logging:
@@ -139,7 +139,8 @@ services:
       # ==================== 选填配置 ====================
       DEFAULT_OPERATOR_USER_IDS: ""
       PUBLIC_BILL_BASE_URL: ""
-      ADMIN_WEB_TOKEN: "change_this_admin_password"
+      ADMIN_SESSION_SECRET: "change_this_independent_session_secret"
+      ADMIN_WEB_TOKEN: ""
       # 普通用户上限；仅宿主、DEFAULT_OPERATOR_USER_IDS、active global_operators 不受限，单群 operators 不豁免。
       ADDRESS_WATCH_FREE_LIMIT: "2"
 

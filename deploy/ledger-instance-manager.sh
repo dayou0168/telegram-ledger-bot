@@ -59,7 +59,7 @@ derive() {
   POSTGRES_HOST="${POSTGRES_HOST:-127.0.0.1}"
   POSTGRES_PORT="${POSTGRES_PORT:-5432}"
   PG_BIN_DIR="${PG_BIN_DIR:-/www/server/pgsql/bin}"
-  BOT_IMAGE="${BOT_IMAGE:-ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.12}"
+  BOT_IMAGE="${BOT_IMAGE:-ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.13}"
   BOT_DEFAULTS_FILE="${BOT_DEFAULTS_FILE:-/etc/telegram-ledger/config/bot-defaults.env}"
   WATCHER_URL="${WATCHER_URL:-http://127.0.0.1:8090}"
   WATCHER_DATABASE_NAME="${WATCHER_DATABASE_NAME:-ledgerchainwatcher}"
@@ -129,10 +129,11 @@ EOF
 }
 
 write_runtime() {
-  local encoded_password watcher_secret admin_token database_url fallback_url
+  local encoded_password watcher_secret session_secret admin_token database_url fallback_url
   encoded_password="$(urlencode "$POSTGRES_PASSWORD")"
   watcher_secret="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')"
-  admin_token="${ADMIN_WEB_TOKEN:-$(openssl rand -base64 24 | tr '+/' '-_' | tr -d '=\n')}"
+  session_secret="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')"
+  admin_token="${ADMIN_WEB_TOKEN:-}"
   database_url="postgres://${POSTGRES_USER}:${encoded_password}@${POSTGRES_HOST}:${POSTGRES_PORT}/${DATABASE_NAME}?sslmode=disable"
   fallback_url="postgres://${POSTGRES_USER}:${encoded_password}@${POSTGRES_HOST}:${POSTGRES_PORT}/${WATCHER_DATABASE_NAME}?sslmode=disable"
 
@@ -146,6 +147,7 @@ DEFAULT_OPERATOR_USER_IDS=${DEFAULT_OPERATOR_USER_IDS:-}
 DATABASE_URL=$database_url
 ADMIN_WEB_HOST=127.0.0.1
 ADMIN_WEB_PORT=$ADMIN_WEB_PORT
+ADMIN_SESSION_SECRET=$session_secret
 ADMIN_WEB_TOKEN=$admin_token
 PUBLIC_BILL_BASE_URL=https://$PUBLIC_DOMAIN
 PUBLIC_BILL_URL_TEMPLATE=

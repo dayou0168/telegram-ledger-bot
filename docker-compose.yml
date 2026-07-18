@@ -1,4 +1,4 @@
-# v2.4.12 发布候选模板；仅在显式发布 workflow 成功后用于生产升级。
+# v2.4.13 发布候选模板；仅在显式发布 workflow 成功后用于生产升级。
 #
 # 单机器人一体部署：
 # 1. 新建宝塔 Compose 项目，把本文件完整粘贴进去。
@@ -6,7 +6,7 @@
 # 3. 分别修改机器人 PostgreSQL 和 watcher PostgreSQL 的密码。
 # 4. 填写 CHAIN_WATCHER_BOT_ID、CHAIN_WATCHER_SECRET，并同步到 watcher 的 CHAIN_WATCHER_BOTS。
 # 5. 在 watcher 服务里填写 CHAIN_WATCHER_TRONSCAN_API_KEYS；1秒×3页长期运行建议至少3个Key。
-# 6. 如果要使用完整账单/后台，把 PUBLIC_BILL_BASE_URL 改成你的 HTTPS 域名，并填写 ADMIN_WEB_TOKEN。
+# 6. 如果要使用完整账单/后台，把 PUBLIC_BILL_BASE_URL 改成你的 HTTPS 域名，并为每个机器人填写独立 ADMIN_SESSION_SECRET；ADMIN_WEB_TOKEN 仅是可选第二因素。
 # 7. 默认使用 Docker json-file 日志上限 max-size=20m/max-file=5，单容器约 100MB。
 #    Docker json-file 不能严格按时间保留 72 小时；这里用大小上限近似最近日志并防止撑爆硬盘。
 
@@ -56,7 +56,7 @@ services:
       retries: 10
 
   ledger-chain-watcher:
-    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.12
+    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.13
     container_name: ledger-chain-watcher
     restart: unless-stopped
     logging:
@@ -122,7 +122,7 @@ services:
       retries: 10
 
   ledger-bot:
-    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.12
+    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.13
     container_name: ledger-bot-go
     restart: unless-stopped
     logging:
@@ -151,7 +151,8 @@ services:
       # ==================== 选填配置 ====================
       DEFAULT_OPERATOR_USER_IDS: ""
       PUBLIC_BILL_BASE_URL: ""
-      ADMIN_WEB_TOKEN: "change_this_admin_password"
+      ADMIN_SESSION_SECRET: "change_this_independent_session_secret"
+      ADMIN_WEB_TOKEN: ""
       # 普通用户上限；仅宿主、DEFAULT_OPERATOR_USER_IDS、active global_operators 不受限，单群 operators 不豁免。
       ADDRESS_WATCH_FREE_LIMIT: "2"
 

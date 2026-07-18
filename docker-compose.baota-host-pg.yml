@@ -1,4 +1,4 @@
-# v2.4.12 发布候选模板；仅在显式发布 workflow 成功后用于生产升级。
+# v2.4.13 发布候选模板；仅在显式发布 workflow 成功后用于生产升级。
 #
 # 适用场景：
 # - PostgreSQL 已经在宿主机/宝塔里安装好。
@@ -15,7 +15,7 @@
 
 services:
   ledger-chain-watcher:
-    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.12
+    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.13
     container_name: ledger-chain-watcher
     restart: unless-stopped
     logging:
@@ -90,7 +90,7 @@ services:
       retries: 10
 
   ledger-bot:
-    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.12
+    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.13
     container_name: ledger-bot-go
     restart: unless-stopped
     logging:
@@ -136,8 +136,11 @@ services:
       # 完整账单/后台公网域名，必须带 https://；不用网页账单可留空。
       PUBLIC_BILL_BASE_URL: ""
 
-      # 后台登录密码。公网部署必须填写随机强密码；不要和 CHAIN_WATCHER_SECRET 共用。
-      ADMIN_WEB_TOKEN: "change_this_admin_password"
+      # 必填：后台会话独立签名密钥。每个机器人使用不同随机强值；缺失时后台 fail-closed。
+      ADMIN_SESSION_SECRET: "change_this_independent_session_secret"
+
+      # 可选：Telegram ticket 登录的第二因素，不能单独登录或签发会话。
+      ADMIN_WEB_TOKEN: ""
 
       # 普通用户上限；仅宿主、DEFAULT_OPERATOR_USER_IDS、active global_operators 不受限，单群 operators 不豁免。
       ADDRESS_WATCH_FREE_LIMIT: "2"
