@@ -198,3 +198,15 @@ func TestPolicyBroadcastGroupOwnershipAndDelegation(t *testing.T) {
 		t.Fatal("secondary should not delegate broadcast permissions")
 	}
 }
+
+func TestPolicyMessageObserverManagementIsHostOnly(t *testing.T) {
+	p := NewPolicy(1001, map[int64]struct{}{2002: {}})
+	if !p.CanManageMessageObservers(1001) {
+		t.Fatal("host should manage cross-primary message observers")
+	}
+	for _, userID := range []int64{2002, 3003, 4004} {
+		if p.CanManageMessageObservers(userID) {
+			t.Fatalf("non-host %d should not manage message observers", userID)
+		}
+	}
+}

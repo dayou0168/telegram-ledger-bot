@@ -1,4 +1,4 @@
-# Go Ledger Bot v2.4.12 Permissions
+# Go Ledger Bot Permission Model
 
 This file is the source of truth for Telegram user permissions in the Go/PostgreSQL runtime. Business modules must use `internal/permissions` and the storage capability helpers instead of reading host/default configuration or legacy operator tables directly.
 
@@ -22,6 +22,15 @@ This file is the source of truth for Telegram user permissions in the Go/Postgre
 - Host/default environment identities are never database global-operator authorization subjects and cannot receive target permissions.
 
 Database checks, a self-reference foreign key, and a parent-validation trigger enforce these invariants independently of the web form.
+
+## Cross-Primary Message Observation
+
+- `operator_message_observer_grants` is an independent message-visibility relation. Its source must be an active secondary and its observer must be a different active primary that is not the source's direct parent.
+- Only the host may grant, change, or revoke this relation. A direct primary, observing primary, secondary, default operator, or ordinary user cannot delegate it.
+- Broadcast and reply observation are separate booleans. At least one must be enabled for an active grant.
+- The recipient contract returns host and the source secondary's direct primary for both channels, then merges active cross-primary observers into only their enabled channels and deduplicates all UIDs. The source sender itself remains the broadcast caller's responsibility.
+- Observation never creates broadcast group/chat use permission, group ownership, operator-management authority, address visibility, or additional backend page data.
+- Disabling either the source secondary or observing primary deactivates related grants. Every grant, update, revoke, and identity-triggered deactivation is appended to immutable `operator_message_observer_audit_events`.
 
 ## Ledger Permissions
 
@@ -81,6 +90,13 @@ Ordinary private users may manage up to `ADDRESS_WATCH_FREE_LIMIT` active addres
 The host can see all backend address watches. Default/global operators see only their own watches. Ordinary users cannot enter the backend.
 
 Host-only backend modules remain host-only. Default operators can manage unrestricted broadcast permission assignments. A primary can access its direct-chat list, owned/use-authorized groups, owned-group management, its own secondary-management, and grants made by that primary. Address-watch visibility is unchanged: only the host sees all owners; every other backend identity sees only its own addresses.
+
+Backend authentication and authorization are separate:
+
+- Telegram creates a five-minute, one-time ticket containing only the Telegram user identity. Stored compatibility role text is never trusted by the current runtime.
+- Ticket preview does not consume it. Ticket consumption and every authenticated request resolve the current identity again; active database primary/secondary roles are reloaded from PostgreSQL. Disabling an operator invalidates an existing session on its next request.
+- `ADMIN_SESSION_SECRET` exclusively signs the backend cookie. `ADMIN_WEB_TOKEN`, when configured, is only a second factor submitted together with a valid ticket.
+- Password-only login is disabled and cannot create a host session. Single-group operators and ordinary users remain ineligible even if a ticket row is forged for their UID.
 
 ## Disable, Cache, Migration, And Audit
 

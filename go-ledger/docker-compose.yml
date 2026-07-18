@@ -132,7 +132,8 @@ services:
       # Normal mode only consumes watcher events. On sustained failure, all bots elect one shared no-key leader through PostgreSQL lease.
       DEFAULT_OPERATOR_USER_IDS: ""
       PUBLIC_BILL_BASE_URL: ""
-      ADMIN_WEB_TOKEN: "change_this_admin_password"
+      ADMIN_SESSION_SECRET: "${ADMIN_SESSION_SECRET:-}"
+      ADMIN_WEB_TOKEN: "${ADMIN_WEB_TOKEN:-}"
       # 普通用户上限；仅宿主、DEFAULT_OPERATOR_USER_IDS、active global_operators 不受限，单群 operators 不豁免。
       ADDRESS_WATCH_FREE_LIMIT: "2"
       BOT_TIMEZONE: "Asia/Shanghai"

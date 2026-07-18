@@ -247,32 +247,32 @@ func TestAdminGlobalManagementIsHostOnly(t *testing.T) {
 	}
 }
 
-func TestAdminSessionSecretRequiresAdminWebToken(t *testing.T) {
-	withoutToken := &Server{cfg: config.Config{TelegramBotToken: "telegram-secret"}}
-	if got := withoutToken.adminSessionSecret(); got != "" {
-		t.Fatalf("admin session secret without ADMIN_WEB_TOKEN = %q, want empty", got)
+func TestAdminSessionSecretIsIndependentFromAdminWebToken(t *testing.T) {
+	withoutSecret := &Server{cfg: config.Config{AdminWebToken: "second-factor"}}
+	if got := withoutSecret.adminSessionSecret(); got != "" {
+		t.Fatalf("admin session secret without ADMIN_SESSION_SECRET = %q, want empty", got)
 	}
-	withToken := &Server{cfg: config.Config{AdminWebToken: " admin-secret "}}
-	if got := withToken.adminSessionSecret(); got != "admin-secret" {
-		t.Fatalf("admin session secret = %q, want trimmed ADMIN_WEB_TOKEN", got)
+	withSecret := &Server{cfg: config.Config{AdminWebToken: "second-factor", AdminSessionSecret: " session-secret "}}
+	if got := withSecret.adminSessionSecret(); got != "session-secret" {
+		t.Fatalf("admin session secret = %q, want trimmed ADMIN_SESSION_SECRET", got)
 	}
 }
 
-func TestLoginTemplateExplainsInvalidShortcutCanUsePassword(t *testing.T) {
+func TestLoginTemplateDoesNotOfferPasswordOnlyLogin(t *testing.T) {
 	rec := httptest.NewRecorder()
-	renderLogin(rec, false, "快捷登录链接无效或已过期，请输入后台密码登录")
+	renderLogin(rec, false, "请从 Telegram 获取一次性链接")
 	html := rec.Body.String()
-	if !strings.Contains(html, "快捷登录链接无效或已过期，请输入后台密码登录") {
-		t.Fatal("login page should explain invalid shortcut login can fall back to password")
+	if !strings.Contains(html, "请从 Telegram 获取一次性链接") {
+		t.Fatal("login page should direct users to Telegram")
 	}
-	if !strings.Contains(html, `name="password"`) || !strings.Contains(html, "进入后台") {
-		t.Fatal("login page should keep password login available")
+	if strings.Contains(html, `name="password"`) || strings.Contains(html, "进入后台") {
+		t.Fatal("login page must not offer password-only login")
 	}
 }
 
-func TestLoginTemplateRendersShortcutSubmitWithoutHidingPassword(t *testing.T) {
+func TestLoginTemplateRendersTicketWithOptionalSecondFactor(t *testing.T) {
 	rec := httptest.NewRecorder()
-	renderLoginWithTicket(rec, false, "快捷登录链接有效，点击下方按钮进入后台。", "ticket-value")
+	renderLoginWithTicket(rec, false, true, "快捷登录链接有效，点击下方按钮进入后台。", "ticket-value")
 	html := rec.Body.String()
 	for _, want := range []string{
 		`method="post" action="/admin/login"`,
@@ -286,9 +286,26 @@ func TestLoginTemplateRendersShortcutSubmitWithoutHidingPassword(t *testing.T) {
 	}
 }
 
+func TestPasswordOnlyLoginNeverCreatesSession(t *testing.T) {
+	s := &Server{cfg: config.Config{
+		HostUserID: 1001, AdminWebToken: "password", AdminSessionSecret: "session-secret",
+	}}
+	form := url.Values{"password": {"password"}}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/admin/login", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	s.login(rec, req)
+	if len(rec.Result().Cookies()) != 0 {
+		t.Fatal("password-only login created an admin cookie")
+	}
+	if !strings.Contains(rec.Body.String(), "不支持通用密码登录") {
+		t.Fatalf("unexpected password-only response: %q", rec.Body.String())
+	}
+}
+
 func TestAdminCookieSecureFlag(t *testing.T) {
 	rec := httptest.NewRecorder()
-	s := &Server{cfg: config.Config{AdminWebToken: "secret", AdminWebCookieSecure: true}}
+	s := &Server{cfg: config.Config{AdminSessionSecret: "secret", AdminWebCookieSecure: true}}
 	s.setAdminCookie(rec, adminauth.Session{UserID: 1, Role: adminauth.RoleHost, ExpiresAt: time.Now().Add(time.Hour)})
 	cookies := rec.Result().Cookies()
 	if len(cookies) != 1 {
@@ -296,6 +313,23 @@ func TestAdminCookieSecureFlag(t *testing.T) {
 	}
 	if !cookies[0].Secure {
 		t.Fatal("admin cookie should honor AdminWebCookieSecure=true")
+	}
+}
+
+func TestAdminCookieFailsClosedWithoutSessionSecret(t *testing.T) {
+	s := &Server{}
+	session := adminauth.Session{UserID: 1001, Role: adminauth.RoleHost, ExpiresAt: time.Now().Add(time.Hour)}
+
+	rec := httptest.NewRecorder()
+	s.setAdminCookie(rec, session)
+	if len(rec.Result().Cookies()) != 0 {
+		t.Fatal("missing ADMIN_SESSION_SECRET must prevent cookie creation")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	req.AddCookie(&http.Cookie{Name: adminCookieName, Value: adminauth.SignSession(session, "")})
+	if got, ok := s.adminSessionFromRequest(req); ok {
+		t.Fatalf("empty-key forged cookie was accepted: %+v", got)
 	}
 }
 

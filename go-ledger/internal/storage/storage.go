@@ -26,7 +26,8 @@ const (
 	telegramPrivateRouteStateMigrationVersion = "2.4.14-telegram-private-route-state"
 	telegramQuickReplyOutboxMigrationVersion  = "2.4.15-telegram-quick-reply-outbox"
 	chatMemberDiscoveryMigrationVersion       = "2.4.16-chat-member-discovery"
-	latestSchemaMigrationVersion              = "2.4.17-broadcast-reply-preferences"
+	broadcastReplyPreferencesMigrationVersion = "2.4.17-broadcast-reply-preferences"
+	latestSchemaMigrationVersion              = "2.4.18-operator-message-observers-admin-identity"
 )
 
 const (
@@ -527,6 +528,116 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE TRIGGER trg_validate_global_operator_parent
 			BEFORE INSERT OR UPDATE OF level, status, parent_user_id ON global_operators
 			FOR EACH ROW EXECUTE FUNCTION validate_global_operator_parent()`,
+		`CREATE TABLE IF NOT EXISTS operator_message_observer_grants (
+			source_secondary_user_id BIGINT NOT NULL,
+			observer_primary_user_id BIGINT NOT NULL,
+			receive_broadcast BOOLEAN NOT NULL DEFAULT FALSE,
+			receive_reply BOOLEAN NOT NULL DEFAULT FALSE,
+			active BOOLEAN NOT NULL DEFAULT TRUE,
+			granted_by BIGINT NOT NULL,
+			granted_at TIMESTAMPTZ NOT NULL,
+			revoked_by BIGINT,
+			revoked_at TIMESTAMPTZ,
+			PRIMARY KEY(source_secondary_user_id, observer_primary_user_id),
+			CONSTRAINT operator_message_observer_source_fkey
+				FOREIGN KEY(source_secondary_user_id) REFERENCES global_operators(user_id) ON DELETE RESTRICT,
+			CONSTRAINT operator_message_observer_observer_fkey
+				FOREIGN KEY(observer_primary_user_id) REFERENCES global_operators(user_id) ON DELETE RESTRICT,
+			CONSTRAINT operator_message_observer_distinct_check
+				CHECK(source_secondary_user_id <> observer_primary_user_id),
+			CONSTRAINT operator_message_observer_channel_check
+				CHECK(NOT active OR receive_broadcast OR receive_reply),
+			CONSTRAINT operator_message_observer_revocation_check
+				CHECK((active AND revoked_by IS NULL AND revoked_at IS NULL) OR NOT active)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_operator_message_observer_source_active
+			ON operator_message_observer_grants(source_secondary_user_id, observer_primary_user_id)
+			WHERE active=TRUE`,
+		`CREATE INDEX IF NOT EXISTS idx_operator_message_observer_observer_active
+			ON operator_message_observer_grants(observer_primary_user_id, source_secondary_user_id)
+			WHERE active=TRUE`,
+		`CREATE TABLE IF NOT EXISTS operator_message_observer_audit_events (
+			id BIGSERIAL PRIMARY KEY,
+			source_secondary_user_id BIGINT NOT NULL,
+			observer_primary_user_id BIGINT NOT NULL,
+			action TEXT NOT NULL,
+			receive_broadcast BOOLEAN NOT NULL,
+			receive_reply BOOLEAN NOT NULL,
+			actor_user_id BIGINT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL,
+			CONSTRAINT operator_message_observer_audit_action_check
+				CHECK(action IN ('granted', 'updated', 'revoked', 'identity_disabled'))
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_operator_message_observer_audit_source
+			ON operator_message_observer_audit_events(source_secondary_user_id, created_at DESC, id DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_operator_message_observer_audit_observer
+			ON operator_message_observer_audit_events(observer_primary_user_id, created_at DESC, id DESC)`,
+		`DROP TRIGGER IF EXISTS trg_operator_message_observer_audit_immutable ON operator_message_observer_audit_events`,
+		`CREATE TRIGGER trg_operator_message_observer_audit_immutable
+			BEFORE UPDATE OR DELETE ON operator_message_observer_audit_events
+			FOR EACH ROW EXECUTE FUNCTION reject_permission_audit_mutation()`,
+		`CREATE OR REPLACE FUNCTION validate_operator_message_observer_grant() RETURNS trigger AS $$
+		DECLARE
+			direct_parent BIGINT;
+		BEGIN
+			IF NOT NEW.active THEN
+				RETURN NEW;
+			END IF;
+			SELECT parent_user_id INTO direct_parent
+			FROM global_operators
+			WHERE user_id=NEW.source_secondary_user_id
+			  AND level='secondary' AND status='active';
+			IF direct_parent IS NULL THEN
+				RAISE EXCEPTION 'message observation source must be an active secondary operator';
+			END IF;
+			IF NOT EXISTS (
+				SELECT 1 FROM global_operators
+				WHERE user_id=NEW.observer_primary_user_id
+				  AND level='primary' AND status='active'
+			) THEN
+				RAISE EXCEPTION 'message observer must be an active primary operator';
+			END IF;
+			IF direct_parent=NEW.observer_primary_user_id THEN
+				RAISE EXCEPTION 'direct primary already receives secondary messages';
+			END IF;
+			RETURN NEW;
+		END;
+		$$ LANGUAGE plpgsql`,
+		`DROP TRIGGER IF EXISTS trg_validate_operator_message_observer_grant ON operator_message_observer_grants`,
+		`CREATE TRIGGER trg_validate_operator_message_observer_grant
+			BEFORE INSERT OR UPDATE OF source_secondary_user_id, observer_primary_user_id, active ON operator_message_observer_grants
+			FOR EACH ROW EXECUTE FUNCTION validate_operator_message_observer_grant()`,
+		`CREATE OR REPLACE FUNCTION revoke_operator_message_observers_on_disable() RETURNS trigger AS $$
+		DECLARE
+			event_actor BIGINT;
+			event_time TIMESTAMPTZ;
+		BEGIN
+			IF OLD.status='active' AND NEW.status='disabled' THEN
+				event_actor := COALESCE(NEW.disabled_by, 0);
+				event_time := COALESCE(NEW.disabled_at, NOW());
+				INSERT INTO operator_message_observer_audit_events(
+					source_secondary_user_id, observer_primary_user_id, action,
+					receive_broadcast, receive_reply, actor_user_id, created_at
+				)
+				SELECT source_secondary_user_id, observer_primary_user_id, 'identity_disabled',
+					receive_broadcast, receive_reply, event_actor, event_time
+				FROM operator_message_observer_grants
+				WHERE active=TRUE AND (
+					source_secondary_user_id=NEW.user_id OR observer_primary_user_id=NEW.user_id
+				);
+				UPDATE operator_message_observer_grants
+				SET active=FALSE, revoked_by=event_actor, revoked_at=event_time
+				WHERE active=TRUE AND (
+					source_secondary_user_id=NEW.user_id OR observer_primary_user_id=NEW.user_id
+				);
+			END IF;
+			RETURN NEW;
+		END;
+		$$ LANGUAGE plpgsql`,
+		`DROP TRIGGER IF EXISTS trg_revoke_operator_message_observers ON global_operators`,
+		`CREATE TRIGGER trg_revoke_operator_message_observers
+			AFTER UPDATE OF status ON global_operators
+			FOR EACH ROW EXECUTE FUNCTION revoke_operator_message_observers_on_disable()`,
 		`CREATE TABLE IF NOT EXISTS permission_epochs (
 			scope TEXT PRIMARY KEY,
 			epoch BIGINT NOT NULL DEFAULT 1,
@@ -1469,6 +1580,11 @@ func (s *Store) migrate(ctx context.Context) error {
 		VALUES($1, NOW())
 		ON CONFLICT(version) DO NOTHING`, chatMemberDiscoveryMigrationVersion); err != nil {
 		return fmt.Errorf("record chat member discovery migration: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
+		VALUES($1, NOW())
+		ON CONFLICT(version) DO NOTHING`, broadcastReplyPreferencesMigrationVersion); err != nil {
+		return fmt.Errorf("record broadcast reply preferences migration: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
 		VALUES($1, NOW())
@@ -3181,21 +3297,17 @@ func trimError(value string, limit int) string {
 	return value[:limit]
 }
 
-func (s *Store) CreateAdminLoginTicket(ctx context.Context, tokenHash string, userID int64, role string, expiresAt, now time.Time) error {
+func (s *Store) CreateAdminLoginTicket(ctx context.Context, tokenHash string, userID int64, expiresAt, now time.Time) error {
 	tokenHash = strings.TrimSpace(tokenHash)
-	role = strings.TrimSpace(role)
 	if tokenHash == "" {
 		return errors.New("admin login ticket token hash is empty")
 	}
 	if userID <= 0 {
 		return errors.New("admin login ticket user id is empty")
 	}
-	if role == "" {
-		return errors.New("admin login ticket role is empty")
-	}
 	_, err := s.pool.Exec(ctx, `INSERT INTO admin_login_tickets(token_hash, user_id, role, expires_at, created_at)
-		VALUES($1, $2, $3, $4, $5)
-		ON CONFLICT(token_hash) DO NOTHING`, tokenHash, userID, role, expiresAt, now)
+		VALUES($1, $2, 'identity', $3, $4)
+		ON CONFLICT(token_hash) DO NOTHING`, tokenHash, userID, expiresAt, now)
 	return err
 }
 

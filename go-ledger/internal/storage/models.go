@@ -520,6 +520,34 @@ type AdminLoginTicket struct {
 	CreatedAt time.Time
 }
 
+type OperatorMessageObserverGrant struct {
+	SourceSecondaryUserID int64
+	ObserverPrimaryUserID int64
+	ReceiveBroadcast      bool
+	ReceiveReply          bool
+	Active                bool
+	GrantedBy             int64
+	GrantedAt             time.Time
+	RevokedBy             int64
+	RevokedAt             *time.Time
+}
+
+type OperatorMessageObserverAuditEvent struct {
+	ID                    int64
+	SourceSecondaryUserID int64
+	ObserverPrimaryUserID int64
+	Action                string
+	ReceiveBroadcast      bool
+	ReceiveReply          bool
+	ActorUserID           int64
+	CreatedAt             time.Time
+}
+
+type OperatorMessageRecipients struct {
+	Broadcast []int64
+	Reply     []int64
+}
+
 type LedgerClearTicket struct {
 	TokenHash             string
 	ChatID                int64

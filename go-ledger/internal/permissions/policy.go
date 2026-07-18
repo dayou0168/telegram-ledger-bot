@@ -117,6 +117,10 @@ func (p Policy) CanManageGlobalAdmin(userID int64) bool {
 	return p.IsHost(userID)
 }
 
+func (p Policy) CanManageMessageObservers(userID int64) bool {
+	return p.IsHost(userID)
+}
+
 func (caps UserCapabilities) IsGlobalOperator() bool {
 	return caps.GlobalOperatorLevel == "primary" || caps.GlobalOperatorLevel == "secondary"
 }

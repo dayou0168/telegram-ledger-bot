@@ -68,13 +68,13 @@ func (b *Bot) sendAdminEntry(ctx context.Context, chatID, replyTo, userID int64)
 
 	text := "后台管理用于设置群组、广播分组、广播权限、地址监听和广播替换。"
 	opts := map[string]any{"reply_to_message_id": replyTo}
-	if b.cfg.PublicBillBaseURL != "" {
+	if b.cfg.PublicBillBaseURL != "" && strings.TrimSpace(b.cfg.AdminSessionSecret) != "" {
 		token, err := adminauth.NewToken()
 		if err != nil {
 			return err
 		}
 		now := time.Now().In(b.loc)
-		if err := b.store.CreateAdminLoginTicket(ctx, adminauth.HashToken(token), userID, role, now.Add(adminauth.TicketTTL), now); err != nil {
+		if err := b.store.CreateAdminLoginTicket(ctx, adminauth.HashToken(token), userID, now.Add(adminauth.TicketTTL), now); err != nil {
 			return err
 		}
 		link := strings.TrimRight(b.cfg.PublicBillBaseURL, "/") + "/admin/login?ticket=" + url.QueryEscape(token)
@@ -82,8 +82,10 @@ func (b *Bot) sendAdminEntry(ctx context.Context, chatID, replyTo, userID int64)
 		opts["reply_markup"] = telegram.InlineKeyboardMarkup{InlineKeyboard: [][]telegram.InlineKeyboardButton{
 			{{Text: "打开后台管理", URL: link}},
 		}}
-	} else {
+	} else if b.cfg.PublicBillBaseURL == "" {
 		text += "\n\n当前没有配置 PUBLIC_BILL_BASE_URL，公网使用时请先在 Compose 里填写你的 HTTPS 域名。"
+	} else {
+		text += "\n\n当前没有配置 ADMIN_SESSION_SECRET，后台会话已安全禁用。"
 	}
 	return b.enqueueReliableText(ctx, sendPriorityNormal, "admin_entry", messageScopedDedupe("admin_entry", chatID, replyTo), chatID, text, opts, reliableMessageRef{}, time.Now().In(b.loc))
 }

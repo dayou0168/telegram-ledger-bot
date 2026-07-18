@@ -160,7 +160,8 @@ PUBLIC_BILL_BASE_URL=https://bot.your-domain.example
 ADMIN_WEB_ENABLED=1
 ADMIN_WEB_HOST=0.0.0.0
 ADMIN_WEB_PORT=8080
-ADMIN_WEB_TOKEN=change-this-admin-token
+ADMIN_SESSION_SECRET=change-this-independent-session-secret
+ADMIN_WEB_TOKEN=
 ```
 
 机器人会给每个群生成类似这样的独立链接：
@@ -169,7 +170,7 @@ ADMIN_WEB_TOKEN=change-this-admin-token
 https://bot.your-domain.example/b/-100xxx/20260705
 ```
 
-宝塔里给域名申请 SSL 后，把站点反向代理到 `http://127.0.0.1:8080`。`ADMIN_WEB_TOKEN` 是 `/admin` 后台登录密码和会话签名密钥，建议设置为一串随机强密码。
+宝塔里给域名申请 SSL 后，把站点反向代理到 `http://127.0.0.1:8080`。`ADMIN_SESSION_SECRET` 是独立 cookie 签名密钥；可选的 `ADMIN_WEB_TOKEN` 只作为 Telegram ticket 登录的第二因素，不能单独登录。
 
 后台入口：
 
@@ -177,7 +178,7 @@ https://bot.your-domain.example/b/-100xxx/20260705
 https://bot.your-domain.example/admin
 ```
 
-宿主、`DEFAULT_OPERATOR_USER_IDS` 和 active `global_operators` 可以在私聊菜单点击 `⚙后台管理` 获取 5 分钟有效的后台登录链接。宿主可查看和管理全部后台数据；默认操作人和 active 全局操作人进入后台后只看到自己可管理的内容。单群 `operators` 不获得私聊后台资格。直接打开 `/admin/login` 仍可使用 `ADMIN_WEB_TOKEN` 作为宿主紧急入口。
+宿主、`DEFAULT_OPERATOR_USER_IDS` 和 active `global_operators` 可以在私聊菜单点击 `⚙后台管理` 获取 5 分钟有效的一次性后台登录链接。消费 ticket 和每次后台请求都会重新确认当前身份；宿主可查看和管理全部后台数据，默认操作人和 active 全局操作人只看到自己可管理的内容。单群 `operators` 不获得私聊后台资格。直接打开 `/admin/login` 不提供通用密码登录。
 
 后台用标签页拆分为已保存群组、广播分组、权限/操作人、地址监听和广播替换，可管理广播操作人、广播分组、分组/单群权限、监听地址开关和广播替换开关。
 

@@ -50,7 +50,7 @@ type SendGatewayStatsProvider interface {
 
 type pageData struct {
 	Version                        string
-	TokenUnset                     bool
+	SessionSecretUnset             bool
 	Message                        string
 	MessageIsError                 bool
 	ActiveAdminTab                 string
@@ -63,6 +63,7 @@ type pageData struct {
 	PrimaryOperators               []storage.GlobalOperator
 	Permissions                    []storage.BroadcastPermission
 	PermissionFilterData           []storage.BroadcastPermission
+	MessageObserverGrants          []storage.OperatorMessageObserverGrant
 	ReplyNotificationTargets       []replyNotificationTarget
 	ReplyNotificationScope         string
 	CanConfigureReplyNotifications bool
@@ -225,6 +226,8 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("/admin/group/transfer-owner", s.withAuth(s.transferGroupOwner))
 	mux.HandleFunc("/admin/operator/save", s.withAuth(s.saveOperator))
 	mux.HandleFunc("/admin/operator/disable", s.withAuth(s.disableOperator))
+	mux.HandleFunc("/admin/message-observer/save", s.withAuth(s.saveMessageObserver))
+	mux.HandleFunc("/admin/message-observer/revoke", s.withAuth(s.revokeMessageObserver))
 	mux.HandleFunc("/admin/operator/cleanup", s.withAuth(s.saveOperatorCleanup))
 	mux.HandleFunc("/admin/reply-notifications/save", s.withAuth(s.saveReplyNotificationPreference))
 	mux.HandleFunc("/admin/permission/grant", s.withAuth(s.grantPermission))
@@ -431,7 +434,11 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 			s.renderTicketLogin(w, r, ticket)
 			return
 		}
-		renderLogin(w, s.cfg.AdminWebToken == "", "")
+		renderLogin(w, s.adminSessionSecret() == "", "请从 Telegram 私聊机器人获取一次性后台登录链接。")
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	if err := r.ParseForm(); err != nil {
@@ -442,52 +449,42 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		s.loginWithTicket(w, r, ticket)
 		return
 	}
-	if strings.TrimSpace(s.cfg.AdminWebToken) == "" {
-		renderLogin(w, true, "未配置 ADMIN_WEB_TOKEN，无法创建后台会话")
-		return
-	}
-	if s.cfg.AdminWebToken != "" && r.FormValue("password") != s.cfg.AdminWebToken {
-		renderLogin(w, false, "密码不正确")
-		return
-	}
-	hostUserID := s.perms.HostUserID()
-	if hostUserID <= 0 {
-		renderLogin(w, s.cfg.AdminWebToken == "", "未配置宿主 UID，无法创建后台会话")
-		return
-	}
-	s.setAdminCookie(w, adminauth.Session{
-		UserID:    hostUserID,
-		Role:      adminauth.RoleHost,
-		ExpiresAt: time.Now().Add(adminauth.SessionTTL),
-	})
-	http.Redirect(w, r, "/admin", http.StatusSeeOther)
+	renderLogin(w, s.adminSessionSecret() == "", "后台不支持通用密码登录，请从 Telegram 私聊机器人获取一次性链接。")
 }
 
 func (s *Server) renderTicketLogin(w http.ResponseWriter, r *http.Request, ticket string) {
+	if s.adminSessionSecret() == "" {
+		renderLogin(w, true, "未配置 ADMIN_SESSION_SECRET，后台会话已禁用")
+		return
+	}
 	now := time.Now()
 	item, ok, err := s.store.GetAdminLoginTicket(r.Context(), adminauth.HashToken(ticket), now)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if !ok || !adminauth.IsAllowedRole(item.Role) {
-		renderLogin(w, s.cfg.AdminWebToken == "", "快捷登录链接无效或已过期，请输入后台密码登录")
+	if !ok {
+		renderLogin(w, false, "快捷登录链接无效或已过期，请返回 Telegram 重新获取")
 		return
 	}
-	if ok, err := s.adminSessionAllowed(r.Context(), adminauth.Session{UserID: item.UserID, Role: item.Role, ExpiresAt: item.ExpiresAt}); err != nil {
+	if _, ok, err := s.resolveAdminIdentity(r.Context(), item.UserID); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	} else if !ok {
-		renderLogin(w, s.cfg.AdminWebToken == "", "后台登录身份已失效，请输入后台密码登录")
+		renderLogin(w, false, "后台登录身份已失效，请返回 Telegram 联系宿主")
 		return
 	}
-	renderLoginWithTicket(w, s.cfg.AdminWebToken == "", "快捷登录链接有效，点击下方按钮进入后台。", ticket)
+	renderLoginWithTicket(w, false, s.adminPasswordSecondFactorEnabled(), "快捷登录链接有效，点击下方按钮进入后台。", ticket)
 }
 
 func (s *Server) loginWithTicket(w http.ResponseWriter, r *http.Request, ticket string) {
 	now := time.Now()
-	if strings.TrimSpace(s.cfg.AdminWebToken) == "" {
-		renderLogin(w, true, "未配置 ADMIN_WEB_TOKEN，无法创建后台会话")
+	if s.adminSessionSecret() == "" {
+		renderLogin(w, true, "未配置 ADMIN_SESSION_SECRET，后台会话已禁用")
+		return
+	}
+	if s.adminPasswordSecondFactorEnabled() && r.FormValue("password") != s.cfg.AdminWebToken {
+		renderLoginWithTicket(w, false, true, "后台密码不正确，一次性链接尚未消费。", ticket)
 		return
 	}
 	item, ok, err := s.store.ConsumeAdminLoginTicket(r.Context(), adminauth.HashToken(ticket), now)
@@ -495,23 +492,22 @@ func (s *Server) loginWithTicket(w http.ResponseWriter, r *http.Request, ticket 
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if !ok || !adminauth.IsAllowedRole(item.Role) {
-		renderLogin(w, s.cfg.AdminWebToken == "", "快捷登录链接无效或已过期，请输入后台密码登录")
+	if !ok {
+		renderLogin(w, false, "快捷登录链接无效、已过期或已使用，请返回 Telegram 重新获取")
 		return
 	}
-	if ok, err := s.adminSessionAllowed(r.Context(), adminauth.Session{UserID: item.UserID, Role: item.Role, ExpiresAt: item.ExpiresAt}); err != nil {
+	freshSession, ok, err := s.resolveAdminIdentity(r.Context(), item.UserID)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
-	} else if !ok {
-		renderLogin(w, s.cfg.AdminWebToken == "", "后台登录身份已失效")
+	}
+	if !ok {
+		renderLogin(w, false, "后台登录身份已失效")
 		return
 	}
 	_ = s.store.CleanupAdminLoginTickets(r.Context(), now.Add(-24*time.Hour))
-	s.setAdminCookie(w, adminauth.Session{
-		UserID:    item.UserID,
-		Role:      item.Role,
-		ExpiresAt: now.Add(adminauth.SessionTTL),
-	})
+	freshSession.ExpiresAt = now.Add(adminauth.SessionTTL)
+	s.setAdminCookie(w, freshSession)
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
 }
 
@@ -523,7 +519,7 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if session, ok := s.adminSessionFromRequest(r); ok {
-			allowed, err := s.adminSessionAllowed(r.Context(), session)
+			freshSession, allowed, err := s.resolveAdminIdentity(r.Context(), session.UserID)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
@@ -533,7 +529,8 @@ func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 				http.Redirect(w, r, "/admin/login", http.StatusSeeOther)
 				return
 			}
-			ctx := context.WithValue(r.Context(), adminContextKey{}, session)
+			freshSession.ExpiresAt = session.ExpiresAt
+			ctx := context.WithValue(r.Context(), adminContextKey{}, freshSession)
 			next(w, r.WithContext(ctx))
 			return
 		}
@@ -553,31 +550,39 @@ func (s *Server) adminSessionFromRequest(r *http.Request) (adminauth.Session, bo
 }
 
 func (s *Server) adminSessionAllowed(ctx context.Context, session adminauth.Session) (bool, error) {
-	switch session.Role {
-	case adminauth.RoleHost:
-		return s.perms.IsHost(session.UserID), nil
-	case adminauth.RoleDefaultOperator:
-		return s.perms.IsDefaultOperator(session.UserID), nil
-	case adminauth.RoleOperator:
-		if session.UserID <= 0 {
-			return false, nil
-		}
-		level, ok, err := s.store.GetGlobalOperatorLevel(ctx, session.UserID)
-		if err != nil || !ok {
-			return false, err
-		}
-		return s.perms.CanUsePrivateGlobalFeatures(session.UserID, permissions.UserCapabilities{
-			GlobalOperatorLevel: level,
-		}), nil
-	default:
-		return false, nil
+	_, ok, err := s.resolveAdminIdentity(ctx, session.UserID)
+	return ok, err
+}
+
+func (s *Server) resolveAdminIdentity(ctx context.Context, userID int64) (adminauth.Session, bool, error) {
+	if userID <= 0 {
+		return adminauth.Session{}, false, nil
 	}
+	if s.perms.IsHost(userID) {
+		return adminauth.Session{UserID: userID, Role: adminauth.RoleHost}, true, nil
+	}
+	if s.perms.IsDefaultOperator(userID) {
+		return adminauth.Session{UserID: userID, Role: adminauth.RoleDefaultOperator}, true, nil
+	}
+	op, ok, err := s.store.GetGlobalOperator(ctx, userID)
+	if err != nil || !ok || op.Status != "active" {
+		return adminauth.Session{}, false, err
+	}
+	caps := permissions.UserCapabilities{GlobalOperatorLevel: op.Level, ParentUserID: op.ParentUserID}
+	if !s.perms.CanUsePrivateGlobalFeatures(userID, caps) {
+		return adminauth.Session{}, false, nil
+	}
+	return adminauth.Session{UserID: userID, Role: adminauth.RoleOperator}, true, nil
 }
 
 func (s *Server) setAdminCookie(w http.ResponseWriter, session adminauth.Session) {
+	secret := s.adminSessionSecret()
+	if secret == "" {
+		return
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     adminCookieName,
-		Value:    adminauth.SignSession(session, s.adminSessionSecret()),
+		Value:    adminauth.SignSession(session, secret),
 		Path:     "/admin",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
@@ -587,7 +592,11 @@ func (s *Server) setAdminCookie(w http.ResponseWriter, session adminauth.Session
 }
 
 func (s *Server) adminSessionSecret() string {
-	return strings.TrimSpace(s.cfg.AdminWebToken)
+	return strings.TrimSpace(s.cfg.AdminSessionSecret)
+}
+
+func (s *Server) adminPasswordSecondFactorEnabled() bool {
+	return strings.TrimSpace(s.cfg.AdminWebToken) != ""
 }
 
 func adminSessionFromContext(ctx context.Context) adminauth.Session {
@@ -1089,6 +1098,72 @@ func (s *Server) disableOperator(w http.ResponseWriter, r *http.Request) {
 	redirectMsg(w, r, "操作人已禁用")
 }
 
+func (s *Server) saveMessageObserver(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r) {
+		return
+	}
+	session := adminSessionFromContext(r.Context())
+	if !s.perms.CanManageMessageObservers(session.UserID) {
+		http.Error(w, "只有宿主可以管理跨一级消息观察授权", http.StatusForbidden)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	sourceUserID, sourceOK := parsePositiveFormID(r, "source_secondary_user_id")
+	observerUserID, observerOK := parsePositiveFormID(r, "observer_primary_user_id")
+	receiveBroadcast := r.FormValue("receive_broadcast") == "1"
+	receiveReply := r.FormValue("receive_reply") == "1"
+	if !sourceOK || !observerOK || (!receiveBroadcast && !receiveReply) {
+		http.Error(w, "消息观察授权参数不正确", http.StatusBadRequest)
+		return
+	}
+	_, err := s.store.UpsertOperatorMessageObserverGrant(
+		r.Context(), sourceUserID, observerUserID,
+		receiveBroadcast, receiveReply, session.UserID, time.Now(),
+	)
+	if errors.Is(err, storage.ErrMessageObserverInvalidIdentity) ||
+		errors.Is(err, storage.ErrMessageObserverInvalidScope) ||
+		errors.Is(err, storage.ErrMessageObserverNoChannels) {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	redirectMsg(w, r, "消息观察授权已保存")
+}
+
+func (s *Server) revokeMessageObserver(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r) {
+		return
+	}
+	session := adminSessionFromContext(r.Context())
+	if !s.perms.CanManageMessageObservers(session.UserID) {
+		http.Error(w, "只有宿主可以撤销跨一级消息观察授权", http.StatusForbidden)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	sourceUserID, sourceOK := parsePositiveFormID(r, "source_secondary_user_id")
+	observerUserID, observerOK := parsePositiveFormID(r, "observer_primary_user_id")
+	if !sourceOK || !observerOK {
+		http.Error(w, "消息观察授权参数不正确", http.StatusBadRequest)
+		return
+	}
+	if _, err := s.store.RevokeOperatorMessageObserverGrant(
+		r.Context(), sourceUserID, observerUserID, session.UserID, time.Now(),
+	); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	redirectMsg(w, r, "消息观察授权已撤销")
+}
+
 func (s *Server) saveOperatorCleanup(w http.ResponseWriter, r *http.Request) {
 	if !s.requireGlobalAdmin(w, r) {
 		return
@@ -1465,6 +1540,7 @@ func (s *Server) loadPageData(ctx context.Context, message string, session admin
 		permissionOperators []storage.GlobalOperator
 		permissions         []storage.BroadcastPermission
 		replace             storage.BroadcastReplaceSetting
+		messageObservers    []storage.OperatorMessageObserverGrant
 	)
 	if canManageGlobal || canManageBroadcastPermissions || canManageBroadcastGroups {
 		allOperators, err = s.store.ListGlobalOperators(ctx)
@@ -1528,6 +1604,10 @@ func (s *Server) loadPageData(ctx context.Context, message string, session admin
 		}
 	}
 	if canManageGlobal {
+		messageObservers, err = s.store.ListOperatorMessageObserverGrants(ctx)
+		if err != nil {
+			return pageData{}, err
+		}
 		replace, err = s.store.GetBroadcastReplaceSetting(ctx)
 		if err != nil {
 			return pageData{}, err
@@ -1595,7 +1675,7 @@ func (s *Server) loadPageData(ctx context.Context, message string, session admin
 	permissions, permissionPager := pageAdminPermissions(permissions, chatNames, opLabels, filters)
 	return pageData{
 		Version:                        config.Version,
-		TokenUnset:                     s.cfg.AdminWebToken == "",
+		SessionSecretUnset:             s.adminSessionSecret() == "",
 		Message:                        message,
 		Groups:                         groups,
 		BGroups:                        bgroups,
@@ -1605,6 +1685,7 @@ func (s *Server) loadPageData(ctx context.Context, message string, session admin
 		PrimaryOperators:               primaryOperators,
 		Permissions:                    permissions,
 		PermissionFilterData:           allPermissions,
+		MessageObserverGrants:          messageObservers,
 		ReplyNotificationTargets:       replyTargets,
 		ReplyNotificationScope:         replyScope,
 		CanConfigureReplyNotifications: canConfigureReplies,
@@ -1890,13 +1971,18 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func renderLogin(w http.ResponseWriter, tokenUnset bool, message string) {
-	renderLoginWithTicket(w, tokenUnset, message, "")
+func renderLogin(w http.ResponseWriter, sessionSecretUnset bool, message string) {
+	renderLoginWithTicket(w, sessionSecretUnset, false, message, "")
 }
 
-func renderLoginWithTicket(w http.ResponseWriter, tokenUnset bool, message, ticket string) {
+func renderLoginWithTicket(w http.ResponseWriter, sessionSecretUnset, passwordRequired bool, message, ticket string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_ = loginTemplate.Execute(w, map[string]any{"TokenUnset": tokenUnset, "Message": message, "Ticket": ticket})
+	_ = loginTemplate.Execute(w, map[string]any{
+		"SessionSecretUnset": sessionSecretUnset,
+		"PasswordRequired":   passwordRequired,
+		"Message":            message,
+		"Ticket":             ticket,
+	})
 }
 
 func chatLabel(group storage.Group) string {
@@ -3219,17 +3305,13 @@ button{background:#12213a;color:#fff;font-weight:700;cursor:pointer}
 </head>
 <body><main class="box">
 <h1>后台管理登录</h1>
-{{if .TokenUnset}}<div class="warn">当前没有配置 ADMIN_WEB_TOKEN，无法创建后台会话；公网部署请务必设置。</div>{{end}}
+{{if .SessionSecretUnset}}<div class="warn">当前没有配置 ADMIN_SESSION_SECRET，后台会话已安全禁用。</div>{{end}}
 {{if .Message}}<div class="err">{{.Message}}</div>{{end}}
 {{if .Ticket}}<form method="post" action="/admin/login">
 <input type="hidden" name="ticket" value="{{.Ticket}}">
+{{if .PasswordRequired}}<input type="password" name="password" placeholder="输入后台第二因素密码" autocomplete="current-password">{{end}}
 <button type="submit">使用快捷登录进入后台</button>
-</form>
-<div class="warn">如果快捷登录失败，也可以输入后台密码登录。</div>{{end}}
-<form method="post" action="/admin/login">
-<input type="password" name="password" placeholder="输入后台密码">
-<button type="submit">进入后台</button>
-</form>
+</form>{{end}}
 </main></body></html>`
 
 const adminHTML = `<!doctype html>
@@ -3274,7 +3356,7 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 <div><div class="brand">Telegram 记账机器人</div><div class="title">后台管理</div><div class="sub">Go v{{.Version}} · {{.AdminRoleLabel}} · {{if or .CanManageGlobal .CanManageOperators .CanManageBroadcastPermissions .CanManageBroadcastGroups}}操作人、广播权限和地址监听{{else}}地址监听{{end}}</div></div>
 <div class="actions"><a class="btn secondary" href="/admin">刷新</a><a class="btn secondary" href="/admin/logout">退出</a></div>
 </section>
-{{if .TokenUnset}}<div class="warn">当前没有配置 ADMIN_WEB_TOKEN，公网部署请先设置后台密码。</div>{{end}}
+{{if .SessionSecretUnset}}<div class="warn">当前没有配置 ADMIN_SESSION_SECRET，后台会话已禁用。</div>{{end}}
 {{if .Message}}<div class="msg {{if .MessageIsError}}error{{end}}">{{.Message}}</div>{{end}}
 <nav class="tabs" aria-label="后台模块">
 {{if or .CanManageGlobal .CanManageBroadcastGroups}}

@@ -279,3 +279,16 @@ func TestLoadLedgerPerformanceGatesAndRollbackValues(t *testing.T) {
 		t.Fatalf("rollback gates = write=%s read=%s route=%s critical=%v", cfg.LedgerSummaryWriteMode, cfg.LedgerSummaryReadMode, cfg.GroupRouteMode, cfg.CriticalOutboxFastpath)
 	}
 }
+
+func TestLoadAdminSessionSecretIsIndependent(t *testing.T) {
+	t.Setenv("TELEGRAM_BOT_TOKEN", "token")
+	t.Setenv("ADMIN_WEB_TOKEN", "second-factor")
+	t.Setenv("ADMIN_SESSION_SECRET", "session-signing-secret")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AdminWebToken != "second-factor" || cfg.AdminSessionSecret != "session-signing-secret" {
+		t.Fatalf("admin secrets token=%q session=%q", cfg.AdminWebToken, cfg.AdminSessionSecret)
+	}
+}

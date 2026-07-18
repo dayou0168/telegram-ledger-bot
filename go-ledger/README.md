@@ -24,7 +24,7 @@ v2.4.12 增加可靠的群成员发现与操作员目标解析，并把广播回
 - 回复用户、选择 Telegram 可点击昵称（`text_mention`）或输入机器人已记录的 `@用户名` 添加/删除本群操作员；普通手打昵称和数字 UID 不作为目标。
 - 加账写库和 Telegram 账单回执发送拆开：同群写库串行，回执异步有序发送，并保存机器人回执消息 ID 供撤销定位。
 - 完整账单按钮使用短链接：`/b/{chat_id}/{yyyymmdd}`，不再拼接冗长的 `begintime/endtime` 参数。
-- 内置后台管理和短账单网页，后台支持 Telegram 临时登录链接，`ADMIN_WEB_TOKEN` 保留为宿主紧急入口和会话签名密钥；账单页支持历史日期、上一天/下一天、高级筛选和下载 `.xlsx`。
+- 内置后台管理和短账单网页。后台只接受 Telegram 一次性身份 ticket；`ADMIN_SESSION_SECRET` 独立签名 cookie，`ADMIN_WEB_TOKEN` 仅作为可选第二因素，不能单独登录或提升身份。账单页支持历史日期、上一天/下一天、高级筛选和下载 `.xlsx`。
 - 私聊按钮式广播入口：群发、分组广播、单群发送；选定目标后可连续发送文字、图片、图片+文字或文件，不再逐条确认。
 - 广播目标选择后可切换“通知所有人”，开启后广播投递到目标群会自动追加 @ 已发言成员。
 - 私聊菜单已接入详细说明、UID 查询和后台管理入口；后台入口会生成 5 分钟有效的 `PUBLIC_BILL_BASE_URL/admin/login?ticket=...` 登录链接。
@@ -80,7 +80,8 @@ TELEGRAM_BOT_USERNAME=your_bot_username
 BOT_HOST_USER_ID=123456789
 DATABASE_URL=postgres://ledger:change_this_strong_password@postgres:5432/ledger_bot?sslmode=disable
 PUBLIC_BILL_BASE_URL=https://bot.example.com
-ADMIN_WEB_TOKEN=change_this_admin_password
+ADMIN_SESSION_SECRET=change_this_independent_session_secret
+ADMIN_WEB_TOKEN=
 ADDRESS_WATCH_FREE_LIMIT=2
 CHAIN_WATCHER_URL=http://ledger-chain-watcher:8090
 CHAIN_WATCHER_BOT_ID=ledger-main

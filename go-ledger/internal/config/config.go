@@ -87,6 +87,7 @@ type Config struct {
 	AdminWebHost                  string
 	AdminWebPort                  int
 	AdminWebToken                 string
+	AdminSessionSecret            string
 	AdminWebCookieSecure          bool
 	AddressWatchFreeLimit         int
 }
@@ -167,6 +168,7 @@ func Load() (Config, error) {
 		AdminWebHost:                  env("ADMIN_WEB_HOST", "0.0.0.0"),
 		AdminWebPort:                  intEnv("ADMIN_WEB_PORT", 8080),
 		AdminWebToken:                 strings.TrimSpace(os.Getenv("ADMIN_WEB_TOKEN")),
+		AdminSessionSecret:            strings.TrimSpace(os.Getenv("ADMIN_SESSION_SECRET")),
 		AddressWatchFreeLimit:         intEnv("ADDRESS_WATCH_FREE_LIMIT", 2),
 	}
 	if raw := strings.TrimSpace(os.Getenv("ADMIN_WEB_COOKIE_SECURE")); raw != "" {
