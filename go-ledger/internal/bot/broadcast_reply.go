@@ -30,14 +30,23 @@ func (b *Bot) notifyBroadcastReplyAsync(ctx context.Context, msg telegram.Messag
 			return
 		}
 		delivery = b.tryReplaceBroadcastDelivery(jobCtx, delivery, msg.ReplyTo.Caption)
-		text := formatBroadcastReplyNotice(msg, user, delivery)
+		payload, payloadOK := broadcastReplyPayload(msg, user, delivery)
+		if !payloadOK {
+			return
+		}
 		operatorCanReply := b.canQuickReplyDelivery(jobCtx, delivery.OperatorUserID, delivery)
 		for recipient := range b.broadcastReplyRecipients(jobCtx, delivery.OperatorUserID) {
 			keyboard := broadcastReplyKeyboard(msg, delivery, recipient == delivery.OperatorUserID && operatorCanReply)
-			if err := b.enqueueReliableText(jobCtx, sendPriorityNormal, "broadcast_reply_notice", fmt.Sprintf("broadcast_reply_notice:%d:%d:%d", recipient, chatID, msg.MessageID), recipient, text, map[string]any{
+			var replyToUpstreamID int64
+			if upstream, upstreamOK, upstreamErr := b.store.GetBroadcastUpstreamMessage(jobCtx, delivery.SourceChatID, delivery.SourceMessageID, recipient); upstreamErr != nil {
+				log.Printf("load broadcast upstream reply target: %v", upstreamErr)
+			} else if upstreamOK {
+				replyToUpstreamID = upstream.ID
+			}
+			if err := b.enqueueReliablePayload(jobCtx, sendPriorityNormal, "broadcast_reply_notice", fmt.Sprintf("broadcast_reply_notice:%d:%d:%d", recipient, chatID, msg.MessageID), recipient, payload, map[string]any{
 				"parse_mode":   "HTML",
 				"reply_markup": keyboard,
-			}, reliableMessageRef{}, time.Now().In(b.loc)); err != nil {
+			}, reliableMessageRef{}, replyToUpstreamID, time.Now().In(b.loc)); err != nil {
 				log.Printf("enqueue broadcast reply notice: %v", err)
 			}
 		}
@@ -70,10 +79,11 @@ func (b *Bot) handleBroadcastReplyCallback(ctx context.Context, cb telegram.Call
 		QuickReplyMessageID:  delivery.TargetMessageID,
 		CreatedAt:            time.Now().In(b.loc),
 	}
-	if current, ok := b.privateStates.Get(formatID(cb.From.ID)); ok && current.Mode != "quick_reply" && len(current.ChatIDs) > 0 {
+	if current, ok := b.privateStates.Get(formatID(cb.From.ID)); ok && current.Mode != "quick_reply" && isBroadcastTargetState(current) {
 		quickState.ReturnMode = current.Mode
 		quickState.ReturnTargetName = current.TargetName
-		quickState.ReturnChatIDs = append([]int64(nil), current.ChatIDs...)
+		quickState.ReturnTargetChatID = current.TargetChatID
+		quickState.ReturnGroupID = current.GroupID
 		quickState.ReturnNotifyAll = current.NotifyAll
 		quickState.ReturnControlMessageID = current.ControlMessageID
 	}
@@ -182,9 +192,15 @@ func broadcastReplyKeyboard(msg telegram.Message, delivery storage.BroadcastDeli
 func (b *Bot) exitQuickReply(ctx context.Context, msg telegram.Message, user storage.User, state privateState) error {
 	ctx = withPrivateCleanupCategory(ctx, "quick_reply")
 	b.deleteMessageBestEffort(ctx, msg.Chat.ID, msg.MessageID)
-	if restored, ok := quickReplyReturnState(state); ok {
+	if restored, ok, err := b.loadBroadcastTargetState(ctx, user.ID); err != nil {
+		return err
+	} else if ok {
 		b.privateStates.Set(formatID(user.ID), restored)
-		_, err := b.sendText(ctx, sendPriorityNormal, msg.Chat.ID, formatBroadcastReadyText(restored.TargetName, len(restored.ChatIDs), restored.NotifyAll), map[string]any{
+		targets, err := b.currentBroadcastTargets(ctx, user.ID, restored)
+		if err != nil {
+			return err
+		}
+		_, err = b.sendText(ctx, sendPriorityNormal, msg.Chat.ID, formatBroadcastReadyText(restored.TargetName, len(targets), restored.NotifyAll), map[string]any{
 			"reply_markup": broadcastSessionKeyboard(restored.TargetName, restored.NotifyAll),
 		})
 		return err
@@ -194,12 +210,14 @@ func (b *Bot) exitQuickReply(ctx context.Context, msg telegram.Message, user sto
 }
 
 func quickReplyReturnState(state privateState) (privateState, bool) {
-	if state.ReturnMode == "" || len(state.ReturnChatIDs) == 0 {
+	if state.ReturnMode == "" {
 		return privateState{}, false
 	}
 	return privateState{
 		Mode:             state.ReturnMode,
 		TargetName:       state.ReturnTargetName,
+		TargetChatID:     state.ReturnTargetChatID,
+		GroupID:          state.ReturnGroupID,
 		ChatIDs:          append([]int64(nil), state.ReturnChatIDs...),
 		NotifyAll:        state.ReturnNotifyAll,
 		ControlMessageID: state.ReturnControlMessageID,
@@ -244,6 +262,10 @@ func (b *Bot) findBroadcastDeliveryByID(ctx context.Context, id int64) (storage.
 }
 
 func formatBroadcastReplyNotice(msg telegram.Message, user storage.User, delivery storage.BroadcastDelivery) string {
+	return formatBroadcastReplyNoticeLimit(msg, user, delivery, 1200)
+}
+
+func formatBroadcastReplyNoticeLimit(msg telegram.Message, user storage.User, delivery storage.BroadcastDelivery, contentLimit int) string {
 	group := delivery.TargetTitle
 	if group == "" {
 		group = msg.Chat.Title
@@ -270,7 +292,18 @@ func formatBroadcastReplyNotice(msg telegram.Message, user storage.User, deliver
 		sender = formatID(user.ID)
 	}
 	sender = `<a href="tg://user?id=` + formatID(user.ID) + `">` + sender + `</a>`
-	return fmt.Sprintf("群：%s\n人：%s\n\n内容：\n\n%s", groupLabel, sender, html.EscapeString(trimRunes(content, 1200)))
+	return fmt.Sprintf("群：%s\n人：%s\n\n内容：\n\n%s", groupLabel, sender, html.EscapeString(trimRunes(content, contentLimit)))
+}
+
+func broadcastReplyPayload(msg telegram.Message, user storage.User, delivery storage.BroadcastDelivery) (reliablePayload, bool) {
+	if len(msg.Photo) > 0 {
+		fileID := strings.TrimSpace(msg.Photo[len(msg.Photo)-1].FileID)
+		if fileID == "" {
+			return reliablePayload{}, false
+		}
+		return reliablePayload{Type: "photo", FileID: fileID, Caption: formatBroadcastReplyNoticeLimit(msg, user, delivery, 650)}, true
+	}
+	return reliablePayload{Type: "text", Text: formatBroadcastReplyNotice(msg, user, delivery)}, true
 }
 
 func (b *Bot) broadcastReplyRecipients(ctx context.Context, operatorID int64) map[int64]struct{} {

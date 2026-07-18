@@ -25,7 +25,7 @@ func privateCleanupCategoryFromContext(ctx context.Context) string {
 
 func normalizePrivateCleanupCategory(category string) string {
 	switch strings.TrimSpace(category) {
-	case "broadcast", "quick_reply", "menu":
+	case "broadcast", "quick_reply", "menu", "broadcast_copy", "broadcast_reply":
 		return strings.TrimSpace(category)
 	default:
 		return "menu"
@@ -35,7 +35,11 @@ func normalizePrivateCleanupCategory(category string) string {
 func privateCleanupCategoryForKind(kind string) string {
 	kind = strings.ToLower(strings.TrimSpace(kind))
 	switch {
-	case strings.HasPrefix(kind, "quick_reply"), strings.HasPrefix(kind, "broadcast_reply"):
+	case strings.HasPrefix(kind, "broadcast_upstream"):
+		return "broadcast_copy"
+	case strings.HasPrefix(kind, "broadcast_reply"):
+		return "broadcast_reply"
+	case strings.HasPrefix(kind, "quick_reply"):
 		return "quick_reply"
 	case strings.HasPrefix(kind, "broadcast"):
 		return "broadcast"
@@ -58,7 +62,7 @@ func (b *Bot) recordIncomingPrivateChatMessage(ctx context.Context, msg telegram
 	if state, ok := b.privateStates.Get(formatID(user.ID)); ok {
 		if state.Mode == "quick_reply" {
 			category = "quick_reply"
-		} else if len(state.ChatIDs) > 0 {
+		} else if isBroadcastTargetState(state) {
 			category = "broadcast"
 		}
 	}

@@ -281,6 +281,16 @@ func (g *telegramSendGateway) SendPhotoBytes(ctx context.Context, priority sendP
 	})
 }
 
+func (g *telegramSendGateway) SendPhoto(ctx context.Context, priority sendPriority, chatID int64, fileID, caption string, opts map[string]any) (telegram.Message, error) {
+	if g == nil || g.tg == nil {
+		return telegram.Message{}, errTelegramSendGatewayNotConfigured
+	}
+	cloned := cloneSendOptions(opts)
+	return g.Do(ctx, priority, chatID, func(opCtx context.Context) (telegram.Message, error) {
+		return g.tg.SendPhoto(opCtx, chatID, fileID, caption, cloned)
+	})
+}
+
 func (g *telegramSendGateway) EditMessagePhotoBytes(ctx context.Context, priority sendPriority, chatID, messageID int64, filename string, data []byte, caption string, opts map[string]any) (telegram.Message, error) {
 	if g == nil || g.tg == nil {
 		return telegram.Message{}, errTelegramSendGatewayNotConfigured

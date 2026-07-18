@@ -114,6 +114,11 @@ func (b *Bot) cleanupNotificationOutbox(ctx context.Context) {
 	} else if deleted > 0 {
 		log.Printf("cleanup broadcast deliveries: deleted=%d", deleted)
 	}
+	if deleted, err := b.store.CleanupBroadcastUpstreamMessages(ctx, now.Add(-deliveryRetention)); err != nil {
+		log.Printf("cleanup broadcast upstream messages: %v", err)
+	} else if deleted > 0 {
+		log.Printf("cleanup broadcast upstream messages: deleted=%d", deleted)
+	}
 	if deleted, err := b.store.CleanupLedgerClearTickets(ctx, now.Add(-24*time.Hour)); err != nil {
 		log.Printf("cleanup ledger clear tickets: %v", err)
 	} else if deleted > 0 {
@@ -154,6 +159,17 @@ func (b *Bot) drainNotificationOutbox(ctx context.Context) {
 }
 
 func (b *Bot) sendOutboxNotification(ctx context.Context, item storage.NotificationOutbox) {
+	if item.ReplyToUpstreamID > 0 && item.ReplyToMessageID == 0 {
+		upstream, ok, err := b.store.GetBroadcastUpstreamMessageByID(ctx, item.ReplyToUpstreamID)
+		if err != nil {
+			now := time.Now().In(b.loc)
+			_ = b.store.MarkNotificationFailed(ctx, item.ID, err.Error(), now.Add(notificationRetryDelay(item.Attempts, err)), now)
+			return
+		}
+		if ok && upstream.TelegramMessageID > 0 {
+			item.ReplyToMessageID = upstream.TelegramMessageID
+		}
+	}
 	renderStarted := time.Now()
 	text, opts, err := b.renderOutboxMessage(ctx, item)
 	renderDuration := time.Since(renderStarted)
@@ -165,7 +181,7 @@ func (b *Bot) sendOutboxNotification(ctx context.Context, item storage.Notificat
 		return
 	}
 	priority := outboxSendPriority(item.Priority)
-	message, err, sendMetrics := b.sendOutboxText(ctx, priority, item.Kind, item.ChatID, text, opts)
+	message, err, sendMetrics := b.sendOutboxPayload(ctx, priority, item, text, opts)
 	now := time.Now().In(b.loc)
 	if err == nil {
 		if item.Kind == "chain" {
@@ -180,24 +196,39 @@ func (b *Bot) sendOutboxNotification(ctx context.Context, item storage.Notificat
 	if item.Kind == "chain" {
 		logChainOutboxSendTiming(item, priority, renderDuration, sendMetrics, delay, err)
 	}
+	if !telegramGatewayRetryable(err) {
+		if markErr := b.store.MarkNotificationTerminalFailed(ctx, item.ID, notificationOutboxMaxAttempt, err.Error(), now); markErr != nil {
+			log.Printf("mark notification terminal failure %d: %v", item.ID, markErr)
+		}
+		return
+	}
 	if err := b.store.MarkNotificationFailed(ctx, item.ID, err.Error(), now.Add(delay), now); err != nil {
 		log.Printf("mark notification failed %d: %v", item.ID, err)
 	}
 }
 
 func (b *Bot) sendOutboxText(ctx context.Context, priority sendPriority, kind string, chatID int64, text string, opts map[string]any) (telegram.Message, error, telegramSendMetrics) {
+	return b.sendOutboxPayload(ctx, priority, storage.NotificationOutbox{Kind: kind, ChatID: chatID, Text: text, PayloadType: "text"}, text, opts)
+}
+
+func (b *Bot) sendOutboxPayload(ctx context.Context, priority sendPriority, item storage.NotificationOutbox, text string, opts map[string]any) (telegram.Message, error, telegramSendMetrics) {
 	done := measurePerfStage(ctx, "send_enqueue")
 	defer done()
 	var msg telegram.Message
 	var err error
 	var metrics telegramSendMetrics
 	if b.sendGateway != nil {
-		msg, err, metrics = b.sendGateway.SendMessageWithMetrics(ctx, priority, chatID, text, opts)
+		switch item.PayloadType {
+		case "photo":
+			msg, err = b.sendGateway.SendPhoto(ctx, priority, item.ChatID, item.FileID, item.Caption, opts)
+		default:
+			msg, err, metrics = b.sendGateway.SendMessageWithMetrics(ctx, priority, item.ChatID, text, opts)
+		}
 	} else {
 		err = errTelegramSendGatewayNotConfigured
 	}
 	if err == nil {
-		b.recordOutgoingPrivateChatMessageCategory(ctx, msg, "outgoing", privateCleanupCategoryForKind(kind))
+		b.recordOutgoingPrivateChatMessageCategory(ctx, msg, "outgoing", privateCleanupCategoryForKind(item.Kind))
 	}
 	return msg, err, metrics
 }

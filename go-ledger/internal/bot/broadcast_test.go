@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -151,6 +152,59 @@ func TestBroadcastReplyKeyboardHidesQuickReplyWithoutPermission(t *testing.T) {
 	}
 }
 
+func TestBroadcastReliablePayloadMatrixPreservesTextPhotoAndCaption(t *testing.T) {
+	tests := []struct {
+		name                            string
+		msg                             telegram.Message
+		typeName, text, fileID, caption string
+	}{
+		{name: "text", msg: telegram.Message{Text: "hello"}, typeName: "text", text: "hello"},
+		{name: "photo", msg: telegram.Message{Photo: []telegram.Photo{{FileID: "small"}, {FileID: "large"}}}, typeName: "photo", fileID: "large"},
+		{name: "photo caption", msg: telegram.Message{Photo: []telegram.Photo{{FileID: "photo"}}, Caption: "caption"}, typeName: "photo", fileID: "photo", caption: "caption"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			payload, ok := reliablePayloadFromMessage(test.msg)
+			if !ok || payload.Type != test.typeName || payload.Text != test.text || payload.FileID != test.fileID || payload.Caption != test.caption {
+				t.Fatalf("payload=%+v ok=%t", payload, ok)
+			}
+		})
+	}
+	for _, test := range []struct {
+		name, wantType, wantContent string
+		msg                         telegram.Message
+	}{
+		{name: "reply text", msg: telegram.Message{Text: "text reply"}, wantType: "text", wantContent: "text reply"},
+		{name: "reply photo", msg: telegram.Message{Photo: []telegram.Photo{{FileID: "reply"}}}, wantType: "photo", wantContent: "[图片]"},
+		{name: "reply photo caption", msg: telegram.Message{Photo: []telegram.Photo{{FileID: "reply"}}, Caption: "photo reply"}, wantType: "photo", wantContent: "photo reply"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			payload, ok := broadcastReplyPayload(test.msg, storage.User{ID: 9, DisplayName: "user"}, storage.BroadcastDelivery{TargetTitle: "group"})
+			content := payload.Text
+			if payload.Type == "photo" {
+				content = payload.Caption
+			}
+			if !ok || payload.Type != test.wantType || !strings.Contains(content, test.wantContent) {
+				t.Fatalf("reply payload=%+v ok=%t", payload, ok)
+			}
+		})
+	}
+}
+
+func TestPrivateStateTTLBoundaryDoesNotExpireDurableBroadcastTarget(t *testing.T) {
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	if !privateStateIsFresh(now.Add(-29*time.Minute-59*time.Second), now) {
+		t.Fatal("29:59 transient state should remain fresh")
+	}
+	if privateStateIsFresh(now.Add(-30*time.Minute), now) || privateStateIsFresh(now.Add(-30*time.Minute-time.Second), now) {
+		t.Fatal("30:00 and 30:01 transient states should expire")
+	}
+	state := privateStateFromBroadcastTarget(storage.TelegramBroadcastTarget{Mode: "group", GroupID: 7, TargetName: "saved", NotifyAll: true, UpdatedAt: now.Add(-365 * 24 * time.Hour)})
+	if !isBroadcastTargetState(state) || state.GroupID != 7 || !state.NotifyAll {
+		t.Fatalf("durable target should not depend on transient ttl: %+v", state)
+	}
+}
+
 func TestPostgresBroadcastReplyRecipientMatrixAndPreferences(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
@@ -213,6 +267,72 @@ func TestPostgresBroadcastReplyRecipientMatrixAndPreferences(t *testing.T) {
 	brokenStore.Close()
 	brokenBot := &Bot{store: brokenStore, perms: b.perms}
 	assertBroadcastReplyRecipients(t, brokenBot.broadcastReplyRecipients(ctx, secondaryAID), secondaryAID)
+}
+
+type testBroadcastObserverResolver struct{ ids []int64 }
+
+func (r testBroadcastObserverResolver) AdditionalBroadcastUpstreamObservers(context.Context, int64) ([]int64, error) {
+	return append([]int64(nil), r.ids...), nil
+}
+
+func TestPostgresBroadcastUpstreamHierarchyAndExtensionPoint(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store, err := storage.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	base := int64(986000000000 + time.Now().UnixNano()%1000000)
+	hostID, primaryAID, primaryBID, secondaryAID, extraID := base, base+1, base+2, base+3, base+4
+	now := time.Now().UTC()
+	for _, op := range []struct {
+		id, parent int64
+		level      string
+	}{{primaryAID, 0, "primary"}, {primaryBID, 0, "primary"}, {secondaryAID, primaryAID, "secondary"}} {
+		if err := store.UpsertGlobalOperator(ctx, op.id, op.level, op.parent, hostID, "upstream hierarchy", now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b := &Bot{store: store, perms: permissions.NewPolicy(hostID, nil), loc: time.UTC, privateStates: newTTLCache[privateState](privateStateTTL)}
+	assertInt64Slice(t, mustBroadcastUpstreamRecipients(t, b, ctx, hostID))
+	assertInt64Slice(t, mustBroadcastUpstreamRecipients(t, b, ctx, primaryAID), hostID)
+	assertInt64Slice(t, mustBroadcastUpstreamRecipients(t, b, ctx, secondaryAID), hostID, primaryAID)
+	b.broadcastObserverResolver = testBroadcastObserverResolver{ids: []int64{extraID, primaryBID}}
+	assertInt64Slice(t, mustBroadcastUpstreamRecipients(t, b, ctx, secondaryAID), hostID, primaryAID, primaryBID, extraID)
+	if err := b.saveBroadcastTarget(ctx, secondaryAID, privateState{Mode: "chat", TargetChatID: -1001, TargetName: "target"}); err != nil {
+		t.Fatal(err)
+	}
+	b.privateStates.Set(formatID(secondaryAID), privateState{Mode: "chat", TargetChatID: -1001})
+	b.InvalidateBroadcastPermission(secondaryAID)
+	if _, ok, err := store.GetTelegramBroadcastTarget(ctx, b.telegramInboxStreamKey(), secondaryAID); err != nil || ok {
+		t.Fatalf("revoked target remained ok=%t err=%v", ok, err)
+	}
+}
+
+func mustBroadcastUpstreamRecipients(t *testing.T, b *Bot, ctx context.Context, sourceID int64) []int64 {
+	t.Helper()
+	ids, err := b.broadcastUpstreamRecipients(ctx, sourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ids
+}
+
+func assertInt64Slice(t *testing.T, got []int64, want ...int64) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("got=%v want=%v", got, want)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("got=%v want=%v", got, want)
+		}
+	}
 }
 
 func assertBroadcastReplyRecipients(t *testing.T, got map[int64]struct{}, want ...int64) {

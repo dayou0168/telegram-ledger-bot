@@ -17,6 +17,8 @@ import (
 type privateState struct {
 	Mode                   string
 	TargetName             string
+	TargetChatID           int64
+	GroupID                int64
 	ChatIDs                []int64
 	NotifyAll              bool
 	ControlMessageID       int64
@@ -25,6 +27,8 @@ type privateState struct {
 	QuickReplyMessageID    int64
 	ReturnMode             string
 	ReturnTargetName       string
+	ReturnTargetChatID     int64
+	ReturnGroupID          int64
 	ReturnChatIDs          []int64
 	ReturnNotifyAll        bool
 	ReturnControlMessageID int64
@@ -81,6 +85,7 @@ func (b *Bot) handleBroadcastCallback(ctx context.Context, cb telegram.CallbackQ
 	switch {
 	case cb.Data == "bc:cancel":
 		b.privateStates.Delete(formatID(cb.From.ID))
+		_ = b.clearBroadcastTarget(ctx, cb.From.ID)
 		if err := b.tg.AnswerCallback(ctx, cb.ID, "已取消"); err != nil {
 			return err
 		}
@@ -315,8 +320,23 @@ func (b *Bot) setBroadcastTargets(ctx context.Context, cb telegram.CallbackQuery
 	state := privateState{
 		Mode:       mode,
 		TargetName: name,
-		ChatIDs:    chatIDs,
 		CreatedAt:  time.Now().In(b.loc),
+	}
+	if mode == "chat" {
+		state.TargetChatID = chatIDs[0]
+	}
+	if mode == "group" {
+		group, ok, err := b.store.GetBroadcastGroup(ctx, name)
+		if err != nil {
+			return err
+		}
+		if !ok || group.ID <= 0 {
+			return b.tg.AnswerCallback(ctx, cb.ID, "分组已失效，请重新选择")
+		}
+		state.GroupID = group.ID
+	}
+	if err := b.saveBroadcastTarget(ctx, cb.From.ID, state); err != nil {
+		return err
 	}
 	if err := b.tg.AnswerCallback(ctx, cb.ID, "已选择"); err != nil {
 		return err
@@ -335,10 +355,13 @@ func (b *Bot) setBroadcastTargets(ctx context.Context, cb telegram.CallbackQuery
 func (b *Bot) toggleBroadcastNotifyAll(ctx context.Context, cb telegram.CallbackQuery) error {
 	ctx = withPrivateCleanupCategory(ctx, "broadcast")
 	state, ok := b.privateStates.Get(formatID(cb.From.ID))
-	if !ok || len(state.ChatIDs) == 0 || state.Mode == "quick_reply" {
+	if !ok || !isBroadcastTargetState(state) || state.Mode == "quick_reply" {
 		return b.tg.AnswerCallback(ctx, cb.ID, "请先选择广播目标")
 	}
 	state.NotifyAll = !state.NotifyAll
+	if err := b.saveBroadcastTarget(ctx, cb.From.ID, state); err != nil {
+		return err
+	}
 	b.privateStates.Set(formatID(cb.From.ID), state)
 	if err := b.tg.AnswerCallback(ctx, cb.ID, "通知所有人已切换"); err != nil {
 		return err
@@ -346,7 +369,11 @@ func (b *Bot) toggleBroadcastNotifyAll(ctx context.Context, cb telegram.Callback
 	if cb.Message == nil {
 		return nil
 	}
-	_, err := b.editText(ctx, cb.Message.Chat.ID, cb.Message.MessageID, formatBroadcastReadyText(state.TargetName, len(state.ChatIDs), state.NotifyAll), map[string]any{
+	targets, err := b.currentBroadcastTargets(ctx, cb.From.ID, state)
+	if err != nil {
+		return err
+	}
+	_, err = b.editText(ctx, cb.Message.Chat.ID, cb.Message.MessageID, formatBroadcastReadyText(state.TargetName, len(targets), state.NotifyAll), map[string]any{
 		"reply_markup": broadcastReadyKeyboard(state.NotifyAll),
 	})
 	return err
@@ -356,22 +383,27 @@ func (b *Bot) handleBroadcastMaterial(ctx context.Context, msg telegram.Message,
 	ctx = withPrivateCleanupCategory(ctx, "broadcast")
 	if !b.canUseBroadcast(ctx, user.ID) {
 		b.privateStates.Delete(formatID(user.ID))
+		_ = b.clearBroadcastTarget(ctx, user.ID)
 		return b.enqueueReplyText(ctx, sendPriorityNormal, "broadcast_denied", msg.Chat.ID, msg.MessageID, "没有广播权限。", nil, now)
 	}
-	if len(state.ChatIDs) == 0 {
+	if !isBroadcastTargetState(state) {
 		b.privateStates.Delete(formatID(user.ID))
+		_ = b.clearBroadcastTarget(ctx, user.ID)
 		return b.enqueueReplyText(ctx, sendPriorityNormal, "broadcast_target_lost", msg.Chat.ID, msg.MessageID, "广播目标已失效，请重新选择。", nil, now)
 	}
 	if msg.Text == "菜单" || msg.Text == "/start" {
 		b.privateStates.Delete(formatID(user.ID))
+		_ = b.clearBroadcastTarget(ctx, user.ID)
 		return b.sendPrivateMenu(ctx, msg.Chat.ID, msg.MessageID)
 	}
 	if isBroadcastEndText(msg.Text) {
 		b.privateStates.Delete(formatID(user.ID))
+		_ = b.clearBroadcastTarget(ctx, user.ID)
 		return b.sendPrivateMenu(ctx, msg.Chat.ID, msg.MessageID)
 	}
 	if isBroadcastSwitchTargetText(msg.Text) {
 		b.privateStates.Delete(formatID(user.ID))
+		_ = b.clearBroadcastTarget(ctx, user.ID)
 		removed, removeErr := b.sendText(ctx, sendPriorityNormal, msg.Chat.ID, "请选择新的广播目标。", map[string]any{
 			"reply_markup": telegram.ReplyKeyboardRemove{RemoveKeyboard: true},
 		})
@@ -390,6 +422,9 @@ func (b *Bot) handleBroadcastMaterial(ctx context.Context, msg telegram.Message,
 	}
 	if isBroadcastNotifyToggleText(msg.Text) {
 		state.NotifyAll = !state.NotifyAll
+		if err := b.saveBroadcastTarget(ctx, user.ID, state); err != nil {
+			return err
+		}
 		b.privateStates.Set(formatID(user.ID), state)
 		return b.refreshBroadcastSessionKeyboard(ctx, msg, state)
 	}
@@ -399,6 +434,7 @@ func (b *Bot) handleBroadcastMaterial(ctx context.Context, msg telegram.Message,
 	}
 	if len(targets) == 0 {
 		b.privateStates.Delete(formatID(user.ID))
+		_ = b.clearBroadcastTarget(ctx, user.ID)
 		return b.enqueueReplyText(ctx, sendPriorityNormal, "broadcast_target_lost", msg.Chat.ID, msg.MessageID, "广播目标已失效，请重新选择。", nil, now)
 	}
 	sourceChatID := msg.Chat.ID
@@ -416,6 +452,10 @@ func (b *Bot) handleBroadcastMaterial(ctx context.Context, msg telegram.Message,
 	}
 	jobDone := make(chan error, 1)
 	job := func(jobCtx context.Context) {
+		if err := b.enqueueBroadcastUpstreamCopies(jobCtx, msg, operatorID, time.Now().In(b.loc)); err != nil {
+			jobDone <- err
+			return
+		}
 		success, failed := b.copyBroadcast(jobCtx, operatorID, sourceChatID, sourceMessageID, targets, mode, targetName, notifyAll)
 		text := formatBroadcastResultText(mode, success, failed, notifyAll)
 		if _, err := b.editText(jobCtx, sourceChatID, status.MessageID, text, nil); err != nil {
@@ -465,14 +505,39 @@ func (b *Bot) currentBroadcastTargets(ctx context.Context, userID int64, state p
 	var allowed []storage.Group
 	var err error
 	if state.Mode == "group" {
-		allowed, err = b.allowedChatsForBroadcastGroup(ctx, userID, state.TargetName)
+		var group storage.BroadcastGroup
+		var ok bool
+		var groupErr error
+		if state.GroupID > 0 {
+			group, ok, groupErr = b.store.GetBroadcastGroupByID(ctx, state.GroupID)
+		} else {
+			group, ok, groupErr = b.store.GetBroadcastGroup(ctx, state.TargetName)
+		}
+		if groupErr != nil || !ok {
+			return nil, groupErr
+		}
+		allowed, err = b.allowedChatsForBroadcastGroup(ctx, userID, group.Name)
 	} else {
 		allowed, err = b.store.ListAllowedBroadcastChats(ctx, userID, b.perms.HasGlobalBroadcastAccess(userID))
 	}
 	if err != nil {
 		return nil, err
 	}
-	return intersectBroadcastTargets(state.ChatIDs, allowed), nil
+	switch state.Mode {
+	case "all", "group":
+		return allowed, nil
+	case "chat":
+		targetChatID := state.TargetChatID
+		if targetChatID == 0 && len(state.ChatIDs) == 1 {
+			targetChatID = state.ChatIDs[0]
+		}
+		for _, target := range allowed {
+			if target.ChatID == targetChatID {
+				return []storage.Group{target}, nil
+			}
+		}
+	}
+	return nil, nil
 }
 
 func intersectBroadcastTargets(original []int64, allowed []storage.Group) []storage.Group {
@@ -650,7 +715,11 @@ func isBroadcastTargetLabelText(text string) bool {
 func (b *Bot) refreshBroadcastSessionKeyboard(ctx context.Context, msg telegram.Message, state privateState) error {
 	ctx = withPrivateCleanupCategory(ctx, "broadcast")
 	oldControlMessageID := state.ControlMessageID
-	refresh, err := b.sendText(ctx, sendPriorityNormal, msg.Chat.ID, formatBroadcastReadyText(state.TargetName, len(state.ChatIDs), state.NotifyAll), map[string]any{
+	targets, err := b.currentBroadcastTargets(ctx, msg.From.ID, state)
+	if err != nil {
+		return err
+	}
+	refresh, err := b.sendText(ctx, sendPriorityNormal, msg.Chat.ID, formatBroadcastReadyText(state.TargetName, len(targets), state.NotifyAll), map[string]any{
 		"reply_markup": broadcastSessionKeyboard(state.TargetName, state.NotifyAll),
 	})
 	if err != nil {

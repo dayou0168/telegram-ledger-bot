@@ -38,11 +38,12 @@ func TestPrivateCleanupMessageSchedule(t *testing.T) {
 
 func TestPrivateCleanupScopeCategories(t *testing.T) {
 	for kind, want := range map[string]string{
-		"broadcast_menu":         "broadcast",
-		"broadcast_result":       "broadcast",
-		"broadcast_reply_notice": "quick_reply",
-		"quick_reply_failed":     "quick_reply",
-		"private_menu":           "menu",
+		"broadcast_menu":          "broadcast",
+		"broadcast_result":        "broadcast",
+		"broadcast_reply_notice":  "broadcast_reply",
+		"broadcast_upstream_copy": "broadcast_copy",
+		"quick_reply_failed":      "quick_reply",
+		"private_menu":            "menu",
 	} {
 		if got := privateCleanupCategoryForKind(kind); got != want {
 			t.Errorf("category %q = %q, want %q", kind, got, want)
@@ -50,5 +51,12 @@ func TestPrivateCleanupScopeCategories(t *testing.T) {
 	}
 	if got := privateCleanupCategoryFromContext(withPrivateCleanupCategory(context.Background(), "quick_reply")); got != "quick_reply" {
 		t.Fatalf("context category = %q", got)
+	}
+}
+
+func TestBroadcastCopyAndReplyAreRetainedByLegacyCleanupScopes(t *testing.T) {
+	legacyScope := "broadcast,quick_reply,menu"
+	if storage.PrivateCleanupScopeIncludes(legacyScope, "broadcast_copy") || storage.PrivateCleanupScopeIncludes(legacyScope, "broadcast_reply") {
+		t.Fatal("upstream copies and reply notices must require an explicit cleanup category")
 	}
 }

@@ -110,6 +110,22 @@ func (c *Client) SendPhotoBytes(ctx context.Context, chatID int64, filename stri
 	return msg, err
 }
 
+func (c *Client) SendPhoto(ctx context.Context, chatID int64, fileID, caption string, opts map[string]any) (Message, error) {
+	payload := map[string]any{
+		"chat_id": chatID,
+		"photo":   fileID,
+	}
+	if caption != "" {
+		payload["caption"] = caption
+	}
+	for key, value := range opts {
+		payload[key] = value
+	}
+	var msg Message
+	err := c.call(ctx, http.MethodPost, "sendPhoto", nil, payload, &msg)
+	return msg, err
+}
+
 func (c *Client) AnswerCallback(ctx context.Context, callbackID, text string) error {
 	payload := map[string]any{"callback_query_id": callbackID}
 	if text != "" {

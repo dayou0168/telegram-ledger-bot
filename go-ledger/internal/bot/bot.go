@@ -46,40 +46,41 @@ type Bot struct {
 	criticalPool    *worker.Pool
 	quickReplyLease time.Duration
 
-	groupTouchCache       *ttlCache[string]
-	groupCache            *ttlCache[storage.Group]
-	billSummaryCache      *ttlCache[storage.BillSummaryData]
-	userTouchCache        *ttlCache[string]
-	operatorCache         *ttlCache[bool]
-	globalCapabilityCache *globalCapabilityCache
-	watchTargetCache      *ttlCache[[]storage.WatchTarget]
-	fallbackSubCache      *ttlCache[[]storage.ChainWatcherSubscription]
-	rateBookCache         *ttlCache[[]p2p.OrderBookEntry]
-	rateBookState         rateBookState
-	privateStates         *ttlCache[privateState]
-	notificationWake      chan struct{}
-	quickReplyWake        chan struct{}
-	criticalOutboxWake    chan int64
-	telegramLedgerWake    chan struct{}
-	telegramBypassWake    chan struct{}
-	telegramInboxLease    time.Duration
-	telegramLimiter       *telegramRateLimiter
-	sendGateway           *telegramSendGateway
-	watchRunning          atomic.Bool
-	watcherFallback       *watcherFallbackController
-	watcherTiming         chainWatcherTimingStatus
-	fallbackNextPoll      atomic.Int64
-	fallbackBackoff       atomic.Int32
-	fallbackLeaderActive  atomic.Bool
-	globalPermissionEpoch atomic.Int64
-	telegramInboxStats    atomic.Value
-	ledgerSummaryCompare  atomic.Uint64
-	globalOperatorLookup  func(context.Context, int64) (permissions.UserCapabilities, bool, error)
-	permissionEpochLookup func(context.Context) (int64, error)
-	groupOperatorLookup   func(context.Context, int64, int64) (bool, error)
-	updateHandler         func(context.Context, telegram.Update) error
-	inboxMarkHandled      func(context.Context, storage.TelegramInboxUpdate, string, time.Time) (bool, error)
-	inboxComplete         func(context.Context, storage.TelegramInboxUpdate, string, time.Time) (bool, error)
+	groupTouchCache           *ttlCache[string]
+	groupCache                *ttlCache[storage.Group]
+	billSummaryCache          *ttlCache[storage.BillSummaryData]
+	userTouchCache            *ttlCache[string]
+	operatorCache             *ttlCache[bool]
+	globalCapabilityCache     *globalCapabilityCache
+	watchTargetCache          *ttlCache[[]storage.WatchTarget]
+	fallbackSubCache          *ttlCache[[]storage.ChainWatcherSubscription]
+	rateBookCache             *ttlCache[[]p2p.OrderBookEntry]
+	rateBookState             rateBookState
+	privateStates             *ttlCache[privateState]
+	notificationWake          chan struct{}
+	quickReplyWake            chan struct{}
+	criticalOutboxWake        chan int64
+	telegramLedgerWake        chan struct{}
+	telegramBypassWake        chan struct{}
+	telegramInboxLease        time.Duration
+	telegramLimiter           *telegramRateLimiter
+	sendGateway               *telegramSendGateway
+	watchRunning              atomic.Bool
+	watcherFallback           *watcherFallbackController
+	watcherTiming             chainWatcherTimingStatus
+	fallbackNextPoll          atomic.Int64
+	fallbackBackoff           atomic.Int32
+	fallbackLeaderActive      atomic.Bool
+	globalPermissionEpoch     atomic.Int64
+	telegramInboxStats        atomic.Value
+	ledgerSummaryCompare      atomic.Uint64
+	globalOperatorLookup      func(context.Context, int64) (permissions.UserCapabilities, bool, error)
+	permissionEpochLookup     func(context.Context) (int64, error)
+	groupOperatorLookup       func(context.Context, int64, int64) (bool, error)
+	broadcastObserverResolver BroadcastUpstreamObserverResolver
+	updateHandler             func(context.Context, telegram.Update) error
+	inboxMarkHandled          func(context.Context, storage.TelegramInboxUpdate, string, time.Time) (bool, error)
+	inboxComplete             func(context.Context, storage.TelegramInboxUpdate, string, time.Time) (bool, error)
 }
 
 const privateStateTTL = 30 * time.Minute

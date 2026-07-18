@@ -641,23 +641,39 @@ func (b *Bot) restoreTelegramPrivateState(ctx context.Context, item storage.Tele
 		return nil, err
 	}
 	key := formatID(userID)
-	stateFresh := found && state.HasState && (state.UpdatedAt.IsZero() || time.Since(state.UpdatedAt) < privateStateTTL)
+	stateFresh := found && state.HasState && privateStateIsFresh(state.UpdatedAt, time.Now())
 	if stateFresh {
 		var value privateState
 		if err := json.Unmarshal(state.StateJSON, &value); err != nil {
 			return nil, fmt.Errorf("decode private route state user=%d: %w", userID, err)
 		}
+		value, err = b.upgradeLegacyBroadcastState(ctx, userID, value)
+		if err != nil {
+			return nil, err
+		}
 		b.privateStates.Set(key, value)
 	} else if !found && legacyState != nil {
 		b.privateStates.Set(key, *legacyState)
 	} else {
-		b.privateStates.Delete(key)
+		broadcastState, targetFound, targetErr := b.loadBroadcastTargetState(ctx, userID)
+		if targetErr != nil {
+			return nil, targetErr
+		}
+		if targetFound {
+			b.privateStates.Set(key, broadcastState)
+		} else {
+			b.privateStates.Delete(key)
+		}
 	}
 	expected := int64(-1)
 	if found {
 		expected = state.VersionUpdateID
 	}
 	return &telegramPrivateStateRevision{userID: userID, expectedVersion: expected}, nil
+}
+
+func privateStateIsFresh(updatedAt, now time.Time) bool {
+	return updatedAt.IsZero() || now.Sub(updatedAt) < privateStateTTL
 }
 
 func (b *Bot) persistTelegramHandled(ctx context.Context, item storage.TelegramInboxUpdate, owner string, guard *telegramInboxLeaseGuard, revision *telegramPrivateStateRevision, commitSignal *telegramUpdateCommitSignal) bool {

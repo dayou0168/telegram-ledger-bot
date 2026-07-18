@@ -164,6 +164,13 @@ func (b *Bot) InvalidateBroadcastPermission(userID int64) {
 	if b.privateStates != nil {
 		b.privateStates.Delete(formatID(userID))
 	}
+	if b.store != nil && userID > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := b.clearBroadcastTarget(ctx, userID); err != nil {
+			log.Printf("clear revoked broadcast target %d: %v", userID, err)
+		}
+	}
 }
 
 func (b *Bot) InvalidateAllPermissionCaches() {

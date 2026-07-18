@@ -32,6 +32,7 @@ type Group struct {
 }
 
 type BroadcastGroup struct {
+	ID               int64
 	Name             string
 	ChatIDs          []int64
 	ChatNames        []string
@@ -159,6 +160,29 @@ type BroadcastDelivery struct {
 	TargetName      string
 	CreatedAt       time.Time
 	ReplacedAt      *time.Time
+}
+
+type TelegramBroadcastTarget struct {
+	StreamKey  string
+	UserID     int64
+	Mode       string
+	ChatID     int64
+	GroupID    int64
+	TargetName string
+	NotifyAll  bool
+	UpdatedAt  time.Time
+}
+
+type BroadcastUpstreamMessage struct {
+	ID                   int64
+	SourceOperatorUserID int64
+	SourceChatID         int64
+	SourceMessageID      int64
+	RecipientUserID      int64
+	OutboxID             int64
+	TelegramMessageID    int64
+	CreatedAt            time.Time
+	SentAt               *time.Time
 }
 
 type TelegramInboxUpdate struct {
@@ -585,25 +609,29 @@ type AddressValidation struct {
 }
 
 type NotificationOutbox struct {
-	ID               int64
-	Kind             string
-	DedupeKey        string
-	ChatID           int64
-	Text             string
-	ParseMode        string
-	DisablePreview   bool
-	ReplyToMessageID int64
-	ReplyMarkupJSON  string
-	ReferenceKind    string
-	ReferenceID      int64
-	Priority         int
-	Status           string
-	Attempts         int
-	NextAttemptAt    time.Time
-	LastError        string
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
-	SentAt           *time.Time
+	ID                int64
+	Kind              string
+	DedupeKey         string
+	ChatID            int64
+	Text              string
+	PayloadType       string
+	FileID            string
+	Caption           string
+	ParseMode         string
+	DisablePreview    bool
+	ReplyToMessageID  int64
+	ReplyToUpstreamID int64
+	ReplyMarkupJSON   string
+	ReferenceKind     string
+	ReferenceID       int64
+	Priority          int
+	Status            string
+	Attempts          int
+	NextAttemptAt     time.Time
+	LastError         string
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+	SentAt            *time.Time
 }
 
 type NotificationOutboxStats struct {
