@@ -415,6 +415,165 @@ func TestPostgresLedgerStartStopResumePeriodContract(t *testing.T) {
 	}
 }
 
+func TestPostgresDisableCutoffAliasesPreserveStateAcrossMidnightAndRestart(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	loc := time.FixedZone("Asia/Shanghai", 8*3600)
+	beforeMidnight := time.Date(2026, 7, 19, 23, 59, 59, 0, loc)
+	afterMidnight := time.Date(2026, 7, 20, 0, 0, 1, 0, loc)
+	periodStart := time.Date(2026, 7, 19, 10, 0, 0, 0, loc)
+	dayKey := "2026-07-19"
+	owner := storage.User{ID: 94001, DisplayName: "owner"}
+	suffix := time.Now().UnixNano() % 1000000
+
+	newBot := func(store *storage.Store) *Bot {
+		b := New(config.Config{
+			Timezone: "Asia/Shanghai", QueueSize: 16, GroupCacheTTL: time.Minute,
+			OperatorCacheTTL: time.Minute, BillSummaryCacheTTL: time.Minute,
+		}, store, nil, nil, nil)
+		b.globalOperatorLookup = func(context.Context, int64) (permissions.UserCapabilities, bool, error) {
+			return permissions.UserCapabilities{}, false, nil
+		}
+		return b
+	}
+	message := func(chatID, id int64, text string) telegram.Message {
+		return telegram.Message{
+			MessageID: id,
+			Chat:      telegram.Chat{ID: chatID, Type: "supergroup", Title: "cutoff alias test"},
+			From:      &telegram.User{ID: owner.ID, FirstName: owner.DisplayName},
+			Text:      text,
+		}
+	}
+	prepare := func(t *testing.T, store *storage.Store, chatID int64) {
+		t.Helper()
+		if err := store.EnsureGroup(ctx, chatID, "cutoff alias test", periodStart); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.TouchUser(ctx, chatID, owner, periodStart); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.SetGroupOwner(ctx, chatID, owner, periodStart); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.SetGroupExchangeRate(ctx, chatID, "7.1", periodStart); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.SetGroupFeeRate(ctx, chatID, "3", periodStart); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.SetGroupCutoffState(ctx, chatID, 0, true, dayKey, dayKey, periodStart); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertSettingsPreserved := func(t *testing.T, group storage.Group) {
+		t.Helper()
+		if group.DepositExchangeRate != "7.1" || group.PayoutExchangeRate != "7.1" || group.FeeRate != "3" {
+			t.Fatalf("disabling cutoff changed rate settings: %+v", group)
+		}
+	}
+
+	for index, alias := range []string{"关闭日切", "设置日切-1"} {
+		t.Run(alias, func(t *testing.T) {
+			store, err := storage.Open(ctx, dsn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			activeChatID := int64(-1009400000000) - int64(index*10) - suffix
+			stoppedChatID := activeChatID - 1
+			prepare(t, store, activeChatID)
+			prepare(t, store, stoppedChatID)
+			b := newBot(store)
+			cmd, ok := parseSetting(alias)
+			if !ok || cmd.Kind != "cutoff" || cmd.CutoffHour != cutoffDisabledHour {
+				store.Close()
+				t.Fatalf("parseSetting(%q) = %+v, %v", alias, cmd, ok)
+			}
+
+			if err := b.handleSetting(ctx, message(activeChatID, 100+int64(index), alias), owner, cmd, beforeMidnight); err != nil {
+				store.Close()
+				t.Fatal(err)
+			}
+			activeGroup, err := store.GetGroup(ctx, activeChatID)
+			if err != nil {
+				store.Close()
+				t.Fatal(err)
+			}
+			if !activeGroup.Active || activeGroup.CutoffHour != cutoffDisabledHour || activeGroup.ActiveDayKey != dayKey ||
+				activeGroup.ActiveExpiresDayKey != "" || !activeGroup.ActivePeriodStartedAt.Equal(periodStart) {
+				store.Close()
+				t.Fatalf("active group changed period while disabling cutoff: %+v", activeGroup)
+			}
+			assertSettingsPreserved(t, activeGroup)
+
+			if err := b.stopAccounting(ctx, message(stoppedChatID, 200+int64(index), "停止"), owner, beforeMidnight.Add(-time.Hour)); err != nil {
+				store.Close()
+				t.Fatal(err)
+			}
+			if err := b.handleSetting(ctx, message(stoppedChatID, 300+int64(index), alias), owner, cmd, beforeMidnight); err != nil {
+				store.Close()
+				t.Fatal(err)
+			}
+			stoppedGroup, err := store.GetGroup(ctx, stoppedChatID)
+			if err != nil {
+				store.Close()
+				t.Fatal(err)
+			}
+			if stoppedGroup.Active || stoppedGroup.CutoffHour != cutoffDisabledHour || stoppedGroup.ActiveDayKey != dayKey ||
+				stoppedGroup.ActiveExpiresDayKey != "" || !stoppedGroup.ActivePeriodStartedAt.Equal(periodStart) {
+				store.Close()
+				t.Fatalf("disabled cutoff changed stopped period: %+v", stoppedGroup)
+			}
+			assertSettingsPreserved(t, stoppedGroup)
+			store.Close()
+
+			reopened, err := storage.Open(ctx, dsn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reopened.Close()
+			activeGroup, err = reopened.GetGroup(ctx, activeChatID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !groupAccountingActive(activeGroup, afterMidnight) || currentLedgerDayKey(activeGroup, afterMidnight) != dayKey {
+				t.Fatalf("active disabled-cutoff period did not survive midnight/restart: %+v", activeGroup)
+			}
+			assertSettingsPreserved(t, activeGroup)
+
+			restartedBot := newBot(reopened)
+			ledgerCmd, ok := parseLedger("+100")
+			if !ok {
+				t.Fatal("parseLedger(+100) failed")
+			}
+			recordMessageID := int64(400 + index)
+			if err := restartedBot.handleLedger(ctx, message(activeChatID, recordMessageID, "+100"), owner, ledgerCmd, afterMidnight); err != nil {
+				t.Fatal(err)
+			}
+			record, ok, err := reopened.FindRecordByMessage(ctx, activeChatID, recordMessageID)
+			if err != nil || !ok {
+				t.Fatalf("find post-midnight record: ok=%v err=%v", ok, err)
+			}
+			if record.DayKey != dayKey || !record.PeriodStartedAt.Equal(periodStart) {
+				t.Fatalf("post-midnight record left continuous period: %+v", record)
+			}
+
+			stoppedGroup, err = reopened.GetGroup(ctx, stoppedChatID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stoppedGroup.Active || groupAccountingActive(stoppedGroup, afterMidnight) {
+				t.Fatalf("stopped group was restarted by disabling cutoff: %+v", stoppedGroup)
+			}
+			assertSettingsPreserved(t, stoppedGroup)
+		})
+	}
+}
+
 func TestPostgresBillRenderSeesCommitFromAnotherProcessCachePath(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {

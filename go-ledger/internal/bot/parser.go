@@ -159,12 +159,17 @@ func parseSetting(text string) (settingCommand, bool) {
 		if err != nil {
 			return settingCommand{}, false
 		}
-		return settingCommand{Kind: "cutoff", CutoffHour: hour}, hour >= 0 && hour <= 23
+		return parseCutoffSetting(hour)
 	}
 	if text == "关闭日切" {
-		return settingCommand{Kind: "cutoff", CutoffHour: cutoffDisabledHour}, true
+		return parseCutoffSetting(cutoffDisabledHour)
 	}
 	return settingCommand{}, false
+}
+
+func parseCutoffSetting(hour int) (settingCommand, bool) {
+	cmd := settingCommand{Kind: "cutoff", CutoffHour: hour}
+	return cmd, hour == cutoffDisabledHour || hour >= 0 && hour <= 23
 }
 
 func isBillCommand(text string) bool {

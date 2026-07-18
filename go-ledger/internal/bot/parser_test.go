@@ -121,9 +121,16 @@ func TestParseSettings(t *testing.T) {
 	if !ok || cutoff.Kind != "cutoff" || cutoff.CutoffHour != 4 {
 		t.Fatalf("unexpected cutoff setting: %+v ok=%v", cutoff, ok)
 	}
-	disabled, ok := parseSetting("\u5173\u95ed\u65e5\u5207")
-	if !ok || disabled.Kind != "cutoff" || disabled.CutoffHour != cutoffDisabledHour {
-		t.Fatalf("unexpected disabled cutoff setting: %+v ok=%v", disabled, ok)
+	for _, text := range []string{"关闭日切", "设置日切-1", "设置日切 -1"} {
+		disabled, ok := parseSetting(text)
+		if !ok || disabled.Kind != "cutoff" || disabled.CutoffHour != cutoffDisabledHour {
+			t.Fatalf("parseSetting(%q) = %+v, %v; want disabled cutoff", text, disabled, ok)
+		}
+	}
+	for _, text := range []string{"设置日切-2", "设置日切24"} {
+		if cmd, ok := parseSetting(text); ok {
+			t.Fatalf("parseSetting(%q) = %+v, true; want invalid", text, cmd)
+		}
 	}
 }
 

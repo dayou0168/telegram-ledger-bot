@@ -6,6 +6,9 @@ import (
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
 )
 
+// CutoffDisabledHour is the explicit disabled sentinel. Existing zero values
+// are indistinguishable from intentional midnight cutoffs and must not be
+// inferred or bulk-migrated to this value.
 const CutoffDisabledHour = -1
 
 func BusinessDayKey(now time.Time, cutoffHour int) string {
