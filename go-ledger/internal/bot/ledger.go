@@ -313,6 +313,10 @@ func (b *Bot) handleOperatorCommand(ctx context.Context, msg telegram.Message, u
 		return err
 	}
 	if len(targets) == 0 {
+		if len(missing) > 0 {
+			return b.enqueueLedgerTraceText(ctx, sendPriorityNormal, "ledger_operator_user_unknown", msg.Chat.ID, msg.MessageID,
+				"未找到："+strings.Join(missing, "、")+"\n机器人尚未获取到该用户信息。请回复对方的群消息后发送“设置操作人”；或让对方先在群里发言、被机器人发现后，再使用 @用户名设置。", nil, now)
+		}
 		return b.enqueueLedgerTraceText(ctx, sendPriorityNormal, "ledger_operator_no_target", msg.Chat.ID, msg.MessageID, "请回复对方消息，或输入 @用户名。", nil, now)
 	}
 	var changed []string
@@ -391,10 +395,27 @@ func (b *Bot) handleListOperators(ctx context.Context, msg telegram.Message) err
 func (b *Bot) operatorTargets(ctx context.Context, msg telegram.Message, text string) ([]storage.User, []string, error) {
 	seen := make(map[int64]struct{})
 	var targets []storage.User
+	actorUserID := int64(0)
+	if msg.From != nil {
+		actorUserID = msg.From.ID
+	}
+	addTarget := func(candidate telegram.User) {
+		if candidate.ID <= 0 || candidate.ID == actorUserID || candidate.IsBot {
+			return
+		}
+		if _, exists := seen[candidate.ID]; exists {
+			return
+		}
+		seen[candidate.ID] = struct{}{}
+		targets = append(targets, userFromTelegram(candidate))
+	}
 	if msg.ReplyTo != nil && msg.ReplyTo.From != nil {
-		user := userFromTelegram(*msg.ReplyTo.From)
-		targets = append(targets, user)
-		seen[user.ID] = struct{}{}
+		addTarget(*msg.ReplyTo.From)
+	}
+	for _, entity := range msg.Entities {
+		if entity.Type == "text_mention" && entity.User != nil {
+			addTarget(*entity.User)
+		}
 	}
 	var missing []string
 	for _, username := range parseMentions(text) {
@@ -406,11 +427,11 @@ func (b *Bot) operatorTargets(ctx context.Context, msg telegram.Message, text st
 			missing = append(missing, "@"+username)
 			continue
 		}
-		if _, exists := seen[user.ID]; exists {
-			continue
-		}
-		seen[user.ID] = struct{}{}
-		targets = append(targets, user)
+		addTarget(telegram.User{
+			ID:        user.ID,
+			FirstName: user.DisplayName,
+			Username:  user.Username,
+		})
 	}
 	return targets, missing, nil
 }

@@ -766,6 +766,139 @@ func TestPostgresTelegramMetadataNewestUpdateWinsAcrossInstances(t *testing.T) {
 	}
 }
 
+func TestPostgresObservedMemberDoesNotEnterMentionAudienceUntilSpeaking(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	store, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+
+	suffix := time.Now().UnixNano()
+	chatID := int64(-906000000000 - suffix%1000000)
+	userID := int64(706000000000 + suffix%1000000)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	member := User{ID: userID, Username: "member_only", DisplayName: "Member Only"}
+	if err := store.ObserveUserForTelegramUpdate(ctx, chatID, member, 100, now); err != nil {
+		t.Fatalf("observe member: %v", err)
+	}
+	if found, ok, err := store.FindUserByUsername(ctx, chatID, "member_only"); err != nil || !ok || found.ID != userID {
+		t.Fatalf("find observed member = %+v, %v, %v", found, ok, err)
+	}
+	users, err := store.ListUsersForMention(ctx, chatID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(users) != 0 {
+		t.Fatalf("unspoken member entered notify-all audience: %+v", users)
+	}
+	if err := store.TouchUserForTelegramUpdate(ctx, chatID, member, 101, now.Add(time.Second)); err != nil {
+		t.Fatalf("touch speaking member: %v", err)
+	}
+	users, err = store.ListUsersForMention(ctx, chatID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(users) != 1 || users[0].ID != userID {
+		t.Fatalf("speaking member missing from notify-all audience: %+v", users)
+	}
+}
+
+func TestPostgresBroadcastReplyPreferencesUpgradeAndOverrides(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	migrationURL, admin, quotedSchema := postgresTestSchema(t, ctx, dsn, "broadcast_reply_preferences")
+	schemaName := strings.Trim(quotedSchema, `"`)
+
+	fresh, err := Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatalf("fresh Open: %v", err)
+	}
+	fresh.Close()
+	if _, err := admin.Exec(ctx, "DROP TABLE "+quotedSchema+".broadcast_reply_preferences"); err != nil {
+		t.Fatalf("drop reply preference fixture: %v", err)
+	}
+	if _, err := admin.Exec(ctx, "DELETE FROM "+quotedSchema+".schema_migrations WHERE version=$1", latestSchemaMigrationVersion); err != nil {
+		t.Fatalf("delete reply preference marker: %v", err)
+	}
+	var memberMarker int
+	if err := admin.QueryRow(ctx, "SELECT count(*) FROM "+quotedSchema+".schema_migrations WHERE version=$1",
+		chatMemberDiscoveryMigrationVersion).Scan(&memberMarker); err != nil || memberMarker != 1 {
+		t.Fatalf("member marker count=%d err=%v", memberMarker, err)
+	}
+
+	store, err := Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatalf("upgrade Open: %v", err)
+	}
+	defer store.Close()
+	reopened, err := Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatalf("idempotent Open: %v", err)
+	}
+	reopened.Close()
+
+	var tableCount, indexCount, constraintCount, markerCount int
+	if err := admin.QueryRow(ctx, `SELECT count(*) FROM pg_catalog.pg_tables
+		WHERE schemaname=$1 AND tablename='broadcast_reply_preferences'`, schemaName).Scan(&tableCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := admin.QueryRow(ctx, `SELECT count(*) FROM pg_catalog.pg_indexes
+		WHERE schemaname=$1 AND indexname='idx_broadcast_reply_preferences_source'`, schemaName).Scan(&indexCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := admin.QueryRow(ctx, `SELECT count(*) FROM pg_catalog.pg_constraint c
+		JOIN pg_catalog.pg_class r ON r.oid=c.conrelid
+		JOIN pg_catalog.pg_namespace n ON n.oid=r.relnamespace
+		WHERE n.nspname=$1 AND r.relname='broadcast_reply_preferences'
+		  AND c.conname='broadcast_reply_preferences_distinct_users'`, schemaName).Scan(&constraintCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := admin.QueryRow(ctx, "SELECT count(*) FROM "+quotedSchema+".schema_migrations WHERE version=$1",
+		latestSchemaMigrationVersion).Scan(&markerCount); err != nil {
+		t.Fatal(err)
+	}
+	if tableCount != 1 || indexCount != 1 || constraintCount != 1 || markerCount != 1 {
+		t.Fatalf("upgrade table=%d index=%d constraint=%d marker=%d", tableCount, indexCount, constraintCount, markerCount)
+	}
+
+	observerA, observerB, source := int64(71001), int64(71002), int64(72001)
+	overrides, err := store.BroadcastReplyPreferenceOverrides(ctx, observerA)
+	if err != nil || len(overrides) != 0 {
+		t.Fatalf("default overrides=%v err=%v", overrides, err)
+	}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	if err := store.SetBroadcastReplyPreference(ctx, observerA, source, false, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetBroadcastReplyPreference(ctx, observerB, source, true, now); err != nil {
+		t.Fatal(err)
+	}
+	bySource, err := store.BroadcastReplyPreferenceOverridesForSource(ctx, source, []int64{observerA, observerB, 79999})
+	if err != nil || len(bySource) != 2 || bySource[observerA] || !bySource[observerB] {
+		t.Fatalf("source overrides=%v err=%v", bySource, err)
+	}
+	if err := store.SetBroadcastReplyPreference(ctx, observerA, source, true, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	overrides, err = store.BroadcastReplyPreferenceOverrides(ctx, observerA)
+	if err != nil || !overrides[source] {
+		t.Fatalf("restored overrides=%v err=%v", overrides, err)
+	}
+	if err := store.SetBroadcastReplyPreference(ctx, source, source, false, now); err == nil {
+		t.Fatal("self preference must be rejected")
+	}
+}
+
 func TestPostgresLedgerClearTicketSecurity(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {

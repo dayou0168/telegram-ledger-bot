@@ -61,7 +61,7 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64, timeout time.Dura
 		values.Set("offset", strconv.FormatInt(offset, 10))
 	}
 	values.Set("timeout", strconv.Itoa(int(timeout.Seconds())))
-	values.Set("allowed_updates", `["message","callback_query","my_chat_member"]`)
+	values.Set("allowed_updates", `["message","callback_query","my_chat_member","chat_member"]`)
 	var result []Update
 	err := c.call(ctx, http.MethodGet, "getUpdates", values, nil, &result)
 	return result, err

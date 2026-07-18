@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"testing"
 	"time"
 
@@ -148,6 +149,91 @@ func TestBroadcastReplyKeyboardHidesQuickReplyWithoutPermission(t *testing.T) {
 	if len(operator.InlineKeyboard) != 2 || operator.InlineKeyboard[0][0].CallbackData != "br:q:7" {
 		t.Fatalf("operator keyboard rows = %#v", operator.InlineKeyboard)
 	}
+}
+
+func TestPostgresBroadcastReplyRecipientMatrixAndPreferences(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store, err := storage.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	base := int64(985000000000 + time.Now().UnixNano()%1000000)
+	hostID, defaultAID, defaultBID := base, base+1, base+2
+	primaryAID, primaryBID := base+3, base+4
+	secondaryAID, secondaryBID := base+5, base+6
+	now := time.Now().UTC()
+	for _, op := range []struct {
+		id, parent int64
+		level      string
+	}{
+		{primaryAID, 0, "primary"},
+		{primaryBID, 0, "primary"},
+		{secondaryAID, primaryAID, "secondary"},
+		{secondaryBID, primaryBID, "secondary"},
+	} {
+		if err := store.UpsertGlobalOperator(ctx, op.id, op.level, op.parent, hostID, "reply matrix", now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b := &Bot{store: store, perms: permissions.NewPolicy(hostID, map[int64]struct{}{defaultAID: {}, defaultBID: {}})}
+
+	assertBroadcastReplyRecipients(t, b.broadcastReplyRecipients(ctx, secondaryAID),
+		secondaryAID, hostID, defaultAID, defaultBID, primaryAID)
+	if err := store.SetBroadcastReplyPreference(ctx, hostID, secondaryAID, false, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetBroadcastReplyPreference(ctx, primaryAID, secondaryAID, false, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetBroadcastReplyPreference(ctx, defaultBID, secondaryAID, false, now); err != nil {
+		t.Fatal(err)
+	}
+	assertBroadcastReplyRecipients(t, b.broadcastReplyRecipients(ctx, secondaryAID), secondaryAID, defaultAID)
+
+	if err := store.SetBroadcastReplyPreference(ctx, hostID, secondaryAID, true, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	assertBroadcastReplyRecipients(t, b.broadcastReplyRecipients(ctx, secondaryAID), secondaryAID, hostID, defaultAID)
+	assertBroadcastReplyRecipients(t, b.broadcastReplyRecipients(ctx, primaryAID),
+		primaryAID, hostID, defaultAID, defaultBID)
+	assertBroadcastReplyRecipients(t, b.broadcastReplyRecipients(ctx, defaultAID),
+		defaultAID, hostID, defaultBID)
+
+	brokenStore, err := storage.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brokenStore.Close()
+	brokenBot := &Bot{store: brokenStore, perms: b.perms}
+	assertBroadcastReplyRecipients(t, brokenBot.broadcastReplyRecipients(ctx, secondaryAID), secondaryAID)
+}
+
+func assertBroadcastReplyRecipients(t *testing.T, got map[int64]struct{}, want ...int64) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("recipients=%v want=%v", sortedRecipientIDs(got), want)
+	}
+	for _, id := range want {
+		if _, ok := got[id]; !ok {
+			t.Fatalf("recipients=%v missing=%d", sortedRecipientIDs(got), id)
+		}
+	}
+}
+
+func sortedRecipientIDs(values map[int64]struct{}) []int64 {
+	ids := make([]int64, 0, len(values))
+	for id := range values {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
 }
 
 func TestBroadcastQueueFullRunsFailureFallback(t *testing.T) {

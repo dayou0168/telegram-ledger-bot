@@ -5,18 +5,23 @@ type Update struct {
 	Message       *Message       `json:"message,omitempty"`
 	CallbackQuery *CallbackQuery `json:"callback_query,omitempty"`
 	MyChatMember  *ChatMemberUpd `json:"my_chat_member,omitempty"`
+	ChatMember    *ChatMemberUpd `json:"chat_member,omitempty"`
 }
 
 type Message struct {
-	MessageID   int64        `json:"message_id"`
-	From        *User        `json:"from,omitempty"`
-	Chat        Chat         `json:"chat"`
-	Text        string       `json:"text,omitempty"`
-	Caption     string       `json:"caption,omitempty"`
-	ReplyTo     *Message     `json:"reply_to_message,omitempty"`
-	Photo       []Photo      `json:"photo,omitempty"`
-	Document    *Document    `json:"document,omitempty"`
-	UsersShared *UsersShared `json:"users_shared,omitempty"`
+	MessageID       int64           `json:"message_id"`
+	Date            int64           `json:"date,omitempty"`
+	From            *User           `json:"from,omitempty"`
+	Chat            Chat            `json:"chat"`
+	Text            string          `json:"text,omitempty"`
+	Caption         string          `json:"caption,omitempty"`
+	Entities        []MessageEntity `json:"entities,omitempty"`
+	CaptionEntities []MessageEntity `json:"caption_entities,omitempty"`
+	ReplyTo         *Message        `json:"reply_to_message,omitempty"`
+	NewChatMembers  []User          `json:"new_chat_members,omitempty"`
+	Photo           []Photo         `json:"photo,omitempty"`
+	Document        *Document       `json:"document,omitempty"`
+	UsersShared     *UsersShared    `json:"users_shared,omitempty"`
 }
 
 func (m Message) TextOrCaption() string {
@@ -36,6 +41,8 @@ type CallbackQuery struct {
 type ChatMemberUpd struct {
 	Chat          Chat       `json:"chat"`
 	From          User       `json:"from"`
+	Date          int64      `json:"date,omitempty"`
+	OldChatMember ChatMember `json:"old_chat_member"`
 	NewChatMember ChatMember `json:"new_chat_member"`
 }
 
@@ -50,6 +57,13 @@ type User struct {
 	FirstName string `json:"first_name,omitempty"`
 	LastName  string `json:"last_name,omitempty"`
 	Username  string `json:"username,omitempty"`
+}
+
+type MessageEntity struct {
+	Type   string `json:"type"`
+	Offset int    `json:"offset"`
+	Length int    `json:"length"`
+	User   *User  `json:"user,omitempty"`
 }
 
 func (u User) DisplayName() string {

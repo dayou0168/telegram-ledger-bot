@@ -44,6 +44,63 @@ func TestAddressWatchAdminDoesNotAdvertiseUnsupportedTRXNotifications(t *testing
 	}
 }
 
+func TestAdminReplyNotificationTemplateIsIndependentAndResponsive(t *testing.T) {
+	data := pageData{
+		Version:                        "test",
+		AdminRoleLabel:                 "宿主",
+		CanConfigureReplyNotifications: true,
+		ReplyNotificationScope:         "逐人控制。",
+		ReplyNotificationTargets: []replyNotificationTarget{
+			{UserID: 1001, Label: "一级甲", Relation: "一级操作人", Enabled: true},
+			{UserID: 1002, Label: "下级乙", Relation: "下级操作人", Enabled: false},
+		},
+	}
+	var body bytes.Buffer
+	if err := adminTemplate.Execute(&body, data); err != nil {
+		t.Fatal(err)
+	}
+	html := body.String()
+	for _, want := range []string{
+		`data-admin-tab-target="replies"`,
+		`data-admin-tab="replies"`,
+		`action="/admin/reply-notifications/save"`,
+		`name="source_user_id" value="1001"`,
+		`name="source_user_id" value="1002"`,
+		`一级甲`,
+		`下级乙`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("reply notification template missing %q", want)
+		}
+	}
+	if checked := strings.Count(html, `name="enabled" value="1" checked`); checked != 1 {
+		t.Fatalf("checked reply toggles=%d, want 1", checked)
+	}
+
+	body.Reset()
+	data.CanConfigureReplyNotifications = false
+	if err := adminTemplate.Execute(&body, data); err != nil {
+		t.Fatal(err)
+	}
+	html = body.String()
+	if strings.Contains(html, `data-admin-tab-target="replies"`) || strings.Contains(html, `/admin/reply-notifications/save`) {
+		t.Fatal("reply notification controls rendered for an unauthorized operator")
+	}
+
+	for _, want := range []string{
+		`.reply-settings{max-height:min(620px,calc(100vh - 260px));overflow-y:auto`,
+		`.reply-row{display:grid;grid-template-columns:minmax(180px,1fr) minmax(150px,.6fr) minmax(210px,.8fr) auto`,
+		`@media(max-width:900px)`,
+		`.reply-settings{max-height:calc(100vh - 230px)}`,
+		`.reply-row{grid-template-columns:minmax(0,1fr) auto}`,
+		`@media(max-width:420px)`,
+	} {
+		if !strings.Contains(adminHTML, want) {
+			t.Fatalf("responsive reply notification CSS missing %q", want)
+		}
+	}
+}
+
 func TestSummarizeBillIncludesSubjectAndRateStats(t *testing.T) {
 	group := storage.Group{DepositExchangeRate: "10", FeeRate: "3"}
 	records := []storage.Record{

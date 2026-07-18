@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -14,6 +15,165 @@ import (
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/config"
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/storage"
 )
+
+func TestAdminBroadcastReplyNotificationScopeAndHandler(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store, err := storage.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	base := int64(970000000000 + now.UnixNano()%1000000)
+	hostID := base
+	defaultID := base + 1
+	primaryAID := base + 2
+	primaryBID := base + 3
+	secondaryAID := base + 4
+	secondaryBID := base + 5
+	disabledSecondaryID := base + 6
+	singleChatOperatorID := base + 7
+	for _, op := range []struct {
+		userID, parentID, createdBy int64
+		level, remark               string
+	}{
+		{primaryAID, 0, hostID, "primary", "primary A"},
+		{primaryBID, 0, hostID, "primary", "primary B"},
+		{secondaryAID, primaryAID, primaryAID, "secondary", "secondary A"},
+		{secondaryBID, primaryBID, primaryBID, "secondary", "secondary B"},
+		{disabledSecondaryID, primaryAID, primaryAID, "secondary", "disabled secondary"},
+	} {
+		if err := store.UpsertGlobalOperator(ctx, op.userID, op.level, op.parentID, op.createdBy, op.remark, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.DisableGlobalOperator(ctx, disabledSecondaryID, primaryAID, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(config.Config{
+		HostUserID:         hostID,
+		DefaultOperatorIDs: map[int64]struct{}{defaultID: {}},
+	}, store)
+	hostSession := adminauth.Session{UserID: hostID, Role: adminauth.RoleHost}
+	defaultSession := adminauth.Session{UserID: defaultID, Role: adminauth.RoleDefaultOperator}
+	primaryASession := adminauth.Session{UserID: primaryAID, Role: adminauth.RoleOperator}
+	primaryBSession := adminauth.Session{UserID: primaryBID, Role: adminauth.RoleOperator}
+	secondarySession := adminauth.Session{UserID: secondaryAID, Role: adminauth.RoleOperator}
+	singleChatSession := adminauth.Session{UserID: singleChatOperatorID, Role: adminauth.RoleOperator}
+
+	targetIDs := func(session adminauth.Session) (map[int64]bool, bool) {
+		t.Helper()
+		caps, err := s.operatorActorCapabilities(ctx, session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		targets, _, allowed, err := s.replyNotificationTargets(ctx, session, caps)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids := make(map[int64]bool, len(targets))
+		for _, target := range targets {
+			ids[target.UserID] = target.Enabled
+		}
+		return ids, allowed
+	}
+	assertScope := func(name string, session adminauth.Session, want, blocked []int64, wantAllowed bool) {
+		t.Helper()
+		ids, allowed := targetIDs(session)
+		if allowed != wantAllowed {
+			t.Errorf("%s allowed=%v, want %v", name, allowed, wantAllowed)
+		}
+		for _, userID := range want {
+			if enabled, exists := ids[userID]; !exists || !enabled {
+				t.Errorf("%s missing default-enabled source %d: %+v", name, userID, ids)
+			}
+		}
+		for _, userID := range blocked {
+			if _, exists := ids[userID]; exists {
+				t.Errorf("%s exposed source %d: %+v", name, userID, ids)
+			}
+		}
+	}
+	assertScope("host", hostSession,
+		[]int64{defaultID, primaryAID, primaryBID, secondaryAID, secondaryBID},
+		[]int64{hostID, disabledSecondaryID}, true)
+	assertScope("default", defaultSession,
+		[]int64{hostID, primaryAID, primaryBID, secondaryAID, secondaryBID},
+		[]int64{defaultID, disabledSecondaryID}, true)
+	assertScope("primary A", primaryASession,
+		[]int64{secondaryAID},
+		[]int64{hostID, defaultID, primaryAID, primaryBID, secondaryBID, disabledSecondaryID}, true)
+	assertScope("primary B", primaryBSession,
+		[]int64{secondaryBID},
+		[]int64{hostID, defaultID, primaryAID, primaryBID, secondaryAID, disabledSecondaryID}, true)
+	assertScope("secondary", secondarySession, nil,
+		[]int64{hostID, defaultID, primaryAID, primaryBID, secondaryAID, secondaryBID}, false)
+	assertScope("single chat operator", singleChatSession, nil,
+		[]int64{hostID, defaultID, primaryAID, primaryBID, secondaryAID, secondaryBID}, false)
+
+	post := func(session adminauth.Session, sourceUserID int64, enabled bool) *httptest.ResponseRecorder {
+		t.Helper()
+		form := url.Values{"source_user_id": {fmt.Sprint(sourceUserID)}}
+		if enabled {
+			form.Set("enabled", "1")
+		}
+		req := httptest.NewRequest(http.MethodPost, "/admin/reply-notifications/save", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req = req.WithContext(context.WithValue(req.Context(), adminContextKey{}, session))
+		rec := httptest.NewRecorder()
+		s.saveReplyNotificationPreference(rec, req)
+		return rec
+	}
+
+	if rec := post(primaryASession, secondaryAID, false); rec.Code != http.StatusSeeOther {
+		t.Fatalf("primary disable status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	ids, _ := targetIDs(primaryASession)
+	if enabled, exists := ids[secondaryAID]; !exists || enabled {
+		t.Fatalf("explicit disable not reflected: %+v", ids)
+	}
+	if rec := post(primaryASession, secondaryAID, true); rec.Code != http.StatusSeeOther {
+		t.Fatalf("primary restore status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if ids, _ := targetIDs(primaryASession); !ids[secondaryAID] {
+		t.Fatalf("explicit restore not reflected: %+v", ids)
+	}
+	if rec := post(hostSession, defaultID, false); rec.Code != http.StatusSeeOther {
+		t.Fatalf("host disable default status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if ids, _ := targetIDs(hostSession); ids[defaultID] {
+		t.Fatalf("host explicit disable not reflected: %+v", ids)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		session adminauth.Session
+		source  int64
+	}{
+		{"primary cross hierarchy", primaryASession, secondaryBID},
+		{"primary self", primaryASession, primaryAID},
+		{"secondary", secondarySession, secondaryAID},
+		{"single chat operator", singleChatSession, secondaryAID},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if rec := post(tc.session, tc.source, false); rec.Code != http.StatusForbidden {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+	if overrides, err := store.BroadcastReplyPreferenceOverrides(ctx, secondaryAID); err != nil {
+		t.Fatal(err)
+	} else if _, exists := overrides[secondaryAID]; exists {
+		t.Fatalf("forged self preference was stored: %+v", overrides)
+	}
+}
 
 func TestAdminGlobalOperatorDisableAndDelegatedBroadcastScope(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")

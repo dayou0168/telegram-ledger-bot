@@ -49,35 +49,38 @@ type SendGatewayStatsProvider interface {
 }
 
 type pageData struct {
-	Version                       string
-	TokenUnset                    bool
-	Message                       string
-	MessageIsError                bool
-	ActiveAdminTab                string
-	OwnerTransferForm             ownerTransferFormState
-	Groups                        []storage.Group
-	BGroups                       []storage.BroadcastGroup
-	BroadcastMemberships          []storage.BroadcastGroup
-	BOperators                    []storage.GlobalOperator
-	PermissionOperators           []storage.GlobalOperator
-	PrimaryOperators              []storage.GlobalOperator
-	Permissions                   []storage.BroadcastPermission
-	PermissionFilterData          []storage.BroadcastPermission
-	Replace                       storage.BroadcastReplaceSetting
-	WatchTargets                  []storage.WatchTarget
-	AdminUserID                   int64
-	AdminRole                     string
-	AdminRoleLabel                string
-	CanManageGlobal               bool
-	CanManageOperators            bool
-	CanManageBroadcastPermissions bool
-	CanManageBroadcastGroups      bool
-	ChatNames                     map[int64]string
-	OpLabels                      map[int64]string
-	GroupPager                    adminPager
-	BroadcastPager                adminPager
-	OperatorPager                 adminPager
-	PermissionPager               adminPager
+	Version                        string
+	TokenUnset                     bool
+	Message                        string
+	MessageIsError                 bool
+	ActiveAdminTab                 string
+	OwnerTransferForm              ownerTransferFormState
+	Groups                         []storage.Group
+	BGroups                        []storage.BroadcastGroup
+	BroadcastMemberships           []storage.BroadcastGroup
+	BOperators                     []storage.GlobalOperator
+	PermissionOperators            []storage.GlobalOperator
+	PrimaryOperators               []storage.GlobalOperator
+	Permissions                    []storage.BroadcastPermission
+	PermissionFilterData           []storage.BroadcastPermission
+	ReplyNotificationTargets       []replyNotificationTarget
+	ReplyNotificationScope         string
+	CanConfigureReplyNotifications bool
+	Replace                        storage.BroadcastReplaceSetting
+	WatchTargets                   []storage.WatchTarget
+	AdminUserID                    int64
+	AdminRole                      string
+	AdminRoleLabel                 string
+	CanManageGlobal                bool
+	CanManageOperators             bool
+	CanManageBroadcastPermissions  bool
+	CanManageBroadcastGroups       bool
+	ChatNames                      map[int64]string
+	OpLabels                       map[int64]string
+	GroupPager                     adminPager
+	BroadcastPager                 adminPager
+	OperatorPager                  adminPager
+	PermissionPager                adminPager
 }
 
 type ownerTransferFormState struct {
@@ -86,6 +89,13 @@ type ownerTransferFormState struct {
 	ExpectedOwnerUserID    int64
 	NewOwnerUserID         int64
 	SyncMissingPermissions bool
+}
+
+type replyNotificationTarget struct {
+	UserID   int64
+	Label    string
+	Relation string
+	Enabled  bool
 }
 
 type adminPager struct {
@@ -216,6 +226,7 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("/admin/operator/save", s.withAuth(s.saveOperator))
 	mux.HandleFunc("/admin/operator/disable", s.withAuth(s.disableOperator))
 	mux.HandleFunc("/admin/operator/cleanup", s.withAuth(s.saveOperatorCleanup))
+	mux.HandleFunc("/admin/reply-notifications/save", s.withAuth(s.saveReplyNotificationPreference))
 	mux.HandleFunc("/admin/permission/grant", s.withAuth(s.grantPermission))
 	mux.HandleFunc("/admin/permission/revoke", s.withAuth(s.revokePermission))
 	mux.HandleFunc("/admin/watch/save", s.withAuth(s.saveWatchTarget))
@@ -1174,6 +1185,57 @@ func (s *Server) saveOperatorCleanup(w http.ResponseWriter, r *http.Request) {
 	redirectMsg(w, r, "私聊自动清空已关闭")
 }
 
+func (s *Server) saveReplyNotificationPreference(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r) {
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	session := adminSessionFromContext(r.Context())
+	caps, err := s.operatorActorCapabilities(r.Context(), session)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	targets, _, allowed, err := s.replyNotificationTargets(r.Context(), session, caps)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !allowed {
+		http.Error(w, "没有广播回复通知设置权限", http.StatusForbidden)
+		return
+	}
+	sourceUserID, err := strconv.ParseInt(strings.TrimSpace(r.FormValue("source_user_id")), 10, 64)
+	if err != nil || sourceUserID <= 0 {
+		redirectAdminTab(w, r, "replies", "操作人不正确")
+		return
+	}
+	found := false
+	for _, target := range targets {
+		if target.UserID == sourceUserID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		http.Error(w, "不能设置该操作人的广播回复", http.StatusForbidden)
+		return
+	}
+	enabled := r.FormValue("enabled") == "1"
+	if err := s.store.SetBroadcastReplyPreference(r.Context(), session.UserID, sourceUserID, enabled, time.Now()); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	message := "已停止接收该操作人的广播回复"
+	if enabled {
+		message = "已开启接收该操作人的广播回复"
+	}
+	redirectAdminTab(w, r, "replies", message)
+}
+
 func (s *Server) grantPermission(w http.ResponseWriter, r *http.Request) {
 	if !requirePost(w, r) {
 		return
@@ -1391,6 +1453,10 @@ func (s *Server) loadPageData(ctx context.Context, message string, session admin
 		s.perms.CanCreateGlobalOperator(session.UserID, caps, "secondary")
 	canManageBroadcastPermissions := s.perms.CanManageBroadcastPermissions(session.UserID, caps)
 	canManageBroadcastGroups := s.perms.CanManageBroadcastGroups(session.UserID, caps)
+	replyTargets, replyScope, canConfigureReplies, err := s.replyNotificationTargets(ctx, session, caps)
+	if err != nil {
+		return pageData{}, err
+	}
 	var (
 		groups              []storage.Group
 		bgroups             []storage.BroadcastGroup
@@ -1528,32 +1594,35 @@ func (s *Server) loadPageData(ctx context.Context, message string, session admin
 	operators, operatorPager := pageAdminOperators(operators, filters)
 	permissions, permissionPager := pageAdminPermissions(permissions, chatNames, opLabels, filters)
 	return pageData{
-		Version:                       config.Version,
-		TokenUnset:                    s.cfg.AdminWebToken == "",
-		Message:                       message,
-		Groups:                        groups,
-		BGroups:                       bgroups,
-		BroadcastMemberships:          allBroadcastGroups,
-		BOperators:                    operators,
-		PermissionOperators:           permissionOperators,
-		PrimaryOperators:              primaryOperators,
-		Permissions:                   permissions,
-		PermissionFilterData:          allPermissions,
-		Replace:                       replace,
-		WatchTargets:                  watchTargets,
-		AdminUserID:                   session.UserID,
-		AdminRole:                     session.Role,
-		AdminRoleLabel:                adminauth.RoleLabel(session.Role),
-		CanManageGlobal:               canManageGlobal,
-		CanManageOperators:            canManageOperators,
-		CanManageBroadcastPermissions: canManageBroadcastPermissions,
-		CanManageBroadcastGroups:      canManageBroadcastGroups,
-		ChatNames:                     chatNames,
-		OpLabels:                      opLabels,
-		GroupPager:                    groupPager,
-		BroadcastPager:                broadcastPager,
-		OperatorPager:                 operatorPager,
-		PermissionPager:               permissionPager,
+		Version:                        config.Version,
+		TokenUnset:                     s.cfg.AdminWebToken == "",
+		Message:                        message,
+		Groups:                         groups,
+		BGroups:                        bgroups,
+		BroadcastMemberships:           allBroadcastGroups,
+		BOperators:                     operators,
+		PermissionOperators:            permissionOperators,
+		PrimaryOperators:               primaryOperators,
+		Permissions:                    permissions,
+		PermissionFilterData:           allPermissions,
+		ReplyNotificationTargets:       replyTargets,
+		ReplyNotificationScope:         replyScope,
+		CanConfigureReplyNotifications: canConfigureReplies,
+		Replace:                        replace,
+		WatchTargets:                   watchTargets,
+		AdminUserID:                    session.UserID,
+		AdminRole:                      session.Role,
+		AdminRoleLabel:                 adminauth.RoleLabel(session.Role),
+		CanManageGlobal:                canManageGlobal,
+		CanManageOperators:             canManageOperators,
+		CanManageBroadcastPermissions:  canManageBroadcastPermissions,
+		CanManageBroadcastGroups:       canManageBroadcastGroups,
+		ChatNames:                      chatNames,
+		OpLabels:                       opLabels,
+		GroupPager:                     groupPager,
+		BroadcastPager:                 broadcastPager,
+		OperatorPager:                  operatorPager,
+		PermissionPager:                permissionPager,
 	}, nil
 }
 
@@ -1701,6 +1770,95 @@ func (s *Server) privateCleanupConfigOperator(ctx context.Context, userID int64,
 		op.PrivateCleanupScope = settings.Scope
 	}
 	return op, nil
+}
+
+func (s *Server) replyNotificationTargets(ctx context.Context, session adminauth.Session, caps permissions.UserCapabilities) ([]replyNotificationTarget, string, bool, error) {
+	privileged := s.perms.IsPrivileged(session.UserID)
+	if !privileged && caps.GlobalOperatorLevel != "primary" {
+		return nil, "", false, nil
+	}
+	operators, err := s.store.ListGlobalOperators(ctx)
+	if err != nil {
+		return nil, "", false, err
+	}
+	candidates := make([]storage.GlobalOperator, 0, len(operators)+len(s.perms.PrivilegedUserIDs()))
+	if privileged {
+		seen := make(map[int64]struct{})
+		for _, userID := range s.perms.PrivilegedUserIDs() {
+			if userID == session.UserID || userID <= 0 {
+				continue
+			}
+			op, err := s.replyNotificationEnvironmentOperator(ctx, userID)
+			if err != nil {
+				return nil, "", false, err
+			}
+			candidates = append(candidates, op)
+			seen[userID] = struct{}{}
+		}
+		for _, op := range operators {
+			if op.Status != "active" || op.UserID == session.UserID {
+				continue
+			}
+			if _, exists := seen[op.UserID]; exists {
+				continue
+			}
+			candidates = append(candidates, op)
+		}
+	} else {
+		for _, op := range operators {
+			if op.Status == "active" && op.Level == "secondary" && op.ParentUserID == session.UserID {
+				candidates = append(candidates, op)
+			}
+		}
+	}
+	overrides, err := s.store.BroadcastReplyPreferenceOverrides(ctx, session.UserID)
+	if err != nil {
+		return nil, "", false, err
+	}
+	targets := make([]replyNotificationTarget, 0, len(candidates))
+	for _, op := range candidates {
+		enabled := true
+		if value, exists := overrides[op.UserID]; exists {
+			enabled = value
+		}
+		relation := operatorLevelLabel(op.Level)
+		if !privileged {
+			relation = "我的下级操作人"
+		}
+		targets = append(targets, replyNotificationTarget{UserID: op.UserID, Label: operatorLabel(op), Relation: relation, Enabled: enabled})
+	}
+	sort.Slice(targets, func(i, j int) bool {
+		if targets[i].Relation != targets[j].Relation {
+			return targets[i].Relation < targets[j].Relation
+		}
+		return targets[i].Label < targets[j].Label
+	})
+	scope := "可逐个设置是否接收所有操作人的广播回复。"
+	if !privileged {
+		scope = "只能逐个设置是否接收自己名下下级操作人的广播回复。"
+	}
+	return targets, scope, true, nil
+}
+
+func (s *Server) replyNotificationEnvironmentOperator(ctx context.Context, userID int64) (storage.GlobalOperator, error) {
+	op := storage.GlobalOperator{UserID: userID, Level: "default", Status: "active", Remark: "默认操作人"}
+	if s.perms.IsHost(userID) {
+		op.Level = "host"
+		op.Remark = "宿主"
+	}
+	identity, ok, err := s.store.GetLatestUserIdentity(ctx, userID)
+	if err != nil {
+		return op, err
+	}
+	if ok {
+		op.Username = identity.Username
+		op.DisplayName = identity.DisplayName
+	}
+	return op, nil
+}
+
+func redirectAdminTab(w http.ResponseWriter, r *http.Request, tab, msg string) {
+	http.Redirect(w, r, "/admin?msg="+template.URLQueryEscaper(msg)+"#"+url.QueryEscape(tab), http.StatusSeeOther)
 }
 
 func redirectMsg(w http.ResponseWriter, r *http.Request, msg string) {
@@ -3106,7 +3264,8 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 .actions{display:flex;gap:8px;flex-wrap:wrap}.mini{height:32px;padding:0 10px}
 .group-operations{display:grid;grid-template-columns:minmax(250px,.8fr) minmax(480px,1.45fr);grid-template-areas:"create edit" "danger edit";align-items:start;margin-bottom:14px;border:1px solid #d7e1ec;border-radius:8px;overflow:hidden;background:#fff}.group-operation{min-width:0;padding:14px}.group-operation-create{grid-area:create}.group-operation-edit{grid-area:edit;min-height:100%;border-left:1px solid #d7e1ec}.group-operation-title{margin:0 0 4px;color:#243852;font-size:15px;font-weight:800}.group-operation-desc{min-height:34px;margin:0 0 10px;color:var(--muted);font-size:12px;line-height:1.4}.group-operation-form{display:grid;gap:9px;min-width:0}.group-operation-form label{display:block;min-width:0}.group-operation-form input,.group-operation-form select{width:100%;max-width:100%}.group-operation-form .btn{width:100%;white-space:normal}.group-edit-forms{display:grid;gap:14px}.group-transfer-form{padding-top:14px;border-top:1px solid #d7e1ec}.group-transfer-form .sync-option{display:flex;gap:8px;align-items:flex-start;padding:9px 10px;border:1px solid #d7e1ec;border-radius:6px;background:#f7f9fc;color:#334a66;font-size:13px;line-height:1.4}.group-transfer-form .sync-option input{flex:0 0 auto;width:auto;min-height:auto;margin-top:2px}.transfer-summary{min-height:34px;padding:8px 10px;border-left:3px solid var(--gold);background:#fbf8ef;color:#394f68;font-size:12px;line-height:1.45;overflow-wrap:anywhere}.group-operation-danger{grid-area:danger;border-top:1px solid #d7e1ec;background:#fffafa}.group-operation-danger .group-operation-title{color:#9f2016}.broadcast-group-table .group-name-cell{min-width:150px;font-weight:700;text-align:left;overflow-wrap:anywhere}.broadcast-group-table .group-owner-cell{min-width:130px;overflow-wrap:anywhere}.broadcast-group-table .group-members-cell{min-width:220px;text-align:left;overflow-wrap:anywhere}.cleanup-cell{min-width:150px;max-width:230px}.cleanup-cell-inner{display:flex;gap:8px;align-items:center;justify-content:space-between;text-align:left}.cleanup-summary{display:block;min-width:0;max-width:170px;color:var(--muted);font-size:12px;line-height:1.35;overflow-wrap:anywhere}.cleanup-dialog{width:min(680px,calc(100vw - 32px));max-height:min(760px,calc(100vh - 32px));padding:0;border:1px solid var(--line);border-radius:8px;color:var(--ink);box-shadow:0 18px 60px rgba(14,27,47,.26)}.cleanup-dialog::backdrop{background:rgba(14,27,47,.48)}.cleanup-dialog-form{display:flex;flex-direction:column;max-height:min(760px,calc(100vh - 32px))}.cleanup-dialog-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:16px 18px;border-bottom:1px solid var(--line);background:#f7f9fc}.cleanup-dialog-title{margin:0;font-size:19px}.cleanup-dialog-body{padding:16px 18px;overflow:auto;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:end}.cleanup-dialog-body .wide{grid-column:1/-1}.cleanup-dialog-body select,.cleanup-dialog-body input{width:100%}.cleanup-scopes{display:flex;gap:14px;align-items:center;flex-wrap:wrap;border:1px solid #dce5ef;border-radius:6px;padding:9px 10px}.cleanup-scopes label{display:flex;gap:5px;align-items:center}.cleanup-scopes input{width:auto;min-height:auto;height:auto}.cleanup-time{display:grid;grid-template-columns:minmax(90px,1fr) auto minmax(90px,1fr) auto;gap:8px;align-items:end}.cleanup-time-colon{font-size:22px;font-weight:800;padding-bottom:7px}.cleanup-time-clear{align-self:end}.cleanup-note{color:var(--muted);font-size:12px;line-height:1.45}.cleanup-dialog-actions{position:sticky;bottom:0;display:flex;justify-content:flex-end;gap:8px;padding:12px 18px;border-top:1px solid var(--line);background:#fff}.section-title{margin:4px 0 8px;font-size:15px;font-weight:800;color:#243852}.member-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:14px}.member-form{border:1px solid #dce5ef;background:var(--soft);border-radius:8px;padding:12px;min-width:0}.member-form select{width:100%;margin-bottom:8px}.member-form select[multiple]{height:220px;min-height:220px;background:#fff}.group-name-list{max-width:760px;text-align:left;line-height:1.65}.permission-panels{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:14px}.permission-panel{border:1px solid #dce5ef;background:var(--soft);border-radius:8px;padding:12px;min-width:0}.permission-panel form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;align-items:end}.permission-panel .btn{grid-column:1/-1;justify-self:start;min-width:180px}.permission-table td:first-child,.operator-name{text-align:left}.field-label{display:block;margin:0 0 5px;color:var(--muted);font-size:12px;font-weight:700}.field-stack{min-width:0}.field-stack select{width:100%}.field-stack.disabled{opacity:.45}
 .watch-panel{max-height:620px;overflow:auto;border:1px solid #dce5ef;border-radius:8px;background:#fff}.watch-panel form{margin:0}.watch-head,.watch-row{display:grid;grid-template-columns:minmax(130px,.7fr) minmax(330px,1.6fr) minmax(150px,.7fr) repeat(2,88px) minmax(110px,.5fr) auto auto;gap:8px;align-items:center}.watch-head{position:sticky;top:0;z-index:1;background:#f4f7fb;font-weight:800;padding:10px;border-bottom:1px solid #dce5ef;text-align:center}.watch-row{padding:10px;border-bottom:1px solid #e7eef6}.watch-row:last-child{border-bottom:0}.watch-row code{word-break:break-all;color:#173f82}.watch-row .owner{font-weight:700}.watch-row .latest{color:var(--muted);font-size:12px}.watch-check{display:flex;gap:5px;align-items:center;justify-content:center}.watch-check input{min-height:auto}.watch-row .btn{height:34px;min-width:64px;padding:0 10px}.watch-empty{border:1px dashed #cbd8e8;border-radius:8px;padding:22px;text-align:center;color:var(--muted);background:var(--soft)}
-@media(max-width:900px){.top{align-items:flex-start;flex-direction:column}.row,.row.two,.group-operations,.member-grid,.permission-panels,.permission-panel form{grid-template-columns:1fr}.group-operations{grid-template-areas:"create" "edit" "danger"}.group-operation-edit{min-height:0;border-left:0;border-top:1px solid #d7e1ec}.group-operation-desc{min-height:0}.watch-head{display:none}.watch-row{grid-template-columns:1fr}.btn{width:100%}.table-tools{flex-wrap:nowrap}.table-tools input[type=search]{flex:1 1 0;width:0;min-width:0}.table-tools .btn{flex:0 0 auto;width:auto;min-width:68px}.cleanup-dialog-body{grid-template-columns:1fr}.cleanup-dialog-body .wide{grid-column:auto}.cleanup-dialog-actions .btn,.cleanup-time .btn{width:auto}.cleanup-cell{min-width:140px;max-width:190px}.cleanup-summary{max-width:125px}}
+.reply-settings{max-height:min(620px,calc(100vh - 260px));overflow-y:auto;overscroll-behavior:contain;border:1px solid #dce5ef;border-radius:8px;background:#fff}.reply-row{display:grid;grid-template-columns:minmax(180px,1fr) minmax(150px,.6fr) minmax(210px,.8fr) auto;gap:12px;align-items:center;min-width:0;padding:12px 14px;border-bottom:1px solid #e6edf5}.reply-row:last-child{border-bottom:0}.reply-name{min-width:0;font-weight:800;overflow-wrap:anywhere}.reply-relation{min-width:0;color:var(--muted);overflow-wrap:anywhere}.reply-toggle{position:relative;display:flex;align-items:center;gap:9px;min-width:0;white-space:nowrap;cursor:pointer}.reply-toggle input{position:absolute;opacity:0;pointer-events:none}.reply-toggle-track{position:relative;flex:0 0 44px;width:44px;height:24px;border-radius:999px;background:#aab7c6;transition:.18s}.reply-toggle-track::after{content:"";position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.25);transition:.18s}.reply-toggle input:checked+.reply-toggle-track{background:var(--blue)}.reply-toggle input:checked+.reply-toggle-track::after{transform:translateX(20px)}.reply-toggle input:focus-visible+.reply-toggle-track{outline:3px solid rgba(45,108,223,.25);outline-offset:2px}.reply-status{min-width:48px;color:var(--muted);font-weight:700}.reply-empty{padding:24px;text-align:center;color:var(--muted)}
+@media(max-width:900px){.top{align-items:flex-start;flex-direction:column}.row,.row.two,.group-operations,.member-grid,.permission-panels,.permission-panel form{grid-template-columns:1fr}.group-operations{grid-template-areas:"create" "edit" "danger"}.group-operation-edit{min-height:0;border-left:0;border-top:1px solid #d7e1ec}.group-operation-desc{min-height:0}.watch-head{display:none}.watch-row{grid-template-columns:1fr}.reply-settings{max-height:calc(100vh - 230px)}.reply-row{grid-template-columns:minmax(0,1fr) auto}.reply-relation{grid-column:1/-1}.reply-row .btn{grid-column:1/-1;width:100%}.btn{width:100%}.table-tools{flex-wrap:nowrap}.table-tools input[type=search]{flex:1 1 0;width:0;min-width:0}.table-tools .btn{flex:0 0 auto;width:auto;min-width:68px}.cleanup-dialog-body{grid-template-columns:1fr}.cleanup-dialog-body .wide{grid-column:auto}.cleanup-dialog-actions .btn,.cleanup-time .btn{width:auto}.cleanup-cell{min-width:140px;max-width:190px}.cleanup-summary{max-width:125px}}
 @media(max-width:420px){.wrap{padding:12px}.card{padding:14px}.table-tools{gap:6px}.table-tools .btn{min-width:64px;padding:0 10px}.group-operation{padding:12px}.group-transfer-form .sync-option{padding:8px}.cleanup-time{grid-template-columns:minmax(76px,1fr) auto minmax(76px,1fr)}.cleanup-time-clear{grid-column:1/-1;justify-self:start}.cleanup-dialog{width:calc(100vw - 16px);max-height:calc(100vh - 16px)}.cleanup-dialog-form{max-height:calc(100vh - 16px)}}
 </style>
 </head>
@@ -3128,6 +3287,9 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 <button class="tab-btn {{if not (or .CanManageGlobal .CanManageOperators .CanManageBroadcastPermissions .CanManageBroadcastGroups)}}active{{end}}" type="button" data-admin-tab-target="watch">地址监听</button>
 {{if .CanManageGlobal}}
 <button class="tab-btn" type="button" data-admin-tab-target="replace">广播替换</button>
+{{end}}
+{{if .CanConfigureReplyNotifications}}
+<button class="tab-btn" type="button" data-admin-tab-target="replies">回复通知</button>
 {{end}}
 </nav>
 
@@ -3287,6 +3449,24 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 <div class="pager"><span>{{.PermissionPager.ItemFrom}}-{{.PermissionPager.ItemTo}} / {{.PermissionPager.Total}}</span>{{if .PermissionPager.HasPrev}}<a href="{{.PermissionPager.PrevURL}}">上一页</a>{{else}}<span class="disabled">上一页</span>{{end}}{{if .PermissionPager.HasNext}}<a href="{{.PermissionPager.NextURL}}">下一页</a>{{else}}<span class="disabled">下一页</span>{{end}}</div>
 </div>
 
+{{end}}
+
+{{if .CanConfigureReplyNotifications}}
+<div class="card wide tab-card" data-admin-tab="replies">
+<h2>广播回复通知</h2>
+<p class="hint">{{.ReplyNotificationScope}}广播发送人始终会收到自己广播的回复，这里只控制是否额外接收其他操作人的回复。</p>
+<div class="reply-settings">
+{{range .ReplyNotificationTargets}}
+<form method="post" action="/admin/reply-notifications/save" class="reply-row">
+<input type="hidden" name="source_user_id" value="{{.UserID}}">
+<div class="reply-name">{{.Label}}</div>
+<div class="reply-relation">{{.Relation}}</div>
+<label class="reply-toggle"><input type="checkbox" name="enabled" value="1" {{if .Enabled}}checked{{end}}><span class="reply-toggle-track" aria-hidden="true"></span><span class="reply-status">{{if .Enabled}}接收{{else}}不接收{{end}}</span></label>
+<button class="btn mini" type="submit">保存</button>
+</form>
+{{else}}<div class="reply-empty">当前没有可设置的操作人。</div>{{end}}
+</div>
+</div>
 {{end}}
 
 <div class="card wide tab-card {{if not (or .CanManageGlobal .CanManageOperators .CanManageBroadcastPermissions)}}active{{end}}" data-admin-tab="watch">

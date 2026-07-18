@@ -239,6 +239,9 @@ func (b *Bot) persistTelegramUpdateBatch(ctx context.Context, updates []telegram
 	now := time.Now().In(b.loc)
 	items := make([]storage.TelegramInboxUpdate, 0, len(updates))
 	for _, update := range updates {
+		if err := b.observeTelegramUpdateIdentityAtIngress(ctx, update, now); err != nil {
+			return 0, fmt.Errorf("observe update %d identity: %w", update.UpdateID, err)
+		}
 		durable := durableTelegramPayload{Version: 1, Update: update}
 		payload, err := json.Marshal(durable)
 		if err != nil {

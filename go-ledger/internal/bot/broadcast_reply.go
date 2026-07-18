@@ -32,7 +32,7 @@ func (b *Bot) notifyBroadcastReplyAsync(ctx context.Context, msg telegram.Messag
 		delivery = b.tryReplaceBroadcastDelivery(jobCtx, delivery, msg.ReplyTo.Caption)
 		text := formatBroadcastReplyNotice(msg, user, delivery)
 		operatorCanReply := b.canQuickReplyDelivery(jobCtx, delivery.OperatorUserID, delivery)
-		for recipient := range b.broadcastReplyRecipients(delivery.OperatorUserID) {
+		for recipient := range b.broadcastReplyRecipients(jobCtx, delivery.OperatorUserID) {
 			keyboard := broadcastReplyKeyboard(msg, delivery, recipient == delivery.OperatorUserID && operatorCanReply)
 			if err := b.enqueueReliableText(jobCtx, sendPriorityNormal, "broadcast_reply_notice", fmt.Sprintf("broadcast_reply_notice:%d:%d:%d", recipient, chatID, msg.MessageID), recipient, text, map[string]any{
 				"parse_mode":   "HTML",
@@ -273,13 +273,37 @@ func formatBroadcastReplyNotice(msg telegram.Message, user storage.User, deliver
 	return fmt.Sprintf("群：%s\n人：%s\n\n内容：\n\n%s", groupLabel, sender, html.EscapeString(trimRunes(content, 1200)))
 }
 
-func (b *Bot) broadcastReplyRecipients(operatorID int64) map[int64]struct{} {
+func (b *Bot) broadcastReplyRecipients(ctx context.Context, operatorID int64) map[int64]struct{} {
 	recipients := map[int64]struct{}{}
 	if operatorID != 0 {
 		recipients[operatorID] = struct{}{}
 	}
-	for _, id := range b.perms.PrivilegedUserIDs() {
-		recipients[id] = struct{}{}
+	defaults := make(map[int64]struct{})
+	for _, observerID := range b.perms.PrivilegedUserIDs() {
+		if observerID != 0 && observerID != operatorID {
+			defaults[observerID] = struct{}{}
+		}
+	}
+	if operator, ok, err := b.store.GetGlobalOperator(ctx, operatorID); err != nil {
+		log.Printf("load broadcast reply source operator: %v", err)
+	} else if ok && operator.Status == "active" && operator.Level == "secondary" && operator.ParentUserID > 0 && operator.ParentUserID != operatorID {
+		if _, exists := defaults[operator.ParentUserID]; !exists {
+			defaults[operator.ParentUserID] = struct{}{}
+		}
+	}
+	observerIDs := make([]int64, 0, len(defaults))
+	for observerID := range defaults {
+		observerIDs = append(observerIDs, observerID)
+	}
+	overrides, err := b.store.BroadcastReplyPreferenceOverridesForSource(ctx, operatorID, observerIDs)
+	if err != nil {
+		log.Printf("load broadcast reply preferences for source %d: %v", operatorID, err)
+		return recipients
+	}
+	for observerID := range defaults {
+		if enabled, exists := overrides[observerID]; !exists || enabled {
+			recipients[observerID] = struct{}{}
+		}
 	}
 	return recipients
 }

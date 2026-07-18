@@ -44,6 +44,13 @@ func TestSplitRouteKeepsLedgerStateAndReadsInOneFIFO(t *testing.T) {
 	if key, pool := b.updateRoute(membership); key != "ledger:-100123" || pool != b.ledgerPool {
 		t.Fatalf("membership route = %s/%p", key, pool)
 	}
+	member := telegram.Update{UpdateID: 202, ChatMember: &telegram.ChatMemberUpd{Chat: telegram.Chat{ID: chatID, Type: "supergroup"}}}
+	if key, pool := b.updateRoute(member); key != "ledger:-100123" || pool != b.ledgerPool {
+		t.Fatalf("chat member route = %s/%p", key, pool)
+	}
+	if got := updateChatID(member); got != chatID {
+		t.Fatalf("chat member updateChatID = %d want %d", got, chatID)
+	}
 }
 
 func TestSplitRouteOrdinaryFloodDoesNotBlockLedgerFIFO(t *testing.T) {

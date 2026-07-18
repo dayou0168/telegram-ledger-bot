@@ -229,6 +229,9 @@ func updateChatID(update telegram.Update) int64 {
 	if update.MyChatMember != nil {
 		return update.MyChatMember.Chat.ID
 	}
+	if update.ChatMember != nil {
+		return update.ChatMember.Chat.ID
+	}
 	return 0
 }
 
@@ -326,6 +329,9 @@ func (b *Bot) updateRoute(update telegram.Update) (string, worker.Executor) {
 	if update.MyChatMember != nil {
 		return "ledger:" + strconv.FormatInt(update.MyChatMember.Chat.ID, 10), b.ledgerPool
 	}
+	if update.ChatMember != nil {
+		return "ledger:" + strconv.FormatInt(update.ChatMember.Chat.ID, 10), b.ledgerPool
+	}
 	return "update:" + strconv.FormatInt(update.UpdateID, 10), b.controlPool
 }
 
@@ -339,6 +345,8 @@ func (b *Bot) handleUpdate(ctx context.Context, update telegram.Update) error {
 		return b.handleCallback(ctx, *update.CallbackQuery)
 	case update.MyChatMember != nil:
 		return b.handleMyChatMember(ctx, *update.MyChatMember)
+	case update.ChatMember != nil:
+		return b.handleChatMember(ctx, *update.ChatMember)
 	default:
 		return nil
 	}
@@ -366,6 +374,9 @@ func (b *Bot) handleMessage(ctx context.Context, msg telegram.Message) error {
 		return err
 	}
 	if err := b.touchUserCached(ctx, msg.Chat.ID, user, eventTime); err != nil {
+		return err
+	}
+	if err := b.observeMessageUsers(ctx, msg, user.ID, eventTime); err != nil {
 		return err
 	}
 	if msg.ReplyTo != nil {
@@ -551,6 +562,131 @@ func (b *Bot) handleMyChatMember(ctx context.Context, upd telegram.ChatMemberUpd
 			return err
 		}
 		return nil
+	}
+	return nil
+}
+
+func (b *Bot) handleChatMember(ctx context.Context, upd telegram.ChatMemberUpd) error {
+	if upd.Chat.Type != "group" && upd.Chat.Type != "supergroup" {
+		return nil
+	}
+	eventTime := telegramUpdateEventTime(ctx, b.loc)
+	if upd.Date > 0 {
+		eventTime = time.Unix(upd.Date, 0).In(b.loc)
+	}
+	if err := b.ensureGroupCached(ctx, upd.Chat.ID, upd.Chat.Title, eventTime); err != nil {
+		return err
+	}
+	switch upd.NewChatMember.Status {
+	case "creator", "administrator", "member", "restricted":
+		member := upd.NewChatMember.User
+		if member.ID == 0 || member.IsBot {
+			return nil
+		}
+		updateID, _ := ctx.Value(telegramUpdateIDContextKey{}).(int64)
+		return b.store.ObserveUserForTelegramUpdate(ctx, upd.Chat.ID, userFromTelegram(member), updateID, eventTime)
+	default:
+		return nil
+	}
+}
+
+// observeTelegramUpdateIdentityAtIngress persists group identities before the
+// durable inbox can wait behind ledger or broadcast work. Handler-side writes
+// remain as an idempotent fallback for updates queued before this version.
+func (b *Bot) observeTelegramUpdateIdentityAtIngress(ctx context.Context, update telegram.Update, fallback time.Time) error {
+	switch {
+	case update.Message != nil:
+		msg := *update.Message
+		if msg.Chat.Type != "group" && msg.Chat.Type != "supergroup" {
+			return nil
+		}
+		eventTime := fallback
+		if msg.Date > 0 {
+			eventTime = time.Unix(msg.Date, 0).In(b.loc)
+		}
+		if err := b.store.EnsureGroupForTelegramUpdate(ctx, msg.Chat.ID, msg.Chat.Title, update.UpdateID, eventTime); err != nil {
+			return err
+		}
+		senderID := int64(0)
+		if msg.From != nil && msg.From.ID != 0 && !msg.From.IsBot {
+			senderID = msg.From.ID
+			if err := b.store.TouchUserForTelegramUpdate(ctx, msg.Chat.ID, userFromTelegram(*msg.From), update.UpdateID, eventTime); err != nil {
+				return err
+			}
+		}
+		return b.observeMessageUsersForUpdate(ctx, msg, senderID, update.UpdateID, eventTime)
+	case update.ChatMember != nil:
+		upd := *update.ChatMember
+		if upd.Chat.Type != "group" && upd.Chat.Type != "supergroup" {
+			return nil
+		}
+		eventTime := fallback
+		if upd.Date > 0 {
+			eventTime = time.Unix(upd.Date, 0).In(b.loc)
+		}
+		if err := b.store.EnsureGroupForTelegramUpdate(ctx, upd.Chat.ID, upd.Chat.Title, update.UpdateID, eventTime); err != nil {
+			return err
+		}
+		member := upd.NewChatMember.User
+		if member.ID == 0 || member.IsBot {
+			return nil
+		}
+		return b.store.ObserveUserForTelegramUpdate(ctx, upd.Chat.ID, userFromTelegram(member), update.UpdateID, eventTime)
+	default:
+		return nil
+	}
+}
+
+func (b *Bot) observeMessageUsers(ctx context.Context, msg telegram.Message, senderID int64, eventTime time.Time) error {
+	updateID, _ := ctx.Value(telegramUpdateIDContextKey{}).(int64)
+	return b.observeMessageUsersForUpdate(ctx, msg, senderID, updateID, eventTime)
+}
+
+func (b *Bot) observeMessageUsersForUpdate(ctx context.Context, msg telegram.Message, senderID, updateID int64, eventTime time.Time) error {
+	observed := make(map[int64]struct{})
+	observe := func(candidate telegram.User, spoken bool, seenAt time.Time) error {
+		if candidate.ID == 0 || candidate.ID == senderID || candidate.IsBot {
+			return nil
+		}
+		if _, exists := observed[candidate.ID]; exists {
+			return nil
+		}
+		observed[candidate.ID] = struct{}{}
+		user := userFromTelegram(candidate)
+		if spoken {
+			return b.store.TouchUserForTelegramUpdate(ctx, msg.Chat.ID, user, updateID, seenAt)
+		}
+		return b.store.ObserveUserForTelegramUpdate(ctx, msg.Chat.ID, user, updateID, seenAt)
+	}
+	if msg.ReplyTo != nil && msg.ReplyTo.From != nil {
+		seenAt := eventTime
+		if msg.ReplyTo.Date > 0 {
+			seenAt = time.Unix(msg.ReplyTo.Date, 0).In(b.loc)
+		}
+		if err := observe(*msg.ReplyTo.From, true, seenAt); err != nil {
+			return err
+		}
+	}
+	for _, member := range msg.NewChatMembers {
+		if err := observe(member, false, eventTime); err != nil {
+			return err
+		}
+	}
+	observeEntities := func(entities []telegram.MessageEntity) error {
+		for _, entity := range entities {
+			if entity.Type == "text_mention" && entity.User != nil {
+				if err := observe(*entity.User, false, eventTime); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if err := observeEntities(msg.Entities); err != nil {
+		return err
+	}
+	if err := observeEntities(msg.CaptionEntities); err != nil {
+		return err
 	}
 	return nil
 }

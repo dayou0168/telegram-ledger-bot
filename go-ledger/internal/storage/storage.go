@@ -24,7 +24,9 @@ type Store struct {
 
 const (
 	telegramPrivateRouteStateMigrationVersion = "2.4.14-telegram-private-route-state"
-	latestSchemaMigrationVersion              = "2.4.15-telegram-quick-reply-outbox"
+	telegramQuickReplyOutboxMigrationVersion  = "2.4.15-telegram-quick-reply-outbox"
+	chatMemberDiscoveryMigrationVersion       = "2.4.16-chat-member-discovery"
+	latestSchemaMigrationVersion              = "2.4.17-broadcast-reply-preferences"
 )
 
 const (
@@ -297,8 +299,12 @@ func (s *Store) migrate(ctx context.Context) error {
 			PRIMARY KEY(chat_id, user_id)
 		)`,
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_telegram_update_id BIGINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS has_spoken BOOLEAN NOT NULL DEFAULT TRUE`,
 		`CREATE INDEX IF NOT EXISTS idx_users_chat_seen
 			ON users(chat_id, last_seen_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_users_chat_spoken_seen
+			ON users(chat_id, last_seen_at DESC)
+			WHERE has_spoken=TRUE`,
 		`CREATE INDEX IF NOT EXISTS idx_users_chat_username_lower
 			ON users(chat_id, lower(username))
 			WHERE username <> ''`,
@@ -345,6 +351,28 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_broadcast_operators_cleanup
 			ON broadcast_operators(private_cleanup_enabled, private_cleanup_time, user_id)
 			WHERE status='active'`,
+		`CREATE TABLE IF NOT EXISTS broadcast_reply_preferences (
+			observer_user_id BIGINT NOT NULL,
+			source_user_id BIGINT NOT NULL,
+			enabled BOOLEAN NOT NULL,
+			updated_at TIMESTAMPTZ NOT NULL,
+			PRIMARY KEY(observer_user_id, source_user_id),
+			CONSTRAINT broadcast_reply_preferences_distinct_users CHECK(observer_user_id <> source_user_id)
+		)`,
+		`DO $$
+		BEGIN
+			IF NOT EXISTS (
+				SELECT 1 FROM pg_constraint
+				WHERE conname='broadcast_reply_preferences_distinct_users'
+				  AND conrelid='broadcast_reply_preferences'::regclass
+			) THEN
+				ALTER TABLE broadcast_reply_preferences
+					ADD CONSTRAINT broadcast_reply_preferences_distinct_users
+					CHECK(observer_user_id <> source_user_id);
+			END IF;
+		END $$`,
+		`CREATE INDEX IF NOT EXISTS idx_broadcast_reply_preferences_source
+			ON broadcast_reply_preferences(source_user_id, observer_user_id)`,
 		`INSERT INTO schema_migrations(version, applied_at)
 			SELECT '2.4.2-global-operators-table-preexisting', NOW()
 			WHERE to_regclass('global_operators') IS NOT NULL
@@ -1434,6 +1462,16 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
 		VALUES($1, NOW())
+		ON CONFLICT(version) DO NOTHING`, telegramQuickReplyOutboxMigrationVersion); err != nil {
+		return fmt.Errorf("record telegram quick reply outbox migration: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
+		VALUES($1, NOW())
+		ON CONFLICT(version) DO NOTHING`, chatMemberDiscoveryMigrationVersion); err != nil {
+		return fmt.Errorf("record chat member discovery migration: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
+		VALUES($1, NOW())
 		ON CONFLICT(version) DO NOTHING`, latestSchemaMigrationVersion); err != nil {
 		return fmt.Errorf("record schema migration: %w", err)
 	}
@@ -1478,12 +1516,13 @@ func (s *Store) EnsureGroupForTelegramUpdate(ctx context.Context, chatID int64, 
 }
 
 func (s *Store) TouchUser(ctx context.Context, chatID int64, user User, now time.Time) error {
-	_, err := s.pool.Exec(ctx, `INSERT INTO users(chat_id, user_id, username, display_name, last_seen_at)
-		VALUES($1, $2, $3, $4, $5)
+	_, err := s.pool.Exec(ctx, `INSERT INTO users(chat_id, user_id, username, display_name, last_seen_at, has_spoken)
+		VALUES($1, $2, $3, $4, $5, TRUE)
 		ON CONFLICT(chat_id, user_id) DO UPDATE SET
 			username=excluded.username,
 			display_name=excluded.display_name,
-			last_seen_at=excluded.last_seen_at`,
+			last_seen_at=excluded.last_seen_at,
+			has_spoken=TRUE`,
 		chatID, user.ID, user.Username, user.DisplayName, now)
 	return err
 }
@@ -1501,14 +1540,34 @@ func (s *Store) TouchUserForTelegramUpdate(ctx context.Context, chatID int64, us
 		return s.TouchUser(ctx, chatID, user, now)
 	}
 	_, err := s.pool.Exec(ctx, `INSERT INTO users(
-			chat_id, user_id, username, display_name, last_seen_at, last_telegram_update_id
-		) VALUES($1, $2, $3, $4, $5, $6)
+			chat_id, user_id, username, display_name, last_seen_at, last_telegram_update_id, has_spoken
+		) VALUES($1, $2, $3, $4, $5, $6, TRUE)
 		ON CONFLICT(chat_id, user_id) DO UPDATE SET
-			username=excluded.username,
-			display_name=excluded.display_name,
-			last_seen_at=excluded.last_seen_at,
-			last_telegram_update_id=excluded.last_telegram_update_id
-		WHERE users.last_telegram_update_id < excluded.last_telegram_update_id`,
+			username=CASE WHEN users.last_telegram_update_id < excluded.last_telegram_update_id
+				THEN excluded.username ELSE users.username END,
+			display_name=CASE WHEN users.last_telegram_update_id < excluded.last_telegram_update_id
+				THEN excluded.display_name ELSE users.display_name END,
+			last_seen_at=GREATEST(users.last_seen_at, excluded.last_seen_at),
+			last_telegram_update_id=GREATEST(users.last_telegram_update_id, excluded.last_telegram_update_id),
+			has_spoken=TRUE`,
+		chatID, user.ID, user.Username, user.DisplayName, now, updateID)
+	return err
+}
+
+// ObserveUserForTelegramUpdate records a Telegram identity without treating a
+// membership or mention event as a message sent by that user.
+func (s *Store) ObserveUserForTelegramUpdate(ctx context.Context, chatID int64, user User, updateID int64, now time.Time) error {
+	_, err := s.pool.Exec(ctx, `INSERT INTO users(
+			chat_id, user_id, username, display_name, last_seen_at, last_telegram_update_id, has_spoken
+		) VALUES($1, $2, $3, $4, $5, $6, FALSE)
+		ON CONFLICT(chat_id, user_id) DO UPDATE SET
+			username=CASE WHEN users.last_telegram_update_id < excluded.last_telegram_update_id
+				THEN excluded.username ELSE users.username END,
+			display_name=CASE WHEN users.last_telegram_update_id < excluded.last_telegram_update_id
+				THEN excluded.display_name ELSE users.display_name END,
+			last_seen_at=CASE WHEN users.has_spoken THEN users.last_seen_at
+				ELSE GREATEST(users.last_seen_at, excluded.last_seen_at) END,
+			last_telegram_update_id=GREATEST(users.last_telegram_update_id, excluded.last_telegram_update_id)`,
 		chatID, user.ID, user.Username, user.DisplayName, now, updateID)
 	return err
 }
@@ -1763,7 +1822,7 @@ func (s *Store) ListUsersForMention(ctx context.Context, chatID int64, limit int
 	}
 	rows, err := s.pool.Query(ctx, `SELECT user_id, username, display_name
 		FROM users
-		WHERE chat_id=$1
+		WHERE chat_id=$1 AND has_spoken=TRUE
 		ORDER BY last_seen_at DESC, user_id ASC
 		LIMIT $2`, chatID, limit)
 	if err != nil {
@@ -2660,6 +2719,63 @@ func (s *Store) ListGlobalOperators(ctx context.Context) ([]GlobalOperator, erro
 		operators = append(operators, op)
 	}
 	return operators, rows.Err()
+}
+
+func (s *Store) BroadcastReplyPreferenceOverrides(ctx context.Context, observerUserID int64) (map[int64]bool, error) {
+	overrides := make(map[int64]bool)
+	rows, err := s.pool.Query(ctx, `SELECT source_user_id, enabled
+		FROM broadcast_reply_preferences
+		WHERE observer_user_id=$1`, observerUserID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var sourceUserID int64
+		var enabled bool
+		if err := rows.Scan(&sourceUserID, &enabled); err != nil {
+			return nil, err
+		}
+		overrides[sourceUserID] = enabled
+	}
+	return overrides, rows.Err()
+}
+
+func (s *Store) BroadcastReplyPreferenceOverridesForSource(ctx context.Context, sourceUserID int64, observerUserIDs []int64) (map[int64]bool, error) {
+	overrides := make(map[int64]bool)
+	if sourceUserID <= 0 || len(observerUserIDs) == 0 {
+		return overrides, nil
+	}
+	rows, err := s.pool.Query(ctx, `SELECT observer_user_id, enabled
+		FROM broadcast_reply_preferences
+		WHERE source_user_id=$1 AND observer_user_id=ANY($2)`, sourceUserID, observerUserIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var observerUserID int64
+		var enabled bool
+		if err := rows.Scan(&observerUserID, &enabled); err != nil {
+			return nil, err
+		}
+		overrides[observerUserID] = enabled
+	}
+	return overrides, rows.Err()
+}
+
+func (s *Store) SetBroadcastReplyPreference(ctx context.Context, observerUserID, sourceUserID int64, enabled bool, now time.Time) error {
+	if observerUserID <= 0 || sourceUserID <= 0 || observerUserID == sourceUserID {
+		return errors.New("broadcast reply preference identity is invalid")
+	}
+	_, err := s.pool.Exec(ctx, `INSERT INTO broadcast_reply_preferences(
+			observer_user_id, source_user_id, enabled, updated_at
+		) VALUES($1, $2, $3, $4)
+		ON CONFLICT(observer_user_id, source_user_id) DO UPDATE SET
+			enabled=excluded.enabled,
+			updated_at=excluded.updated_at`,
+		observerUserID, sourceUserID, enabled, now)
+	return err
 }
 
 func (s *Store) GetLatestUserIdentity(ctx context.Context, userID int64) (User, bool, error) {
