@@ -25,7 +25,7 @@ func TestPostgresOperatorMessageObserversMigrationAndRecipientContract(t *testin
 
 	var markerCount, grantTableCount, auditTableCount int
 	if err := admin.QueryRow(ctx, "SELECT count(*) FROM "+quotedSchema+".schema_migrations WHERE version=$1",
-		latestSchemaMigrationVersion).Scan(&markerCount); err != nil {
+		operatorMessageObserversMigrationVersion).Scan(&markerCount); err != nil {
 		t.Fatal(err)
 	}
 	if err := admin.QueryRow(ctx, `SELECT count(*) FROM pg_catalog.pg_tables
@@ -46,7 +46,7 @@ func TestPostgresOperatorMessageObserversMigrationAndRecipientContract(t *testin
 		"DROP TRIGGER IF EXISTS trg_revoke_operator_message_observers ON " + quotedSchema + ".global_operators",
 		"DROP TABLE " + quotedSchema + ".operator_message_observer_audit_events",
 		"DROP TABLE " + quotedSchema + ".operator_message_observer_grants",
-		"DELETE FROM " + quotedSchema + ".schema_migrations WHERE version='" + latestSchemaMigrationVersion + "'",
+		"DELETE FROM " + quotedSchema + ".schema_migrations WHERE version IN ('" + operatorMessageObserversMigrationVersion + "','" + latestSchemaMigrationVersion + "')",
 	} {
 		if _, err := admin.Exec(ctx, statement); err != nil {
 			t.Fatalf("prepare prior-schema fixture: %v", err)

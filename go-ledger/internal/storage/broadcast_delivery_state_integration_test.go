@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-func TestPostgresBroadcastDeliveryStateMigrationUpgradesV2417AndIsIdempotent(t *testing.T) {
+func TestPostgresBroadcastDeliveryStateMigrationUpgradesObserverSchemaAndIsIdempotent(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("TEST_DATABASE_URL is not set")
@@ -19,7 +19,7 @@ func TestPostgresBroadcastDeliveryStateMigrationUpgradesV2417AndIsIdempotent(t *
 	if _, err := admin.Exec(ctx, `CREATE TABLE `+schema+`.schema_migrations(version TEXT PRIMARY KEY,applied_at TIMESTAMPTZ NOT NULL)`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := admin.Exec(ctx, `INSERT INTO `+schema+`.schema_migrations(version,applied_at) VALUES('2.4.17-broadcast-reply-preferences',NOW())`); err != nil {
+	if _, err := admin.Exec(ctx, `INSERT INTO `+schema+`.schema_migrations(version,applied_at) VALUES($1,NOW())`, operatorMessageObserversMigrationVersion); err != nil {
 		t.Fatal(err)
 	}
 	for attempt := 0; attempt < 2; attempt++ {

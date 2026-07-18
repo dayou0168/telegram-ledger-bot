@@ -207,6 +207,10 @@ func TestPostgresMessageObserverHandlersAreHostOnly(t *testing.T) {
 	}
 	primarySession := adminauth.Session{UserID: primaryAID, Role: adminauth.RoleOperator}
 	secondarySession := adminauth.Session{UserID: secondaryID, Role: adminauth.RoleOperator}
+	forgedHostSession := adminauth.Session{UserID: hostID, Role: adminauth.RoleOperator}
+	if rec := post(forgedHostSession, s.saveMessageObserver, grantForm); rec.Code != http.StatusForbidden {
+		t.Fatalf("host uid with non-host role forged grant status=%d", rec.Code)
+	}
 	if rec := post(primarySession, s.saveMessageObserver, grantForm); rec.Code != http.StatusForbidden {
 		t.Fatalf("primary forged grant status=%d", rec.Code)
 	}

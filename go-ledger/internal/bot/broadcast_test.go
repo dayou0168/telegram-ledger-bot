@@ -239,22 +239,24 @@ func TestPostgresBroadcastReplyRecipientMatrixAndPreferences(t *testing.T) {
 	b := &Bot{store: store, perms: permissions.NewPolicy(hostID, map[int64]struct{}{defaultAID: {}, defaultBID: {}})}
 
 	assertBroadcastReplyRecipients(t, b.broadcastReplyRecipients(ctx, secondaryAID),
-		secondaryAID, hostID, defaultAID, defaultBID, primaryAID)
+		secondaryAID, hostID, primaryAID)
+	if changed, err := store.UpsertOperatorMessageObserverGrant(ctx, secondaryAID, primaryBID, false, true, hostID, now); err != nil || !changed {
+		t.Fatalf("grant reply observer changed=%v err=%v", changed, err)
+	}
+	assertBroadcastReplyRecipients(t, b.broadcastReplyRecipients(ctx, secondaryAID),
+		secondaryAID, hostID, primaryAID, primaryBID)
 	if err := store.SetBroadcastReplyPreference(ctx, hostID, secondaryAID, false, now); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.SetBroadcastReplyPreference(ctx, primaryAID, secondaryAID, false, now); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.SetBroadcastReplyPreference(ctx, defaultBID, secondaryAID, false, now); err != nil {
-		t.Fatal(err)
-	}
-	assertBroadcastReplyRecipients(t, b.broadcastReplyRecipients(ctx, secondaryAID), secondaryAID, defaultAID)
+	assertBroadcastReplyRecipients(t, b.broadcastReplyRecipients(ctx, secondaryAID), secondaryAID, primaryBID)
 
 	if err := store.SetBroadcastReplyPreference(ctx, hostID, secondaryAID, true, now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	assertBroadcastReplyRecipients(t, b.broadcastReplyRecipients(ctx, secondaryAID), secondaryAID, hostID, defaultAID)
+	assertBroadcastReplyRecipients(t, b.broadcastReplyRecipients(ctx, secondaryAID), secondaryAID, hostID, primaryBID)
 	assertBroadcastReplyRecipients(t, b.broadcastReplyRecipients(ctx, primaryAID),
 		primaryAID, hostID, defaultAID, defaultBID)
 	assertBroadcastReplyRecipients(t, b.broadcastReplyRecipients(ctx, defaultAID),
@@ -269,13 +271,7 @@ func TestPostgresBroadcastReplyRecipientMatrixAndPreferences(t *testing.T) {
 	assertBroadcastReplyRecipients(t, brokenBot.broadcastReplyRecipients(ctx, secondaryAID), secondaryAID)
 }
 
-type testBroadcastObserverResolver struct{ ids []int64 }
-
-func (r testBroadcastObserverResolver) AdditionalBroadcastUpstreamObservers(context.Context, int64) ([]int64, error) {
-	return append([]int64(nil), r.ids...), nil
-}
-
-func TestPostgresBroadcastUpstreamHierarchyAndExtensionPoint(t *testing.T) {
+func TestPostgresBroadcastUpstreamHierarchyAndObserverGrants(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("TEST_DATABASE_URL is not set")
@@ -288,7 +284,7 @@ func TestPostgresBroadcastUpstreamHierarchyAndExtensionPoint(t *testing.T) {
 	}
 	defer store.Close()
 	base := int64(986000000000 + time.Now().UnixNano()%1000000)
-	hostID, primaryAID, primaryBID, secondaryAID, extraID := base, base+1, base+2, base+3, base+4
+	hostID, primaryAID, primaryBID, secondaryAID := base, base+1, base+2, base+3
 	now := time.Now().UTC()
 	for _, op := range []struct {
 		id, parent int64
@@ -302,8 +298,10 @@ func TestPostgresBroadcastUpstreamHierarchyAndExtensionPoint(t *testing.T) {
 	assertInt64Slice(t, mustBroadcastUpstreamRecipients(t, b, ctx, hostID))
 	assertInt64Slice(t, mustBroadcastUpstreamRecipients(t, b, ctx, primaryAID), hostID)
 	assertInt64Slice(t, mustBroadcastUpstreamRecipients(t, b, ctx, secondaryAID), hostID, primaryAID)
-	b.broadcastObserverResolver = testBroadcastObserverResolver{ids: []int64{extraID, primaryBID}}
-	assertInt64Slice(t, mustBroadcastUpstreamRecipients(t, b, ctx, secondaryAID), hostID, primaryAID, primaryBID, extraID)
+	if changed, err := store.UpsertOperatorMessageObserverGrant(ctx, secondaryAID, primaryBID, true, false, hostID, now); err != nil || !changed {
+		t.Fatalf("grant broadcast observer changed=%v err=%v", changed, err)
+	}
+	assertInt64Slice(t, mustBroadcastUpstreamRecipients(t, b, ctx, secondaryAID), hostID, primaryAID, primaryBID)
 	if err := b.saveBroadcastTarget(ctx, secondaryAID, privateState{Mode: "chat", TargetChatID: -1001, TargetName: "target"}); err != nil {
 		t.Fatal(err)
 	}

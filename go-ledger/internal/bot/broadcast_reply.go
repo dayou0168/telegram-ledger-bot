@@ -312,16 +312,27 @@ func (b *Bot) broadcastReplyRecipients(ctx context.Context, operatorID int64) ma
 		recipients[operatorID] = struct{}{}
 	}
 	defaults := make(map[int64]struct{})
-	for _, observerID := range b.perms.PrivilegedUserIDs() {
-		if observerID != 0 && observerID != operatorID {
-			defaults[observerID] = struct{}{}
-		}
-	}
-	if operator, ok, err := b.store.GetGlobalOperator(ctx, operatorID); err != nil {
+	operator, ok, err := b.store.GetGlobalOperator(ctx, operatorID)
+	if err != nil {
 		log.Printf("load broadcast reply source operator: %v", err)
-	} else if ok && operator.Status == "active" && operator.Level == "secondary" && operator.ParentUserID > 0 && operator.ParentUserID != operatorID {
-		if _, exists := defaults[operator.ParentUserID]; !exists {
-			defaults[operator.ParentUserID] = struct{}{}
+		return recipients
+	}
+	if ok && operator.Status == "active" && operator.Level == "secondary" {
+		resolved, resolveErr := b.store.ResolveOperatorMessageRecipients(ctx, operatorID, b.perms.HostUserID())
+		if resolveErr != nil {
+			log.Printf("resolve broadcast reply recipients for source %d: %v", operatorID, resolveErr)
+			return recipients
+		}
+		for _, recipientID := range resolved.Reply {
+			if recipientID > 0 && recipientID != operatorID {
+				defaults[recipientID] = struct{}{}
+			}
+		}
+	} else {
+		for _, observerID := range b.perms.PrivilegedUserIDs() {
+			if observerID != 0 && observerID != operatorID {
+				defaults[observerID] = struct{}{}
+			}
 		}
 	}
 	observerIDs := make([]int64, 0, len(defaults))

@@ -9,13 +9,6 @@ import (
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/telegram"
 )
 
-// BroadcastUpstreamObserverResolver is the permission-module integration point
-// for additional observers. The built-in host/parent hierarchy is always
-// applied before these optional recipients are merged.
-type BroadcastUpstreamObserverResolver interface {
-	AdditionalBroadcastUpstreamObservers(context.Context, int64) ([]int64, error)
-}
-
 func (b *Bot) broadcastUpstreamRecipients(ctx context.Context, sourceUserID int64) ([]int64, error) {
 	set := make(map[int64]struct{})
 	hostID := b.perms.HostUserID()
@@ -31,29 +24,15 @@ func (b *Bot) broadcastUpstreamRecipients(ctx context.Context, sourceUserID int6
 					set[hostID] = struct{}{}
 				}
 			case "secondary":
-				if hostID > 0 {
-					set[hostID] = struct{}{}
+				resolved, resolveErr := b.store.ResolveOperatorMessageRecipients(ctx, sourceUserID, hostID)
+				if resolveErr != nil {
+					return nil, resolveErr
 				}
-				if operator.ParentUserID > 0 && operator.ParentUserID != sourceUserID {
-					parent, parentOK, parentErr := b.store.GetGlobalOperator(ctx, operator.ParentUserID)
-					if parentErr != nil {
-						return nil, parentErr
-					}
-					if parentOK && parent.Status == "active" && parent.Level == "primary" {
-						set[operator.ParentUserID] = struct{}{}
+				for _, recipientID := range resolved.Broadcast {
+					if recipientID > 0 {
+						set[recipientID] = struct{}{}
 					}
 				}
-			}
-		}
-	}
-	if b.broadcastObserverResolver != nil {
-		extra, err := b.broadcastObserverResolver.AdditionalBroadcastUpstreamObservers(ctx, sourceUserID)
-		if err != nil {
-			return nil, err
-		}
-		for _, observerID := range extra {
-			if observerID > 0 && observerID != sourceUserID {
-				set[observerID] = struct{}{}
 			}
 		}
 	}

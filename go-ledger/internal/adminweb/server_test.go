@@ -101,6 +101,65 @@ func TestAdminReplyNotificationTemplateIsIndependentAndResponsive(t *testing.T) 
 	}
 }
 
+func TestAdminMessageObserverTemplateIsHostOnlyAndResponsive(t *testing.T) {
+	data := pageData{
+		Version:                   "test",
+		AdminRoleLabel:            "宿主",
+		CanManageMessageObservers: true,
+		MessageObserverSources: []storage.GlobalOperator{{
+			UserID: 1001, Level: "secondary", ParentUserID: 2001, Status: "active", Remark: "下级甲",
+		}},
+		MessageObserverPrimaries: []storage.GlobalOperator{
+			{UserID: 2001, Level: "primary", Status: "active", Remark: "直属一级"},
+			{UserID: 2002, Level: "primary", Status: "active", Remark: "观察一级"},
+		},
+		MessageObserverGrants: []storage.OperatorMessageObserverGrant{{
+			SourceSecondaryUserID: 1001, ObserverPrimaryUserID: 2002,
+			ReceiveBroadcast: true, Active: true,
+		}},
+		OpLabels: map[int64]string{1001: "下级甲", 2001: "直属一级", 2002: "观察一级"},
+	}
+	var body bytes.Buffer
+	if err := adminTemplate.Execute(&body, data); err != nil {
+		t.Fatal(err)
+	}
+	html := body.String()
+	for _, want := range []string{
+		`data-admin-tab-target="observers"`,
+		`data-admin-tab="observers"`,
+		`action="/admin/message-observer/save"`,
+		`action="/admin/message-observer/revoke"`,
+		`data-parent-user-id="2001"`,
+		`name="receive_broadcast" value="1" checked`,
+		`name="receive_reply" value="1" checked`,
+		`下级甲`, `直属一级`, `观察一级`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("message observer template missing %q", want)
+		}
+	}
+	for _, want := range []string{
+		`.observer-editor{display:grid;grid-template-columns:`,
+		`.observer-grants{max-height:min(520px,calc(100vh - 310px));overflow:auto`,
+		`.permission-panel form,.observer-editor{grid-template-columns:1fr}`,
+		`.observer-editor .btn{width:100%}`,
+	} {
+		if !strings.Contains(adminHTML, want) {
+			t.Fatalf("responsive message observer CSS missing %q", want)
+		}
+	}
+
+	body.Reset()
+	data.CanManageMessageObservers = false
+	if err := adminTemplate.Execute(&body, data); err != nil {
+		t.Fatal(err)
+	}
+	html = body.String()
+	if strings.Contains(html, `data-admin-tab-target="observers"`) || strings.Contains(html, `/admin/message-observer/`) {
+		t.Fatal("message observer controls rendered for a non-host")
+	}
+}
+
 func TestSummarizeBillIncludesSubjectAndRateStats(t *testing.T) {
 	group := storage.Group{DepositExchangeRate: "10", FeeRate: "3"}
 	records := []storage.Record{
