@@ -23,7 +23,7 @@ func TestPostgresLedgerPeriodSummaryFallbackAndClear(t *testing.T) {
 	defer store.Close()
 
 	now := time.Now().UTC().Truncate(time.Microsecond)
-	chatID := -7000000000000 - now.UnixNano()%1000000
+	chatID := -7000000000000 - now.UnixNano()
 	dayKey := "2026-07-14"
 	nextDayKey := "2026-07-15"
 	period1 := now.Add(-2 * time.Hour)
@@ -168,7 +168,7 @@ func TestPostgresLedgerRecordOutboxDedupeConcurrent(t *testing.T) {
 	defer store.Close()
 
 	now := time.Now().UTC().Truncate(time.Microsecond)
-	chatID := -7020000000000 - now.UnixNano()%1000000
+	chatID := -7020000000000 - now.UnixNano()
 	dayKey := "2026-07-14"
 	periodStart := now.Add(-time.Minute)
 	if err := store.EnsureGroup(ctx, chatID, "dedupe", periodStart); err != nil {
@@ -241,7 +241,7 @@ func TestPostgresLedgerPeriodSummaryCurrenciesUndoAndRollback(t *testing.T) {
 	defer store.Close()
 
 	now := time.Now().UTC().Truncate(time.Microsecond)
-	chatID := -7040000000000 - now.UnixNano()%1000000
+	chatID := -7040000000000 - now.UnixNano()
 	dayKey := "2026-07-14"
 	periodStart := now.Add(-time.Hour)
 	if err := store.EnsureGroup(ctx, chatID, "currencies", periodStart); err != nil {
@@ -328,7 +328,7 @@ func TestPostgresLedgerSummaryBackfillUsesRecordKeysetAndPeriodReconcile(t *test
 	defer store.Close()
 
 	now := time.Now().UTC().Truncate(time.Microsecond)
-	chatID := -7050000000000 - now.UnixNano()%1000000
+	chatID := -7050000000000 - now.UnixNano()
 	dayKey := "2026-07-14"
 	if _, err := store.pool.Exec(ctx, `INSERT INTO records(
 		chat_id,day_key,kind,currency,amount,rate,fee_rate,result_usdt,
@@ -410,7 +410,7 @@ func TestPostgresLedgerSummaryReconcileSerializesConcurrentWrite(t *testing.T) {
 	defer store.Close()
 
 	now := time.Now().UTC().Truncate(time.Microsecond)
-	chatID := -7060000000000 - now.UnixNano()%1000000
+	chatID := -7060000000000 - now.UnixNano()
 	dayKey := "2026-07-14"
 	periodStart := now.Add(-time.Hour)
 	key := LedgerPeriodSummaryKey{ChatID: chatID, DayKey: dayKey, PeriodStartedAt: periodStart}
@@ -488,7 +488,7 @@ func TestPostgresSameBusinessDayPauseResumeSharesLedgerPeriod(t *testing.T) {
 	defer store.Close()
 
 	now := time.Now().UTC().Truncate(time.Microsecond)
-	chatID := -7010000000000 - now.UnixNano()%1000000
+	chatID := -7010000000000 - now.UnixNano()
 	dayKey := "2026-07-14"
 	periodStart := now.Add(-time.Hour)
 	if err := store.EnsureGroup(ctx, chatID, "pause resume", periodStart); err != nil {
@@ -562,7 +562,7 @@ func TestPostgresPausedLedgerPeriodPersistsAcrossStoreReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC().Truncate(time.Microsecond)
-	chatID := -7030000000000 - now.UnixNano()%1000000
+	chatID := -7030000000000 - now.UnixNano()
 	periodStart := now.Add(-time.Hour)
 	if err := store.EnsureGroup(ctx, chatID, "reopen", periodStart); err != nil {
 		store.Close()
@@ -605,7 +605,7 @@ func TestPostgresCriticalOutboxFastpathOrderingBulkAndCrashRecovery(t *testing.T
 	}
 	defer store.Close()
 	now := time.Now().UTC()
-	chatID := -7100000000000 - now.UnixNano()%1000000
+	chatID := -7100000000000 - now.UnixNano()
 	prefix := fmt.Sprintf("bulk-fastpath-%d", now.UnixNano())
 	if _, err := store.pool.Exec(ctx, `INSERT INTO notification_outbox(
 		kind,dedupe_key,chat_id,text,priority,status,attempts,next_attempt_at,created_at,updated_at)

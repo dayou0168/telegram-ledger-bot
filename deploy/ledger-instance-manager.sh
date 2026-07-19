@@ -59,7 +59,7 @@ derive() {
   POSTGRES_HOST="${POSTGRES_HOST:-127.0.0.1}"
   POSTGRES_PORT="${POSTGRES_PORT:-5432}"
   PG_BIN_DIR="${PG_BIN_DIR:-/www/server/pgsql/bin}"
-  BOT_IMAGE="${BOT_IMAGE:-ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.13}"
+  BOT_IMAGE="${BOT_IMAGE:-ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.14}"
   BOT_DEFAULTS_FILE="${BOT_DEFAULTS_FILE:-/etc/telegram-ledger/config/bot-defaults.env}"
   WATCHER_URL="${WATCHER_URL:-http://127.0.0.1:8090}"
   WATCHER_DATABASE_NAME="${WATCHER_DATABASE_NAME:-ledgerchainwatcher}"

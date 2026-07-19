@@ -5,22 +5,22 @@ Pushes a validated release candidate, waits for CI, and explicitly publishes it.
 .DESCRIPTION
 The script never deploys production. It requires a clean repository, HTTPS origin,
 Git Credential Manager, and a source version matching the requested version. A real
-run pushes the current integration branch and master, waits for the ordinary push CI,
-then dispatches the explicit release workflow and verifies the immutable assets.
+run fast-forwards master only, waits for the ordinary push CI, then dispatches the
+explicit release workflow and verifies the immutable assets and remote branch set.
 
 .EXAMPLE
 pwsh -File scripts/publish-release.ps1 -DryRun
 
 .EXAMPLE
-pwsh -File scripts/publish-release.ps1 -Version 2.4.13
+pwsh -File scripts/publish-release.ps1 -Version 2.4.14
 #>
 [CmdletBinding()]
 param(
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = '2.4.13',
+    [string]$Version = '2.4.14',
 
     [ValidatePattern('^[0-9a-f]{40}$')]
-    [string]$ExpectedRemoteMaster = 'de6370e4f6884e52b3e910c915ebd2bd9afab247',
+    [string]$ExpectedRemoteMaster = '980bdf09b4efacf6e3991bf7c191a620510806d2',
 
     [string]$Repository = 'dayou0168/telegram-ledger-bot',
 
@@ -47,6 +47,18 @@ function Get-NativeOutput {
         throw "$File failed with exit code $LASTEXITCODE"
     }
     return (($output | ForEach-Object { [string]$_ }) -join [Environment]::NewLine).Trim()
+}
+
+function Assert-OnlyRemoteMaster {
+    param([string]$ExpectedSha)
+    $heads = @(& git ls-remote --heads origin)
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Unable to query remote heads'
+    }
+    $expected = "$ExpectedSha`trefs/heads/master"
+    if ($heads.Count -ne 1 -or [string]$heads[0] -ne $expected) {
+        throw 'Remote heads must contain exactly master at the expected commit'
+    }
 }
 
 function Invoke-GitPush {
@@ -234,6 +246,7 @@ $remoteMaster = Get-NativeOutput git @('rev-parse', 'refs/remotes/origin/master'
 if ($remoteMaster -ne $ExpectedRemoteMaster) {
     throw "origin/master changed: expected $ExpectedRemoteMaster, got $remoteMaster"
 }
+Assert-OnlyRemoteMaster -ExpectedSha $remoteMaster
 $head = Get-NativeOutput git @('rev-parse', 'HEAD')
 $branch = Get-NativeOutput git @('branch', '--show-current')
 if ($branch -notmatch '^codex/') {
@@ -275,8 +288,7 @@ $pushArguments = @('push')
 if ($DryRun) {
     $pushArguments += '--dry-run'
 }
-Write-Host "Publishing candidate branch $branch at $head"
-Invoke-GitPush ($pushArguments + @('origin', "HEAD:refs/heads/$branch"))
+Write-Host "Publishing candidate $branch to master at $head"
 Invoke-GitPush ($pushArguments + @('origin', 'HEAD:refs/heads/master'))
 if ($DryRun) {
     Write-Host 'Dry run passed. No refs, workflows, images, tags, or Releases were created.'
@@ -299,6 +311,7 @@ if ($tagCommit -ne $head) {
     throw "Published tag does not point to candidate commit: $tagCommit"
 }
 $release = Test-ReleaseAssets -Tag $tag -HeadSha $head
+Assert-OnlyRemoteMaster -ExpectedSha $head
 Write-Host "Published $tag at $head"
 Write-Host "Release URL: $($release.url)"
 Write-Host 'Production deployment was not performed.'
