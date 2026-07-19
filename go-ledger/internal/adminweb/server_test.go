@@ -51,8 +51,8 @@ func TestAdminReplyNotificationTemplateIsIndependentAndResponsive(t *testing.T) 
 		CanConfigureReplyNotifications: true,
 		ReplyNotificationScope:         "逐人控制。",
 		ReplyNotificationTargets: []replyNotificationTarget{
-			{UserID: 1001, Label: "一级甲", Relation: "一级操作人", Enabled: true},
-			{UserID: 1002, Label: "下级乙", Relation: "下级操作人", Enabled: false},
+			{UserID: 1001, Label: "一级甲", Relation: "一级操作人", AllowBroadcast: true, AllowReply: true, ReceiveBroadcast: true, ReceiveReply: true},
+			{UserID: 1002, Label: "下级乙", Relation: "观察授权", AllowBroadcast: true, AllowReply: true, ReceiveBroadcast: false, ReceiveReply: true},
 		},
 	}
 	var body bytes.Buffer
@@ -64,6 +64,9 @@ func TestAdminReplyNotificationTemplateIsIndependentAndResponsive(t *testing.T) 
 		`data-admin-tab-target="replies"`,
 		`data-admin-tab="replies"`,
 		`action="/admin/reply-notifications/save"`,
+		`发送/回复通知`,
+		`name="receive_broadcast"`,
+		`name="receive_reply"`,
 		`name="source_user_id" value="1001"`,
 		`name="source_user_id" value="1002"`,
 		`一级甲`,
@@ -73,8 +76,11 @@ func TestAdminReplyNotificationTemplateIsIndependentAndResponsive(t *testing.T) 
 			t.Fatalf("reply notification template missing %q", want)
 		}
 	}
-	if checked := strings.Count(html, `name="enabled" value="1" checked`); checked != 1 {
-		t.Fatalf("checked reply toggles=%d, want 1", checked)
+	if checked := strings.Count(html, `name="receive_broadcast" value="1" checked`); checked != 1 {
+		t.Fatalf("checked broadcast toggles=%d, want 1", checked)
+	}
+	if checked := strings.Count(html, `name="receive_reply" value="1" checked`); checked != 2 {
+		t.Fatalf("checked reply toggles=%d, want 2", checked)
 	}
 
 	body.Reset()
@@ -89,10 +95,11 @@ func TestAdminReplyNotificationTemplateIsIndependentAndResponsive(t *testing.T) 
 
 	for _, want := range []string{
 		`.reply-settings{max-height:min(620px,calc(100vh - 260px));overflow-y:auto`,
-		`.reply-row{display:grid;grid-template-columns:minmax(180px,1fr) minmax(150px,.6fr) minmax(210px,.8fr) auto`,
+		`.reply-row{display:grid;grid-template-columns:minmax(180px,1fr) minmax(150px,.65fr) minmax(300px,1.2fr) auto`,
+		`.reply-controls{display:grid;grid-template-columns:repeat(2,minmax(130px,1fr))`,
 		`@media(max-width:900px)`,
 		`.reply-settings{max-height:calc(100vh - 230px)}`,
-		`.reply-row{grid-template-columns:minmax(0,1fr) auto}`,
+		`.reply-row{grid-template-columns:minmax(0,1fr)}`,
 		`@media(max-width:420px)`,
 	} {
 		if !strings.Contains(adminHTML, want) {

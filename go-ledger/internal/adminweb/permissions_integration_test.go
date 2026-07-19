@@ -56,6 +56,9 @@ func TestAdminBroadcastReplyNotificationScopeAndHandler(t *testing.T) {
 	if _, err := store.DisableGlobalOperator(ctx, disabledSecondaryID, primaryAID, now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.UpsertOperatorMessageObserverGrant(ctx, secondaryBID, primaryAID, true, false, hostID, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
 
 	s := New(config.Config{
 		HostUserID:         hostID,
@@ -68,7 +71,7 @@ func TestAdminBroadcastReplyNotificationScopeAndHandler(t *testing.T) {
 	secondarySession := adminauth.Session{UserID: secondaryAID, Role: adminauth.RoleOperator}
 	singleChatSession := adminauth.Session{UserID: singleChatOperatorID, Role: adminauth.RoleOperator}
 
-	targetIDs := func(session adminauth.Session) (map[int64]bool, bool) {
+	targetIDs := func(session adminauth.Session) (map[int64]replyNotificationTarget, bool) {
 		t.Helper()
 		caps, err := s.operatorActorCapabilities(ctx, session)
 		if err != nil {
@@ -78,9 +81,9 @@ func TestAdminBroadcastReplyNotificationScopeAndHandler(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		ids := make(map[int64]bool, len(targets))
+		ids := make(map[int64]replyNotificationTarget, len(targets))
 		for _, target := range targets {
-			ids[target.UserID] = target.Enabled
+			ids[target.UserID] = target
 		}
 		return ids, allowed
 	}
@@ -91,8 +94,8 @@ func TestAdminBroadcastReplyNotificationScopeAndHandler(t *testing.T) {
 			t.Errorf("%s allowed=%v, want %v", name, allowed, wantAllowed)
 		}
 		for _, userID := range want {
-			if enabled, exists := ids[userID]; !exists || !enabled {
-				t.Errorf("%s missing default-enabled source %d: %+v", name, userID, ids)
+			if _, exists := ids[userID]; !exists {
+				t.Errorf("%s missing source %d: %+v", name, userID, ids)
 			}
 		}
 		for _, userID := range blocked {
@@ -102,14 +105,13 @@ func TestAdminBroadcastReplyNotificationScopeAndHandler(t *testing.T) {
 		}
 	}
 	assertScope("host", hostSession,
-		[]int64{defaultID, primaryAID, primaryBID, secondaryAID, secondaryBID},
-		[]int64{hostID, disabledSecondaryID}, true)
-	assertScope("default", defaultSession,
-		[]int64{hostID, primaryAID, primaryBID, secondaryAID, secondaryBID},
-		[]int64{defaultID, disabledSecondaryID}, true)
+		[]int64{primaryAID, primaryBID, secondaryAID, secondaryBID},
+		[]int64{hostID, defaultID, disabledSecondaryID}, true)
+	assertScope("default", defaultSession, nil,
+		[]int64{hostID, primaryAID, primaryBID, secondaryAID, secondaryBID}, false)
 	assertScope("primary A", primaryASession,
-		[]int64{secondaryAID},
-		[]int64{hostID, defaultID, primaryAID, primaryBID, secondaryBID, disabledSecondaryID}, true)
+		[]int64{secondaryAID, secondaryBID},
+		[]int64{hostID, defaultID, primaryAID, primaryBID, disabledSecondaryID}, true)
 	assertScope("primary B", primaryBSession,
 		[]int64{secondaryBID},
 		[]int64{hostID, defaultID, primaryAID, primaryBID, secondaryAID, disabledSecondaryID}, true)
@@ -118,11 +120,14 @@ func TestAdminBroadcastReplyNotificationScopeAndHandler(t *testing.T) {
 	assertScope("single chat operator", singleChatSession, nil,
 		[]int64{hostID, defaultID, primaryAID, primaryBID, secondaryAID, secondaryBID}, false)
 
-	post := func(session adminauth.Session, sourceUserID int64, enabled bool) *httptest.ResponseRecorder {
+	post := func(session adminauth.Session, sourceUserID int64, receiveBroadcast, receiveReply bool) *httptest.ResponseRecorder {
 		t.Helper()
 		form := url.Values{"source_user_id": {fmt.Sprint(sourceUserID)}}
-		if enabled {
-			form.Set("enabled", "1")
+		if receiveBroadcast {
+			form.Set("receive_broadcast", "1")
+		}
+		if receiveReply {
+			form.Set("receive_reply", "1")
 		}
 		req := httptest.NewRequest(http.MethodPost, "/admin/reply-notifications/save", strings.NewReader(form.Encode()))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -132,24 +137,48 @@ func TestAdminBroadcastReplyNotificationScopeAndHandler(t *testing.T) {
 		return rec
 	}
 
-	if rec := post(primaryASession, secondaryAID, false); rec.Code != http.StatusSeeOther {
+	if rec := post(primaryASession, secondaryAID, false, true); rec.Code != http.StatusSeeOther {
 		t.Fatalf("primary disable status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	ids, _ := targetIDs(primaryASession)
-	if enabled, exists := ids[secondaryAID]; !exists || enabled {
+	if target, exists := ids[secondaryAID]; !exists || target.ReceiveBroadcast || !target.ReceiveReply {
 		t.Fatalf("explicit disable not reflected: %+v", ids)
 	}
-	if rec := post(primaryASession, secondaryAID, true); rec.Code != http.StatusSeeOther {
+	if rec := post(primaryASession, secondaryAID, true, true); rec.Code != http.StatusSeeOther {
 		t.Fatalf("primary restore status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	if ids, _ := targetIDs(primaryASession); !ids[secondaryAID] {
+	if ids, _ := targetIDs(primaryASession); !ids[secondaryAID].ReceiveBroadcast || !ids[secondaryAID].ReceiveReply {
 		t.Fatalf("explicit restore not reflected: %+v", ids)
 	}
-	if rec := post(hostSession, defaultID, false); rec.Code != http.StatusSeeOther {
-		t.Fatalf("host disable default status=%d body=%s", rec.Code, rec.Body.String())
+	if observed := ids[secondaryBID]; !observed.AllowBroadcast || observed.AllowReply || !observed.ReceiveBroadcast || observed.ReceiveReply {
+		t.Fatalf("observer grant ceiling not reflected: %+v", observed)
 	}
-	if ids, _ := targetIDs(hostSession); ids[defaultID] {
-		t.Fatalf("host explicit disable not reflected: %+v", ids)
+	if rec := post(primaryASession, secondaryBID, true, true); rec.Code != http.StatusForbidden {
+		t.Fatalf("observer exceeded reply ceiling status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := post(hostSession, secondaryAID, false, true); rec.Code != http.StatusSeeOther {
+		t.Fatalf("host independent preference status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if ids, _ := targetIDs(hostSession); ids[secondaryAID].ReceiveBroadcast || !ids[secondaryAID].ReceiveReply {
+		t.Fatalf("host preference not reflected: %+v", ids)
+	}
+	if ids, _ := targetIDs(primaryASession); !ids[secondaryAID].ReceiveBroadcast {
+		t.Fatalf("host preference changed primary preference: %+v", ids)
+	}
+	if rec := post(primaryASession, secondaryBID, false, false); rec.Code != http.StatusSeeOther {
+		t.Fatalf("observer personal preference status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if ids, _ := targetIDs(primaryBSession); !ids[secondaryBID].ReceiveBroadcast || !ids[secondaryBID].ReceiveReply {
+		t.Fatalf("one primary preference changed another primary: %+v", ids)
+	}
+	if changed, err := store.RevokeOperatorMessageObserverGrant(ctx, secondaryBID, primaryAID, hostID, now.Add(3*time.Second)); err != nil || !changed {
+		t.Fatalf("revoke observer grant changed=%t err=%v", changed, err)
+	}
+	if ids, _ := targetIDs(primaryASession); ids[secondaryBID].UserID != 0 {
+		t.Fatalf("revoked observer source remains visible: %+v", ids)
+	}
+	if rec := post(primaryASession, secondaryBID, false, false); rec.Code != http.StatusForbidden {
+		t.Fatalf("old session wrote revoked observer source status=%d body=%s", rec.Code, rec.Body.String())
 	}
 
 	for _, tc := range []struct {
@@ -163,12 +192,12 @@ func TestAdminBroadcastReplyNotificationScopeAndHandler(t *testing.T) {
 		{"single chat operator", singleChatSession, secondaryAID},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if rec := post(tc.session, tc.source, false); rec.Code != http.StatusForbidden {
+			if rec := post(tc.session, tc.source, false, false); rec.Code != http.StatusForbidden {
 				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 			}
 		})
 	}
-	if overrides, err := store.BroadcastReplyPreferenceOverrides(ctx, secondaryAID); err != nil {
+	if overrides, err := store.BroadcastMessagePreferenceOverrides(ctx, secondaryAID); err != nil {
 		t.Fatal(err)
 	} else if _, exists := overrides[secondaryAID]; exists {
 		t.Fatalf("forged self preference was stored: %+v", overrides)

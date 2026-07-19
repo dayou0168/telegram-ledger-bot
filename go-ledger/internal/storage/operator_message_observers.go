@@ -221,6 +221,54 @@ func (s *Store) ResolveOperatorMessageRecipients(
 	}, nil
 }
 
+func (s *Store) ListOperatorMessageSourcesForObserver(ctx context.Context, observerUserID, hostUserID int64) ([]OperatorMessageSourceScope, error) {
+	if observerUserID <= 0 || hostUserID <= 0 {
+		return nil, ErrMessageObserverInvalidIdentity
+	}
+	isHost := observerUserID == hostUserID
+	if !isHost {
+		var activePrimary bool
+		if err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM global_operators
+			WHERE user_id=$1 AND level='primary' AND status='active')`, observerUserID).Scan(&activePrimary); err != nil {
+			return nil, err
+		}
+		if !activePrimary {
+			return nil, nil
+		}
+	}
+	rows, err := s.pool.Query(ctx, `SELECT source.user_id,
+		CASE WHEN $2 THEN TRUE ELSE source.parent_user_id=$1 OR COALESCE(observer_grant.receive_broadcast,FALSE) END,
+		CASE WHEN $2 THEN TRUE ELSE source.parent_user_id=$1 OR COALESCE(observer_grant.receive_reply,FALSE) END
+		FROM global_operators source
+		LEFT JOIN operator_message_observer_grants observer_grant
+		  ON observer_grant.source_secondary_user_id=source.user_id
+		 AND observer_grant.observer_primary_user_id=$1 AND observer_grant.active=TRUE
+		WHERE source.status='active' AND source.user_id<>$1
+		  AND (
+			($2 AND source.level IN ('primary','secondary'))
+			OR (
+				NOT $2 AND source.level='secondary'
+				AND (source.parent_user_id=$1 OR observer_grant.observer_primary_user_id IS NOT NULL)
+			)
+		  )
+		ORDER BY source.level,source.user_id`, observerUserID, isHost)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var scopes []OperatorMessageSourceScope
+	for rows.Next() {
+		var scope OperatorMessageSourceScope
+		if err := rows.Scan(&scope.SourceUserID, &scope.AllowBroadcast, &scope.AllowReply); err != nil {
+			return nil, err
+		}
+		if scope.AllowBroadcast || scope.AllowReply {
+			scopes = append(scopes, scope)
+		}
+	}
+	return scopes, rows.Err()
+}
+
 func (s *Store) ListOperatorMessageObserverAuditEvents(ctx context.Context, limit int) ([]OperatorMessageObserverAuditEvent, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100

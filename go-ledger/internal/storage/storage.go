@@ -23,13 +23,14 @@ type Store struct {
 }
 
 const (
-	telegramPrivateRouteStateMigrationVersion = "2.4.14-telegram-private-route-state"
-	telegramQuickReplyOutboxMigrationVersion  = "2.4.15-telegram-quick-reply-outbox"
-	chatMemberDiscoveryMigrationVersion       = "2.4.16-chat-member-discovery"
-	broadcastReplyPreferencesMigrationVersion = "2.4.17-broadcast-reply-preferences"
-	operatorMessageObserversMigrationVersion  = "2.4.18-operator-message-observers-admin-identity"
-	broadcastDeliveryStateMigrationVersion    = "2.4.19-broadcast-delivery-state"
-	latestSchemaMigrationVersion              = broadcastDeliveryStateMigrationVersion
+	telegramPrivateRouteStateMigrationVersion   = "2.4.14-telegram-private-route-state"
+	telegramQuickReplyOutboxMigrationVersion    = "2.4.15-telegram-quick-reply-outbox"
+	chatMemberDiscoveryMigrationVersion         = "2.4.16-chat-member-discovery"
+	broadcastReplyPreferencesMigrationVersion   = "2.4.17-broadcast-reply-preferences"
+	operatorMessageObserversMigrationVersion    = "2.4.18-operator-message-observers-admin-identity"
+	broadcastDeliveryStateMigrationVersion      = "2.4.19-broadcast-delivery-state"
+	broadcastMessagePreferencesMigrationVersion = "2.4.20-broadcast-message-preferences"
+	latestSchemaMigrationVersion                = broadcastMessagePreferencesMigrationVersion
 )
 
 const (
@@ -358,10 +359,17 @@ func (s *Store) migrate(ctx context.Context) error {
 			observer_user_id BIGINT NOT NULL,
 			source_user_id BIGINT NOT NULL,
 			enabled BOOLEAN NOT NULL,
+			receive_broadcast BOOLEAN NOT NULL DEFAULT TRUE,
+			receive_reply BOOLEAN NOT NULL DEFAULT TRUE,
 			updated_at TIMESTAMPTZ NOT NULL,
 			PRIMARY KEY(observer_user_id, source_user_id),
 			CONSTRAINT broadcast_reply_preferences_distinct_users CHECK(observer_user_id <> source_user_id)
 		)`,
+		`ALTER TABLE broadcast_reply_preferences ADD COLUMN IF NOT EXISTS receive_broadcast BOOLEAN NOT NULL DEFAULT TRUE`,
+		`ALTER TABLE broadcast_reply_preferences ADD COLUMN IF NOT EXISTS receive_reply BOOLEAN`,
+		`UPDATE broadcast_reply_preferences SET receive_reply=enabled WHERE receive_reply IS NULL`,
+		`ALTER TABLE broadcast_reply_preferences ALTER COLUMN receive_reply SET DEFAULT TRUE`,
+		`ALTER TABLE broadcast_reply_preferences ALTER COLUMN receive_reply SET NOT NULL`,
 		`DO $$
 		BEGIN
 			IF NOT EXISTS (
@@ -1640,6 +1648,11 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
 		VALUES($1, NOW())
+		ON CONFLICT(version) DO NOTHING`, broadcastDeliveryStateMigrationVersion); err != nil {
+		return fmt.Errorf("record broadcast delivery state migration: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
+		VALUES($1, NOW())
 		ON CONFLICT(version) DO NOTHING`, latestSchemaMigrationVersion); err != nil {
 		return fmt.Errorf("record schema migration: %w", err)
 	}
@@ -2890,31 +2903,56 @@ func (s *Store) ListGlobalOperators(ctx context.Context) ([]GlobalOperator, erro
 }
 
 func (s *Store) BroadcastReplyPreferenceOverrides(ctx context.Context, observerUserID int64) (map[int64]bool, error) {
+	preferences, err := s.BroadcastMessagePreferenceOverrides(ctx, observerUserID)
+	if err != nil {
+		return nil, err
+	}
 	overrides := make(map[int64]bool)
-	rows, err := s.pool.Query(ctx, `SELECT source_user_id, enabled
-		FROM broadcast_reply_preferences
-		WHERE observer_user_id=$1`, observerUserID)
+	for sourceUserID, preference := range preferences {
+		overrides[sourceUserID] = preference.ReceiveReply
+	}
+	return overrides, nil
+}
+
+func (s *Store) BroadcastReplyPreferenceOverridesForSource(ctx context.Context, sourceUserID int64, observerUserIDs []int64) (map[int64]bool, error) {
+	preferences, err := s.BroadcastMessagePreferenceOverridesForSource(ctx, sourceUserID, observerUserIDs)
+	if err != nil {
+		return nil, err
+	}
+	overrides := make(map[int64]bool)
+	for observerUserID, preference := range preferences {
+		overrides[observerUserID] = preference.ReceiveReply
+	}
+	return overrides, nil
+}
+
+func (s *Store) BroadcastMessagePreferenceOverrides(ctx context.Context, observerUserID int64) (map[int64]BroadcastMessagePreference, error) {
+	overrides := make(map[int64]BroadcastMessagePreference)
+	if observerUserID <= 0 {
+		return overrides, nil
+	}
+	rows, err := s.pool.Query(ctx, `SELECT source_user_id,receive_broadcast,receive_reply,updated_at
+		FROM broadcast_reply_preferences WHERE observer_user_id=$1`, observerUserID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var sourceUserID int64
-		var enabled bool
-		if err := rows.Scan(&sourceUserID, &enabled); err != nil {
+		var preference BroadcastMessagePreference
+		if err := rows.Scan(&preference.SourceUserID, &preference.ReceiveBroadcast, &preference.ReceiveReply, &preference.UpdatedAt); err != nil {
 			return nil, err
 		}
-		overrides[sourceUserID] = enabled
+		overrides[preference.SourceUserID] = preference
 	}
 	return overrides, rows.Err()
 }
 
-func (s *Store) BroadcastReplyPreferenceOverridesForSource(ctx context.Context, sourceUserID int64, observerUserIDs []int64) (map[int64]bool, error) {
-	overrides := make(map[int64]bool)
+func (s *Store) BroadcastMessagePreferenceOverridesForSource(ctx context.Context, sourceUserID int64, observerUserIDs []int64) (map[int64]BroadcastMessagePreference, error) {
+	overrides := make(map[int64]BroadcastMessagePreference)
 	if sourceUserID <= 0 || len(observerUserIDs) == 0 {
 		return overrides, nil
 	}
-	rows, err := s.pool.Query(ctx, `SELECT observer_user_id, enabled
+	rows, err := s.pool.Query(ctx, `SELECT observer_user_id,receive_broadcast,receive_reply,updated_at
 		FROM broadcast_reply_preferences
 		WHERE source_user_id=$1 AND observer_user_id=ANY($2)`, sourceUserID, observerUserIDs)
 	if err != nil {
@@ -2923,11 +2961,11 @@ func (s *Store) BroadcastReplyPreferenceOverridesForSource(ctx context.Context, 
 	defer rows.Close()
 	for rows.Next() {
 		var observerUserID int64
-		var enabled bool
-		if err := rows.Scan(&observerUserID, &enabled); err != nil {
+		preference := BroadcastMessagePreference{SourceUserID: sourceUserID}
+		if err := rows.Scan(&observerUserID, &preference.ReceiveBroadcast, &preference.ReceiveReply, &preference.UpdatedAt); err != nil {
 			return nil, err
 		}
-		overrides[observerUserID] = enabled
+		overrides[observerUserID] = preference
 	}
 	return overrides, rows.Err()
 }
@@ -2937,12 +2975,29 @@ func (s *Store) SetBroadcastReplyPreference(ctx context.Context, observerUserID,
 		return errors.New("broadcast reply preference identity is invalid")
 	}
 	_, err := s.pool.Exec(ctx, `INSERT INTO broadcast_reply_preferences(
-			observer_user_id, source_user_id, enabled, updated_at
-		) VALUES($1, $2, $3, $4)
+			observer_user_id,source_user_id,enabled,receive_broadcast,receive_reply,updated_at
+		) VALUES($1,$2,$3,TRUE,$3,$4)
 		ON CONFLICT(observer_user_id, source_user_id) DO UPDATE SET
 			enabled=excluded.enabled,
+			receive_reply=excluded.receive_reply,
 			updated_at=excluded.updated_at`,
 		observerUserID, sourceUserID, enabled, now)
+	return err
+}
+
+func (s *Store) SetBroadcastMessagePreference(ctx context.Context, observerUserID, sourceUserID int64, receiveBroadcast, receiveReply bool, now time.Time) error {
+	if observerUserID <= 0 || sourceUserID <= 0 || observerUserID == sourceUserID {
+		return errors.New("broadcast message preference identity is invalid")
+	}
+	_, err := s.pool.Exec(ctx, `INSERT INTO broadcast_reply_preferences(
+			observer_user_id,source_user_id,enabled,receive_broadcast,receive_reply,updated_at
+		) VALUES($1,$2,$4,$3,$4,$5)
+		ON CONFLICT(observer_user_id,source_user_id) DO UPDATE SET
+			enabled=excluded.enabled,
+			receive_broadcast=excluded.receive_broadcast,
+			receive_reply=excluded.receive_reply,
+			updated_at=excluded.updated_at`,
+		observerUserID, sourceUserID, receiveBroadcast, receiveReply, now)
 	return err
 }
 

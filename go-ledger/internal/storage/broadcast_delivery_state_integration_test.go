@@ -180,3 +180,162 @@ func TestPostgresBroadcastMediaOutboxIsIdempotentMapsReplyAndRetainsPending(t *t
 		t.Fatalf("pending cleanup deleted=%d err=%v", deleted, err)
 	}
 }
+
+func TestPostgresBroadcastUpstreamCompanionIsAtomicOrderedAndIdempotent(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	migrationURL, _, _ := postgresTestSchema(t, ctx, dsn, "broadcast_upstream_companion")
+	store, err := Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC().Add(-200 * time.Hour)
+	primary := NotificationOutbox{Kind: "broadcast_upstream_copy", DedupeKey: "upstream:context:primary", ChatID: 202,
+		PayloadType: "photo", FileID: "original-photo", Caption: "original caption", Priority: 1}
+	companion := NotificationOutbox{Kind: "broadcast_upstream_context", DedupeKey: "upstream:context:companion", ChatID: 202,
+		PayloadType: "text", Text: "sender and target", Priority: 1}
+	inserted, upstream, err := store.EnqueueBroadcastUpstreamMessage(ctx, primary, 102, 102, 12, 202, now, companion)
+	if err != nil || !inserted || upstream.ID <= 0 {
+		t.Fatalf("enqueue inserted=%t upstream=%+v err=%v", inserted, upstream, err)
+	}
+	if inserted, duplicate, err := store.EnqueueBroadcastUpstreamMessage(ctx, primary, 102, 102, 12, 202, now, companion); err != nil || inserted || duplicate.ID != upstream.ID {
+		t.Fatalf("duplicate inserted=%t upstream=%+v err=%v", inserted, duplicate, err)
+	}
+	var rows int
+	if err := store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM notification_outbox WHERE dedupe_key IN ($1,$2)`, primary.DedupeKey, companion.DedupeKey).Scan(&rows); err != nil || rows != 2 {
+		t.Fatalf("outbox rows=%d err=%v", rows, err)
+	}
+	claimed, err := store.ClaimDueNotifications(ctx, 10, 8, time.Now().UTC())
+	if err != nil || len(claimed) != 1 || claimed[0].DedupeKey != primary.DedupeKey {
+		t.Fatalf("first claim=%+v err=%v", claimed, err)
+	}
+	if deleted, err := store.CleanupBroadcastUpstreamMessages(ctx, time.Now().UTC().Add(-168*time.Hour)); err != nil || deleted != 0 {
+		t.Fatalf("primary sending cleanup deleted=%d err=%v", deleted, err)
+	}
+	if err := store.MarkNotificationSent(ctx, claimed[0].ID, 888, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if deleted, err := store.CleanupBroadcastUpstreamMessages(ctx, time.Now().UTC().Add(-168*time.Hour)); err != nil || deleted != 0 {
+		t.Fatalf("companion pending cleanup deleted=%d err=%v", deleted, err)
+	}
+	claimed, err = store.ClaimDueNotifications(ctx, 10, 8, time.Now().UTC())
+	if err != nil || len(claimed) != 1 || claimed[0].DedupeKey != companion.DedupeKey || claimed[0].ReplyToUpstreamID != upstream.ID {
+		t.Fatalf("companion claim=%+v err=%v", claimed, err)
+	}
+
+	badPrimary := NotificationOutbox{Kind: "broadcast_upstream_copy", DedupeKey: "upstream:rollback:primary", ChatID: 203,
+		PayloadType: "text", Text: "original", Priority: 1}
+	badCompanion := NotificationOutbox{Kind: "broadcast_upstream_context", PayloadType: "text", Text: "invalid", Priority: 1}
+	if _, _, err := store.EnqueueBroadcastUpstreamMessage(ctx, badPrimary, 103, 103, 13, 203, time.Now().UTC(), badCompanion); err == nil {
+		t.Fatal("invalid companion should roll back the transaction")
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM notification_outbox WHERE dedupe_key=$1`, badPrimary.DedupeKey).Scan(&rows); err != nil || rows != 0 {
+		t.Fatalf("rolled-back outbox rows=%d err=%v", rows, err)
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM broadcast_upstream_messages WHERE source_chat_id=$1 AND source_message_id=$2`, int64(103), int64(13)).Scan(&rows); err != nil || rows != 0 {
+		t.Fatalf("rolled-back upstream rows=%d err=%v", rows, err)
+	}
+}
+
+func TestPostgresBroadcastReplaceSettingDisableClearAndRestart(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	migrationURL, _, _ := postgresTestSchema(t, ctx, dsn, "broadcast_replace_restart")
+	store, err := Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := store.SaveBroadcastReplaceSetting(ctx, BroadcastReplaceSetting{
+		Enabled: true, Text: "fixed", ImageName: "fixed.jpg", ImageData: []byte("image"), UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+	store, err = Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setting, err := store.GetBroadcastReplaceSetting(ctx)
+	if err != nil || !setting.Enabled || setting.Text != "fixed" || string(setting.ImageData) != "image" {
+		t.Fatalf("restored setting=%+v err=%v", setting, err)
+	}
+	if err := store.SaveBroadcastReplaceSetting(ctx, BroadcastReplaceSetting{Enabled: false, UpdatedAt: now.Add(time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+	store, err = Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	setting, err = store.GetBroadcastReplaceSetting(ctx)
+	if err != nil || setting.Enabled || setting.Text != "" || setting.ImageName != "" || len(setting.ImageData) != 0 {
+		t.Fatalf("cleared setting=%+v err=%v", setting, err)
+	}
+}
+
+func TestPostgresBroadcastFinalReceiptRetriesAcrossRestartWithoutDuplicates(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	migrationURL, _, _ := postgresTestSchema(t, ctx, dsn, "broadcast_final_receipt")
+	store, err := Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	item := NotificationOutbox{Kind: "broadcast_result", DedupeKey: "broadcast_result:501:601", ChatID: 501,
+		PayloadType: "text", Text: "发送完成", Priority: 1}
+	if inserted, err := store.EnqueueNotification(ctx, item, now); err != nil || !inserted {
+		t.Fatalf("enqueue inserted=%t err=%v", inserted, err)
+	}
+	if inserted, err := store.EnqueueNotification(ctx, item, now); err != nil || inserted {
+		t.Fatalf("duplicate inserted=%t err=%v", inserted, err)
+	}
+	claimed, err := store.ClaimDueNotifications(ctx, 10, 8, now)
+	if err != nil || len(claimed) != 1 || claimed[0].DedupeKey != item.DedupeKey {
+		t.Fatalf("first claim=%+v err=%v", claimed, err)
+	}
+	retryAt := now.Add(time.Second)
+	if err := store.MarkNotificationFailed(ctx, claimed[0].ID, "telegram 429", retryAt, now); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+	store, err = Open(ctx, migrationURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if claimed, err := store.ClaimDueNotifications(ctx, 10, 8, now.Add(500*time.Millisecond)); err != nil || len(claimed) != 0 {
+		t.Fatalf("premature retry=%+v err=%v", claimed, err)
+	}
+	claimed, err = store.ClaimDueNotifications(ctx, 10, 8, retryAt)
+	if err != nil || len(claimed) != 1 || claimed[0].ID <= 0 {
+		t.Fatalf("restart retry=%+v err=%v", claimed, err)
+	}
+	if err := store.MarkNotificationSent(ctx, claimed[0].ID, 701, retryAt); err != nil {
+		t.Fatal(err)
+	}
+	if inserted, err := store.EnqueueNotification(ctx, item, retryAt); err != nil || inserted {
+		t.Fatalf("post-send duplicate inserted=%t err=%v", inserted, err)
+	}
+	var count int
+	var status string
+	if err := store.pool.QueryRow(ctx, `SELECT COUNT(*),MIN(status) FROM notification_outbox WHERE dedupe_key=$1`, item.DedupeKey).Scan(&count, &status); err != nil || count != 1 || status != "sent" {
+		t.Fatalf("receipt count=%d status=%q err=%v", count, status, err)
+	}
+}

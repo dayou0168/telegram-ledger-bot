@@ -178,7 +178,7 @@ func TestPostgresDurableQuickReplyRestartRevocationClearsState(t *testing.T) {
 	}
 }
 
-func TestPostgresDurableQuickReplyRechecksPermissionAfterQueueWait(t *testing.T) {
+func TestPostgresDurableQuickReplyRechecksRecipientAfterQueueWait(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("TEST_DATABASE_URL is not set")
@@ -225,8 +225,8 @@ func TestPostgresDurableQuickReplyRechecksPermissionAfterQueueWait(t *testing.T)
 	go fixture.bot.quickReplyOutboxScheduler(runCtx)
 	update := privateMessageUpdate(fixture.seedUpdateID+1, fixture.userID, "queued payload")
 	persistAndHandleTelegramInboxUpdate(t, ctx, fixture.bot, store, update, time.Now(), "queued-revoked-owner")
-	if removed, err := store.RemoveBroadcastPermission(ctx, fixture.userID, "chat", fixture.targetChatID, "", fixture.userID, time.Now()); err != nil || !removed {
-		t.Fatalf("remove broadcast permission=%v err=%v", removed, err)
+	if disabled, err := store.DisableGlobalOperator(ctx, fixture.userID, fixture.userID, time.Now()); err != nil || !disabled {
+		t.Fatalf("disable recipient=%v err=%v", disabled, err)
 	}
 	close(releaseBlock)
 	deadline := time.Now().Add(5 * time.Second)
@@ -296,6 +296,99 @@ func TestPostgresDurableQuickReplyRestartsAfterCommitBeforeSend(t *testing.T) {
 	waitQuickReplyOutboxStatus(t, ctx, store, dedupe, "sent")
 	if got := copyCalls.Load(); got != 1 {
 		t.Fatalf("restart copies=%d want=1", got)
+	}
+}
+
+func TestPostgresDurableQuickReplyAllowsCurrentRecipientWithoutTargetPermissionAndRejectsOldButton(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store, err := storage.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var copyCalls atomic.Int32
+	var answerText atomic.Value
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/copyMessage") {
+			copyCalls.Add(1)
+			_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":9151,"chat":{"id":-1,"type":"supergroup"}}}`))
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/answerCallbackQuery") {
+			var payload struct {
+				Text string `json:"text"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+			answerText.Store(payload.Text)
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"result":true}`))
+	}))
+	defer server.Close()
+	tg := telegram.NewClient(server.URL, "test", 2*time.Second)
+
+	base := time.Now().UnixNano()
+	hostID, primaryID, sourceID := base+1, base+2, base+3
+	targetChatID := -base - 10
+	targetMessageID := base + 11
+	now := time.Now().UTC()
+	if err := store.UpsertGlobalOperator(ctx, primaryID, "primary", 0, hostID, "direct primary", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertGlobalOperator(ctx, sourceID, "secondary", primaryID, hostID, "source", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnsureGroup(ctx, targetChatID, "target without primary membership", now); err != nil {
+		t.Fatal(err)
+	}
+	deliveryID, err := store.InsertBroadcastDelivery(ctx, storage.BroadcastDelivery{
+		OperatorUserID: sourceID, SourceChatID: sourceID, SourceMessageID: base + 10,
+		TargetChatID: targetChatID, TargetTitle: "target without primary membership", TargetMessageID: targetMessageID,
+		Mode: "chat", TargetName: "target", CreatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := telegramInboxIntegrationConfig(fmt.Sprintf("quick-reply-recipient-%d", base))
+	cfg.HostUserID = hostID
+	cfg.TelegramAPIBase = "test"
+	b := New(cfg, store, tg, nil, nil)
+	state := privateState{Mode: "quick_reply", TargetName: "target", QuickReplyTargetChat: targetChatID, QuickReplyMessageID: targetMessageID, CreatedAt: now}
+	seedDurablePrivateState(t, ctx, b, store, base+20, primaryID, state)
+	update := privateMessageUpdate(base+21, primaryID, "reply as non-member")
+	persistAndHandleTelegramInboxUpdate(t, ctx, b, store, update, now, "recipient-no-membership")
+	dedupe := fmt.Sprintf("quick_reply:%s:%d", b.telegramInboxStreamKey(), update.UpdateID)
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	b.quickReplyPool.Start(runCtx)
+	b.sendGateway.Start(runCtx)
+	go b.quickReplyOutboxScheduler(runCtx)
+	waitQuickReplyOutboxStatus(t, ctx, store, dedupe, "sent")
+	if copyCalls.Load() != 1 {
+		t.Fatalf("non-member recipient copy calls=%d want=1", copyCalls.Load())
+	}
+
+	if err := store.SetBroadcastMessagePreference(ctx, primaryID, sourceID, true, false, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	b.privateStates.Delete(formatID(primaryID))
+	err = b.handleBroadcastReplyCallback(ctx, telegram.CallbackQuery{
+		ID: "old-button", From: telegram.User{ID: primaryID}, Data: fmt.Sprintf("br:q:%d", deliveryID),
+		Message: &telegram.Message{MessageID: base + 30, Chat: telegram.Chat{ID: primaryID, Type: "private"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value, _ := answerText.Load().(string); value != "当前无快速回复权限" {
+		t.Fatalf("old button answer=%q", value)
+	}
+	if _, exists := b.privateStates.Get(formatID(primaryID)); exists || copyCalls.Load() != 1 {
+		t.Fatalf("old button restored quick state=%t copies=%d", exists, copyCalls.Load())
 	}
 }
 

@@ -230,6 +230,13 @@ type BroadcastReplaceSetting struct {
 	UpdatedAt time.Time
 }
 
+type BroadcastMessagePreference struct {
+	SourceUserID     int64
+	ReceiveBroadcast bool
+	ReceiveReply     bool
+	UpdatedAt        time.Time
+}
+
 type PrivateChatMessage struct {
 	ID                  int64
 	OperatorUserID      int64
@@ -570,6 +577,12 @@ type OperatorMessageObserverAuditEvent struct {
 type OperatorMessageRecipients struct {
 	Broadcast []int64
 	Reply     []int64
+}
+
+type OperatorMessageSourceScope struct {
+	SourceUserID   int64
+	AllowBroadcast bool
+	AllowReply     bool
 }
 
 type LedgerClearTicket struct {

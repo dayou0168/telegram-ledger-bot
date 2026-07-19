@@ -15,24 +15,18 @@ import (
 	"github.com/dayou0168/telegram-ledger-bot/go-ledger/internal/worker"
 )
 
-func TestFormatBroadcastProgressText(t *testing.T) {
-	if got := formatBroadcastProgressText("chat", 1); got != "发送中..." {
-		t.Fatalf("single chat progress = %q", got)
-	}
-	if got := formatBroadcastProgressText("group", 3); got != "广播发送中：目标 3 个。" {
-		t.Fatalf("group progress = %q", got)
-	}
-}
-
 func TestFormatBroadcastResultText(t *testing.T) {
-	if got := formatBroadcastResultText("chat", 1, 0, false); got != "发送完成。" {
-		t.Fatalf("single chat success = %q", got)
+	if got := formatBroadcastResultText(1, 0); got != "发送完成" {
+		t.Fatalf("single success = %q", got)
 	}
-	if got := formatBroadcastResultText("chat", 0, 1, true); got != "发送失败。\n通知所有人：开启" {
-		t.Fatalf("single chat failed notify = %q", got)
+	if got := formatBroadcastResultText(20, 0); got != "发送完成" {
+		t.Fatalf("broadcast success = %q", got)
 	}
-	if got := formatBroadcastResultText("group", 2, 1, false); got != "广播完成：成功 2 个，失败 1 个。" {
-		t.Fatalf("group result = %q", got)
+	if got := formatBroadcastResultText(2, 1); got != "部分发送失败：失败 1 个。" {
+		t.Fatalf("partial result = %q", got)
+	}
+	if got := formatBroadcastResultText(0, 1); got != "发送失败，请稍后重试。" {
+		t.Fatalf("failure result = %q", got)
 	}
 }
 
@@ -141,14 +135,40 @@ func TestIntersectBroadcastTargetsRechecksAndKeepsStoredTitle(t *testing.T) {
 
 func TestBroadcastReplyKeyboardHidesQuickReplyWithoutPermission(t *testing.T) {
 	msg := telegram.Message{Chat: telegram.Chat{ID: -1001}, MessageID: 20}
-	delivery := storage.BroadcastDelivery{ID: 7, TargetChatID: -1001, TargetMessageID: 10}
-	viewer := broadcastReplyKeyboard(msg, delivery, false)
-	if len(viewer.InlineKeyboard) != 1 {
-		t.Fatalf("viewer keyboard rows = %#v", viewer.InlineKeyboard)
+	chatDelivery := storage.BroadcastDelivery{ID: 7, Mode: "chat", TargetChatID: -1001, TargetMessageID: 10}
+	viewer := broadcastReplyKeyboard(msg, chatDelivery, false)
+	if len(viewer.InlineKeyboard) != 0 {
+		t.Fatalf("single-chat viewer keyboard rows = %#v", viewer.InlineKeyboard)
 	}
-	operator := broadcastReplyKeyboard(msg, delivery, true)
-	if len(operator.InlineKeyboard) != 2 || operator.InlineKeyboard[0][0].CallbackData != "br:q:7" {
-		t.Fatalf("operator keyboard rows = %#v", operator.InlineKeyboard)
+	operator := broadcastReplyKeyboard(msg, chatDelivery, true)
+	if len(operator.InlineKeyboard) != 1 || operator.InlineKeyboard[0][0].CallbackData != "br:q:7" {
+		t.Fatalf("single-chat operator keyboard rows = %#v", operator.InlineKeyboard)
+	}
+	for _, mode := range []string{"group", "all"} {
+		delivery := chatDelivery
+		delivery.Mode = mode
+		viewer = broadcastReplyKeyboard(msg, delivery, false)
+		if len(viewer.InlineKeyboard) != 1 || len(viewer.InlineKeyboard[0]) != 2 {
+			t.Fatalf("%s viewer location rows = %#v", mode, viewer.InlineKeyboard)
+		}
+		operator = broadcastReplyKeyboard(msg, delivery, true)
+		if len(operator.InlineKeyboard) != 2 || operator.InlineKeyboard[0][0].CallbackData != "br:q:7" {
+			t.Fatalf("%s operator keyboard rows = %#v", mode, operator.InlineKeyboard)
+		}
+	}
+}
+
+func TestBroadcastReplyKeyboardModeIsIndependentOfReplyMedia(t *testing.T) {
+	for _, msg := range []telegram.Message{
+		{Text: "reply", Chat: telegram.Chat{ID: -1001}, MessageID: 20},
+		{Photo: []telegram.Photo{{FileID: "photo"}}, Chat: telegram.Chat{ID: -1001}, MessageID: 20},
+		{Photo: []telegram.Photo{{FileID: "photo"}}, Caption: "caption", Chat: telegram.Chat{ID: -1001}, MessageID: 20},
+	} {
+		chat := broadcastReplyKeyboard(msg, storage.BroadcastDelivery{ID: 1, Mode: "chat"}, false)
+		group := broadcastReplyKeyboard(msg, storage.BroadcastDelivery{ID: 2, Mode: "group"}, false)
+		if len(chat.InlineKeyboard) != 0 || len(group.InlineKeyboard) != 1 {
+			t.Fatalf("media=%+v chat=%+v group=%+v", msg, chat, group)
+		}
 	}
 }
 
@@ -179,15 +199,87 @@ func TestBroadcastReliablePayloadMatrixPreservesTextPhotoAndCaption(t *testing.T
 		{name: "reply photo caption", msg: telegram.Message{Photo: []telegram.Photo{{FileID: "reply"}}, Caption: "photo reply"}, wantType: "photo", wantContent: "photo reply"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			payload, ok := broadcastReplyPayload(test.msg, storage.User{ID: 9, DisplayName: "user"}, storage.BroadcastDelivery{TargetTitle: "group"})
+			payload, ok := broadcastReplyPayload(test.msg, storage.User{ID: 9, DisplayName: "user"}, storage.BroadcastDelivery{TargetTitle: "group"}, "@operator")
 			content := payload.Text
 			if payload.Type == "photo" {
 				content = payload.Caption
 			}
-			if !ok || payload.Type != test.wantType || !strings.Contains(content, test.wantContent) {
+			if !ok || payload.Type != test.wantType || !strings.Contains(content, test.wantContent) || !strings.Contains(content, "原广播发送人：@operator") {
 				t.Fatalf("reply payload=%+v ok=%t", payload, ok)
 			}
 		})
+	}
+}
+
+func TestBroadcastUpstreamPayloadsShowContextAndPreserveMedia(t *testing.T) {
+	dispatch := broadcastDispatchContext{SenderLabel: "@operator", TargetDisplay: "广播分组 · 财务组（当前 3 个群）"}
+	for _, test := range []struct {
+		name    string
+		msg     telegram.Message
+		kind    string
+		fileID  string
+		content string
+	}{
+		{name: "text", msg: telegram.Message{Text: "原始文字"}, kind: "text", content: "原始内容：\n原始文字"},
+		{name: "photo", msg: telegram.Message{Photo: []telegram.Photo{{FileID: "photo"}}}, kind: "photo", fileID: "photo"},
+		{name: "photo caption", msg: telegram.Message{Photo: []telegram.Photo{{FileID: "photo-caption"}}, Caption: "原始说明"}, kind: "photo", fileID: "photo-caption", content: "原始说明：\n原始说明"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			payload, companion, ok := broadcastUpstreamPayloads(test.msg, dispatch)
+			if !ok || companion != nil || payload.Type != test.kind || payload.FileID != test.fileID {
+				t.Fatalf("payload=%+v companion=%+v ok=%t", payload, companion, ok)
+			}
+			visible := payload.Text
+			if payload.Type == "photo" {
+				visible = payload.Caption
+			}
+			if !strings.Contains(visible, "发送人：@operator") || !strings.Contains(visible, "发送目标：广播分组 · 财务组（当前 3 个群）") || !strings.Contains(visible, test.content) {
+				t.Fatalf("visible content=%q", visible)
+			}
+		})
+	}
+}
+
+func TestBroadcastUpstreamPayloadsKeepLongOriginalAndUseCompanion(t *testing.T) {
+	dispatch := broadcastDispatchContext{SenderLabel: "操作人", TargetDisplay: "单群 · 当前群名"}
+	longCaption := strings.Repeat("图", telegramCaptionLimitUnits+1)
+	payload, companion, ok := broadcastUpstreamPayloads(telegram.Message{
+		Photo: []telegram.Photo{{FileID: "original-photo"}}, Caption: longCaption,
+	}, dispatch)
+	if !ok || payload.Type != "photo" || payload.FileID != "original-photo" || payload.Caption != longCaption {
+		t.Fatalf("long media payload=%+v ok=%t", payload, ok)
+	}
+	if companion == nil || companion.Type != "text" || !strings.Contains(companion.Text, "发送人：操作人") || !strings.Contains(companion.Text, "发送目标：单群 · 当前群名") {
+		t.Fatalf("companion=%+v", companion)
+	}
+	longText := strings.Repeat("😀", telegramTextLimitUnits/2+1)
+	payload, companion, ok = broadcastUpstreamPayloads(telegram.Message{Text: longText}, dispatch)
+	if !ok || payload.Text != longText || companion == nil || telegramTextUnits(longText) <= telegramTextLimitUnits {
+		t.Fatalf("long text payload=%+v companion=%+v units=%d", payload, companion, telegramTextUnits(longText))
+	}
+}
+
+func TestBroadcastUpstreamCaptionBoundary(t *testing.T) {
+	dispatch := broadcastDispatchContext{SenderLabel: "@sender", TargetDisplay: "单群 · 群名"}
+	prefix := "发送人：@sender\n发送目标：单群 · 群名\n\n原始说明：\n"
+	exactCaption := strings.Repeat("a", telegramCaptionLimitUnits-telegramTextUnits(prefix))
+	payload, companion, ok := broadcastUpstreamPayloads(telegram.Message{Photo: []telegram.Photo{{FileID: "photo"}}, Caption: exactCaption}, dispatch)
+	if !ok || companion != nil || telegramTextUnits(payload.Caption) != telegramCaptionLimitUnits {
+		t.Fatalf("exact payload units=%d companion=%+v ok=%t", telegramTextUnits(payload.Caption), companion, ok)
+	}
+	payload, companion, ok = broadcastUpstreamPayloads(telegram.Message{Photo: []telegram.Photo{{FileID: "photo"}}, Caption: exactCaption + "b"}, dispatch)
+	if !ok || companion == nil || payload.Caption != exactCaption+"b" {
+		t.Fatalf("overflow payload=%+v companion=%+v ok=%t", payload, companion, ok)
+	}
+}
+
+func TestBroadcastSenderLabelPrefersUsernameThenDisplayName(t *testing.T) {
+	b := &Bot{}
+	if got := b.broadcastSenderLabel(context.Background(), storage.User{ID: 1, Username: "alice", DisplayName: "Alice"}); got != "@alice" {
+		t.Fatalf("username label=%q", got)
+	}
+	if got := b.broadcastSenderLabel(context.Background(), storage.User{ID: 2, DisplayName: "Alice Example"}); got != "Alice Example" {
+		t.Fatalf("display label=%q", got)
 	}
 }
 
@@ -257,10 +349,8 @@ func TestPostgresBroadcastReplyRecipientMatrixAndPreferences(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertBroadcastReplyRecipients(t, b.broadcastReplyRecipients(ctx, secondaryAID), secondaryAID, hostID, primaryBID)
-	assertBroadcastReplyRecipients(t, b.broadcastReplyRecipients(ctx, primaryAID),
-		primaryAID, hostID, defaultAID, defaultBID)
-	assertBroadcastReplyRecipients(t, b.broadcastReplyRecipients(ctx, defaultAID),
-		defaultAID, hostID, defaultBID)
+	assertBroadcastReplyRecipients(t, b.broadcastReplyRecipients(ctx, primaryAID), primaryAID, hostID)
+	assertBroadcastReplyRecipients(t, b.broadcastReplyRecipients(ctx, defaultAID), defaultAID)
 
 	brokenStore, err := storage.Open(ctx, dsn)
 	if err != nil {
@@ -295,6 +385,9 @@ func TestPostgresBroadcastUpstreamHierarchyAndObserverGrants(t *testing.T) {
 		}
 	}
 	b := &Bot{store: store, perms: permissions.NewPolicy(hostID, nil), loc: time.UTC, privateStates: newTTLCache[privateState](privateStateTTL)}
+	if got := b.broadcastSenderLabel(ctx, storage.User{ID: secondaryAID}); got != "upstream hierarchy" {
+		t.Fatalf("operator remark fallback label=%q", got)
+	}
 	assertInt64Slice(t, mustBroadcastUpstreamRecipients(t, b, ctx, hostID))
 	assertInt64Slice(t, mustBroadcastUpstreamRecipients(t, b, ctx, primaryAID), hostID)
 	assertInt64Slice(t, mustBroadcastUpstreamRecipients(t, b, ctx, secondaryAID), hostID, primaryAID)
@@ -302,6 +395,16 @@ func TestPostgresBroadcastUpstreamHierarchyAndObserverGrants(t *testing.T) {
 		t.Fatalf("grant broadcast observer changed=%v err=%v", changed, err)
 	}
 	assertInt64Slice(t, mustBroadcastUpstreamRecipients(t, b, ctx, secondaryAID), hostID, primaryAID, primaryBID)
+	if err := store.SetBroadcastMessagePreference(ctx, hostID, secondaryAID, false, true, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	assertInt64Slice(t, mustBroadcastUpstreamRecipients(t, b, ctx, secondaryAID), primaryAID, primaryBID)
+	assertBroadcastReplyRecipients(t, b.broadcastReplyRecipients(ctx, secondaryAID), secondaryAID, hostID, primaryAID)
+	if err := store.SetBroadcastMessagePreference(ctx, primaryBID, secondaryAID, false, false, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	assertInt64Slice(t, mustBroadcastUpstreamRecipients(t, b, ctx, secondaryAID), primaryAID)
+	assertBroadcastReplyRecipients(t, b.broadcastReplyRecipients(ctx, secondaryAID), secondaryAID, hostID, primaryAID)
 	if err := b.saveBroadcastTarget(ctx, secondaryAID, privateState{Mode: "chat", TargetChatID: -1001, TargetName: "target"}); err != nil {
 		t.Fatal(err)
 	}
@@ -309,6 +412,163 @@ func TestPostgresBroadcastUpstreamHierarchyAndObserverGrants(t *testing.T) {
 	b.InvalidateBroadcastPermission(secondaryAID)
 	if _, ok, err := store.GetTelegramBroadcastTarget(ctx, b.telegramInboxStreamKey(), secondaryAID); err != nil || ok {
 		t.Fatalf("revoked target remained ok=%t err=%v", ok, err)
+	}
+}
+
+func TestPostgresBroadcastReplyQuickReplyEligibilityTracksRecipientsAndRestart(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store, err := storage.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := int64(987000000000 + time.Now().UnixNano()%1000000)
+	hostID, directPrimaryID, observerPrimaryID, noPermissionObserverID, sourceID := base, base+1, base+2, base+3, base+4
+	targetChatID := -base - 10
+	now := time.Now().UTC()
+	for _, op := range []struct {
+		id, parent int64
+		level      string
+	}{
+		{directPrimaryID, 0, "primary"},
+		{observerPrimaryID, 0, "primary"},
+		{noPermissionObserverID, 0, "primary"},
+		{sourceID, directPrimaryID, "secondary"},
+	} {
+		if err := store.UpsertGlobalOperator(ctx, op.id, op.level, op.parent, hostID, "quick reply role", now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.EnsureGroup(ctx, targetChatID, "quick reply group", now); err != nil {
+		t.Fatal(err)
+	}
+	for _, userID := range []int64{sourceID, directPrimaryID, observerPrimaryID} {
+		if err := store.AddBroadcastPermission(ctx, userID, "chat", targetChatID, "", hostID, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, observerID := range []int64{observerPrimaryID, noPermissionObserverID} {
+		if _, err := store.UpsertOperatorMessageObserverGrant(ctx, sourceID, observerID, false, true, hostID, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deliveryID, err := store.InsertBroadcastDelivery(ctx, storage.BroadcastDelivery{
+		OperatorUserID: sourceID, SourceChatID: sourceID, SourceMessageID: base + 20,
+		TargetChatID: targetChatID, TargetTitle: "quick reply group", TargetMessageID: base + 21,
+		Mode: "group", TargetName: "group", CreatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery, ok, err := store.GetBroadcastDelivery(ctx, deliveryID)
+	if err != nil || !ok {
+		t.Fatalf("delivery=%+v ok=%t err=%v", delivery, ok, err)
+	}
+	policy := permissions.NewPolicy(hostID, nil)
+	b := &Bot{store: store, perms: policy}
+	for _, userID := range []int64{hostID, sourceID, directPrimaryID, observerPrimaryID, noPermissionObserverID} {
+		if allowed, err := b.canQuickReplyDeliveryFresh(ctx, userID, delivery); err != nil || !allowed {
+			t.Fatalf("user %d quick reply allowed=%t err=%v", userID, allowed, err)
+		}
+	}
+	if err := store.SetBroadcastMessagePreference(ctx, observerPrimaryID, sourceID, true, false, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if allowed, err := b.canQuickReplyDeliveryFresh(ctx, observerPrimaryID, delivery); err != nil || allowed {
+		t.Fatalf("observer with reply preference disabled allowed=%t err=%v", allowed, err)
+	}
+	if allowed, err := b.canQuickReplyDeliveryFresh(ctx, noPermissionObserverID, delivery); err != nil || !allowed {
+		t.Fatalf("independent observer without group membership allowed=%t err=%v", allowed, err)
+	}
+	if changed, err := store.RevokeOperatorMessageObserverGrant(ctx, sourceID, noPermissionObserverID, hostID, now.Add(2*time.Second)); err != nil || !changed {
+		t.Fatalf("revoke observer grant changed=%t err=%v", changed, err)
+	}
+	if allowed, err := b.canQuickReplyDeliveryFresh(ctx, noPermissionObserverID, delivery); err != nil || allowed {
+		t.Fatalf("observer after grant revoke allowed=%t err=%v", allowed, err)
+	}
+	store.Close()
+	restartedStore, err := storage.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restartedStore.Close()
+	restarted := &Bot{store: restartedStore, perms: policy}
+	delivery, ok, err = restartedStore.GetBroadcastDelivery(ctx, deliveryID)
+	if err != nil || !ok || !restarted.canQuickReplyDelivery(ctx, hostID, delivery) || !restarted.canQuickReplyDelivery(ctx, directPrimaryID, delivery) || restarted.canQuickReplyDelivery(ctx, observerPrimaryID, delivery) {
+		t.Fatalf("restart delivery=%+v ok=%t host=%t direct=%t observer=%t err=%v", delivery, ok,
+			restarted.canQuickReplyDelivery(ctx, hostID, delivery), restarted.canQuickReplyDelivery(ctx, directPrimaryID, delivery), restarted.canQuickReplyDelivery(ctx, observerPrimaryID, delivery), err)
+	}
+}
+
+func TestPostgresBroadcastDispatchTargetUsesCurrentChatAndGroupNames(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store, err := storage.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	base := int64(988000000000 + time.Now().UnixNano()%1000000)
+	hostID, chatA, chatB := base, -base-10, -base-11
+	now := time.Now().UTC()
+	if err := store.EnsureGroup(ctx, chatA, "旧群名", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnsureGroup(ctx, chatB, "第二群", now); err != nil {
+		t.Fatal(err)
+	}
+	groupName := fmt.Sprintf("当前分组-%d", base)
+	if err := store.UpsertBroadcastGroup(ctx, groupName, hostID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddChatsToBroadcastGroup(ctx, groupName, []int64{chatA}, now); err != nil {
+		t.Fatal(err)
+	}
+	group, ok, err := store.GetBroadcastGroup(ctx, groupName)
+	if err != nil || !ok {
+		t.Fatalf("group=%+v ok=%t err=%v", group, ok, err)
+	}
+	b := &Bot{store: store, perms: permissions.NewPolicy(hostID, nil), loc: time.UTC}
+	if err := b.saveBroadcastTarget(ctx, hostID, privateState{Mode: "group", GroupID: group.ID, TargetName: groupName}); err != nil {
+		t.Fatal(err)
+	}
+	chatTargets, chatName, chatDisplay, err := b.resolveCurrentBroadcastTarget(ctx, hostID, privateState{Mode: "chat", TargetChatID: chatA, TargetName: "过期群名"})
+	if err != nil || len(chatTargets) != 1 || chatName != "旧群名" || chatDisplay != "单群 · 旧群名" {
+		t.Fatalf("chat targets=%+v name=%q display=%q err=%v", chatTargets, chatName, chatDisplay, err)
+	}
+	if err := store.EnsureGroup(ctx, chatA, "新群名", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	_, chatName, chatDisplay, err = b.resolveCurrentBroadcastTarget(ctx, hostID, privateState{Mode: "chat", TargetChatID: chatA, TargetName: "旧群名"})
+	if err != nil || chatName != "新群名" || chatDisplay != "单群 · 新群名" {
+		t.Fatalf("renamed chat name=%q display=%q err=%v", chatName, chatDisplay, err)
+	}
+	if _, err := store.AddChatsToBroadcastGroup(ctx, groupName, []int64{chatB}, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	renamed := groupName + "-renamed"
+	if changed, _, err := store.RenameBroadcastGroup(ctx, groupName, renamed, hostID, true, now.Add(3*time.Second)); err != nil || !changed {
+		t.Fatalf("rename changed=%t err=%v", changed, err)
+	}
+	restoredGroupState, ok, err := b.loadBroadcastTargetState(ctx, hostID)
+	if err != nil || !ok {
+		t.Fatalf("restored renamed group state=%+v ok=%t err=%v", restoredGroupState, ok, err)
+	}
+	groupTargets, currentGroupName, groupDisplay, err := b.resolveCurrentBroadcastTarget(ctx, hostID, restoredGroupState)
+	if err != nil || len(groupTargets) != 2 || currentGroupName != renamed || !strings.Contains(groupDisplay, renamed) || !strings.Contains(groupDisplay, "当前 2 个群") {
+		t.Fatalf("group targets=%+v name=%q display=%q err=%v", groupTargets, currentGroupName, groupDisplay, err)
+	}
+	allTargets, allName, allDisplay, err := b.resolveCurrentBroadcastTarget(ctx, hostID, privateState{Mode: "all"})
+	if err != nil || len(allTargets) < 2 || allName != "全部授权群" || !strings.Contains(allDisplay, fmt.Sprintf("当前 %d 个群", len(allTargets))) {
+		t.Fatalf("all targets=%d name=%q display=%q err=%v", len(allTargets), allName, allDisplay, err)
 	}
 }
 

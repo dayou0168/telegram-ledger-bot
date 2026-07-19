@@ -827,6 +827,16 @@ func TestPostgresBroadcastReplyPreferencesUpgradeAndOverrides(t *testing.T) {
 	if _, err := admin.Exec(ctx, "DROP TABLE "+quotedSchema+".broadcast_reply_preferences"); err != nil {
 		t.Fatalf("drop reply preference fixture: %v", err)
 	}
+	if _, err := admin.Exec(ctx, `CREATE TABLE `+quotedSchema+`.broadcast_reply_preferences(
+		observer_user_id BIGINT NOT NULL,source_user_id BIGINT NOT NULL,enabled BOOLEAN NOT NULL,
+		updated_at TIMESTAMPTZ NOT NULL,PRIMARY KEY(observer_user_id,source_user_id),
+		CONSTRAINT broadcast_reply_preferences_distinct_users CHECK(observer_user_id<>source_user_id))`); err != nil {
+		t.Fatalf("create legacy reply preference fixture: %v", err)
+	}
+	if _, err := admin.Exec(ctx, `INSERT INTO `+quotedSchema+`.broadcast_reply_preferences(observer_user_id,source_user_id,enabled,updated_at)
+		VALUES(70001,70002,FALSE,NOW())`); err != nil {
+		t.Fatalf("insert legacy reply preference fixture: %v", err)
+	}
 	if _, err := admin.Exec(ctx, "DELETE FROM "+quotedSchema+".schema_migrations WHERE version=$1", latestSchemaMigrationVersion); err != nil {
 		t.Fatalf("delete reply preference marker: %v", err)
 	}
@@ -841,11 +851,26 @@ func TestPostgresBroadcastReplyPreferencesUpgradeAndOverrides(t *testing.T) {
 		t.Fatalf("upgrade Open: %v", err)
 	}
 	defer store.Close()
-	reopened, err := Open(ctx, migrationURL)
-	if err != nil {
-		t.Fatalf("idempotent Open: %v", err)
+	var wg sync.WaitGroup
+	openErrors := make(chan error, 2)
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			reopened, openErr := Open(ctx, migrationURL)
+			if openErr == nil {
+				reopened.Close()
+			}
+			openErrors <- openErr
+		}()
 	}
-	reopened.Close()
+	wg.Wait()
+	close(openErrors)
+	for openErr := range openErrors {
+		if openErr != nil {
+			t.Fatalf("concurrent idempotent Open: %v", openErr)
+		}
+	}
 
 	var tableCount, indexCount, constraintCount, markerCount int
 	if err := admin.QueryRow(ctx, `SELECT count(*) FROM pg_catalog.pg_tables
@@ -869,6 +894,10 @@ func TestPostgresBroadcastReplyPreferencesUpgradeAndOverrides(t *testing.T) {
 	}
 	if tableCount != 1 || indexCount != 1 || constraintCount != 1 || markerCount != 1 {
 		t.Fatalf("upgrade table=%d index=%d constraint=%d marker=%d", tableCount, indexCount, constraintCount, markerCount)
+	}
+	legacy, err := store.BroadcastMessagePreferenceOverrides(ctx, 70001)
+	if err != nil || !legacy[70002].ReceiveBroadcast || legacy[70002].ReceiveReply {
+		t.Fatalf("legacy preference migration=%+v err=%v", legacy, err)
 	}
 
 	observerA, observerB, source := int64(71001), int64(71002), int64(72001)
@@ -896,6 +925,13 @@ func TestPostgresBroadcastReplyPreferencesUpgradeAndOverrides(t *testing.T) {
 	}
 	if err := store.SetBroadcastReplyPreference(ctx, source, source, false, now); err == nil {
 		t.Fatal("self preference must be rejected")
+	}
+	if err := store.SetBroadcastMessagePreference(ctx, observerA, source, false, true, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	messagePreferences, err := store.BroadcastMessagePreferenceOverridesForSource(ctx, source, []int64{observerA, observerB})
+	if err != nil || messagePreferences[observerA].ReceiveBroadcast || !messagePreferences[observerA].ReceiveReply || !messagePreferences[observerB].ReceiveBroadcast || !messagePreferences[observerB].ReceiveReply {
+		t.Fatalf("message preferences=%+v err=%v", messagePreferences, err)
 	}
 }
 

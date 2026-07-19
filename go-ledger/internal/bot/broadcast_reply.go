@@ -29,14 +29,14 @@ func (b *Bot) notifyBroadcastReplyAsync(ctx context.Context, msg telegram.Messag
 		if !ok || delivery.OperatorUserID == 0 {
 			return
 		}
-		delivery = b.tryReplaceBroadcastDelivery(jobCtx, delivery, msg.ReplyTo.Caption)
-		payload, payloadOK := broadcastReplyPayload(msg, user, delivery)
+		delivery = b.tryReplaceBroadcastDelivery(jobCtx, delivery, *msg.ReplyTo)
+		broadcastSender := b.broadcastDeliverySenderLabel(jobCtx, delivery)
+		payload, payloadOK := broadcastReplyPayload(msg, user, delivery, broadcastSender)
 		if !payloadOK {
 			return
 		}
-		operatorCanReply := b.canQuickReplyDelivery(jobCtx, delivery.OperatorUserID, delivery)
 		for recipient := range b.broadcastReplyRecipients(jobCtx, delivery.OperatorUserID) {
-			keyboard := broadcastReplyKeyboard(msg, delivery, recipient == delivery.OperatorUserID && operatorCanReply)
+			keyboard := broadcastReplyKeyboard(msg, delivery, b.canQuickReplyDelivery(jobCtx, recipient, delivery))
 			var replyToUpstreamID int64
 			if upstream, upstreamOK, upstreamErr := b.store.GetBroadcastUpstreamMessage(jobCtx, delivery.SourceChatID, delivery.SourceMessageID, recipient); upstreamErr != nil {
 				log.Printf("load broadcast upstream reply target: %v", upstreamErr)
@@ -70,7 +70,7 @@ func (b *Bot) handleBroadcastReplyCallback(ctx context.Context, cb telegram.Call
 		return err
 	}
 	if !ok || !b.canQuickReplyDelivery(ctx, cb.From.ID, delivery) {
-		return b.tg.AnswerCallback(ctx, cb.ID, "通知已失效")
+		return b.tg.AnswerCallback(ctx, cb.ID, "当前无快速回复权限")
 	}
 	quickState := privateState{
 		Mode:                 "quick_reply",
@@ -144,40 +144,24 @@ func (b *Bot) quickReplyDeliveryFresh(ctx context.Context, userID int64, state p
 }
 
 func (b *Bot) canQuickReplyDeliveryFresh(ctx context.Context, userID int64, delivery storage.BroadcastDelivery) (bool, error) {
-	if userID <= 0 || delivery.OperatorUserID != userID {
+	if userID <= 0 || delivery.OperatorUserID <= 0 {
 		return false, nil
 	}
-	allowed, err := b.canUseBroadcastFresh(ctx, userID)
-	if err != nil || !allowed {
-		return false, err
-	}
-	groups, err := b.store.ListAllowedBroadcastChats(ctx, userID, b.perms.HasGlobalBroadcastAccess(userID))
+	recipients, err := b.resolveBroadcastReplyRecipients(ctx, delivery.OperatorUserID)
 	if err != nil {
 		return false, err
 	}
-	for _, group := range groups {
-		if group.ChatID == delivery.TargetChatID {
-			return true, nil
-		}
-	}
-	return false, nil
+	_, allowed := recipients[userID]
+	return allowed, nil
 }
 
 func (b *Bot) canQuickReplyDelivery(ctx context.Context, userID int64, delivery storage.BroadcastDelivery) bool {
-	if userID <= 0 || delivery.OperatorUserID != userID || !b.canUseBroadcast(ctx, userID) {
-		return false
-	}
-	allowed, err := b.store.ListAllowedBroadcastChats(ctx, userID, b.perms.HasGlobalBroadcastAccess(userID))
+	allowed, err := b.canQuickReplyDeliveryFresh(ctx, userID, delivery)
 	if err != nil {
-		log.Printf("check quick reply target permission %d: %v", userID, err)
+		log.Printf("check quick reply permission %d: %v", userID, err)
 		return false
 	}
-	for _, group := range allowed {
-		if group.ChatID == delivery.TargetChatID {
-			return true
-		}
-	}
-	return false
+	return allowed
 }
 
 func broadcastReplyKeyboard(msg telegram.Message, delivery storage.BroadcastDelivery, quickReply bool) telegram.InlineKeyboardMarkup {
@@ -185,7 +169,9 @@ func broadcastReplyKeyboard(msg telegram.Message, delivery storage.BroadcastDeli
 	if quickReply {
 		rows = append(rows, []telegram.InlineKeyboardButton{{Text: "快速回复", CallbackData: "br:q:" + formatID(delivery.ID)}})
 	}
-	rows = append(rows, replyLinkButtons(msg, delivery))
+	if delivery.Mode != "chat" {
+		rows = append(rows, replyLinkButtons(msg, delivery))
+	}
 	return telegram.InlineKeyboardMarkup{InlineKeyboard: rows}
 }
 
@@ -261,17 +247,17 @@ func (b *Bot) findBroadcastDeliveryByID(ctx context.Context, id int64) (storage.
 	return b.store.GetBroadcastDelivery(ctx, id)
 }
 
-func formatBroadcastReplyNotice(msg telegram.Message, user storage.User, delivery storage.BroadcastDelivery) string {
-	return formatBroadcastReplyNoticeLimit(msg, user, delivery, 1200)
+func formatBroadcastReplyNotice(msg telegram.Message, user storage.User, delivery storage.BroadcastDelivery, broadcastSender string) string {
+	return formatBroadcastReplyNoticeLimit(msg, user, delivery, broadcastSender, 1200)
 }
 
-func formatBroadcastReplyNoticeLimit(msg telegram.Message, user storage.User, delivery storage.BroadcastDelivery, contentLimit int) string {
+func formatBroadcastReplyNoticeLimit(msg telegram.Message, user storage.User, delivery storage.BroadcastDelivery, broadcastSender string, contentLimit int) string {
 	group := delivery.TargetTitle
 	if group == "" {
 		group = msg.Chat.Title
 	}
 	if group == "" {
-		group = formatID(msg.Chat.ID)
+		group = "未命名群"
 	}
 	content := strings.TrimSpace(msg.TextOrCaption())
 	if content == "" {
@@ -289,67 +275,80 @@ func formatBroadcastReplyNoticeLimit(msg telegram.Message, user storage.User, de
 	}
 	sender := html.EscapeString(user.DisplayName)
 	if sender == "" {
-		sender = formatID(user.ID)
+		sender = "未命名成员"
 	}
 	sender = `<a href="tg://user?id=` + formatID(user.ID) + `">` + sender + `</a>`
-	return fmt.Sprintf("群：%s\n人：%s\n\n内容：\n\n%s", groupLabel, sender, html.EscapeString(trimRunes(content, contentLimit)))
+	broadcastSender = html.EscapeString(trimSingleLine(broadcastSender, 80))
+	if broadcastSender == "" {
+		broadcastSender = "未命名操作人"
+	}
+	return fmt.Sprintf("来源群：%s\n回复人：%s\n原广播发送人：%s\n\n回复内容：\n\n%s", groupLabel, sender, broadcastSender, html.EscapeString(trimRunes(content, contentLimit)))
 }
 
-func broadcastReplyPayload(msg telegram.Message, user storage.User, delivery storage.BroadcastDelivery) (reliablePayload, bool) {
+func broadcastReplyPayload(msg telegram.Message, user storage.User, delivery storage.BroadcastDelivery, broadcastSender string) (reliablePayload, bool) {
 	if len(msg.Photo) > 0 {
 		fileID := strings.TrimSpace(msg.Photo[len(msg.Photo)-1].FileID)
 		if fileID == "" {
 			return reliablePayload{}, false
 		}
-		return reliablePayload{Type: "photo", FileID: fileID, Caption: formatBroadcastReplyNoticeLimit(msg, user, delivery, 650)}, true
+		return reliablePayload{Type: "photo", FileID: fileID, Caption: formatBroadcastReplyNoticeLimit(msg, user, delivery, broadcastSender, 650)}, true
 	}
-	return reliablePayload{Type: "text", Text: formatBroadcastReplyNotice(msg, user, delivery)}, true
+	return reliablePayload{Type: "text", Text: formatBroadcastReplyNotice(msg, user, delivery, broadcastSender)}, true
+}
+
+func (b *Bot) broadcastDeliverySenderLabel(ctx context.Context, delivery storage.BroadcastDelivery) string {
+	if source, ok, err := b.store.GetUser(ctx, delivery.SourceChatID, delivery.OperatorUserID); err == nil && ok {
+		return b.broadcastSenderLabel(ctx, source)
+	}
+	return b.broadcastSenderLabel(ctx, storage.User{ID: delivery.OperatorUserID})
 }
 
 func (b *Bot) broadcastReplyRecipients(ctx context.Context, operatorID int64) map[int64]struct{} {
+	recipients, err := b.resolveBroadcastReplyRecipients(ctx, operatorID)
+	if err != nil {
+		log.Printf("resolve broadcast reply recipients for source %d: %v", operatorID, err)
+		return map[int64]struct{}{operatorID: {}}
+	}
+	return recipients
+}
+
+func (b *Bot) resolveBroadcastReplyRecipients(ctx context.Context, operatorID int64) (map[int64]struct{}, error) {
 	recipients := map[int64]struct{}{}
-	if operatorID != 0 {
+	senderActive, err := b.broadcastReplySenderActive(ctx, operatorID)
+	if err != nil {
+		return nil, err
+	}
+	if senderActive {
 		recipients[operatorID] = struct{}{}
 	}
-	defaults := make(map[int64]struct{})
-	operator, ok, err := b.store.GetGlobalOperator(ctx, operatorID)
+	ceilings, err := b.broadcastRecipientCeilings(ctx, operatorID)
 	if err != nil {
-		log.Printf("load broadcast reply source operator: %v", err)
-		return recipients
+		return nil, err
 	}
-	if ok && operator.Status == "active" && operator.Level == "secondary" {
-		resolved, resolveErr := b.store.ResolveOperatorMessageRecipients(ctx, operatorID, b.perms.HostUserID())
-		if resolveErr != nil {
-			log.Printf("resolve broadcast reply recipients for source %d: %v", operatorID, resolveErr)
-			return recipients
-		}
-		for _, recipientID := range resolved.Reply {
-			if recipientID > 0 && recipientID != operatorID {
-				defaults[recipientID] = struct{}{}
-			}
-		}
-	} else {
-		for _, observerID := range b.perms.PrivilegedUserIDs() {
-			if observerID != 0 && observerID != operatorID {
-				defaults[observerID] = struct{}{}
-			}
-		}
-	}
-	observerIDs := make([]int64, 0, len(defaults))
-	for observerID := range defaults {
-		observerIDs = append(observerIDs, observerID)
-	}
-	overrides, err := b.store.BroadcastReplyPreferenceOverridesForSource(ctx, operatorID, observerIDs)
+	overrides, err := b.store.BroadcastMessagePreferenceOverridesForSource(ctx, operatorID, ceilings.Reply)
 	if err != nil {
-		log.Printf("load broadcast reply preferences for source %d: %v", operatorID, err)
-		return recipients
+		return nil, err
 	}
-	for observerID := range defaults {
-		if enabled, exists := overrides[observerID]; !exists || enabled {
+	for _, observerID := range ceilings.Reply {
+		if preference, exists := overrides[observerID]; !exists || preference.ReceiveReply {
 			recipients[observerID] = struct{}{}
 		}
 	}
-	return recipients
+	return recipients, nil
+}
+
+func (b *Bot) broadcastReplySenderActive(ctx context.Context, operatorID int64) (bool, error) {
+	if operatorID <= 0 {
+		return false, nil
+	}
+	if b.perms.IsPrivileged(operatorID) {
+		return true, nil
+	}
+	operator, ok, err := b.store.GetGlobalOperator(ctx, operatorID)
+	if err != nil {
+		return false, err
+	}
+	return ok && operator.Status == "active", nil
 }
 
 func replyLinkButtons(msg telegram.Message, delivery storage.BroadcastDelivery) []telegram.InlineKeyboardButton {

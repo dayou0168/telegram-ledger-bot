@@ -428,7 +428,7 @@ func (b *Bot) handleBroadcastMaterial(ctx context.Context, msg telegram.Message,
 		b.privateStates.Set(formatID(user.ID), state)
 		return b.refreshBroadcastSessionKeyboard(ctx, msg, state)
 	}
-	targets, err := b.currentBroadcastTargets(ctx, user.ID, state)
+	targets, targetName, targetDisplay, err := b.resolveCurrentBroadcastTarget(ctx, user.ID, state)
 	if err != nil {
 		return err
 	}
@@ -439,43 +439,44 @@ func (b *Bot) handleBroadcastMaterial(ctx context.Context, msg telegram.Message,
 	}
 	sourceChatID := msg.Chat.ID
 	sourceMessageID := msg.MessageID
-	targetName := state.TargetName
+	if targetName != state.TargetName {
+		state.TargetName = targetName
+		if err := b.saveBroadcastTarget(ctx, user.ID, state); err != nil {
+			return err
+		}
+		b.privateStates.Set(formatID(user.ID), state)
+	}
 	mode := state.Mode
 	notifyAll := state.NotifyAll
 	operatorID := user.ID
 	sessionKeyboard := broadcastSessionKeyboard(targetName, notifyAll)
-	status, err := b.sendText(ctx, sendPriorityNormal, msg.Chat.ID, formatBroadcastProgressText(mode, len(targets)), map[string]any{
-		"reply_markup": sessionKeyboard,
-	})
-	if err != nil {
-		return err
+	resultDedupeKey := fmt.Sprintf("broadcast_result:%d:%d", sourceChatID, sourceMessageID)
+	enqueueResult := func(resultCtx context.Context, text string, resultNow time.Time) error {
+		return b.enqueueReliableText(resultCtx, sendPriorityNormal, "broadcast_result", resultDedupeKey, sourceChatID, text, map[string]any{
+			"reply_markup": sessionKeyboard,
+		}, reliableMessageRef{}, resultNow)
 	}
 	jobDone := make(chan error, 1)
 	job := func(jobCtx context.Context) {
-		if err := b.enqueueBroadcastUpstreamCopies(jobCtx, msg, operatorID, time.Now().In(b.loc)); err != nil {
-			jobDone <- err
+		jobNow := time.Now().In(b.loc)
+		dispatch := broadcastDispatchContext{TargetDisplay: targetDisplay}
+		if err := b.enqueueBroadcastUpstreamCopies(jobCtx, msg, user, dispatch, jobNow); err != nil {
+			if resultErr := enqueueResult(jobCtx, formatBroadcastResultText(0, len(targets)), jobNow); resultErr != nil {
+				jobDone <- fmt.Errorf("enqueue upstream copies: %w; enqueue result: %v", err, resultErr)
+				return
+			}
+			jobDone <- nil
 			return
 		}
 		success, failed := b.copyBroadcast(jobCtx, operatorID, sourceChatID, sourceMessageID, targets, mode, targetName, notifyAll)
-		text := formatBroadcastResultText(mode, success, failed, notifyAll)
-		if _, err := b.editText(jobCtx, sourceChatID, status.MessageID, text, nil); err != nil {
-			log.Printf("edit broadcast result: %v", err)
-			b.deleteMessageBestEffort(jobCtx, sourceChatID, status.MessageID)
-			if err := b.enqueueReliableText(jobCtx, sendPriorityLow, "broadcast_result", fmt.Sprintf("broadcast_result:%d:%d", sourceChatID, sourceMessageID), sourceChatID, text, map[string]any{"reply_markup": sessionKeyboard}, reliableMessageRef{}, time.Now().In(b.loc)); err != nil {
-				log.Printf("enqueue broadcast result fallback: %v", err)
-				jobDone <- err
-				return
-			}
+		if err := enqueueResult(jobCtx, formatBroadcastResultText(success, failed), time.Now().In(b.loc)); err != nil {
+			jobDone <- err
+			return
 		}
 		jobDone <- nil
 	}
 	submitted, err := submitBroadcastJob(b.broadcastPool, job, func() error {
-		text := "发送失败：广播队列繁忙，请稍后重试。"
-		if _, err := b.editText(ctx, sourceChatID, status.MessageID, text, nil); err != nil {
-			b.deleteMessageBestEffort(ctx, sourceChatID, status.MessageID)
-			return b.enqueueReliableText(ctx, sendPriorityNormal, "broadcast_queue_full", fmt.Sprintf("broadcast_queue_full:%d:%d", sourceChatID, sourceMessageID), sourceChatID, text, map[string]any{"reply_markup": sessionKeyboard}, reliableMessageRef{}, now)
-		}
-		return nil
+		return enqueueResult(ctx, "发送失败，请稍后重试。", now)
 	})
 	if err != nil {
 		return err
@@ -502,10 +503,15 @@ func submitBroadcastJob(pool *worker.Pool, job worker.Job, onFull func() error) 
 }
 
 func (b *Bot) currentBroadcastTargets(ctx context.Context, userID int64, state privateState) ([]storage.Group, error) {
+	targets, _, _, err := b.resolveCurrentBroadcastTarget(ctx, userID, state)
+	return targets, err
+}
+
+func (b *Bot) resolveCurrentBroadcastTarget(ctx context.Context, userID int64, state privateState) ([]storage.Group, string, string, error) {
 	var allowed []storage.Group
 	var err error
+	var group storage.BroadcastGroup
 	if state.Mode == "group" {
-		var group storage.BroadcastGroup
 		var ok bool
 		var groupErr error
 		if state.GroupID > 0 {
@@ -514,18 +520,20 @@ func (b *Bot) currentBroadcastTargets(ctx context.Context, userID int64, state p
 			group, ok, groupErr = b.store.GetBroadcastGroup(ctx, state.TargetName)
 		}
 		if groupErr != nil || !ok {
-			return nil, groupErr
+			return nil, "", "", groupErr
 		}
 		allowed, err = b.allowedChatsForBroadcastGroup(ctx, userID, group.Name)
 	} else {
 		allowed, err = b.store.ListAllowedBroadcastChats(ctx, userID, b.perms.HasGlobalBroadcastAccess(userID))
 	}
 	if err != nil {
-		return nil, err
+		return nil, "", "", err
 	}
 	switch state.Mode {
-	case "all", "group":
-		return allowed, nil
+	case "all":
+		return allowed, "全部授权群", fmt.Sprintf("全部授权群（当前 %d 个群）", len(allowed)), nil
+	case "group":
+		return allowed, group.Name, fmt.Sprintf("广播分组 · %s（当前 %d 个群）", trimSingleLine(group.Name, 120), len(allowed)), nil
 	case "chat":
 		targetChatID := state.TargetChatID
 		if targetChatID == 0 && len(state.ChatIDs) == 1 {
@@ -533,11 +541,15 @@ func (b *Bot) currentBroadcastTargets(ctx context.Context, userID int64, state p
 		}
 		for _, target := range allowed {
 			if target.ChatID == targetChatID {
-				return []storage.Group{target}, nil
+				title := strings.TrimSpace(target.Title)
+				if title == "" {
+					title = "未命名群"
+				}
+				return []storage.Group{target}, title, "单群 · " + trimSingleLine(title, 140), nil
 			}
 		}
 	}
-	return nil, nil
+	return nil, "", "", nil
 }
 
 func intersectBroadcastTargets(original []int64, allowed []storage.Group) []storage.Group {
@@ -617,28 +629,14 @@ func (b *Bot) copyBroadcast(ctx context.Context, operatorID, fromChatID, message
 	return success, failed
 }
 
-func formatBroadcastProgressText(mode string, count int) string {
-	if mode == "chat" && count == 1 {
-		return "发送中..."
+func formatBroadcastResultText(success, failed int) string {
+	if failed == 0 && success > 0 {
+		return "发送完成"
 	}
-	return fmt.Sprintf("广播发送中：目标 %d 个。", count)
-}
-
-func formatBroadcastResultText(mode string, success, failed int, notifyAll bool) string {
-	var text string
-	if mode == "chat" && success+failed == 1 {
-		if success == 1 {
-			text = "发送完成。"
-		} else {
-			text = "发送失败。"
-		}
-	} else {
-		text = fmt.Sprintf("广播完成：成功 %d 个，失败 %d 个。", success, failed)
+	if success > 0 {
+		return fmt.Sprintf("部分发送失败：失败 %d 个。", failed)
 	}
-	if notifyAll {
-		text += "\n通知所有人：开启"
-	}
-	return text
+	return "发送失败，请稍后重试。"
 }
 
 func formatBroadcastReadyText(name string, count int, notifyAll bool) string {

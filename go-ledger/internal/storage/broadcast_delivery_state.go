@@ -76,7 +76,7 @@ func (s *Store) DeleteTelegramBroadcastTarget(ctx context.Context, streamKey str
 	return err
 }
 
-func (s *Store) EnqueueBroadcastUpstreamMessage(ctx context.Context, item NotificationOutbox, sourceOperatorUserID, sourceChatID, sourceMessageID, recipientUserID int64, now time.Time) (bool, BroadcastUpstreamMessage, error) {
+func (s *Store) EnqueueBroadcastUpstreamMessage(ctx context.Context, item NotificationOutbox, sourceOperatorUserID, sourceChatID, sourceMessageID, recipientUserID int64, now time.Time, companionItems ...NotificationOutbox) (bool, BroadcastUpstreamMessage, error) {
 	item.Kind = strings.TrimSpace(item.Kind)
 	item.DedupeKey = strings.TrimSpace(item.DedupeKey)
 	item.PayloadType = strings.TrimSpace(item.PayloadType)
@@ -91,6 +91,33 @@ func (s *Store) EnqueueBroadcastUpstreamMessage(ctx context.Context, item Notifi
 		return false, BroadcastUpstreamMessage{}, err
 	}
 	defer rollback(ctx, tx)
+	insertOutbox := func(candidate NotificationOutbox) (bool, int64, error) {
+		candidate.Kind = strings.TrimSpace(candidate.Kind)
+		candidate.DedupeKey = strings.TrimSpace(candidate.DedupeKey)
+		candidate.PayloadType = strings.TrimSpace(candidate.PayloadType)
+		if candidate.PayloadType == "" {
+			candidate.PayloadType = "text"
+		}
+		if candidate.Kind == "" || candidate.DedupeKey == "" {
+			return false, 0, errors.New("broadcast upstream companion is incomplete")
+		}
+		var outboxID int64
+		inserted := true
+		err := tx.QueryRow(ctx, `INSERT INTO notification_outbox(
+			kind,dedupe_key,chat_id,text,payload_type,file_id,caption,parse_mode,disable_preview,
+			reply_to_message_id,reply_to_upstream_id,reply_markup_json,reference_kind,reference_id,
+			priority,status,attempts,next_attempt_at,created_at,updated_at
+		) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'pending',0,$16,$16,$16)
+		ON CONFLICT(dedupe_key) DO NOTHING RETURNING id`, candidate.Kind, candidate.DedupeKey, candidate.ChatID,
+			candidate.Text, candidate.PayloadType, candidate.FileID, candidate.Caption, candidate.ParseMode,
+			candidate.DisablePreview, candidate.ReplyToMessageID, candidate.ReplyToUpstreamID,
+			candidate.ReplyMarkupJSON, candidate.ReferenceKind, candidate.ReferenceID, candidate.Priority, now).Scan(&outboxID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			inserted = false
+			err = tx.QueryRow(ctx, `SELECT id FROM notification_outbox WHERE dedupe_key=$1`, candidate.DedupeKey).Scan(&outboxID)
+		}
+		return inserted, outboxID, err
+	}
 	var existing BroadcastUpstreamMessage
 	err = tx.QueryRow(ctx, `SELECT id,source_operator_user_id,source_chat_id,source_message_id,recipient_user_id,
 		outbox_id,telegram_message_id,created_at,sent_at FROM broadcast_upstream_messages
@@ -99,24 +126,22 @@ func (s *Store) EnqueueBroadcastUpstreamMessage(ctx context.Context, item Notifi
 		&existing.SourceChatID, &existing.SourceMessageID, &existing.RecipientUserID, &existing.OutboxID,
 		&existing.TelegramMessageID, &existing.CreatedAt, &existing.SentAt)
 	if err == nil {
-		return false, existing, tx.Commit(ctx)
+		inserted := false
+		for _, companion := range companionItems {
+			companion.ChatID = recipientUserID
+			companion.ReplyToUpstreamID = existing.ID
+			companionInserted, _, companionErr := insertOutbox(companion)
+			if companionErr != nil {
+				return false, BroadcastUpstreamMessage{}, companionErr
+			}
+			inserted = inserted || companionInserted
+		}
+		return inserted, existing, tx.Commit(ctx)
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return false, BroadcastUpstreamMessage{}, err
 	}
-	var outboxID int64
-	inserted := true
-	err = tx.QueryRow(ctx, `INSERT INTO notification_outbox(
-		kind,dedupe_key,chat_id,text,payload_type,file_id,caption,parse_mode,disable_preview,
-		reply_to_message_id,reply_to_upstream_id,reply_markup_json,priority,status,attempts,next_attempt_at,created_at,updated_at
-	) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'pending',0,$14,$14,$14)
-	ON CONFLICT(dedupe_key) DO NOTHING RETURNING id`, item.Kind, item.DedupeKey, item.ChatID,
-		item.Text, item.PayloadType, item.FileID, item.Caption, item.ParseMode, item.DisablePreview,
-		item.ReplyToMessageID, item.ReplyToUpstreamID, item.ReplyMarkupJSON, item.Priority, now).Scan(&outboxID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		inserted = false
-		err = tx.QueryRow(ctx, `SELECT id FROM notification_outbox WHERE dedupe_key=$1`, item.DedupeKey).Scan(&outboxID)
-	}
+	inserted, outboxID, err := insertOutbox(item)
 	if err != nil {
 		return false, BroadcastUpstreamMessage{}, err
 	}
@@ -136,6 +161,15 @@ func (s *Store) EnqueueBroadcastUpstreamMessage(ctx context.Context, item Notifi
 	}
 	if _, err := tx.Exec(ctx, `UPDATE notification_outbox SET reference_kind='broadcast_upstream',reference_id=$2 WHERE id=$1`, outboxID, upstream.ID); err != nil {
 		return false, BroadcastUpstreamMessage{}, err
+	}
+	for _, companion := range companionItems {
+		companion.ChatID = recipientUserID
+		companion.ReplyToUpstreamID = upstream.ID
+		companionInserted, _, companionErr := insertOutbox(companion)
+		if companionErr != nil {
+			return false, BroadcastUpstreamMessage{}, companionErr
+		}
+		inserted = inserted || companionInserted
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return false, BroadcastUpstreamMessage{}, err
@@ -176,7 +210,8 @@ func (s *Store) CleanupBroadcastUpstreamMessages(ctx context.Context, cutoff tim
 		WHERE upstream.created_at<$1
 		  AND NOT EXISTS (
 			SELECT 1 FROM notification_outbox outbox
-			WHERE outbox.id=upstream.outbox_id AND outbox.status IN ('pending','sending')
+			WHERE (outbox.id=upstream.outbox_id OR outbox.reply_to_upstream_id=upstream.id)
+			  AND outbox.status IN ('pending','sending')
 		  )`, cutoff)
 	return tag.RowsAffected(), err
 }

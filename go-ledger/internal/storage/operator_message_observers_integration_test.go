@@ -119,6 +119,26 @@ func TestPostgresOperatorMessageObserversMigrationAndRecipientContract(t *testin
 	if want := []int64{hostID, primaryAID, primaryCID}; !reflect.DeepEqual(recipients.Reply, want) {
 		t.Fatalf("reply recipients=%v want=%v", recipients.Reply, want)
 	}
+	assertSourceScope := func(observerID int64, sourceID int64, wantBroadcast, wantReply bool) {
+		t.Helper()
+		scopes, scopeErr := store.ListOperatorMessageSourcesForObserver(ctx, observerID, hostID)
+		if scopeErr != nil {
+			t.Fatal(scopeErr)
+		}
+		for _, scope := range scopes {
+			if scope.SourceUserID == sourceID {
+				if scope.AllowBroadcast != wantBroadcast || scope.AllowReply != wantReply {
+					t.Fatalf("observer=%d scope=%+v want broadcast=%t reply=%t", observerID, scope, wantBroadcast, wantReply)
+				}
+				return
+			}
+		}
+		t.Fatalf("observer=%d missing source=%d scopes=%+v", observerID, sourceID, scopes)
+	}
+	assertSourceScope(hostID, secondaryID, true, true)
+	assertSourceScope(primaryAID, secondaryID, true, true)
+	assertSourceScope(primaryBID, secondaryID, true, false)
+	assertSourceScope(primaryCID, secondaryID, false, true)
 
 	if changed, err := store.RevokeOperatorMessageObserverGrant(ctx, secondaryID, primaryCID, hostID, now.Add(4*time.Second)); err != nil || !changed {
 		t.Fatalf("revoke changed=%v err=%v", changed, err)
@@ -135,6 +155,9 @@ func TestPostgresOperatorMessageObserversMigrationAndRecipientContract(t *testin
 	}
 	if want := []int64{hostID, primaryAID}; !reflect.DeepEqual(recipients.Broadcast, want) || !reflect.DeepEqual(recipients.Reply, want) {
 		t.Fatalf("recipients after revoke/disable=%+v want=%v", recipients, want)
+	}
+	if scopes, err := store.ListOperatorMessageSourcesForObserver(ctx, primaryBID, hostID); err != nil || len(scopes) != 0 {
+		t.Fatalf("disabled observer scopes=%+v err=%v", scopes, err)
 	}
 
 	grants, err := store.ListOperatorMessageObserverGrants(ctx)
