@@ -53,7 +53,7 @@ func TestChainWatcherClaimWritesCriticalOutboxKicksAndAcknowledges(t *testing.T)
 	event := chainwatcher.MatchedEvent{
 		DeliveryID: "delivery-" + suffix, EventID: "event-" + suffix, BotID: "bot-test",
 		ChatID: 88001, OwnerUserID: 88001, WatchAddress: "TWatch" + suffix,
-		Direction: "income", TxHash: "tx-" + suffix, From: "TFrom", To: "TWatch" + suffix,
+		Direction: "income", MovementKey: "movement-" + suffix, TxHash: "tx-" + suffix, From: "TFrom", To: "TWatch" + suffix,
 		Value: "1000000", TokenSymbol: "USDT", TokenAddress: "TR7", TokenDecimals: 6,
 		BlockTimestamp: time.Now().UTC().UnixMilli(),
 	}
@@ -113,7 +113,7 @@ func TestChainWatcherClaimWritesCriticalOutboxKicksAndAcknowledges(t *testing.T)
 	}
 	found := false
 	for _, item := range items {
-		if item.Kind == "chain" && item.DedupeKey == "chain:88001:"+event.WatchAddress+":"+event.EventID+":income" {
+		if item.Kind == "chain" && item.DedupeKey == "chainmove:88001:"+event.WatchAddress+":"+event.MovementKey+":income" {
 			found = true
 			if item.Priority != 0 {
 				t.Fatalf("chain outbox priority = %d, want critical priority 0", item.Priority)
