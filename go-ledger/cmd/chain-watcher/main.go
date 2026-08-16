@@ -84,20 +84,22 @@ func main() {
 			}
 		}
 	}()
-	go func() {
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				probeCtx, cancel := context.WithTimeout(ctx, cfg.RequestTimeout)
-				tronClient.ProbeDueKeys(probeCtx, cfg.USDTContract)
-				cancel()
+	if cfg.SourceMode != "kafka" {
+		go func() {
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					probeCtx, cancel := context.WithTimeout(ctx, cfg.RequestTimeout)
+					tronClient.ProbeDueKeys(probeCtx, cfg.USDTContract)
+					cancel()
+				}
 			}
-		}
-	}()
+		}()
+	}
 	if keyStatus := tronClient.KeyPoolStatus(time.Now()); !keyStatus.MainCapacitySafe {
 		log.Printf("WARNING: tronscan main-scan capacity is unsafe: %s", keyStatus.CapacityWarning)
 	}

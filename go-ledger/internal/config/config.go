@@ -2,13 +2,14 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 )
 
-const Version = "2.4.14"
+const Version = "2.5.0"
 
 type Config struct {
 	TelegramBotToken string
@@ -151,7 +152,7 @@ func Load() (Config, error) {
 		BotFallbackHeadTimeBudget:     millisEnv("BOT_FALLBACK_HEAD_TIME_BUDGET_MS", 850),
 		BotFallbackSafetyMaxPages:     intEnv("BOT_FALLBACK_SAFETY_MAX_PAGES", 256),
 		BotFallbackRequestInterval:    millisEnv("BOT_FALLBACK_REQUEST_INTERVAL_MS", 0),
-		BotFallbackRecoverySuccesses:  intEnv("BOT_FALLBACK_RECOVERY_SUCCESS_ROUNDS", 3),
+		BotFallbackRecoverySuccesses:  intEnv("BOT_FALLBACK_RECOVERY_SUCCESS_ROUNDS", 2),
 		BotFallbackRecoveryLag:        secondsEnv("BOT_FALLBACK_RECOVERY_LAG_SECONDS", 5),
 		BotFallbackMaxRequestsPerTick: intEnv("BOT_FALLBACK_MAX_REQUESTS_PER_TICK", 6),
 		BotFallbackWindow:             secondsEnv("BOT_FALLBACK_WINDOW_SECONDS", 30),
@@ -328,6 +329,12 @@ type ChainWatcherConfig struct {
 	BotCredentials                  map[string]string
 	ClaimLease                      time.Duration
 	DeliveryRetryEvery              time.Duration
+	SourceMode                      string
+	KafkaBrokers                    []string
+	KafkaPendingTopic               string
+	KafkaConfirmedTopic             string
+	KafkaGroupID                    string
+	KafkaStaleAfter                 time.Duration
 }
 
 func LoadChainWatcher() (ChainWatcherConfig, error) {
@@ -375,6 +382,12 @@ func LoadChainWatcher() (ChainWatcherConfig, error) {
 		BotCredentials:                  parseBotCredentials(os.Getenv("CHAIN_WATCHER_BOTS")),
 		ClaimLease:                      secondsEnv("CHAIN_WATCHER_CLAIM_LEASE_SECONDS", 30),
 		DeliveryRetryEvery:              secondsEnv("CHAIN_WATCHER_DELIVERY_RETRY_SECONDS", 2),
+		SourceMode:                      strings.ToLower(strings.TrimSpace(env("CHAIN_WATCHER_SOURCE_MODE", "tronscan"))),
+		KafkaBrokers:                    parseListEnv(envAny([]string{"CHAIN_WATCHER_KAFKA_BROKERS", "KAFKA_BROKERS"}, "")),
+		KafkaPendingTopic:               strings.TrimSpace(envAny([]string{"CHAIN_WATCHER_KAFKA_PENDING_TOPIC", "KAFKA_PENDING_TOPIC"}, "tron.pending")),
+		KafkaConfirmedTopic:             strings.TrimSpace(envAny([]string{"CHAIN_WATCHER_KAFKA_CONFIRMED_TOPIC", "KAFKA_CONFIRMED_TOPIC"}, "tron.confirmed")),
+		KafkaGroupID:                    strings.TrimSpace(env("CHAIN_WATCHER_KAFKA_GROUP_ID", "ledger-chain-watcher-v1")),
+		KafkaStaleAfter:                 secondsEnv("CHAIN_WATCHER_KAFKA_STALE_SECONDS", 15),
 	}
 	if strings.TrimSpace(cfg.DatabaseURL) == "" {
 		return cfg, errors.New("DATABASE_URL is required")
@@ -384,6 +397,12 @@ func LoadChainWatcher() (ChainWatcherConfig, error) {
 	}
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = time.Second
+	}
+	if cfg.SourceMode != "tronscan" && cfg.SourceMode != "kafka" {
+		return cfg, fmt.Errorf("CHAIN_WATCHER_SOURCE_MODE must be kafka or tronscan")
+	}
+	if cfg.SourceMode == "kafka" && (len(cfg.KafkaBrokers) == 0 || cfg.KafkaPendingTopic == "" || cfg.KafkaConfirmedTopic == "") {
+		return cfg, errors.New("Kafka brokers, pending topic and confirmed topic are required in kafka source mode")
 	}
 	if cfg.MainScanTimeout < time.Second {
 		cfg.MainScanTimeout = 3 * time.Second

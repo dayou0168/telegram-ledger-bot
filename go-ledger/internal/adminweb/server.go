@@ -1430,7 +1430,6 @@ func (s *Server) saveWatchTarget(w http.ResponseWriter, r *http.Request) {
 	target.Label = strings.TrimSpace(r.FormValue("label"))
 	target.WatchIncome = r.FormValue("watch_income") == "1"
 	target.WatchExpense = r.FormValue("watch_expense") == "1"
-	target.NotifyTRX = false
 	target.MinNotifyAmount = normalizeAdminMinAmount(r.FormValue("min_notify_amount"))
 	if _, err := s.store.UpdateWatchTarget(r.Context(), target, time.Now()); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)

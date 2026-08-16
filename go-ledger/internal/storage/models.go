@@ -385,6 +385,7 @@ type ChainWatcherEvent struct {
 	TokenDecimals  int
 	BlockTimestamp int64
 	Confirmed      bool
+	Result         string
 	Source         string
 	EventIndex     string
 }
@@ -398,6 +399,7 @@ type ChainWatcherMatchedEvent struct {
 	WatchAddress   string
 	Label          string
 	Direction      string
+	MovementKey    string
 	TxHash         string
 	From           string
 	To             string
@@ -407,6 +409,7 @@ type ChainWatcherMatchedEvent struct {
 	TokenDecimals  int
 	BlockTimestamp int64
 	Confirmed      bool
+	Result         string
 	Status         string
 	Attempts       int
 	CreatedAt      time.Time

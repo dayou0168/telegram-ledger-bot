@@ -46,6 +46,22 @@ func TestReadyzReflectsSourceFailureAndEmptySuccess(t *testing.T) {
 	}
 }
 
+func TestKafkaHealthAllowsGraceThenBecomesStale(t *testing.T) {
+	now := time.Unix(1000, 0)
+	server := NewServer(config.ChainWatcherConfig{SourceMode: "kafka", KafkaStaleAfter: 12 * time.Second}, nil, nil)
+	server.kafkaMu.Lock()
+	server.kafkaConnected = false
+	server.kafkaLastConfirmed = now.Add(-5 * time.Second)
+	server.kafkaLastError = "connection refused"
+	server.kafkaMu.Unlock()
+	if ready, _ := server.kafkaHealthy(now); !ready {
+		t.Fatal("short Kafka interruption should remain inside grace window")
+	}
+	if ready, _ := server.kafkaHealthy(now.Add(8 * time.Second)); ready {
+		t.Fatal("stale confirmed stream should fail health after grace window")
+	}
+}
+
 func TestReadyzDoesNotFlapWhenOlderRoundTimesOutAfterNewerSuccess(t *testing.T) {
 	now := time.Now()
 	server := NewServer(config.ChainWatcherConfig{

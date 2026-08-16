@@ -31,6 +31,14 @@ func TestLoadChainWatcherDefaults(t *testing.T) {
 	t.Setenv("CHAIN_WATCHER_TRONSCAN_API_KEY", "")
 	t.Setenv("CHAIN_WATCHER_TRON_API_KEY", "")
 	t.Setenv("TRONGRID_API_KEY", "")
+	t.Setenv("CHAIN_WATCHER_KAFKA_BROKERS", "")
+	t.Setenv("CHAIN_WATCHER_SOURCE_MODE", "")
+	t.Setenv("KAFKA_BROKERS", "")
+	t.Setenv("CHAIN_WATCHER_KAFKA_PENDING_TOPIC", "")
+	t.Setenv("KAFKA_PENDING_TOPIC", "")
+	t.Setenv("CHAIN_WATCHER_KAFKA_CONFIRMED_TOPIC", "")
+	t.Setenv("KAFKA_CONFIRMED_TOPIC", "")
+	t.Setenv("CHAIN_WATCHER_KAFKA_GROUP_ID", "")
 	cfg, err := LoadChainWatcher()
 	if err != nil {
 		t.Fatalf("LoadChainWatcher() error = %v", err)
@@ -67,6 +75,28 @@ func TestLoadChainWatcherDefaults(t *testing.T) {
 	}
 	if cfg.BudgetTimezone != "UTC" {
 		t.Fatalf("budget timezone = %s, want UTC", cfg.BudgetTimezone)
+	}
+	if cfg.SourceMode != "tronscan" || len(cfg.KafkaBrokers) != 0 || cfg.KafkaPendingTopic != "tron.pending" || cfg.KafkaConfirmedTopic != "tron.confirmed" || cfg.KafkaGroupID != "ledger-chain-watcher-v1" {
+		t.Fatalf("kafka defaults = %q/%v/%q/%q/%q", cfg.SourceMode, cfg.KafkaBrokers, cfg.KafkaPendingTopic, cfg.KafkaConfirmedTopic, cfg.KafkaGroupID)
+	}
+}
+
+func TestLoadChainWatcherKafkaPending(t *testing.T) {
+	t.Setenv("CHAIN_WATCHER_KEY_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	t.Setenv("CHAIN_WATCHER_SOURCE_MODE", "kafka")
+	t.Setenv("CHAIN_WATCHER_KAFKA_BROKERS", " kafka-a:9092, kafka-b:9092 ")
+	t.Setenv("CHAIN_WATCHER_KAFKA_PENDING_TOPIC", "tron.pending.custom")
+	t.Setenv("CHAIN_WATCHER_KAFKA_CONFIRMED_TOPIC", "tron.confirmed.custom")
+	t.Setenv("CHAIN_WATCHER_KAFKA_GROUP_ID", "watcher-a")
+	cfg, err := LoadChainWatcher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(cfg.KafkaBrokers, ","); got != "kafka-a:9092,kafka-b:9092" {
+		t.Fatalf("KafkaBrokers = %q", got)
+	}
+	if cfg.KafkaPendingTopic != "tron.pending.custom" || cfg.KafkaConfirmedTopic != "tron.confirmed.custom" || cfg.KafkaGroupID != "watcher-a" {
+		t.Fatalf("kafka topic/group = %q/%q/%q", cfg.KafkaPendingTopic, cfg.KafkaConfirmedTopic, cfg.KafkaGroupID)
 	}
 }
 
