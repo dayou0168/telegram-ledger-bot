@@ -5482,8 +5482,8 @@ func (s *Store) RecordChainTransferLifecycle(ctx context.Context, item ChainWatc
 		_, err = tx.Exec(ctx, `INSERT INTO chain_transfer_states(
 			owner_user_id,address,movement_key,direction,tx_hash,token_symbol,status,
 			initial_notified,failure_notified,first_seen_at,confirmed_at,updated_at
-		) VALUES($1,$2,$3,$4,$5,$6,$7,TRUE,$8,$9,
-			CASE WHEN $7='PENDING' THEN NULL ELSE $9 END,$9)`,
+		) VALUES($1,$2,$3,$4,$5,$6,$7,TRUE,$8,$9::timestamptz,
+			CASE WHEN $7='PENDING' THEN NULL ELSE $9::timestamptz END,$9::timestamptz)`,
 			item.OwnerUserID, item.WatchAddress, movementKey, item.Direction, item.TxHash,
 			item.TokenSymbol, incomingStatus, failureNotified, now)
 		if err != nil {
