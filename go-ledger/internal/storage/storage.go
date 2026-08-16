@@ -1430,11 +1430,13 @@ func (s *Store) migrate(ctx context.Context) error {
 			token_decimals INTEGER NOT NULL DEFAULT 6,
 			block_timestamp BIGINT NOT NULL,
 			confirmed BOOLEAN NOT NULL DEFAULT FALSE,
+			result TEXT NOT NULL DEFAULT '',
 			source TEXT NOT NULL DEFAULT '',
 			event_index TEXT NOT NULL DEFAULT '',
 			created_at TIMESTAMPTZ NOT NULL
 		)`,
 		`ALTER TABLE chain_watcher_events ADD COLUMN IF NOT EXISTS event_index TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE chain_watcher_events ADD COLUMN IF NOT EXISTS result TEXT NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_events_tx
 			ON chain_watcher_events(tx_hash, block_timestamp DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_events_created
@@ -1448,6 +1450,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			watch_address TEXT NOT NULL,
 			label TEXT NOT NULL DEFAULT '',
 			direction TEXT NOT NULL,
+			movement_key TEXT NOT NULL DEFAULT '',
 			tx_hash TEXT NOT NULL,
 			from_address TEXT NOT NULL,
 			to_address TEXT NOT NULL,
@@ -1457,6 +1460,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			token_decimals INTEGER NOT NULL DEFAULT 6,
 			block_timestamp BIGINT NOT NULL,
 			confirmed BOOLEAN NOT NULL DEFAULT FALSE,
+			result TEXT NOT NULL DEFAULT '',
 			status TEXT NOT NULL DEFAULT 'pending',
 			attempts INTEGER NOT NULL DEFAULT 0,
 			next_attempt_at TIMESTAMPTZ NOT NULL,
@@ -1465,11 +1469,32 @@ func (s *Store) migrate(ctx context.Context) error {
 			delivered_at TIMESTAMPTZ
 		)`,
 		`ALTER TABLE chain_watcher_matched_events ADD COLUMN IF NOT EXISTS chat_id BIGINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE chain_watcher_matched_events ADD COLUMN IF NOT EXISTS movement_key TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE chain_watcher_matched_events ADD COLUMN IF NOT EXISTS result TEXT NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_matched_due
 			ON chain_watcher_matched_events(bot_id, status, next_attempt_at, created_at)
 			WHERE status IN ('pending', 'delivering')`,
 		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_matched_event
 			ON chain_watcher_matched_events(event_id, bot_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_matched_movement
+			ON chain_watcher_matched_events(bot_id, movement_key, direction)`,
+		`CREATE TABLE IF NOT EXISTS chain_transfer_states (
+			owner_user_id BIGINT NOT NULL,
+			address TEXT NOT NULL,
+			movement_key TEXT NOT NULL,
+			direction TEXT NOT NULL,
+			tx_hash TEXT NOT NULL,
+			token_symbol TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT 'PENDING',
+			initial_notified BOOLEAN NOT NULL DEFAULT FALSE,
+			failure_notified BOOLEAN NOT NULL DEFAULT FALSE,
+			first_seen_at TIMESTAMPTZ NOT NULL,
+			confirmed_at TIMESTAMPTZ,
+			updated_at TIMESTAMPTZ NOT NULL,
+			PRIMARY KEY(owner_user_id, address, movement_key, direction)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_chain_transfer_states_updated
+			ON chain_transfer_states(updated_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_matched_created
 			ON chain_watcher_matched_events(created_at)`,
 		`CREATE TABLE IF NOT EXISTS notification_outbox (
@@ -5419,6 +5444,96 @@ func (s *Store) RecordChainNotificationOutboxEvent(ctx context.Context, owner in
 	return true, tx.Commit(ctx)
 }
 
+// RecordChainTransferLifecycle records the Pending/Confirmed state transition and
+// atomically creates at most one initial notice and one later failure warning.
+// It returns initial, failure, updated, or duplicate.
+func (s *Store) RecordChainTransferLifecycle(ctx context.Context, item ChainWatcherMatchedEvent, initialText, failureText string, chatID int64, now time.Time) (string, error) {
+	movementKey := strings.TrimSpace(item.MovementKey)
+	if movementKey == "" {
+		return "", errors.New("chain transfer movement key is empty")
+	}
+	if chatID == 0 {
+		chatID = item.OwnerUserID
+	}
+	incomingStatus := "PENDING"
+	if item.Confirmed {
+		incomingStatus = strings.ToUpper(strings.TrimSpace(item.Result))
+		if incomingStatus == "" {
+			incomingStatus = "SUCCESS"
+		}
+		if incomingStatus != "SUCCESS" {
+			incomingStatus = "FAILED"
+		}
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer rollback(ctx, tx)
+	var currentStatus string
+	var initialNotified, failureNotified bool
+	err = tx.QueryRow(ctx, `SELECT status,initial_notified,failure_notified
+		FROM chain_transfer_states
+		WHERE owner_user_id=$1 AND address=$2 AND movement_key=$3 AND direction=$4
+		FOR UPDATE`, item.OwnerUserID, item.WatchAddress, movementKey, item.Direction).
+		Scan(&currentStatus, &initialNotified, &failureNotified)
+	if errors.Is(err, pgx.ErrNoRows) {
+		failureNotified = incomingStatus == "FAILED"
+		_, err = tx.Exec(ctx, `INSERT INTO chain_transfer_states(
+			owner_user_id,address,movement_key,direction,tx_hash,token_symbol,status,
+			initial_notified,failure_notified,first_seen_at,confirmed_at,updated_at
+		) VALUES($1,$2,$3,$4,$5,$6,$7,TRUE,$8,$9::timestamptz,
+			CASE WHEN $7='PENDING' THEN NULL ELSE $9::timestamptz END,$9::timestamptz)`,
+			item.OwnerUserID, item.WatchAddress, movementKey, item.Direction, item.TxHash,
+			item.TokenSymbol, incomingStatus, failureNotified, now)
+		if err != nil {
+			return "", err
+		}
+		dedupeKey := fmt.Sprintf("chainmove:%d:%s:%s:%s", item.OwnerUserID, item.WatchAddress, movementKey, item.Direction)
+		_, err = tx.Exec(ctx, `INSERT INTO notification_outbox(
+			kind,dedupe_key,chat_id,text,parse_mode,disable_preview,priority,status,
+			attempts,next_attempt_at,created_at,updated_at
+		) VALUES('chain',$1,$2,$3,'HTML',TRUE,0,'pending',0,$4,$4,$4)
+		ON CONFLICT(dedupe_key) DO NOTHING`, dedupeKey, chatID, initialText, now)
+		if err != nil {
+			return "", err
+		}
+		return "initial", tx.Commit(ctx)
+	}
+	if err != nil {
+		return "", err
+	}
+	if !item.Confirmed {
+		return "duplicate", tx.Commit(ctx)
+	}
+	_, err = tx.Exec(ctx, `UPDATE chain_transfer_states SET status=$5,
+		confirmed_at=COALESCE(confirmed_at,$6),updated_at=$6
+		WHERE owner_user_id=$1 AND address=$2 AND movement_key=$3 AND direction=$4`,
+		item.OwnerUserID, item.WatchAddress, movementKey, item.Direction, incomingStatus, now)
+	if err != nil {
+		return "", err
+	}
+	if incomingStatus != "FAILED" || failureNotified {
+		return "updated", tx.Commit(ctx)
+	}
+	_, err = tx.Exec(ctx, `UPDATE chain_transfer_states SET failure_notified=TRUE,updated_at=$5
+		WHERE owner_user_id=$1 AND address=$2 AND movement_key=$3 AND direction=$4`,
+		item.OwnerUserID, item.WatchAddress, movementKey, item.Direction, now)
+	if err != nil {
+		return "", err
+	}
+	dedupeKey := fmt.Sprintf("chainfail:%d:%s:%s:%s", item.OwnerUserID, item.WatchAddress, movementKey, item.Direction)
+	_, err = tx.Exec(ctx, `INSERT INTO notification_outbox(
+		kind,dedupe_key,chat_id,text,parse_mode,disable_preview,priority,status,
+		attempts,next_attempt_at,created_at,updated_at
+	) VALUES('chain_failure',$1,$2,$3,'HTML',TRUE,0,'pending',0,$4,$4,$4)
+	ON CONFLICT(dedupe_key) DO NOTHING`, dedupeKey, chatID, failureText, now)
+	if err != nil {
+		return "", err
+	}
+	return "failure", tx.Commit(ctx)
+}
+
 func (s *Store) EnqueueNotification(ctx context.Context, item NotificationOutbox, now time.Time) (bool, error) {
 	item.Kind = strings.TrimSpace(item.Kind)
 	item.DedupeKey = strings.TrimSpace(item.DedupeKey)
@@ -5908,11 +6023,11 @@ func (s *Store) recordChainWatcherMatches(ctx context.Context, pool *pgxpool.Poo
 	defer rollback(ctx, tx)
 	eventTag, err := tx.Exec(ctx, `INSERT INTO chain_watcher_events(
 			event_id, tx_hash, contract, from_address, to_address, value, token_symbol, token_address,
-			token_decimals, block_timestamp, confirmed, source, event_index, created_at
-		) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+			token_decimals, block_timestamp, confirmed, result, source, event_index, created_at
+		) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 		ON CONFLICT(event_id) DO NOTHING`,
 		event.EventID, event.TxHash, event.Contract, event.From, event.To, event.Value, event.TokenSymbol, event.TokenAddress,
-		event.TokenDecimals, event.BlockTimestamp, event.Confirmed, event.Source, event.EventIndex, now)
+		event.TokenDecimals, event.BlockTimestamp, event.Confirmed, event.Result, event.Source, event.EventIndex, now)
 	if err != nil {
 		return 0, err
 	}
@@ -5927,14 +6042,14 @@ func (s *Store) recordChainWatcherMatches(ctx context.Context, pool *pgxpool.Poo
 			continue
 		}
 		tag, err := tx.Exec(ctx, `INSERT INTO chain_watcher_matched_events(
-				delivery_id, event_id, bot_id, chat_id, owner_user_id, watch_address, label, direction,
+				delivery_id, event_id, bot_id, chat_id, owner_user_id, watch_address, label, direction, movement_key,
 				tx_hash, from_address, to_address, value, token_symbol, token_address, token_decimals,
-				block_timestamp, confirmed, status, attempts, next_attempt_at, created_at, updated_at
-			) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'pending', 0, $18, $18, $18)
+				block_timestamp, confirmed, result, status, attempts, next_attempt_at, created_at, updated_at
+			) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, 'pending', 0, $20, $20, $20)
 			ON CONFLICT(delivery_id) DO NOTHING`,
 			d.DeliveryID, event.EventID, d.BotID, d.ChatID, d.OwnerUserID, d.WatchAddress, d.Label, d.Direction,
-			event.TxHash, event.From, event.To, event.Value, event.TokenSymbol, event.TokenAddress, event.TokenDecimals,
-			event.BlockTimestamp, event.Confirmed, now)
+			d.MovementKey, event.TxHash, event.From, event.To, event.Value, event.TokenSymbol, event.TokenAddress, event.TokenDecimals,
+			event.BlockTimestamp, event.Confirmed, event.Result, now)
 		if err != nil {
 			return 0, err
 		}
@@ -5976,8 +6091,8 @@ func (s *Store) ClaimChainWatcherMatchedEvents(ctx context.Context, botID string
 		FROM next
 		WHERE m.delivery_id=next.delivery_id
 		RETURNING m.delivery_id, m.event_id, m.bot_id, m.chat_id, m.owner_user_id, m.watch_address, m.label,
-			m.direction, m.tx_hash, m.from_address, m.to_address, m.value, m.token_symbol,
-			m.token_address, m.token_decimals, m.block_timestamp, m.confirmed, m.status, m.attempts,
+			m.direction, m.movement_key, m.tx_hash, m.from_address, m.to_address, m.value, m.token_symbol,
+			m.token_address, m.token_decimals, m.block_timestamp, m.confirmed, m.result, m.status, m.attempts,
 			m.created_at, m.updated_at, m.delivered_at`,
 		strings.TrimSpace(botID), now, limit, staleBefore, keepAfter)
 	if err != nil {
@@ -5988,8 +6103,8 @@ func (s *Store) ClaimChainWatcherMatchedEvents(ctx context.Context, botID string
 	for rows.Next() {
 		var item ChainWatcherMatchedEvent
 		if err := rows.Scan(&item.DeliveryID, &item.EventID, &item.BotID, &item.ChatID, &item.OwnerUserID, &item.WatchAddress, &item.Label,
-			&item.Direction, &item.TxHash, &item.From, &item.To, &item.Value, &item.TokenSymbol,
-			&item.TokenAddress, &item.TokenDecimals, &item.BlockTimestamp, &item.Confirmed, &item.Status, &item.Attempts,
+			&item.Direction, &item.MovementKey, &item.TxHash, &item.From, &item.To, &item.Value, &item.TokenSymbol,
+			&item.TokenAddress, &item.TokenDecimals, &item.BlockTimestamp, &item.Confirmed, &item.Result, &item.Status, &item.Attempts,
 			&item.CreatedAt, &item.UpdatedAt, &item.DeliveredAt); err != nil {
 			return nil, err
 		}

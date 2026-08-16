@@ -56,7 +56,7 @@ func (c *Client) UpsertSubscription(ctx context.Context, target storage.WatchTar
 		MinNotifyAmount:   target.MinNotifyAmount,
 		WatchIncome:       target.WatchIncome,
 		WatchExpense:      target.WatchExpense,
-		NotifyTRX:         false,
+		NotifyTRX:         target.NotifyTRX,
 		BaselineTimestamp: target.BaselineTimestamp,
 	}
 	return c.post(ctx, "/v1/subscriptions/upsert", req, nil)
@@ -78,7 +78,7 @@ func (c *Client) SyncSubscriptions(ctx context.Context, targets []storage.WatchT
 			MinNotifyAmount:   target.MinNotifyAmount,
 			WatchIncome:       target.WatchIncome,
 			WatchExpense:      target.WatchExpense,
-			NotifyTRX:         false,
+			NotifyTRX:         target.NotifyTRX,
 			BaselineTimestamp: target.BaselineTimestamp,
 		})
 	}

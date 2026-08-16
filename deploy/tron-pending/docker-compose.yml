@@ -1,0 +1,38 @@
+services:
+  tron-pending:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tron-pending
+    hostname: tron-pending
+    restart: unless-stopped
+    init: true
+
+    environment:
+      TRON_URL: "http://tron-lite:8090"
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_PENDING_TOPIC: "tron.pending"
+      KAFKA_TRANSACTION_TOPIC: "tron.transaction"
+      KAFKA_CONFIRMED_TOPIC: "tron.confirmed"
+      KAFKA_CONFIRMED_GROUP_ID: "tron-confirmed-parser-v1"
+      USDT_CONTRACT: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+      POLL_INTERVAL_MS: "100"
+      HTTP_TIMEOUT_SECONDS: "2"
+      FETCH_WORKERS: "32"
+      SEEN_TTL_SECONDS: "600"
+      LOG_EACH_EVENT: "false"
+
+    networks:
+      - tron-network
+
+    mem_limit: 1g
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+networks:
+  tron-network:
+    external: true

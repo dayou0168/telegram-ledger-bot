@@ -256,6 +256,7 @@ type MatchedEvent struct {
 	WatchAddress   string `json:"watch_address"`
 	Label          string `json:"label"`
 	Direction      string `json:"direction"`
+	MovementKey    string `json:"movement_key"`
 	TxHash         string `json:"tx_hash"`
 	From           string `json:"from"`
 	To             string `json:"to"`
@@ -265,6 +266,16 @@ type MatchedEvent struct {
 	TokenDecimals  int    `json:"token_decimals"`
 	BlockTimestamp int64  `json:"block_timestamp"`
 	Confirmed      bool   `json:"confirmed"`
+	Result         string `json:"result,omitempty"`
+}
+
+func MovementKey(t tron.Transfer) string {
+	raw := strings.ToLower(strings.Join([]string{
+		strings.TrimSpace(t.Hash), strings.TrimSpace(t.TokenAddress), strings.TrimSpace(t.TokenSymbol),
+		strings.TrimSpace(t.From), strings.TrimSpace(t.To), strings.TrimSpace(t.Value),
+	}, "|"))
+	sum := sha1.Sum([]byte(raw))
+	return "move:" + hex.EncodeToString(sum[:])
 }
 
 func EventID(t tron.Transfer) string {
@@ -306,6 +317,7 @@ func TransferEvent(t tron.Transfer, source string) storage.ChainWatcherEvent {
 		TokenDecimals:  t.TokenDecimals,
 		BlockTimestamp: t.BlockTimestamp,
 		Confirmed:      t.Confirmed,
+		Result:         strings.ToUpper(strings.TrimSpace(t.Result)),
 		Source:         source,
 		EventIndex:     t.EventIndex,
 	}
@@ -318,6 +330,9 @@ func MatchTransfer(t tron.Transfer, subs []storage.ChainWatcherSubscription) []s
 			continue
 		}
 		if sub.BaselineTimestamp > 0 && t.BlockTimestamp < sub.BaselineTimestamp {
+			continue
+		}
+		if strings.EqualFold(t.TokenSymbol, "TRX") && !sub.NotifyTRX {
 			continue
 		}
 		direction := ""
@@ -346,6 +361,7 @@ func MatchTransfer(t tron.Transfer, subs []storage.ChainWatcherSubscription) []s
 			WatchAddress: sub.Address,
 			Label:        sub.Label,
 			Direction:    direction,
+			MovementKey:  MovementKey(t),
 		})
 	}
 	return matches
@@ -406,6 +422,7 @@ func FromMatchedStorage(item storage.ChainWatcherMatchedEvent) MatchedEvent {
 		WatchAddress:   item.WatchAddress,
 		Label:          item.Label,
 		Direction:      item.Direction,
+		MovementKey:    item.MovementKey,
 		TxHash:         item.TxHash,
 		From:           item.From,
 		To:             item.To,
@@ -415,5 +432,6 @@ func FromMatchedStorage(item storage.ChainWatcherMatchedEvent) MatchedEvent {
 		TokenDecimals:  item.TokenDecimals,
 		BlockTimestamp: item.BlockTimestamp,
 		Confirmed:      item.Confirmed,
+		Result:         item.Result,
 	}
 }

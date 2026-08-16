@@ -212,7 +212,7 @@ func (b *Bot) handleAddressWatchTargetCallback(ctx context.Context, cb telegram.
 		enabled := targetWatchEnabled(target)
 		target.WatchIncome = !enabled
 		target.WatchExpense = !enabled
-		target.NotifyTRX = false
+		target.NotifyTRX = !enabled
 	case "income":
 		target.WatchIncome = !target.WatchIncome
 	case "expense":
@@ -518,6 +518,10 @@ func tokenAmount(raw string, decimals int) *big.Rat {
 
 func (b *Bot) formatTransferNotice(t tron.Transfer, w storage.WatchTarget, direction string) string {
 	amount := formatAmount(tokenAmount(t.Value, t.TokenDecimals))
+	tokenSymbol := strings.ToUpper(strings.TrimSpace(t.TokenSymbol))
+	if tokenSymbol == "" {
+		tokenSymbol = "USDT"
+	}
 	label := "⬇️收入"
 	signedAmount := amount
 	if direction == "expense" {
@@ -532,15 +536,26 @@ func (b *Bot) formatTransferNotice(t tron.Transfer, w storage.WatchTarget, direc
 	if t.To == w.Address && w.Label != "" {
 		to += " ← " + w.Label
 	}
-	return fmt.Sprintf("交易类型： %s\n交易金额： %s USDT\n出账地址： %s\n入账地址： %s\n交易时间： %s\n交易哈希： <a href=\"https://tronscan.org/#/transaction/%s\">%s</a>",
+	return fmt.Sprintf("交易类型： %s\n交易金额： %s %s\n出账地址： %s\n入账地址： %s\n交易时间： %s\n交易哈希： <a href=\"https://tronscan.org/#/transaction/%s\">%s</a>",
 		label,
 		signedAmount,
+		html.EscapeString(tokenSymbol),
 		formatCode(from),
 		formatCode(to),
 		formatMilliTime(t.BlockTimestamp, b.loc),
 		html.EscapeString(t.Hash),
 		html.EscapeString(shortHash(t.Hash)),
 	)
+}
+
+func (b *Bot) formatTransferFailureWarning(t tron.Transfer) string {
+	tokenSymbol := strings.ToUpper(strings.TrimSpace(t.TokenSymbol))
+	if tokenSymbol == "" {
+		tokenSymbol = "USDT"
+	}
+	amount := formatAmount(tokenAmount(t.Value, t.TokenDecimals))
+	return fmt.Sprintf("⚠️ <b>交易执行失败</b>\n交易金额：%s %s\n交易哈希：<a href=\"https://tronscan.org/#/transaction/%s\">%s</a>",
+		html.EscapeString(amount), html.EscapeString(tokenSymbol), html.EscapeString(t.Hash), html.EscapeString(shortHash(t.Hash)))
 }
 
 func shortHash(hash string) string {

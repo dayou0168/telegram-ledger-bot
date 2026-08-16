@@ -34,6 +34,7 @@ type Transfer struct {
 	TokenDecimals  int
 	BlockTimestamp int64
 	Confirmed      bool
+	Result         string
 	EventIndex     string
 }
 

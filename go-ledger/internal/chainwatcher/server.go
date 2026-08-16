@@ -42,6 +42,12 @@ type Server struct {
 	gapStatusExpiresAt  time.Time
 	anchorMu            sync.RWMutex
 	headAnchor          storage.ChainWatcherWatermark
+	kafkaMu             sync.RWMutex
+	kafkaConnected      bool
+	kafkaLastRecordAt   time.Time
+	kafkaLastConfirmed  time.Time
+	kafkaLastError      string
+	startedAt           time.Time
 }
 
 type expandTask struct {
@@ -55,6 +61,7 @@ func NewServer(cfg config.ChainWatcherConfig, store *storage.Store, tronClient *
 	s := &Server{
 		cfg: cfg, store: store, tron: tronClient, subDirty: true,
 		gapWake: make(chan struct{}, 64), gapOwner: fmt.Sprintf("watcher-%d", time.Now().UnixNano()),
+		startedAt: time.Now(),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealth)
@@ -212,12 +219,15 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	s.setHeadAnchor(anchor)
 	go s.globalLoop(ctx)
-	if s.cfg.CatchupEnabled {
+	if s.cfg.SourceMode != "kafka" && s.cfg.CatchupEnabled {
 		for worker := 0; worker < s.catchupWorkerCount(); worker++ {
 			go s.gapLoop(ctx, worker)
 		}
 	}
 	go s.cleanupLoop(ctx)
+	if s.kafkaPendingEnabled() {
+		go s.kafkaPendingLoop(ctx)
+	}
 	errCh := make(chan error, 1)
 	go func() {
 		log.Printf("chain watcher listening on %s", s.cfg.ListenAddr)
@@ -256,7 +266,19 @@ func (s *Server) globalLoop(ctx context.Context) {
 	ticker := time.NewTicker(s.cfg.PollInterval)
 	defer ticker.Stop()
 	for {
-		s.startGlobalScan(ctx)
+		useAPI := true
+		if s.cfg.SourceMode == "kafka" {
+			useAPI, _ = s.kafkaHealthy(time.Now())
+			useAPI = !useAPI
+		}
+		if useAPI {
+			if s.cfg.SourceMode == "kafka" && s.tron != nil {
+				probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+				s.tron.ProbeDueKeys(probeCtx, s.cfg.USDTContract)
+				cancel()
+			}
+			s.startGlobalScan(ctx)
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -1886,6 +1908,42 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) readinessResponse(ctx context.Context, now time.Time) ReadyStatusResponse {
+	if s.cfg.SourceMode == "kafka" {
+		ready, reason := s.kafkaHealthy(now)
+		response := ReadyStatusResponse{Status: "ready", Ready: ready, SourceReady: ready, Now: now, ContinuityReady: ready}
+		s.kafkaMu.RLock()
+		lastConfirmed := s.kafkaLastConfirmed
+		s.kafkaMu.RUnlock()
+		if !lastConfirmed.IsZero() && now.After(lastConfirmed) {
+			response.CatchupLagSeconds = int64(now.Sub(lastConfirmed) / time.Second)
+		}
+		if !ready {
+			fallback := s.status.response(now, s.sourceStaleAfter(), storage.ChainWatcherDeliveryStats{})
+			if fallback.Ready {
+				response.Ready = true
+				response.SourceReady = true
+				response.ContinuityReady = true
+				response.Status = "degraded/kafka_api_fallback"
+			} else {
+				response.Status = "degraded/kafka"
+			}
+			_ = reason
+		}
+		if s.store == nil {
+			return response
+		}
+		dbCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+		state, err := s.store.GetChainWatcherReadiness(dbCtx, now)
+		cancel()
+		if err != nil {
+			response.Ready = false
+			response.SourceReady = false
+			response.Status = "degraded/readiness_db"
+			return response
+		}
+		response.WatchAddressCount = state.WatchAddressCount
+		return response
+	}
 	base := s.status.response(now, s.sourceStaleAfter(), storage.ChainWatcherDeliveryStats{})
 	response := ReadyStatusResponse{Status: base.Status, Ready: base.Ready, SourceReady: base.Ready, Now: now}
 	if s.tron != nil && s.tron.KeyPoolStatus(now).AvailableCount == 0 {
@@ -2094,6 +2152,15 @@ func (s *Server) statusResponse(ctx context.Context, now time.Time) StatusRespon
 				Recovering: lease.Mode == "RECOVERING", LeaseUntil: timePtr(lease.LeaseUntil),
 			}
 		}
+	}
+	if s.cfg.SourceMode == "kafka" {
+		ready := s.readinessResponse(ctx, now)
+		response.Ready = ready.Ready
+		response.SourceReady = ready.SourceReady
+		response.ContinuityReady = ready.ContinuityReady
+		response.Status = ready.Status
+		response.CatchupLagSeconds = ready.CatchupLagSeconds
+		response.WatchAddressCount = ready.WatchAddressCount
 	}
 	return response
 }

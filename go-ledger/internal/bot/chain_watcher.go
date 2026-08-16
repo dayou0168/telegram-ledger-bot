@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -149,7 +150,7 @@ func (b *Bot) sharedSubscription(target storage.WatchTarget) storage.ChainWatche
 	return chainwatcher.ToSubscription(b.cfg.ChainWatcherBotID, chainwatcher.SubscriptionRequest{
 		ChatID: target.OwnerUserID, OwnerUserID: target.OwnerUserID, Address: target.Address,
 		Label: target.Label, WatchIncome: target.WatchIncome, WatchExpense: target.WatchExpense,
-		NotifyTRX: false, MinNotifyAmount: target.MinNotifyAmount, BaselineTimestamp: target.BaselineTimestamp,
+		NotifyTRX: target.NotifyTRX, MinNotifyAmount: target.MinNotifyAmount, BaselineTimestamp: target.BaselineTimestamp,
 	})
 }
 
@@ -591,6 +592,7 @@ func (b *Bot) processChainWatcherEvent(ctx context.Context, event chainwatcher.M
 		TokenDecimals:  event.TokenDecimals,
 		BlockTimestamp: event.BlockTimestamp,
 		Confirmed:      event.Confirmed,
+		Result:         event.Result,
 	}
 	target := storage.WatchTarget{
 		OwnerUserID:     event.OwnerUserID,
@@ -602,18 +604,30 @@ func (b *Bot) processChainWatcherEvent(ctx context.Context, event chainwatcher.M
 	}
 	notifyStarted := time.Now()
 	text := b.formatTransferNotice(transfer, target, event.Direction)
+	if event.Confirmed && !strings.EqualFold(event.Result, "SUCCESS") {
+		text += "\n交易状态：❌ 失败"
+	}
+	failureText := b.formatTransferFailureWarning(transfer)
 	timing.NotifyDuration = time.Since(notifyStarted)
 	chatID := event.ChatID
 	if chatID == 0 {
 		chatID = event.OwnerUserID
 	}
 	outboxStarted := time.Now()
-	inserted, err := b.store.RecordChainNotificationOutboxEvent(ctx, event.OwnerUserID, event.WatchAddress, event.TxHash, event.EventID, event.Direction, event.BlockTimestamp, chatID, text, "HTML", true, time.Now().In(b.loc))
+	movementKey := strings.TrimSpace(event.MovementKey)
+	if movementKey == "" {
+		movementKey = chainwatcher.MovementKey(transfer)
+	}
+	action, err := b.store.RecordChainTransferLifecycle(ctx, storage.ChainWatcherMatchedEvent{
+		OwnerUserID: event.OwnerUserID, WatchAddress: event.WatchAddress, Direction: event.Direction,
+		MovementKey: movementKey, TxHash: event.TxHash, TokenSymbol: event.TokenSymbol,
+		Confirmed: event.Confirmed, Result: event.Result,
+	}, text, failureText, chatID, time.Now().In(b.loc))
 	timing.OutboxDuration = time.Since(outboxStarted)
 	if err != nil {
 		return timing, err
 	}
-	if inserted {
+	if action == "initial" || action == "failure" {
 		gatewayStarted := time.Now()
 		b.kickNotificationOutbox()
 		timing.GatewayDuration = time.Since(gatewayStarted)

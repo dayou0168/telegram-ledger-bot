@@ -1,4 +1,4 @@
-# v2.4.14 发布模板；仅在显式发布 workflow 成功且镜像 digest 已核验后用于生产升级。
+# v2.5.0 发布模板；仅在显式发布 workflow 成功且镜像 digest 已核验后用于生产升级。
 #
 # 宝塔 GHCR 模板：
 # 1. 单机器人一体部署可直接粘贴本文件。
@@ -54,7 +54,7 @@ services:
       retries: 10
 
   ledger-chain-watcher:
-    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.4.14
+    image: ghcr.io/dayou0168/telegram-ledger-chain-watcher:2.5.0
     container_name: ledger-chain-watcher
     restart: unless-stopped
     logging:
@@ -78,6 +78,12 @@ services:
       CHAIN_WATCHER_TRONSCAN_API_KEY: ""
       CHAIN_WATCHER_TRON_API_KEY: ""
       TRON_USDT_CONTRACT: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+      CHAIN_WATCHER_SOURCE_MODE: "kafka"
+      CHAIN_WATCHER_KAFKA_BROKERS: "107.148.229.136:29092"
+      CHAIN_WATCHER_KAFKA_PENDING_TOPIC: "tron.pending"
+      CHAIN_WATCHER_KAFKA_CONFIRMED_TOPIC: "tron.confirmed"
+      CHAIN_WATCHER_KAFKA_GROUP_ID: "ledger-chain-watcher-v1"
+      CHAIN_WATCHER_KAFKA_STALE_SECONDS: "15"
       CHAIN_WATCHER_SOURCE_POLL_SECONDS: "1"
       CHAIN_WATCHER_MAIN_SCAN_TIMEOUT_MS: "3000"
       CHAIN_WATCHER_MAIN_MAX_INFLIGHT_ROUNDS: "3"
@@ -112,7 +118,7 @@ services:
       retries: 10
 
   ledger-bot:
-    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.4.14
+    image: ghcr.io/dayou0168/telegram-ledger-bot-go:2.5.0
     container_name: ledger-bot-go
     restart: unless-stopped
     logging:
@@ -174,7 +180,7 @@ services:
       BOT_FALLBACK_HEAD_TIME_BUDGET_MS: "850"
       BOT_FALLBACK_SAFETY_MAX_PAGES: "256"
       BOT_FALLBACK_REQUEST_INTERVAL_MS: "200"
-      BOT_FALLBACK_RECOVERY_SUCCESS_ROUNDS: "3"
+      BOT_FALLBACK_RECOVERY_SUCCESS_ROUNDS: "2"
       BOT_FALLBACK_RECOVERY_LAG_SECONDS: "5"
       BOT_FALLBACK_MAX_REQUESTS_PER_TICK: "6"
       BOT_FALLBACK_WINDOW_SECONDS: "30"
