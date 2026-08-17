@@ -38,9 +38,9 @@ func TestBillExchangeRateDisplay(t *testing.T) {
 	}
 }
 
-func TestAddressWatchAdminDoesNotAdvertiseUnsupportedTRXNotifications(t *testing.T) {
-	if strings.Contains(adminHTML, ">TRX<") || strings.Contains(adminHTML, "name=\"notify_trx\"") {
-		t.Fatal("address watch admin still exposes unsupported TRX notification controls")
+func TestAddressWatchAdminExposesIndependentTRXNotifications(t *testing.T) {
+	if !strings.Contains(adminHTML, ">TRX<") || !strings.Contains(adminHTML, "name=\"notify_trx\"") || !strings.Contains(adminHTML, "name=\"min_notify_trx_amount\"") {
+		t.Fatal("address watch admin does not expose the independent TRX notification control")
 	}
 }
 

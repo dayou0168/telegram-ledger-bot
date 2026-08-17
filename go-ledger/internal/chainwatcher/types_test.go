@@ -109,3 +109,46 @@ func TestNewSubscriptionBaselineDoesNotReplayOlderTransfer(t *testing.T) {
 		t.Fatalf("transfer at baseline matches = %d, want 1", len(matches))
 	}
 }
+
+func TestMatchTransferUsesIndependentUSDTAndTRXThresholds(t *testing.T) {
+	sub := storage.ChainWatcherSubscription{
+		BotID: "bot", ChatID: 1, OwnerUserID: 1, Address: "TTo",
+		WatchIncome: true, NotifyTRX: true, MinNotifyAmount: "100", MinNotifyTRXAmount: "1", Active: true,
+	}
+	transfer := tron.Transfer{
+		Hash: "trx", From: "TFrom", To: "TTo", Value: "500000", TokenSymbol: "TRX",
+		TokenDecimals: 6, BlockTimestamp: 1_000,
+	}
+	if matches := MatchTransfer(transfer, []storage.ChainWatcherSubscription{sub}); len(matches) != 0 {
+		t.Fatalf("TRX below its own threshold matched: %#v", matches)
+	}
+	transfer.Value = "1000000"
+	if matches := MatchTransfer(transfer, []storage.ChainWatcherSubscription{sub}); len(matches) != 1 {
+		t.Fatalf("TRX at its own threshold matches = %d, want 1", len(matches))
+	}
+	transfer.TokenSymbol = "USDT"
+	transfer.Value = "99000000"
+	if matches := MatchTransfer(transfer, []storage.ChainWatcherSubscription{sub}); len(matches) != 0 {
+		t.Fatalf("USDT below its own threshold matched: %#v", matches)
+	}
+}
+
+func TestMatchTransferRejectsTRXWhenDisabledAndNonPositiveValues(t *testing.T) {
+	sub := storage.ChainWatcherSubscription{
+		BotID: "bot", ChatID: 1, OwnerUserID: 1, Address: "TTo", WatchIncome: true, Active: true,
+	}
+	transfer := tron.Transfer{
+		Hash: "trx", From: "TFrom", To: "TTo", Value: "2000000", TokenSymbol: "TRX",
+		TokenDecimals: 6, BlockTimestamp: 1_000,
+	}
+	if matches := MatchTransfer(transfer, []storage.ChainWatcherSubscription{sub}); len(matches) != 0 {
+		t.Fatalf("disabled TRX matched: %#v", matches)
+	}
+	sub.NotifyTRX = true
+	for _, value := range []string{"0", "-1", "invalid"} {
+		transfer.Value = value
+		if matches := MatchTransfer(transfer, []storage.ChainWatcherSubscription{sub}); len(matches) != 0 {
+			t.Fatalf("non-positive/invalid value %q matched: %#v", value, matches)
+		}
+	}
+}

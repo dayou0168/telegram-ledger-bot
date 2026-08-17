@@ -169,9 +169,10 @@ func TestWatcherFallbackControllerStateMachineAndRecovery(t *testing.T) {
 func TestSharedSubscriptionPreservesBaselineAndTRXSetting(t *testing.T) {
 	bot := &Bot{cfg: config.Config{ChainWatcherBotID: "bot-a"}}
 	sub := bot.sharedSubscription(storage.WatchTarget{
-		OwnerUserID: 10, Address: "TAddress", WatchIncome: true, NotifyTRX: true, BaselineTimestamp: 1234,
+		OwnerUserID: 10, Address: "TAddress", WatchIncome: true, NotifyTRX: true,
+		MinNotifyAmount: "100", MinNotifyTRXAmount: "2.5", BaselineTimestamp: 1234,
 	})
-	if sub.BotID != "bot-a" || sub.ChatID != 10 || sub.BaselineTimestamp != 1234 || !sub.NotifyTRX {
+	if sub.BotID != "bot-a" || sub.ChatID != 10 || sub.BaselineTimestamp != 1234 || !sub.NotifyTRX || sub.MinNotifyAmount != "100" || sub.MinNotifyTRXAmount != "2.5" {
 		t.Fatalf("shared subscription = %+v", sub)
 	}
 }

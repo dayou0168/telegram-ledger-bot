@@ -31,7 +31,8 @@ const (
 	broadcastDeliveryStateMigrationVersion      = "2.4.19-broadcast-delivery-state"
 	broadcastMessagePreferencesMigrationVersion = "2.4.20-broadcast-message-preferences"
 	chainTransferLifecycleMigrationVersion      = "2.5.1-chain-transfer-lifecycle"
-	latestSchemaMigrationVersion                = chainTransferLifecycleMigrationVersion
+	trxWatchControlsMigrationVersion            = "2.5.2-trx-watch-controls"
+	latestSchemaMigrationVersion                = trxWatchControlsMigrationVersion
 )
 
 const (
@@ -1176,8 +1177,9 @@ func (s *Store) migrate(ctx context.Context) error {
 			label TEXT NOT NULL DEFAULT '',
 			watch_income BOOLEAN NOT NULL DEFAULT TRUE,
 			watch_expense BOOLEAN NOT NULL DEFAULT TRUE,
-			notify_trx BOOLEAN NOT NULL DEFAULT TRUE,
+			notify_trx BOOLEAN NOT NULL DEFAULT FALSE,
 			min_notify_amount TEXT NOT NULL DEFAULT '0',
+			min_notify_trx_amount TEXT NOT NULL DEFAULT '0',
 			active BOOLEAN NOT NULL DEFAULT TRUE,
 			baseline_timestamp BIGINT NOT NULL DEFAULT 0,
 			created_at TIMESTAMPTZ NOT NULL,
@@ -1186,8 +1188,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		)`,
 		`ALTER TABLE address_watches ADD COLUMN IF NOT EXISTS watch_income BOOLEAN NOT NULL DEFAULT TRUE`,
 		`ALTER TABLE address_watches ADD COLUMN IF NOT EXISTS watch_expense BOOLEAN NOT NULL DEFAULT TRUE`,
-		`ALTER TABLE address_watches ADD COLUMN IF NOT EXISTS notify_trx BOOLEAN NOT NULL DEFAULT TRUE`,
+		`ALTER TABLE address_watches ADD COLUMN IF NOT EXISTS notify_trx BOOLEAN NOT NULL DEFAULT FALSE`,
 		`ALTER TABLE address_watches ADD COLUMN IF NOT EXISTS min_notify_amount TEXT NOT NULL DEFAULT '0'`,
+		`ALTER TABLE address_watches ADD COLUMN IF NOT EXISTS min_notify_trx_amount TEXT NOT NULL DEFAULT '0'`,
 		`ALTER TABLE address_watches ADD COLUMN IF NOT EXISTS baseline_timestamp BIGINT NOT NULL DEFAULT 0`,
 		`UPDATE address_watches
 			SET baseline_timestamp=(EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT
@@ -1201,10 +1204,12 @@ func (s *Store) migrate(ctx context.Context) error {
 			owner_user_id BIGINT PRIMARY KEY,
 			watch_income BOOLEAN NOT NULL DEFAULT TRUE,
 			watch_expense BOOLEAN NOT NULL DEFAULT TRUE,
-			notify_trx BOOLEAN NOT NULL DEFAULT TRUE,
+			notify_trx BOOLEAN NOT NULL DEFAULT FALSE,
 			min_notify_amount TEXT NOT NULL DEFAULT '0',
+			min_notify_trx_amount TEXT NOT NULL DEFAULT '0',
 			updated_at TIMESTAMPTZ NOT NULL
 		)`,
+		`ALTER TABLE address_watch_settings ADD COLUMN IF NOT EXISTS min_notify_trx_amount TEXT NOT NULL DEFAULT '0'`,
 		`CREATE TABLE IF NOT EXISTS address_validations (
 			chat_id BIGINT NOT NULL,
 			address TEXT NOT NULL,
@@ -1403,8 +1408,9 @@ func (s *Store) migrate(ctx context.Context) error {
 			label TEXT NOT NULL DEFAULT '',
 			watch_income BOOLEAN NOT NULL DEFAULT TRUE,
 			watch_expense BOOLEAN NOT NULL DEFAULT TRUE,
-			notify_trx BOOLEAN NOT NULL DEFAULT TRUE,
+			notify_trx BOOLEAN NOT NULL DEFAULT FALSE,
 			min_notify_amount TEXT NOT NULL DEFAULT '0',
+			min_notify_trx_amount TEXT NOT NULL DEFAULT '0',
 			baseline_timestamp BIGINT NOT NULL DEFAULT 0,
 			active BOOLEAN NOT NULL DEFAULT TRUE,
 			created_at TIMESTAMPTZ NOT NULL,
@@ -1413,12 +1419,19 @@ func (s *Store) migrate(ctx context.Context) error {
 		)`,
 		`ALTER TABLE chain_watcher_subscriptions ADD COLUMN IF NOT EXISTS chat_id BIGINT NOT NULL DEFAULT 0`,
 		`ALTER TABLE chain_watcher_subscriptions ADD COLUMN IF NOT EXISTS baseline_timestamp BIGINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE chain_watcher_subscriptions ADD COLUMN IF NOT EXISTS min_notify_trx_amount TEXT NOT NULL DEFAULT '0'`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_chain_watcher_subscriptions_identity
 			ON chain_watcher_subscriptions(bot_id, chat_id, owner_user_id, address)`,
 		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_subscriptions_active_address
 			ON chain_watcher_subscriptions(active, address, bot_id, chat_id, owner_user_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_chain_watcher_subscriptions_bot_active
 			ON chain_watcher_subscriptions(bot_id, active, updated_at DESC)`,
+		`ALTER TABLE address_watches ALTER COLUMN notify_trx SET DEFAULT FALSE`,
+		`ALTER TABLE address_watch_settings ALTER COLUMN notify_trx SET DEFAULT FALSE`,
+		`ALTER TABLE chain_watcher_subscriptions ALTER COLUMN notify_trx SET DEFAULT FALSE`,
+		`UPDATE address_watches SET notify_trx=FALSE WHERE notify_trx=TRUE`,
+		`UPDATE address_watch_settings SET notify_trx=FALSE WHERE notify_trx=TRUE`,
+		`UPDATE chain_watcher_subscriptions SET notify_trx=FALSE WHERE notify_trx=TRUE`,
 		`CREATE TABLE IF NOT EXISTS chain_watcher_events (
 			event_id TEXT PRIMARY KEY,
 			tx_hash TEXT NOT NULL,
@@ -5173,12 +5186,12 @@ func (s *Store) SoftDeleteRecordsForPeriod(ctx context.Context, chatID int64, da
 
 func (s *Store) ListWatchTargets(ctx context.Context) ([]WatchTarget, error) {
 	rows, err := s.pool.Query(ctx, `SELECT w.owner_user_id, w.address, w.label,
-		w.watch_income, w.watch_expense, w.notify_trx, w.min_notify_amount,
+		w.watch_income, w.watch_expense, w.notify_trx, w.min_notify_amount, w.min_notify_trx_amount,
 			COALESCE(MAX(n.block_timestamp), 0), w.baseline_timestamp
 		FROM address_watches w
 		LEFT JOIN chain_notifications n ON n.owner_user_id = w.owner_user_id AND n.address = w.address
 		WHERE w.active = TRUE
-		GROUP BY w.owner_user_id, w.address, w.label, w.watch_income, w.watch_expense, w.notify_trx, w.min_notify_amount, w.baseline_timestamp
+		GROUP BY w.owner_user_id, w.address, w.label, w.watch_income, w.watch_expense, w.notify_trx, w.min_notify_amount, w.min_notify_trx_amount, w.baseline_timestamp
 		ORDER BY w.owner_user_id ASC, w.address ASC`)
 	if err != nil {
 		return nil, err
@@ -5187,7 +5200,7 @@ func (s *Store) ListWatchTargets(ctx context.Context) ([]WatchTarget, error) {
 	var targets []WatchTarget
 	for rows.Next() {
 		var t WatchTarget
-		if err := rows.Scan(&t.OwnerUserID, &t.Address, &t.Label, &t.WatchIncome, &t.WatchExpense, &t.NotifyTRX, &t.MinNotifyAmount, &t.LatestTimestamp, &t.BaselineTimestamp); err != nil {
+		if err := rows.Scan(&t.OwnerUserID, &t.Address, &t.Label, &t.WatchIncome, &t.WatchExpense, &t.NotifyTRX, &t.MinNotifyAmount, &t.MinNotifyTRXAmount, &t.LatestTimestamp, &t.BaselineTimestamp); err != nil {
 			return nil, err
 		}
 		targets = append(targets, t)
@@ -5197,12 +5210,12 @@ func (s *Store) ListWatchTargets(ctx context.Context) ([]WatchTarget, error) {
 
 func (s *Store) ListWatchTargetsForOwner(ctx context.Context, owner int64) ([]WatchTarget, error) {
 	rows, err := s.pool.Query(ctx, `SELECT w.owner_user_id, w.address, w.label,
-		w.watch_income, w.watch_expense, w.notify_trx, w.min_notify_amount,
+		w.watch_income, w.watch_expense, w.notify_trx, w.min_notify_amount, w.min_notify_trx_amount,
 			COALESCE(MAX(n.block_timestamp), 0), w.baseline_timestamp
 		FROM address_watches w
 		LEFT JOIN chain_notifications n ON n.owner_user_id = w.owner_user_id AND n.address = w.address
 		WHERE w.active = TRUE AND w.owner_user_id=$1
-		GROUP BY w.owner_user_id, w.address, w.label, w.watch_income, w.watch_expense, w.notify_trx, w.min_notify_amount, w.baseline_timestamp, w.updated_at
+		GROUP BY w.owner_user_id, w.address, w.label, w.watch_income, w.watch_expense, w.notify_trx, w.min_notify_amount, w.min_notify_trx_amount, w.baseline_timestamp, w.updated_at
 		ORDER BY w.updated_at DESC, w.address ASC`, owner)
 	if err != nil {
 		return nil, err
@@ -5211,7 +5224,7 @@ func (s *Store) ListWatchTargetsForOwner(ctx context.Context, owner int64) ([]Wa
 	var targets []WatchTarget
 	for rows.Next() {
 		var t WatchTarget
-		if err := rows.Scan(&t.OwnerUserID, &t.Address, &t.Label, &t.WatchIncome, &t.WatchExpense, &t.NotifyTRX, &t.MinNotifyAmount, &t.LatestTimestamp, &t.BaselineTimestamp); err != nil {
+		if err := rows.Scan(&t.OwnerUserID, &t.Address, &t.Label, &t.WatchIncome, &t.WatchExpense, &t.NotifyTRX, &t.MinNotifyAmount, &t.MinNotifyTRXAmount, &t.LatestTimestamp, &t.BaselineTimestamp); err != nil {
 			return nil, err
 		}
 		targets = append(targets, t)
@@ -5228,15 +5241,16 @@ func (s *Store) CountActiveWatchTargetsForOwner(ctx context.Context, owner int64
 
 func (s *Store) GetWatchSettings(ctx context.Context, owner int64) (WatchSettings, error) {
 	settings := WatchSettings{
-		OwnerUserID:     owner,
-		WatchIncome:     true,
-		WatchExpense:    true,
-		NotifyTRX:       true,
-		MinNotifyAmount: "0",
+		OwnerUserID:        owner,
+		WatchIncome:        true,
+		WatchExpense:       true,
+		NotifyTRX:          false,
+		MinNotifyAmount:    "0",
+		MinNotifyTRXAmount: "0",
 	}
-	row := s.pool.QueryRow(ctx, `SELECT owner_user_id, watch_income, watch_expense, notify_trx, min_notify_amount, updated_at
+	row := s.pool.QueryRow(ctx, `SELECT owner_user_id, watch_income, watch_expense, notify_trx, min_notify_amount, min_notify_trx_amount, updated_at
 		FROM address_watch_settings WHERE owner_user_id=$1`, owner)
-	err := row.Scan(&settings.OwnerUserID, &settings.WatchIncome, &settings.WatchExpense, &settings.NotifyTRX, &settings.MinNotifyAmount, &settings.UpdatedAt)
+	err := row.Scan(&settings.OwnerUserID, &settings.WatchIncome, &settings.WatchExpense, &settings.NotifyTRX, &settings.MinNotifyAmount, &settings.MinNotifyTRXAmount, &settings.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return settings, nil
 	}
@@ -5244,27 +5258,29 @@ func (s *Store) GetWatchSettings(ctx context.Context, owner int64) (WatchSetting
 }
 
 func (s *Store) SaveWatchSettings(ctx context.Context, settings WatchSettings, now time.Time) error {
-	_, err := s.pool.Exec(ctx, `INSERT INTO address_watch_settings(owner_user_id, watch_income, watch_expense, notify_trx, min_notify_amount, updated_at)
-		VALUES($1, $2, $3, $4, $5, $6)
+	_, err := s.pool.Exec(ctx, `INSERT INTO address_watch_settings(owner_user_id, watch_income, watch_expense, notify_trx, min_notify_amount, min_notify_trx_amount, updated_at)
+		VALUES($1, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT(owner_user_id) DO UPDATE SET
 			watch_income=excluded.watch_income,
 			watch_expense=excluded.watch_expense,
 			notify_trx=excluded.notify_trx,
 			min_notify_amount=excluded.min_notify_amount,
+			min_notify_trx_amount=excluded.min_notify_trx_amount,
 			updated_at=excluded.updated_at`,
-		settings.OwnerUserID, settings.WatchIncome, settings.WatchExpense, settings.NotifyTRX, settings.MinNotifyAmount, now)
+		settings.OwnerUserID, settings.WatchIncome, settings.WatchExpense, settings.NotifyTRX, settings.MinNotifyAmount, settings.MinNotifyTRXAmount, now)
 	return err
 }
 
 func (s *Store) AddWatch(ctx context.Context, owner int64, address, label string, now time.Time) error {
 	_, err := s.pool.Exec(ctx, `INSERT INTO address_watches(
-			owner_user_id, address, label, watch_income, watch_expense, notify_trx, min_notify_amount, active, baseline_timestamp, created_at, updated_at
+			owner_user_id, address, label, watch_income, watch_expense, notify_trx, min_notify_amount, min_notify_trx_amount, active, baseline_timestamp, created_at, updated_at
 		)
 		SELECT $1, $2, $3,
 			COALESCE(s.watch_income, TRUE),
 			COALESCE(s.watch_expense, TRUE),
-			COALESCE(s.notify_trx, TRUE),
+			COALESCE(s.notify_trx, FALSE),
 			COALESCE(s.min_notify_amount, '0'),
+			COALESCE(s.min_notify_trx_amount, '0'),
 			TRUE, $4, $5, $5
 		FROM (SELECT 1) seed
 		LEFT JOIN address_watch_settings s ON s.owner_user_id=$1
@@ -5282,15 +5298,15 @@ func (s *Store) AddWatch(ctx context.Context, owner int64, address, label string
 
 func (s *Store) GetWatchTarget(ctx context.Context, owner int64, address string) (WatchTarget, bool, error) {
 	row := s.pool.QueryRow(ctx, `SELECT w.owner_user_id, w.address, w.label,
-		w.watch_income, w.watch_expense, w.notify_trx, w.min_notify_amount,
+		w.watch_income, w.watch_expense, w.notify_trx, w.min_notify_amount, w.min_notify_trx_amount,
 			COALESCE(MAX(n.block_timestamp), 0), w.baseline_timestamp
 		FROM address_watches w
 		LEFT JOIN chain_notifications n ON n.owner_user_id = w.owner_user_id AND n.address = w.address
 		WHERE w.active = TRUE AND w.owner_user_id=$1 AND w.address=$2
-		GROUP BY w.owner_user_id, w.address, w.label, w.watch_income, w.watch_expense, w.notify_trx, w.min_notify_amount, w.baseline_timestamp`,
+		GROUP BY w.owner_user_id, w.address, w.label, w.watch_income, w.watch_expense, w.notify_trx, w.min_notify_amount, w.min_notify_trx_amount, w.baseline_timestamp`,
 		owner, address)
 	var target WatchTarget
-	err := row.Scan(&target.OwnerUserID, &target.Address, &target.Label, &target.WatchIncome, &target.WatchExpense, &target.NotifyTRX, &target.MinNotifyAmount, &target.LatestTimestamp, &target.BaselineTimestamp)
+	err := row.Scan(&target.OwnerUserID, &target.Address, &target.Label, &target.WatchIncome, &target.WatchExpense, &target.NotifyTRX, &target.MinNotifyAmount, &target.MinNotifyTRXAmount, &target.LatestTimestamp, &target.BaselineTimestamp)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return WatchTarget{}, false, nil
 	}
@@ -5304,7 +5320,8 @@ func (s *Store) UpdateWatchTarget(ctx context.Context, target WatchTarget, now t
 			watch_expense=$5,
 			notify_trx=$6,
 			min_notify_amount=$7,
-			updated_at=$8
+			min_notify_trx_amount=$8,
+			updated_at=$9
 		WHERE owner_user_id=$1 AND address=$2 AND active=TRUE`,
 		target.OwnerUserID,
 		target.Address,
@@ -5313,6 +5330,7 @@ func (s *Store) UpdateWatchTarget(ctx context.Context, target WatchTarget, now t
 		target.WatchExpense,
 		target.NotifyTRX,
 		target.MinNotifyAmount,
+		target.MinNotifyTRXAmount,
 		now,
 	)
 	return tag.RowsAffected() > 0, err
@@ -5880,6 +5898,7 @@ func (s *Store) UpsertChainWatcherSubscription(ctx context.Context, sub ChainWat
 	sub.Address = strings.TrimSpace(sub.Address)
 	sub.Label = strings.TrimSpace(sub.Label)
 	sub.MinNotifyAmount = strings.TrimSpace(sub.MinNotifyAmount)
+	sub.MinNotifyTRXAmount = strings.TrimSpace(sub.MinNotifyTRXAmount)
 	if sub.BotID == "" {
 		return errors.New("chain watcher subscription bot id is empty")
 	}
@@ -5895,23 +5914,27 @@ func (s *Store) UpsertChainWatcherSubscription(ctx context.Context, sub ChainWat
 	if sub.MinNotifyAmount == "" {
 		sub.MinNotifyAmount = "0"
 	}
+	if sub.MinNotifyTRXAmount == "" {
+		sub.MinNotifyTRXAmount = "0"
+	}
 	_, err := s.pool.Exec(ctx, `INSERT INTO chain_watcher_subscriptions(
-			bot_id, chat_id, owner_user_id, address, label, watch_income, watch_expense, notify_trx, min_notify_amount,
+			bot_id, chat_id, owner_user_id, address, label, watch_income, watch_expense, notify_trx, min_notify_amount, min_notify_trx_amount,
 			baseline_timestamp, active, created_at, updated_at
-		) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE, $11, $11)
+		) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, TRUE, $12, $12)
 		ON CONFLICT(bot_id, chat_id, owner_user_id, address) DO UPDATE SET
 			label=excluded.label,
 			watch_income=excluded.watch_income,
 			watch_expense=excluded.watch_expense,
 			notify_trx=excluded.notify_trx,
 			min_notify_amount=excluded.min_notify_amount,
+			min_notify_trx_amount=excluded.min_notify_trx_amount,
 			baseline_timestamp=CASE
 				WHEN chain_watcher_subscriptions.active THEN chain_watcher_subscriptions.baseline_timestamp
 				ELSE excluded.baseline_timestamp
 			END,
 			active=TRUE,
 			updated_at=excluded.updated_at`,
-		sub.BotID, sub.ChatID, sub.OwnerUserID, sub.Address, sub.Label, sub.WatchIncome, sub.WatchExpense, sub.NotifyTRX, sub.MinNotifyAmount, sub.BaselineTimestamp, now)
+		sub.BotID, sub.ChatID, sub.OwnerUserID, sub.Address, sub.Label, sub.WatchIncome, sub.WatchExpense, sub.NotifyTRX, sub.MinNotifyAmount, sub.MinNotifyTRXAmount, sub.BaselineTimestamp, now)
 	return err
 }
 
@@ -5947,26 +5970,31 @@ func (s *Store) ReplaceChainWatcherSubscriptions(ctx context.Context, botID stri
 		sub.Address = strings.TrimSpace(sub.Address)
 		sub.Label = strings.TrimSpace(sub.Label)
 		sub.MinNotifyAmount = strings.TrimSpace(sub.MinNotifyAmount)
+		sub.MinNotifyTRXAmount = strings.TrimSpace(sub.MinNotifyTRXAmount)
 		if sub.OwnerUserID == 0 || sub.Address == "" {
 			continue
 		}
 		if sub.MinNotifyAmount == "" {
 			sub.MinNotifyAmount = "0"
 		}
+		if sub.MinNotifyTRXAmount == "" {
+			sub.MinNotifyTRXAmount = "0"
+		}
 		if _, err := tx.Exec(ctx, `INSERT INTO chain_watcher_subscriptions(
-				bot_id, chat_id, owner_user_id, address, label, watch_income, watch_expense, notify_trx, min_notify_amount,
+				bot_id, chat_id, owner_user_id, address, label, watch_income, watch_expense, notify_trx, min_notify_amount, min_notify_trx_amount,
 				baseline_timestamp, active, created_at, updated_at
-			) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE, $11, $11)
+			) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, TRUE, $12, $12)
 			ON CONFLICT(bot_id, chat_id, owner_user_id, address) DO UPDATE SET
 				label=excluded.label,
 				watch_income=excluded.watch_income,
 				watch_expense=excluded.watch_expense,
 				notify_trx=excluded.notify_trx,
 				min_notify_amount=excluded.min_notify_amount,
+				min_notify_trx_amount=excluded.min_notify_trx_amount,
 				baseline_timestamp=chain_watcher_subscriptions.baseline_timestamp,
 				active=TRUE,
 				updated_at=excluded.updated_at`,
-			sub.BotID, sub.ChatID, sub.OwnerUserID, sub.Address, sub.Label, sub.WatchIncome, sub.WatchExpense, sub.NotifyTRX, sub.MinNotifyAmount, sub.BaselineTimestamp, now); err != nil {
+			sub.BotID, sub.ChatID, sub.OwnerUserID, sub.Address, sub.Label, sub.WatchIncome, sub.WatchExpense, sub.NotifyTRX, sub.MinNotifyAmount, sub.MinNotifyTRXAmount, sub.BaselineTimestamp, now); err != nil {
 			return err
 		}
 	}
@@ -5975,7 +6003,7 @@ func (s *Store) ReplaceChainWatcherSubscriptions(ctx context.Context, botID stri
 
 func (s *Store) ListChainWatcherSubscriptions(ctx context.Context) ([]ChainWatcherSubscription, error) {
 	rows, err := s.pool.Query(ctx, `SELECT bot_id, chat_id, owner_user_id, address, label,
-		watch_income, watch_expense, notify_trx, min_notify_amount, baseline_timestamp, active, updated_at
+		watch_income, watch_expense, notify_trx, min_notify_amount, min_notify_trx_amount, baseline_timestamp, active, updated_at
 		FROM chain_watcher_subscriptions
 		WHERE active=TRUE
 		ORDER BY address, bot_id, owner_user_id`)
@@ -5986,7 +6014,7 @@ func (s *Store) ListChainWatcherSubscriptions(ctx context.Context) ([]ChainWatch
 	var out []ChainWatcherSubscription
 	for rows.Next() {
 		var sub ChainWatcherSubscription
-		if err := rows.Scan(&sub.BotID, &sub.ChatID, &sub.OwnerUserID, &sub.Address, &sub.Label, &sub.WatchIncome, &sub.WatchExpense, &sub.NotifyTRX, &sub.MinNotifyAmount, &sub.BaselineTimestamp, &sub.Active, &sub.UpdatedAt); err != nil {
+		if err := rows.Scan(&sub.BotID, &sub.ChatID, &sub.OwnerUserID, &sub.Address, &sub.Label, &sub.WatchIncome, &sub.WatchExpense, &sub.NotifyTRX, &sub.MinNotifyAmount, &sub.MinNotifyTRXAmount, &sub.BaselineTimestamp, &sub.Active, &sub.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, sub)

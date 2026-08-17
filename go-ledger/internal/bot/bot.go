@@ -465,7 +465,7 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg telegram.Message, us
 		switch state.Mode {
 		case "quick_reply":
 			return b.handleQuickReplyMaterial(ctx, msg, user, state)
-		case "watch_add", "watch_remove", "watch_min", "watch_target_min", "watch_target_label":
+		case "watch_add", "watch_remove", "watch_min", "watch_target_min", "watch_target_trx_min", "watch_target_label":
 			if text == "菜单" || text == "/start" || text == "返回" || text == "取消" {
 				b.privateStates.Delete(formatID(user.ID))
 				return b.sendPrivateMenu(ctx, msg.Chat.ID, msg.MessageID)
