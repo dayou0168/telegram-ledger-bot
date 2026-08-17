@@ -159,6 +159,26 @@ func (b *Bot) handleAddressWatchState(ctx context.Context, msg telegram.Message,
 		b.syncChainWatcherTargetAsync(ctx, target)
 		_ = b.enqueueReplyText(ctx, sendPriorityNormal, "watch_target_min_ok", msg.Chat.ID, msg.MessageID, "最小提醒金额已设置为 "+minAmount+" USDT。", nil, now)
 		return b.sendAddressWatchDetail(ctx, msg.Chat.ID, user.ID, target.Address)
+	case "watch_target_trx_min":
+		minAmount := formatRat(parseRat(text), 6)
+		if parseRat(text) == nil || parseRat(text).Sign() < 0 {
+			return b.enqueueReplyText(ctx, sendPriorityNormal, "watch_target_trx_min_invalid", msg.Chat.ID, msg.MessageID, "TRX 最小提醒金额格式不正确，请发送大于等于 0 的数字。", nil, now)
+		}
+		target, ok, err := b.store.GetWatchTarget(ctx, user.ID, state.WatchAddress)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return b.enqueueReplyText(ctx, sendPriorityNormal, "watch_target_trx_min_lost", msg.Chat.ID, msg.MessageID, "没有找到这个监听地址。", nil, now)
+		}
+		target.MinNotifyTRXAmount = minAmount
+		if _, err := b.store.UpdateWatchTarget(ctx, target, now); err != nil {
+			return err
+		}
+		b.InvalidateWatchTargets()
+		b.syncChainWatcherTargetAsync(ctx, target)
+		_ = b.enqueueReplyText(ctx, sendPriorityNormal, "watch_target_trx_min_ok", msg.Chat.ID, msg.MessageID, "TRX 最小提醒金额已设置为 "+minAmount+" TRX。", nil, now)
+		return b.sendAddressWatchDetail(ctx, msg.Chat.ID, user.ID, target.Address)
 	case "watch_target_label":
 		target, ok, err := b.store.GetWatchTarget(ctx, user.ID, state.WatchAddress)
 		if err != nil {
@@ -212,11 +232,18 @@ func (b *Bot) handleAddressWatchTargetCallback(ctx context.Context, cb telegram.
 		enabled := targetWatchEnabled(target)
 		target.WatchIncome = !enabled
 		target.WatchExpense = !enabled
-		target.NotifyTRX = !enabled
 	case "income":
 		target.WatchIncome = !target.WatchIncome
 	case "expense":
 		target.WatchExpense = !target.WatchExpense
+	case "trx":
+		target.NotifyTRX = !target.NotifyTRX
+	case "trx_min":
+		b.privateStates.Set(formatID(cb.From.ID), privateState{Mode: "watch_target_trx_min", WatchAddress: address, CreatedAt: now})
+		if err := b.tg.AnswerCallback(ctx, cb.ID, "请输入 TRX 最小金额"); err != nil {
+			return err
+		}
+		return b.enqueueReliableText(ctx, sendPriorityNormal, "watch_target_trx_min_prompt", fmt.Sprintf("watch_target_trx_min_prompt:%d:%d:%d", chatID, cb.From.ID, now.UnixNano()), chatID, "请发送这个地址的 TRX 最小提醒金额，低于该金额不提醒。\n例如：1；发送 0 表示全部提醒。", nil, reliableMessageRef{}, now)
 	case "min":
 		b.privateStates.Set(formatID(cb.From.ID), privateState{Mode: "watch_target_min", WatchAddress: address, CreatedAt: now})
 		if err := b.tg.AnswerCallback(ctx, cb.ID, "请输入最小金额"); err != nil {
@@ -416,6 +443,11 @@ func formatAddressWatchDetailText(target storage.WatchTarget) string {
 	out.WriteString("\n最小提醒：")
 	out.WriteString(target.MinNotifyAmount)
 	out.WriteString(" USDT")
+	out.WriteString("\nTRX 提醒：")
+	out.WriteString(onOff(target.NotifyTRX))
+	out.WriteString("\nTRX 最小提醒：")
+	out.WriteString(target.MinNotifyTRXAmount)
+	out.WriteString(" TRX")
 	return out.String()
 }
 
@@ -442,7 +474,9 @@ func addressWatchDetailKeyboard(target storage.WatchTarget) [][]telegram.InlineK
 	return [][]telegram.InlineKeyboardButton{
 		{{Text: enabledAction, CallbackData: "watch:t:enabled:" + address}},
 		{{Text: "收入 " + onOff(target.WatchIncome), CallbackData: "watch:t:income:" + address}, {Text: "支出 " + onOff(target.WatchExpense), CallbackData: "watch:t:expense:" + address}},
-		{{Text: "最小金额 " + target.MinNotifyAmount, CallbackData: "watch:t:min:" + address}},
+		{{Text: "TRX 提醒 " + onOff(target.NotifyTRX), CallbackData: "watch:t:trx:" + address}},
+		{{Text: "USDT 最小金额 " + target.MinNotifyAmount, CallbackData: "watch:t:min:" + address}},
+		{{Text: "TRX 最小金额 " + target.MinNotifyTRXAmount, CallbackData: "watch:t:trx_min:" + address}},
 		{{Text: "设置备注", CallbackData: "watch:t:label:" + address}, {Text: "删除地址", CallbackData: "watch:t:del:" + address}},
 		{{Text: "返回列表", CallbackData: "watch:t:back:" + address}},
 	}

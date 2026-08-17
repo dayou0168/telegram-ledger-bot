@@ -13,16 +13,17 @@ import (
 )
 
 type SubscriptionRequest struct {
-	BotID             string `json:"bot_id,omitempty"`
-	ChatID            int64  `json:"chat_id"`
-	OwnerUserID       int64  `json:"owner_user_id"`
-	Address           string `json:"address"`
-	Label             string `json:"label"`
-	MinNotifyAmount   string `json:"min_amount"`
-	WatchIncome       bool   `json:"watch_income"`
-	WatchExpense      bool   `json:"watch_expense"`
-	NotifyTRX         bool   `json:"notify_trx"`
-	BaselineTimestamp int64  `json:"baseline_timestamp"`
+	BotID              string `json:"bot_id,omitempty"`
+	ChatID             int64  `json:"chat_id"`
+	OwnerUserID        int64  `json:"owner_user_id"`
+	Address            string `json:"address"`
+	Label              string `json:"label"`
+	MinNotifyAmount    string `json:"min_amount"`
+	MinNotifyTRXAmount string `json:"min_trx_amount"`
+	WatchIncome        bool   `json:"watch_income"`
+	WatchExpense       bool   `json:"watch_expense"`
+	NotifyTRX          bool   `json:"notify_trx"`
+	BaselineTimestamp  int64  `json:"baseline_timestamp"`
 }
 
 type SyncRequest struct {
@@ -325,6 +326,11 @@ func TransferEvent(t tron.Transfer, source string) storage.ChainWatcherEvent {
 
 func MatchTransfer(t tron.Transfer, subs []storage.ChainWatcherSubscription) []storage.ChainWatcherMatchedEvent {
 	matches := make([]storage.ChainWatcherMatchedEvent, 0)
+	value, ok := new(big.Rat).SetString(strings.TrimSpace(t.Value))
+	if !ok || value.Sign() <= 0 {
+		return matches
+	}
+	tokenSymbol := strings.ToUpper(strings.TrimSpace(t.TokenSymbol))
 	for _, sub := range subs {
 		if !sub.Active {
 			continue
@@ -332,7 +338,7 @@ func MatchTransfer(t tron.Transfer, subs []storage.ChainWatcherSubscription) []s
 		if sub.BaselineTimestamp > 0 && t.BlockTimestamp < sub.BaselineTimestamp {
 			continue
 		}
-		if strings.EqualFold(t.TokenSymbol, "TRX") && !sub.NotifyTRX {
+		if tokenSymbol == "TRX" && !sub.NotifyTRX {
 			continue
 		}
 		direction := ""
@@ -349,7 +355,10 @@ func MatchTransfer(t tron.Transfer, subs []storage.ChainWatcherSubscription) []s
 		if direction == "" {
 			continue
 		}
-		if !amountAtLeast(t.Value, t.TokenDecimals, sub.MinNotifyAmount) {
+		if tokenSymbol != "TRX" && !amountAtLeast(t.Value, t.TokenDecimals, sub.MinNotifyAmount) {
+			continue
+		}
+		if tokenSymbol == "TRX" && !amountAtLeast(t.Value, t.TokenDecimals, sub.MinNotifyTRXAmount) {
 			continue
 		}
 		matches = append(matches, storage.ChainWatcherMatchedEvent{
@@ -393,22 +402,27 @@ func ToSubscription(botID string, req SubscriptionRequest) storage.ChainWatcherS
 	if minAmount == "" {
 		minAmount = "0"
 	}
+	minTRXAmount := strings.TrimSpace(req.MinNotifyTRXAmount)
+	if minTRXAmount == "" {
+		minTRXAmount = "0"
+	}
 	chatID := req.ChatID
 	if chatID == 0 {
 		chatID = req.OwnerUserID
 	}
 	return storage.ChainWatcherSubscription{
-		BotID:             strings.TrimSpace(botID),
-		ChatID:            chatID,
-		OwnerUserID:       req.OwnerUserID,
-		Address:           strings.TrimSpace(req.Address),
-		Label:             strings.TrimSpace(req.Label),
-		WatchIncome:       req.WatchIncome,
-		WatchExpense:      req.WatchExpense,
-		NotifyTRX:         req.NotifyTRX,
-		BaselineTimestamp: req.BaselineTimestamp,
-		MinNotifyAmount:   minAmount,
-		Active:            true,
+		BotID:              strings.TrimSpace(botID),
+		ChatID:             chatID,
+		OwnerUserID:        req.OwnerUserID,
+		Address:            strings.TrimSpace(req.Address),
+		Label:              strings.TrimSpace(req.Label),
+		WatchIncome:        req.WatchIncome,
+		WatchExpense:       req.WatchExpense,
+		NotifyTRX:          req.NotifyTRX,
+		BaselineTimestamp:  req.BaselineTimestamp,
+		MinNotifyAmount:    minAmount,
+		MinNotifyTRXAmount: minTRXAmount,
+		Active:             true,
 	}
 }
 

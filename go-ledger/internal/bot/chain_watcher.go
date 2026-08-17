@@ -150,7 +150,7 @@ func (b *Bot) sharedSubscription(target storage.WatchTarget) storage.ChainWatche
 	return chainwatcher.ToSubscription(b.cfg.ChainWatcherBotID, chainwatcher.SubscriptionRequest{
 		ChatID: target.OwnerUserID, OwnerUserID: target.OwnerUserID, Address: target.Address,
 		Label: target.Label, WatchIncome: target.WatchIncome, WatchExpense: target.WatchExpense,
-		NotifyTRX: target.NotifyTRX, MinNotifyAmount: target.MinNotifyAmount, BaselineTimestamp: target.BaselineTimestamp,
+		NotifyTRX: target.NotifyTRX, MinNotifyAmount: target.MinNotifyAmount, MinNotifyTRXAmount: target.MinNotifyTRXAmount, BaselineTimestamp: target.BaselineTimestamp,
 	})
 }
 

@@ -1430,7 +1430,9 @@ func (s *Server) saveWatchTarget(w http.ResponseWriter, r *http.Request) {
 	target.Label = strings.TrimSpace(r.FormValue("label"))
 	target.WatchIncome = r.FormValue("watch_income") == "1"
 	target.WatchExpense = r.FormValue("watch_expense") == "1"
+	target.NotifyTRX = r.FormValue("notify_trx") == "1"
 	target.MinNotifyAmount = normalizeAdminMinAmount(r.FormValue("min_notify_amount"))
+	target.MinNotifyTRXAmount = normalizeAdminMinAmount(r.FormValue("min_notify_trx_amount"))
 	if _, err := s.store.UpdateWatchTarget(r.Context(), target, time.Now()); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -3309,6 +3311,7 @@ input{padding:0 12px;margin-bottom:12px}
 button{background:#12213a;color:#fff;font-weight:700;cursor:pointer}
 .warn{background:#fff7dd;border:1px solid #e1bd5f;border-radius:6px;padding:10px;margin-bottom:12px}
 .err{color:#b42318;margin-bottom:12px}
+.watch-head,.watch-row{grid-template-columns:minmax(130px,.7fr) minmax(330px,1.6fr) minmax(150px,.7fr) repeat(3,78px) repeat(2,minmax(110px,.5fr)) auto auto}
 </style>
 </head>
 <body><main class="box">
@@ -3589,7 +3592,7 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 <p class="hint">宿主可查看全部监听地址；一级操作人和操作人只显示自己监听的地址。普通用户不能进入后台，只能在私聊机器人里管理自己的监听地址。</p>
 {{if .WatchTargets}}
 <div class="watch-panel">
-<div class="watch-head"><div>所属用户</div><div>地址</div><div>备注</div><div>收入</div><div>支出</div><div>最小提醒</div><div>保存</div><div>删除</div></div>
+<div class="watch-head"><div>所属用户</div><div>地址</div><div>备注</div><div>收入</div><div>支出</div><div>TRX</div><div>USDT 最小提醒</div><div>TRX 最小提醒</div><div>保存</div><div>删除</div></div>
 {{range $i,$w := .WatchTargets}}
 <form id="watch-save-{{$i}}" method="post" action="/admin/watch/save">
 <input type="hidden" name="owner_user_id" value="{{$w.OwnerUserID}}">
@@ -3605,7 +3608,9 @@ table{width:100%;border-collapse:collapse;margin-top:10px}th,td{border:1px solid
 <input form="watch-save-{{$i}}" name="label" value="{{$w.Label}}" placeholder="备注">
 <label class="watch-check"><input form="watch-save-{{$i}}" type="checkbox" name="watch_income" value="1" {{if $w.WatchIncome}}checked{{end}}>收入</label>
 <label class="watch-check"><input form="watch-save-{{$i}}" type="checkbox" name="watch_expense" value="1" {{if $w.WatchExpense}}checked{{end}}>支出</label>
+<label class="watch-check"><input form="watch-save-{{$i}}" type="checkbox" name="notify_trx" value="1" {{if $w.NotifyTRX}}checked{{end}}>TRX</label>
 <input form="watch-save-{{$i}}" name="min_notify_amount" value="{{$w.MinNotifyAmount}}" placeholder="USDT">
+<input form="watch-save-{{$i}}" name="min_notify_trx_amount" value="{{$w.MinNotifyTRXAmount}}" placeholder="TRX">
 <button class="btn mini" form="watch-save-{{$i}}" type="submit">保存</button>
 <button class="btn mini secondary" form="watch-remove-{{$i}}" type="submit">删除</button>
 </div>

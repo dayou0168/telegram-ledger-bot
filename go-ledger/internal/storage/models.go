@@ -339,15 +339,16 @@ type Operator struct {
 }
 
 type WatchTarget struct {
-	OwnerUserID       int64
-	Address           string
-	Label             string
-	WatchIncome       bool
-	WatchExpense      bool
-	NotifyTRX         bool
-	MinNotifyAmount   string
-	LatestTimestamp   int64
-	BaselineTimestamp int64
+	OwnerUserID        int64
+	Address            string
+	Label              string
+	WatchIncome        bool
+	WatchExpense       bool
+	NotifyTRX          bool
+	MinNotifyAmount    string
+	MinNotifyTRXAmount string
+	LatestTimestamp    int64
+	BaselineTimestamp  int64
 }
 
 type ChainWatcherBot struct {
@@ -359,18 +360,19 @@ type ChainWatcherBot struct {
 }
 
 type ChainWatcherSubscription struct {
-	BotID             string
-	ChatID            int64
-	OwnerUserID       int64
-	Address           string
-	Label             string
-	WatchIncome       bool
-	WatchExpense      bool
-	NotifyTRX         bool
-	MinNotifyAmount   string
-	Active            bool
-	UpdatedAt         time.Time
-	BaselineTimestamp int64
+	BotID              string
+	ChatID             int64
+	OwnerUserID        int64
+	Address            string
+	Label              string
+	WatchIncome        bool
+	WatchExpense       bool
+	NotifyTRX          bool
+	MinNotifyAmount    string
+	MinNotifyTRXAmount string
+	Active             bool
+	UpdatedAt          time.Time
+	BaselineTimestamp  int64
 }
 
 type ChainWatcherEvent struct {
@@ -537,12 +539,13 @@ type ChainWatcherFallbackLease struct {
 }
 
 type WatchSettings struct {
-	OwnerUserID     int64
-	WatchIncome     bool
-	WatchExpense    bool
-	NotifyTRX       bool
-	MinNotifyAmount string
-	UpdatedAt       time.Time
+	OwnerUserID        int64
+	WatchIncome        bool
+	WatchExpense       bool
+	NotifyTRX          bool
+	MinNotifyAmount    string
+	MinNotifyTRXAmount string
+	UpdatedAt          time.Time
 }
 
 type AdminLoginTicket struct {
