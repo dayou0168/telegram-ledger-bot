@@ -1692,6 +1692,11 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
 		VALUES($1, NOW())
+		ON CONFLICT(version) DO NOTHING`, chainTransferLifecycleMigrationVersion); err != nil {
+		return fmt.Errorf("record chain transfer lifecycle migration: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version, applied_at)
+		VALUES($1, NOW())
 		ON CONFLICT(version) DO NOTHING`, latestSchemaMigrationVersion); err != nil {
 		return fmt.Errorf("record schema migration: %w", err)
 	}
