@@ -12,12 +12,12 @@ explicit release workflow and verifies the immutable assets and remote branch se
 pwsh -File scripts/publish-release.ps1 -DryRun
 
 .EXAMPLE
-pwsh -File scripts/publish-release.ps1 -Version 2.5.0
+pwsh -File scripts/publish-release.ps1 -Version 2.5.1
 #>
 [CmdletBinding()]
 param(
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = '2.5.0',
+    [string]$Version = '2.5.1',
 
     [ValidatePattern('^[0-9a-f]{40}$')]
     [string]$ExpectedRemoteMaster = '980bdf09b4efacf6e3991bf7c191a620510806d2',

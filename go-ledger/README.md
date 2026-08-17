@@ -1,8 +1,8 @@
-# Telegram Ledger Bot Go Runtime v2.5.0
+# Telegram Ledger Bot Go Runtime v2.5.1
 
-这是机器人 Go 版 v2.5.0 发布主线，目标是把同步、异步、队列、并发、缓存、数据库和共享链上监听从架构层面重新设计。当前已具备：
+这是机器人 Go 版 v2.5.1 发布主线，目标是把同步、异步、队列、并发、缓存、数据库和共享链上监听从架构层面重新设计。当前已具备：
 
-发布说明见 [../docs/releases/v2.5.0.md](../docs/releases/v2.5.0.md)。
+发布说明见 [../docs/releases/v2.5.1.md](../docs/releases/v2.5.1.md)。
 
 v2.4.14 完成广播上级抄送上下文、真实媒体回流、单群替换矩阵、最终回执、发送/回复双偏好和快速回复 fresh 双检。新增 `2.4.20-broadcast-message-preferences` 数据库迁移；watcher 协议不变。
 
