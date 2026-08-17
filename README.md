@@ -1,8 +1,8 @@
 # Telegram 群组记账机器人
 
-这是 Telegram 记账机器人 Go/PostgreSQL 主线；当前源码版本为 v2.5.0。正式镜像、tag 和 Release 只由显式发布 workflow 产生，生产部署使用 PostgreSQL、GHCR 镜像和共享 `ledger-chain-watcher` 链上监听服务。
+这是 Telegram 记账机器人 Go/PostgreSQL 主线；当前源码版本为 v2.5.1。正式镜像、tag 和 Release 只由显式发布 workflow 产生，生产部署使用 PostgreSQL、GHCR 镜像和共享 `ledger-chain-watcher` 链上监听服务。
 
-v2.5.0 发布说明见 [docs/releases/v2.5.0.md](docs/releases/v2.5.0.md)。本版将链上监听主通道切换为 Lite/Kafka，并保留 Kafka 故障时的 Tronscan API 自动兜底。
+v2.5.1 发布说明见 [docs/releases/v2.5.1.md](docs/releases/v2.5.1.md)。本版修复 v2.5.0 旧数据库升级时未创建交易生命周期表的迁移问题。
 
 ## v2.4.14 发布范围
 

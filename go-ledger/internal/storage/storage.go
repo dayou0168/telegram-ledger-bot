@@ -30,7 +30,8 @@ const (
 	operatorMessageObserversMigrationVersion    = "2.4.18-operator-message-observers-admin-identity"
 	broadcastDeliveryStateMigrationVersion      = "2.4.19-broadcast-delivery-state"
 	broadcastMessagePreferencesMigrationVersion = "2.4.20-broadcast-message-preferences"
-	latestSchemaMigrationVersion                = broadcastMessagePreferencesMigrationVersion
+	chainTransferLifecycleMigrationVersion      = "2.5.1-chain-transfer-lifecycle"
+	latestSchemaMigrationVersion                = chainTransferLifecycleMigrationVersion
 )
 
 const (
